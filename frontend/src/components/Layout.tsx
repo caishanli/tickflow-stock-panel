@@ -46,6 +46,8 @@ import {
   Moon,
   X,
   WifiOff,
+  LineChart,
+  Wallet,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, type IndexQuote } from '@/lib/api'
@@ -71,6 +73,8 @@ const nav = [
   { to: '/watchlist',  label: '自选',   icon: Star },
   { to: '/screener',   label: '策略',   icon: ScanSearch },
   { to: '/backtest',   label: '回测',   icon: History },
+  { to: '/quant-backtest', label: '量化回测', icon: LineChart },
+  { to: '/quant-sim',     label: '量化模拟盘', icon: Wallet },
   { to: '/stock-analysis',    label: '个股分析', icon: TrendingUp },
   { to: '/limit-ladder', label: '连板梯队', icon: Flame },
   { to: '/concept-analysis', label: '概念分析', icon: Layers3 },
