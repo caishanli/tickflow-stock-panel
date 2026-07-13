@@ -133,22 +133,20 @@ backend/app/quant/
 
 ## 4. 前端架构
 
-新增路由与菜单，复用现有 `Layout.tsx` 菜单模式与 `pages/backtest/charts` 图表组件（ECharts / Lightweight Charts）、Tanstack Query、Tailwind。
+全部新代码落在独立目录 `frontend/src/quant/`（见 §11），不改动现有 `pages/`、`components/`。仅 `App.tsx` 与 `Layout.tsx` 做单行挂载（见 §10）。图表复用现有 `pages/backtest/charts` 组件（ECharts / Lightweight Charts），请求用 Tanstack Query，样式用 Tailwind。
 
 ```
-frontend/src/
+frontend/src/quant/
 ├── pages/
-│   ├── quant-backtest/
-│   │   ├── QuantBacktest.tsx        # 主页面：策略列表 + 运行 + 结果
-│   │   ├── StrategyEditorDialog.tsx  # CodeMirror 编辑聚宽 .py
-│   │   └── BacktestResult.tsx        # 净值/回撤/成交表/CSV
-│   └── quant-sim/
-│       ├── QuantSim.tsx              # 账户列表 + 实时状态
-│       ├── AccountDialog.tsx         # 新建/配置账户
-│       └── SimReplay.tsx            # 离线回放
-├── components/quant/
-│   └── CodeEditor.tsx               # 封装 @uiw/react-codemirror（python 高亮）
-└── lib/api/quant.ts                 # /api/quant/* 请求封装
+│   ├── QuantBacktest.tsx        # 主页面：策略列表 + 运行 + 结果
+│   ├── QuantSim.tsx             # 模拟盘：账户列表 + 实时状态 + 离线回放
+│   ├── StrategyEditorDialog.tsx # CodeMirror 编辑聚宽 .py
+│   ├── BacktestResult.tsx       # 净值/回撤/成交表/CSV
+│   ├── AccountDialog.tsx        # 新建/配置账户
+│   └── SimReplay.tsx           # 离线回放视图
+├── components/
+│   └── CodeEditor.tsx          # 封装 @uiw/react-codemirror（python 高亮）
+└── api.ts                       # /api/quant/* 请求封装
 ```
 
 - **菜单**：在 `Layout.tsx` 增加两项：`/quant-backtest` 标签「量化回测」、`/quant-sim` 标签「量化模拟盘」（放在现有「回测」「监控中心」附近）。
@@ -160,7 +158,7 @@ frontend/src/
   - 账户列表：新建/启动/暂停/重置（调用 `/sim/accounts` 与 `<id>/{start,pause,reset}`）。
   - 实时面板：净值、现金、持仓、止损日志（轮询 `/sim/accounts/<id>/status`）。
   - 离线回放：选聚宽策略 + 区间 → 复用量化回测的结果展示组件。
-- **代码编辑器**：新增依赖 `@uiw/react-codemirror` + `@codemirror/lang-python`，封装为 `components/quant/CodeEditor.tsx`（比 Monaco 体积小，契合项目轻量取向）。
+ - **代码编辑器**：新增依赖 `@uiw/react-codemirror` + `@codemirror/lang-python`，封装为 `frontend/src/quant/components/CodeEditor.tsx`（比 Monaco 体积小，契合项目轻量取向）。
 
 ## 5. 数据流
 
@@ -197,3 +195,40 @@ frontend/src/
 - 实时盘为独立进程，FastAPI 仅通过文件/账本通信；「暂停」语义需定义为写控制标记由进程读取，而非强杀。
 - vendored 代码来自 MIT/Apache-2.0 仓库（a-stock-data、quant-daydayup），保留原始 license 头与出处注释。
 - 不改动现有回测与 screener，避免回归。
+
+## 10. 隔离与最小改动原则（重要）
+
+原工程持续更新，用户需要频繁合并上游。因此本模块遵循「**新代码尽量单独成目录，对原文件只做最小必要改动**」：
+
+- **后端**：全部新代码落在独立包 `backend/app/quant/`（含 vendored 的 `datasource/`），不改动 `backtest/`、`strategy/`、`services/`、`tickflow/` 任何现有文件。`tickflow_src.py` 仅**只读 import** 现有 `app.tickflow.repository` / `app.parquet`，不修改它们。
+- **前端**：全部新页面/组件/API 封装落在独立目录 `frontend/src/quant/`，不改动现有 `pages/`、`components/`（除下面列出的挂载点）。
+- **唯一允许的“挂载点”改动**（均为小增量，易 rebase）：
+  1. `backend/pyproject.toml`：新增一个 `quant = [...]` extra 块（依赖声明，纯增量）。
+  2. `backend/app/main.py`：`app.include_router(quant_router, prefix="/api/quant")` 一行挂载（增量）。
+  3. `frontend/package.json`：新增 `@uiw/react-codemirror` + `@codemirror/lang-python` 两个依赖（增量）。
+  4. `frontend/src/App.tsx`：新增 2 个 `<Route>` 指向 `quant/` 页面（增量）。
+  5. `frontend/src/components/Layout.tsx`：菜单数组新增 2 项（`量化回测` / `量化模拟盘`），单行插入，不改其它菜单结构。
+  6. `.env.example`：新增量化相关变量（增量）。
+  7. `.gitignore`：新增 `data/quant_*` 目录（增量）。
+
+> 上述 7 处均为「追加」式改动，上游更新时冲突概率极低；即使冲突也只发生在单行附近，易于手动解决。所有业务逻辑、API 路由、策略存储、模拟盘进程均不侵入原文件。
+
+## 11. 目录落地总览（新增 vs 改动）
+
+```
+新增目录：
+  backend/app/quant/            # 全部后端新逻辑（见 §3）
+  frontend/src/quant/          # 全部前端新页面/组件/API（见 §4）
+  data/quant_strategies/       # 用户聚宽策略（gitignore）
+  data/quant_bundle/           # rqalpha bundle 缓存（gitignore）
+  data/quant_sim/              # 模拟盘实时状态（gitignore）
+
+改动现有文件（均最小增量，见 §10）：
+  backend/pyproject.toml       +quant extra
+  backend/app/main.py           +1 行 include_router
+  frontend/package.json        +2 依赖
+  frontend/src/App.tsx         +2 Route
+  frontend/src/components/Layout.tsx  +2 菜单项
+  .env.example                 +量化变量
+  .gitignore                   +data/quant_*
+```
