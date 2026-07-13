@@ -88,6 +88,13 @@ docs/zhihu/
 # ===== 用户自定义策略(私有,不开源) =====
 data/strategies/custom/
 
+# ===== quant (rqalpha 回测/模拟盘) =====
+data/quant_strategies/
+data/quant_bundle/
+data/quant_sim/
+data/quant.db
+data/quant.db-journal
+
 # ===== 临时 / 调试产物 =====
 backend._recheck*.py
 backend/_verify*.py

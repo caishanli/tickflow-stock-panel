@@ -55,6 +55,15 @@ desktop = [
     "pywebview>=5.0",
 ]
 
+# 量化回测/模拟盘依赖 (RQAlpha + 多源)。启用: uv sync --extra quant
+quant = [
+    "rqalpha>=0.26",
+    "mootdx>=0.11.7",
+    "tushare>=1.4.29,<2",
+    "baostock",
+    "requests>=2.31",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
