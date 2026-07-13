@@ -206,14 +206,43 @@ frontend/src/quant/
   1. `backend/pyproject.toml`：新增一个 `quant = [...]` extra 块（依赖声明，纯增量）。
   2. `backend/app/main.py`：`app.include_router(quant_router, prefix="/api/quant")` 一行挂载（增量）。
   3. `frontend/package.json`：新增 `@uiw/react-codemirror` + `@codemirror/lang-python` 两个依赖（增量）。
-  4. `frontend/src/App.tsx`：新增 2 个 `<Route>` 指向 `quant/` 页面（增量）。
+  4. `frontend/src/router.tsx`：新增 2 个 `lazy` 导入 + 2 个 `children` `<Route>` 指向 `quant/` 页面（增量，沿用现有 named-export 懒加载模式）。
   5. `frontend/src/components/Layout.tsx`：菜单数组新增 2 项（`量化回测` / `量化模拟盘`），单行插入，不改其它菜单结构。
   6. `.env.example`：新增量化相关变量（增量）。
   7. `.gitignore`：新增 `data/quant_*` 目录（增量）。
 
 > 上述 7 处均为「追加」式改动，上游更新时冲突概率极低；即使冲突也只发生在单行附近，易于手动解决。所有业务逻辑、API 路由、策略存储、模拟盘进程均不侵入原文件。
 
-## 11. 目录落地总览（新增 vs 改动）
+## 11. 前端风格一致性（强约束）
+
+新增的「量化回测」「量化模拟盘」页面**必须与现有页面视觉、交互、布局完全一致**。实现时严格复用既有设计语言与组件原语，禁止另起一套样式。
+
+### 11.1 设计令牌（必须全部走 token，禁止硬编码色值）
+- 颜色全部用 Tailwind 映射的 CSS 变量类（`frontend/src/index.css` + `tailwind.config.ts`）：
+  `bg-base` / `bg-surface` / `bg-elevated` / `border-border` / `text-foreground` / `text-muted` / `text-accent` / `bg-accent` / `text-bull`（涨·红）/ `text-bear`（跌·绿）/ `text-warning` / `text-danger`。
+- **暗色为默认**（`html.dark`），亮色由 `:root` 反转。新页面一律用上述令牌类，**不得写 `#hex` / `rgb()` 字面量**，否则切换主题会错位、与全局不一致。
+- 涨/跌、盈亏一律用 `text-bull` / `text-bear`；数字用 `.num` / `.tabular`（等宽 + `tabular-nums`），价格格式化复用 `@/lib/format` 的 `fmtPrice` / `fmtPct` / `priceColorClass`。
+
+### 11.2 必须复用的既有组件/约定
+- **页面外壳**：每个页面顶部用 `PageHeader`（title + 可选 subtitle + `right` 放操作按钮 + `border-b border-border`），与现有页一致。
+- **对话框**：策略编辑、账户配置等弹窗一律用共享 `Modal` 原语（已处理 ESC / 焦点陷阱 / 遮罩点击关闭 / 无障碍），**不要自制 dialog**。
+- **卡片容器**：统一 `rounded-card border border-border bg-surface`（与现有卡片一致），层次用 `bg-elevated` 区分。
+- **空/加载/错误态**：复用 `EmptyState`；轻提示用 `Toast` / `AlertToast`。
+- **日期选择**：复用 `DatePicker`，不要引入新日期库。
+- **图表**：净值/回撤/月度收益等复用现有 ECharts 组件（`pages/backtest/charts/` 下的 `StrategyNavChart` / `ReturnDistributionChart` 等）与 `EChartsCandlestick` / `StockDailyKChart`；配色走 token，跟随暗/亮主题。K 线涨跌色用 `--bull` / `--bear`。
+- **表格**：复用现有 `stock-table` 的表头/单元格样式（`text-muted` 表头、行 hover、`border-border` 分隔），不另写表格样式。
+- **表单控件**：输入框/下拉样式对齐现有（参考 `pages/settings/DataSourceEditor.tsx`）：
+  `w-full h-9 px-2.5 rounded-lg bg-base border-0 ring-1 ring-border/40 text-xs text-foreground placeholder:text-muted/30 focus:outline-none focus:ring-2 focus:ring-accent/40 transition-shadow`。
+- **动画**：如需要入场/列表动画，用项目已有的 `framer-motion`（`motion` / `AnimatePresence`），风格对齐 `pages/backtest/StrategyBacktest.tsx`。
+
+### 11.3 工程约定（与现有保持一致）
+- **路由**：在 `frontend/src/router.tsx` 用现有 `lazy(() => import('./pages/X').then(m => ({ default: m.X })))` 命名导出懒加载模式新增 2 条 `children` 路由（`quant-backtest` / `quant-sim`），保持代码分割、不增大首屏 bundle。
+- **数据请求**：统一用 `@tanstack/react-query`（参考 `useQuery` + `QK` query keys from `@/lib/queryKeys`），API 封装放 `frontend/src/quant/api.ts`，函数签名/返回类型对齐 `@/lib/api` 的既有风格。
+- **菜单**：在 `Layout.tsx` 菜单数组追加 2 项，图标从 `lucide-react` 取（与现有菜单一致），不新增图标库。
+- **代码编辑器（CodeMirror）**：`@uiw/react-codemirror` + `@codemirror/lang-python` 必须做**主题跟随**——根据 `html.dark` 切换 light/dark 编辑器主题，否则会与页面主题冲突。
+- 复用既有 lib 工具：`@/lib/cn`（className 合并）、`@/lib/format`、`@/lib/storage`、`@/lib/useSharedQueries`（`useCapabilities` / `useDataStatus`）、`@/lib/board` 等，不要重复造轮子。
+
+## 12. 目录落地总览（新增 vs 改动）
 
 ```
 新增目录：
@@ -227,8 +256,8 @@ frontend/src/quant/
   backend/pyproject.toml       +quant extra
   backend/app/main.py           +1 行 include_router
   frontend/package.json        +2 依赖
-  frontend/src/App.tsx         +2 Route
-  frontend/src/components/Layout.tsx  +2 菜单项
+   frontend/src/router.tsx        +2 lazy 导入 + 2 Route
+   frontend/src/components/Layout.tsx  +2 菜单项
   .env.example                 +量化变量
   .gitignore                   +data/quant_*
 ```
