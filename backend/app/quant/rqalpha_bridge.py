@@ -325,9 +325,14 @@ def _install_bridge_mod():
 
     def load_mod():
         from rqalpha.interface import AbstractMod
+        from app.quant.jqcompat import _register_jq_apis
 
         class _QuantBridgeMod(AbstractMod):
             def start_up(self, env, mod_config):
+                # 系统 mod（sys_accounts/sys_simulation 等）已在各自 start_up
+                # 用原生实现覆盖了 api 同名函数，这里兜底重新注册我们的 shim，
+                # 确保策略 `from jqdata import *` 拿到的是兼容层实现。
+                _register_jq_apis()
                 ds = _consume_pending_data_source()
                 if ds is not None:
                     env.set_data_source(ds)
@@ -342,6 +347,7 @@ def _install_bridge_mod():
         "base": {},
         "mod": {"sys_risk": {}},
         "extra": {},
+        "priority": 900,
     }
     sys.modules["rqalpha_mod_quantbridge"] = mod
 
@@ -512,3 +518,179 @@ def run_backtest_on_bundle(bundle_dir, strategy_code, params, db_path=None) -> d
     if "symbols" not in params:
         params["symbols"] = ["600000.XSHG"]
     return run_backtest(strategy_code, params, provider=_BundleProvider(bundle_dir), db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# 聚宽(wufu) 策略运行入口：注入 jqcompat + JqDataSource，跑 1m 回测并落库 CSV
+# ---------------------------------------------------------------------------
+import re as _re
+
+_EXTRA_INDEX_CODES = [
+    "000300.XSHG", "399101.XSHE", "399006.XSHE", "000510.XSHG",
+]
+
+
+def _extract_fixed_pools(strategy_text: str):
+    """从策略源码中提取固定 ETF 池（全球池 + 中国池）。"""
+    codes = _re.findall(r"\b(\d{6}\.(?:XSHG|XSHE))\b", strategy_text)
+    seen = []
+    for c in codes:
+        if c not in seen:
+            seen.append(c)
+    return seen
+
+
+def run_jq_backtest(strategy_path: str, params: dict,
+                    universe=None, max_universe=None, db_path=None) -> dict:
+    """运行聚宽式策略（如五福闹新春 v5.2）。
+
+    注入 jqcompat 兼容层与 JqDataSource，设置 1m 频率回测，并将成交/净值写入
+    ``runtime/jqwufu/trades.csv`` 与 ``equity.csv``。
+    """
+    if db_path:
+        db.init_db(db_path)
+
+    from .jqcompat import install_jqcompat, JqDataSource
+    from app.quant.jqengine.datasource.manager import DataManager
+    from app.quant.datasource.base import DataSourceError
+
+    with open(strategy_path, "r", encoding="utf-8") as f:
+        strategy_text = f.read()
+
+    benchmark = params.get("benchmark", "510300.XSHG")
+    start = params.get("start", "2026-01-01")
+    end = params.get("end", "2026-07-08")
+
+    # ---- 构造 DataManager，加载原始缓存（离线，无网络回源） ----
+    dm = DataManager()
+    dm.preload_daily()
+    dm.set_minute_window(start, end)
+    # 离线护栏：禁用 mootdx 真实分钟 / baostock 5min 的回源，仅用本地缓存
+    def _offline(*a, **k):
+        raise DataSourceError("offline mode")
+    try:
+        dm.sources["mootdx"].get_minute = _offline
+    except Exception:
+        pass
+    try:
+        dm.sources["baostock"].get_5min = _offline
+    except Exception:
+        pass
+
+    # 全量 ETF 宇宙（与聚宽 get_all_securities(['etf']) 对齐）：取自日线缓存键，排除指数
+    def _is_index(p):
+        return p.startswith("000") or p.startswith("399")
+    all_codes = [k.split("get_daily_", 1)[1]
+                 for k in dm._daily_mem if k.startswith("get_daily_")]
+    etf_universe = [c for c in all_codes if not _is_index(c.split(".")[0])]
+
+    fixed_pools = _extract_fixed_pools(strategy_text)
+    if max_universe and len(fixed_pools) > max_universe:
+        fixed_pools = fixed_pools[:max_universe]
+
+    # get_all_securities(['etf']) 返回全量 ETF；数据源额外覆盖指数/防御ETF以便 get_price 取数
+    ds_universe = list(dict.fromkeys(
+        list(etf_universe) + _EXTRA_INDEX_CODES + [benchmark, "511880.XSHG"]
+    ))
+
+    # 安装兼容层（注册 shim + 补丁 + 假 jqdata）
+    install_jqcompat(etf_universe, names={}, benchmark=benchmark)
+
+    # 构造数据源：包裹 DataManager，日线即时展开 + 分钟线惰性加载
+    ds = JqDataSource(dm, ds_universe, start, end, benchmark=benchmark,
+                      minute_cache_cap=int(params.get("minute_cache_cap", 800)))
+    _set_pending_data_source(ds)
+
+    # 在 initialize 内注入 update_universe，确保 1m 事件循环有标的
+    # （仅订阅固定池即可；策略通过 get_price 按需查询全量 ETF，不依赖订阅）
+    universe_literal = ",\n".join('        "{}"'.format(c) for c in fixed_pools)
+    strategy_code = _re.sub(
+        r"def initialize\(context\):",
+        "def initialize(context):\n    update_universe([\n{}\n    ])".format(universe_literal),
+        strategy_text,
+        count=1,
+    )
+    # rqalpha 期望入口函数为 init（而非聚宽的 initialize），这里做别名桥接
+    strategy_code += "\ninit = initialize\n"
+
+    config = {
+        "base": {
+            "start_date": start,
+            "end_date": end,
+            "frequency": "1m",
+            "run_type": "b",
+            "accounts": {"stock": float(params.get("capital", 100000.0))},
+            "benchmark": benchmark,
+            "data_bundle_path": params.get("bundle_dir") or _dt_dir(),
+            "matching_type": "current_bar",
+            "strategy_file": "strategy.py",
+        },
+        "mod": {
+            "sys_analyser": {"record": True, "benchmark": benchmark},
+            "sys_simulation": {
+                "slippage": float(params.get("slippage", 0.0001)),
+                "matching_type": "current_bar",
+                "price_limit": False,
+                "volume_limit": False,
+                "inactive_limit": False,
+            },
+            "sys_accounts": {
+                "auto_switch_order_value": True,
+            },
+            "sys_transaction_cost": {
+                "commission_multiplier": float(params.get("fee", 0.0001)) / 0.0008,
+                "min_commission": 5,
+            },
+            "quantbridge": {"enabled": True},
+            "jqbarcache": {"enabled": True},
+        },
+        "extra": {"log_level": params.get("log_level", "error")},
+    }
+
+    out_dir = params.get("out_dir") or os.path.join(CONFIG.runtime_dir, "jqwufu")
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        from rqalpha import run as rq_run
+        result = rq_run(config, source_code=strategy_code)
+
+        equity = _extract_equity(result)
+        trades = _extract_trades(result)
+
+        eq_path = os.path.join(out_dir, "equity.csv")
+        tr_path = os.path.join(out_dir, "trades.csv")
+        pd.DataFrame(equity, columns=["date", "value", "unit_net_value", "cash", "market_value"]).to_csv(eq_path, index=False)
+        pd.DataFrame(trades, columns=["dt", "code", "side", "price", "qty", "a", "b", "cost"]).to_csv(tr_path, index=False)
+
+        try:
+            summary = result["sys_analyser"]["summary"]
+            metrics = {
+                "total_return": float(summary.get("total_returns") or 0.0),
+                "annualized": float(summary.get("annualized_returns") or 0.0),
+                "sharpe": float(summary.get("sharpe") or 0.0),
+                "max_drawdown": float(summary.get("max_drawdown") or 0.0),
+            }
+        except Exception:
+            metrics = {}
+
+        n_trades = len(trades)
+        final_equity = equity[-1][1] if equity else float(params.get("capital", 100000.0))
+
+        if db_path:
+            run_id = params.get("run_id") or _re.sub(r"\W+", "", strategy_path).lower()[:16]
+            db.upsert_run(run_id, params.get("strategy_id", "wufu"), json.dumps(params, ensure_ascii=False), "done")
+            db.bulk_insert_equity(run_id, equity)
+            for t in trades:
+                db.insert_trade(run_id, *t)
+
+        return {
+            "trades_csv": tr_path,
+            "equity_csv": eq_path,
+            "n_trades": n_trades,
+            "final_equity": final_equity,
+            "metrics": metrics,
+            "universe_size": len(etf_universe),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("聚宽回测失败: %s", e)
+        return {"error": str(e)}

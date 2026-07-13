@@ -5,7 +5,6 @@ import pandas as pd
 
 from .base import DataSourceError
 from .cache import DataCache
-from .tickflow_src import TickflowSource
 from .tushare_src import TushareSource
 from .mootdx_src import MootdxSource
 from .astock_src import AStockSource
@@ -14,8 +13,18 @@ from .minute_synth import SyntheticMinuteSource
 
 from ..config import CONFIG
 
+
+def _lazy_tickflow():
+    # tickflow 源依赖 duckdb/polars 等可选组件，缺失时返回 None 不阻塞其他数据源
+    try:
+        from .tickflow_src import TickflowSource
+        return TickflowSource
+    except Exception:
+        return None
+
+
 SOURCES = {
-    "tickflow": TickflowSource,
+    "tickflow": None,
     "tushare": TushareSource,
     "mootdx": MootdxSource,
     "astock": AStockSource,
@@ -28,10 +37,19 @@ class QuantDataProvider:
     def __init__(self, priority=None, token=None, cache=None):
         self.cache = cache or DataCache()
         tok = token if token is not None else CONFIG.tushare_token
-        self.sources = {
-            k: (v(token=tok) if k == "tushare" else v())
-            for k, v in SOURCES.items()
-        }
+        self.sources = {}
+        for k, v in SOURCES.items():
+            if v is None:
+                real = _lazy_tickflow() if k == "tickflow" else None
+                if real is None:
+                    continue
+                v = real
+            try:
+                self.sources[k] = v(token=tok) if k == "tushare" else v()
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("数据源 %s 初始化失败，跳过: %s", k, e)
+                continue
         self.minute_source = SyntheticMinuteSource(
             lambda code, start, end: self.fetch("get_daily", code, start, end)
         )
@@ -64,7 +82,23 @@ class QuantDataProvider:
         return self.minute_source.get_minute(code, date)
 
     def get_stock_list(self):
-        return self.fetch("get_stock_list", "ALL")
+        return self._fetch_noarg("get_stock_list")
 
     def get_etf_list(self):
-        return self.fetch("get_etf_list", "ALL")
+        return self._fetch_noarg("get_etf_list")
+
+    def _fetch_noarg(self, method):
+        last = None
+        for name in self.priority:
+            src = self.sources.get(name)
+            if src is None:
+                continue
+            try:
+                return getattr(src, method)()
+            except DataSourceError as e:
+                last = e
+                continue
+            except TypeError:
+                # 部分源的方法签名不带 code 参数，直接无参调用即可
+                continue
+        raise last or DataSourceError(f"所有数据源均不可用: {method}")

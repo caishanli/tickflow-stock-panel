@@ -113,3 +113,8 @@ packaging/installed_run.log
 TickFlowStockPanel.app/
 TickFlowStockPanel-macos*.dmg
 TickFlowStockPanel-macos*.zip
+
+# ===== quant jqengine 数据缓存(DB symlinks) =====
+backend/jqdata/
+backend/runtime/
+backend/app/quant/jqengine/data/

@@ -77,25 +77,6 @@ class SyntheticMinuteSource:
         daily = self._daily(code, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
         if daily is None or daily.empty:
             return pd.DataFrame()
-        # 规整索引为 DatetimeIndex
-        if not isinstance(daily.index, pd.DatetimeIndex):
-            col = None
-            for c in ("date", "datetime", "trade_date", "time"):
-                if c in daily.columns:
-                    col = c
-                    break
-            if col is not None:
-                daily = daily.copy()
-                daily[col] = pd.to_datetime(daily[col], errors="coerce")
-                daily = daily.set_index(col)
-            elif daily.index.dtype == object or str(daily.index.dtype).startswith("str"):
-                daily = daily.copy()
-                daily.index = pd.to_datetime(daily.index, errors="coerce")
-        if not isinstance(daily.index, pd.DatetimeIndex):
-            # 仍非时间索引则无法切片，直接返回空
-            return pd.DataFrame()
-        daily = daily[~daily.index.isna()]
-        daily = daily.sort_index()
         # mootdx 忽略日期范围返回最近约800根日线，按窗口切片避免展开过多
         lo = start
         hi = end
@@ -103,6 +84,17 @@ class SyntheticMinuteSource:
         daily = daily[mask]
         if daily.empty:
             return pd.DataFrame()
+        if not isinstance(daily.index, pd.DatetimeIndex):
+            col = None
+            for c in ("datetime", "trade_date", "date", "time"):
+                if c in daily.columns:
+                    col = c
+                    break
+            if col is not None:
+                daily = daily.copy()
+                daily[col] = pd.to_datetime(daily[col], errors="coerce")
+                daily = daily.set_index(col)
+        daily = daily.sort_index()
         frames = []
         for t, row in daily.iterrows():
             f = _expand_day(row)
