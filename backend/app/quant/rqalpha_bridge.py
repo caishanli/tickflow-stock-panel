@@ -473,7 +473,7 @@ def run_backtest(strategy_code: str, params: dict, provider=None, db_path: str |
     if db_path:
         db.init_db(db_path)
     run_id = params.get("run_id") or uuid.uuid4().hex[:8]
-    db.insert_run(run_id, params.get("strategy_id", ""), json.dumps(params, ensure_ascii=False), "running")
+    db.upsert_run(run_id, params.get("strategy_id", ""), json.dumps(params, ensure_ascii=False), "running")
     try:
         from rqalpha import run as rq_run
 

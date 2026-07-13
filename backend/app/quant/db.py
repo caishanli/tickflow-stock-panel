@@ -72,6 +72,17 @@ def insert_run(run_id, strategy_id, params_json, status="queued"):
         )
 
 
+def upsert_run(run_id, strategy_id, params_json, status="running"):
+    """插入回测记录；若 run_id 已存在（如 API 已建 'queued' 行）则更新，避免 UNIQUE 冲突。"""
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO backtest_runs(id,strategy_id,params_json,status) VALUES(?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "status=excluded.status, strategy_id=excluded.strategy_id, params_json=excluded.params_json",
+            (run_id, strategy_id, params_json, status),
+        )
+
+
 def update_run(run_id, status, metrics_json=None, error=None, finished_at=None):
     with get_conn() as c:
         c.execute(

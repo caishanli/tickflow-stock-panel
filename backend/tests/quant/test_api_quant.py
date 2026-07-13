@@ -24,7 +24,8 @@ def client(tmp_path, monkeypatch):
     from app.quant import db, config
     from app.quant import service
 
-    # 不写真实库 / 不 spawn worker
+    # 不写真实库 / 不 spawn worker（显式指向临时库，隔离 import 顺序影响）
+    config.CONFIG.db_path = str(tmp_path / "quant.db")
     db.init_db()
 
     # patch 掉会派生子进程的编排函数

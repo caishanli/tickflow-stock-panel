@@ -39,3 +39,23 @@ def test_run_on_mini_bundle(tmp_path):
     assert run["status"] == "done", f"status={run['status']}, error={run.get('error')}"
     equity = db.get_equity("t1")
     assert len(equity) >= 1, "未回收净值曲线"
+
+
+def test_run_on_existing_run_row_upserts(tmp_path):
+    """API 已建 'queued' 行时，脚本调用 run_backtest 不应触发 UNIQUE 冲突。"""
+    db_path = str(tmp_path / "q.db")
+    db.init_db(db_path)
+    # 模拟 service.submit_backtest 已先插入一行
+    db.insert_run("t2", "", "{}", "queued")
+
+    res = run_backtest_on_bundle(
+        bundle_dir="tests/quant/fixtures/mini_bundle",
+        strategy_code=_STRATEGY,
+        params={"run_id": "t2", "symbols": ["600000.XSHG"], "start": "2024-01-02",
+                "end": "2024-01-04", "frequency": "daily", "capital": 100000.0,
+                "fee": 0.0003, "slippage": 0.001},
+        db_path=db_path,
+    )
+    assert res["run_id"] == "t2"
+    run = db.get_run("t2")
+    assert run["status"] == "done", f"status={run['status']}, error={run.get('error')}"
