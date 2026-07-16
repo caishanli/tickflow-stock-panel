@@ -540,6 +540,76 @@ def _extract_fixed_pools(strategy_text: str):
     return seen
 
 
+def _ts_to_jq(ts_code: str) -> str:
+    """tushare ts_code -> 聚宽 order_book_id（159059.SZ -> 159059.XSHE）。"""
+    code, _, mkt = ts_code.partition(".")
+    return "{}.{}".format(code, "XSHG" if mkt == "SH" else "XSHE")
+
+
+# 基金公司前缀（与策略 FUND_COMPANIES 对齐，用于把 tushare 全称清洗成近似聚宽简称）
+_FUND_COMPANIES = sorted(set([
+    '易方达', '广发', '华夏', '华安', '嘉实', '富国', '招商', '鹏华', '南方', '汇添富', '国泰', '平安',
+    '银华', '天弘', '建信', '工银', '华泰柏瑞', '博时', '景顺长城', '景顺', '华宝', '申万菱信', '万家', '中欧',
+    '兴证全球', '浙商', '诺安', '前海开源', '泰康', '泰达宏利', '农银汇理', '交银', '东方红', '财通', '华商',
+    '国联', '永赢', '金鹰', '德邦', '创金合信', '西部利得', '圆信永丰', '泓德', '汇安', '诺德', '恒生前海',
+    '华润元大', '大成', '海富通', '摩根', '华泰', '中信', '中银', '兴全', '国信', '长城', '中金', '浙商证券',
+    '东海', '东吴', '浦银安盛', '信达澳亚', '中加', '中航', '中融', '中邮', '中庚', '中信保诚', '中信建投',
+    '中银国际', '中银证券', '九泰', '交银施罗德', '光大保德信', '兴银', '农银', '国投瑞银', '国海富兰克林',
+    '国联安', '国金', '太平', '方正富邦', '民生加银', '汇丰晋信', '银河', '长信', '长安', '长盛', '长江证券', '鹏扬',
+]), key=len, reverse=True)
+
+# 指数编制机构词：聚宽 display_name 不含这些，但会导致 exclude 规则误杀行业 ETF，需清洗。
+# 注意：宽基 ETF 清洗后仍保留 300/500/1000 等数字，会被策略 exclude 正确排除。
+_INDEX_MAKERS = ['中证', '上证', '深证', '国证', '沪深', '中华', '中国']
+
+
+def _clean_etf_name(name: str) -> str:
+    """把 tushare ETF 全称清洗成近似聚宽 display_name 的简称。
+
+    仅去除基金公司前缀与指数编制机构词（不动行业/主题/数字），使策略的
+    exclude / 行业分组逻辑能像在聚宽 display_name 上一样工作。
+    """
+    if not name:
+        return name
+    s = name
+    for c in _FUND_COMPANIES:
+        s = s.replace(c, "")
+    for m in _INDEX_MAKERS:
+        s = s.replace(m, "")
+    return s.strip()
+
+
+def _load_etf_universe(dm):
+    """从 tushare 拉取全市场 ETF 列表（代码 + 清洗后名称），对齐聚宽
+    get_all_securities(['etf'])。返回 (codes, name_map)。失败返回 ([], {})。
+    """
+    try:
+        src = dm.sources.get("tushare")
+        rows = src.get_etf_list()
+    except Exception as e:  # noqa: BLE001
+        print("[universe] tushare get_etf_list 失败，回退缓存派生:", e)
+        return [], {}
+    # 优先使用 mootdx（通达信）证券简称，与聚宽 get_security_name/display_name 一致
+    # （如 513350 -> "油气ETF"）。tushare fund_basic 只给全称（"标普石油天然气..."），
+    # 其 name[:2] 分组键与聚宽不同，会导致行业去重选出不同代表 ETF。缺失时回退清洗全称。
+    tdx_names = {}
+    try:
+        tdx_names = dm.sources["mootdx"].get_stock_names() or {}
+    except Exception as e:  # noqa: BLE001
+        print("[universe] mootdx get_stock_names 失败，回退 tushare 全称清洗:", e)
+    codes = []
+    names = {}
+    for r in rows:
+        try:
+            jq = _ts_to_jq(r["ts_code"])
+        except Exception:
+            continue
+        codes.append(jq)
+        short = tdx_names.get(jq.split(".", 1)[0])
+        names[jq] = short or _clean_etf_name(r.get("name", jq)) or jq
+    return codes, names
+
+
 def run_jq_backtest(strategy_path: str, params: dict,
                     universe=None, max_universe=None, db_path=None) -> dict:
     """运行聚宽式策略（如五福闹新春 v5.2）。
@@ -551,8 +621,8 @@ def run_jq_backtest(strategy_path: str, params: dict,
         db.init_db(db_path)
 
     from .jqcompat import install_jqcompat, JqDataSource
-    from app.quant.jqengine.datasource.manager import DataManager
-    from app.quant.datasource.base import DataSourceError
+    from app.quant.jqengine.datasource.manager import DataManager, get_data_manager
+    from app.quant.jqengine.datasource.base import DataSourceError
 
     with open(strategy_path, "r", encoding="utf-8") as f:
         strategy_text = f.read()
@@ -562,56 +632,80 @@ def run_jq_backtest(strategy_path: str, params: dict,
     end = params.get("end", "2026-07-08")
 
     # ---- 构造 DataManager，加载原始缓存（离线，无网络回源） ----
-    dm = DataManager()
+    # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
+    # 等开关不一致（策略侧单例默认 True 会仍走 mootdx 实时分钟线网络）。
+    dm = get_data_manager()
+    dm._use_real_minute = True  # 回测保留 mootdx 实时分钟线（本地缓存优先，保证收益对齐基线）
     dm.preload_daily()
     dm.set_minute_window(start, end)
-    # 离线护栏：禁用 mootdx 真实分钟 / baostock 5min 的回源，仅用本地缓存
-    def _offline(*a, **k):
-        raise DataSourceError("offline mode")
-    try:
-        dm.sources["mootdx"].get_minute = _offline
-    except Exception:
-        pass
-    try:
-        dm.sources["baostock"].get_5min = _offline
-    except Exception:
-        pass
 
-    # 全量 ETF 宇宙（与聚宽 get_all_securities(['etf']) 对齐）：取自日线缓存键，排除指数
+    # 全量 ETF 宇宙（与聚宽 get_all_securities(['etf']) 对齐）：
+    # 优先从 tushare 拉取全市场 ETF 列表（按需回源：JqDataSource 构造时对每只
+    # 调 dm.fetch("get_daily")，本地缓存缺失即回源并落盘，无需独立预下载步骤）。
+    # tushare 不可用时回退到日线缓存键派生（离线可复现）。
     def _is_index(p):
         return p.startswith("000") or p.startswith("399")
-    all_codes = [k.split("get_daily_", 1)[1]
-                 for k in dm._daily_mem if k.startswith("get_daily_")]
-    etf_universe = [c for c in all_codes if not _is_index(c.split(".")[0])]
+
+    etf_universe, etf_names = _load_etf_universe(dm)
+    if not etf_universe:
+        all_codes = [k.split("get_daily_", 1)[1]
+                     for k in dm._daily_mem if k.startswith("get_daily_")]
+        etf_universe = [c for c in all_codes if not _is_index(c.split(".")[0])]
+        etf_names = {}
+    else:
+        etf_universe = [c for c in etf_universe if not _is_index(c.split(".")[0])]
+    if max_universe and len(etf_universe) > max_universe:
+        etf_universe = etf_universe[:max_universe]
+    print("[universe] 全市场 ETF 池: {} 只".format(len(etf_universe)))
 
     fixed_pools = _extract_fixed_pools(strategy_text)
-    if max_universe and len(fixed_pools) > max_universe:
-        fixed_pools = fixed_pools[:max_universe]
 
-    # get_all_securities(['etf']) 返回全量 ETF；数据源额外覆盖指数/防御ETF以便 get_price 取数
+    # 数据源宇宙需覆盖：全市场动态池(etf_universe) + 策略源码固定池(fixed_pools，
+    # 含 LOF 如 501018 等不在 tushare ETF 列表中的标的) + 指数/基准/防御 ETF。
+    # 固定池标的会被策略直接下单，必须建 instrument，否则 RQInvalidArgument。
     ds_universe = list(dict.fromkeys(
-        list(etf_universe) + _EXTRA_INDEX_CODES + [benchmark, "511880.XSHG"]
+        list(etf_universe) + list(fixed_pools) + _EXTRA_INDEX_CODES
+        + [benchmark, "511880.XSHG"]
     ))
 
-    # 安装兼容层（注册 shim + 补丁 + 假 jqdata）
-    install_jqcompat(etf_universe, names={}, benchmark=benchmark)
-
-    # 构造数据源：包裹 DataManager，日线即时展开 + 分钟线惰性加载
+    # 先构造数据源：包裹 DataManager，日线按需回源+展开 + 分钟线惰性加载。
+    # （对 ds_universe 逐只 dm.fetch("get_daily")，本地缺失即回源落盘。）
     ds = JqDataSource(dm, ds_universe, start, end, benchmark=benchmark,
                       minute_cache_cap=int(params.get("minute_cache_cap", 800)))
     _set_pending_data_source(ds)
 
-    # 在 initialize 内注入 update_universe，确保 1m 事件循环有标的
-    # （仅订阅固定池即可；策略通过 get_price 按需查询全量 ETF，不依赖订阅）
+    # 惰性日线加载：不再预过滤 universe，JqDataSource 会按需加载日线并注册 instrument
+    valid_universe = ds_universe
+    print("[universe] 数据源覆盖标的: {} 只（含固定池+基准，惰性加载日线）".format(len(valid_universe)))
+
+    # 安装兼容层（注册 shim + 补丁 + 假 jqdata）
+    install_jqcompat(valid_universe, names=etf_names, benchmark=benchmark)
+
+    # 在 init/initialize 内注入 update_universe 与 _replay_run_daily，
+    # 确保 1m 事件循环有标的、且全局 run_daily 在正确上下文内重放注册。
+    # （聚宽允许全局调用 run_daily，rqalpha 要求在 init 上下文内注册，
+    #  故 jqcompat 先缓存、init 时再重放。）
     universe_literal = ",\n".join('        "{}"'.format(c) for c in fixed_pools)
-    strategy_code = _re.sub(
-        r"def initialize\(context\):",
-        "def initialize(context):\n    update_universe([\n{}\n    ])".format(universe_literal),
-        strategy_text,
-        count=1,
-    )
-    # rqalpha 期望入口函数为 init（而非聚宽的 initialize），这里做别名桥接
-    strategy_code += "\ninit = initialize\n"
+    inject = (
+        "    from app.quant.jqcompat import _replay_run_daily\n"
+        "    _replay_run_daily()\n"
+        "    update_universe([\n{}\n    ])"
+    ).format(universe_literal)
+    if _re.search(r"def initialize\s*\(", strategy_text):
+        strategy_code = _re.sub(
+            r"(def initialize\(context\):)",
+            r"\1\n" + inject,
+            strategy_text, count=1)
+        # rqalpha 期望入口函数为 init（而非聚宽的 initialize），这里做别名桥接
+        if not _re.search(r"def init\s*\(", strategy_text):
+            strategy_code += "\ninit = initialize\n"
+    elif _re.search(r"def init\s*\(", strategy_text):
+        strategy_code = _re.sub(
+            r"(def init\(context\):)",
+            r"\1\n" + inject,
+            strategy_text, count=1)
+    else:
+        strategy_code = strategy_text
 
     config = {
         "base": {

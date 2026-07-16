@@ -40,6 +40,7 @@ _UNIVERSE = []                    # ETF 代码列表（get_all_securities 返回
 _NAMES = {}                       # code -> display_name
 _BENCHMARK = "000300.XSHG"
 _EVERY_BAR_CALLBACKS = []         # 'every_bar' 调度回调
+_PENDING_RUN_DAILY = []           # 全局 run_daily 缓存（mod start_up 时重放）
 
 
 def _set_current_bar_dict(bd):
@@ -254,6 +255,17 @@ def set_option(*args, **kwargs):
     pass
 
 
+# 方案 A（current_price=昨收）已证伪，保留兼容接口
+_use_prev_close = False
+
+def set_use_prev_close(val: bool):
+    global _use_prev_close
+    _use_prev_close = val
+
+def get_use_prev_close() -> bool:
+    return _use_prev_close
+
+
 class PriceRelatedSlippage:
     def __init__(self, *a, **k):
         pass
@@ -298,12 +310,13 @@ def run_daily(func, time=None, *args, **kwargs):
 
     聚宽回调签名是 ``func(context)``，而 rqalpha 调度器要求
     ``func(context, bar_dict)``，这里用包装函数做桥接。
+
+    全局作用域调用时（聚宽允许，rqalpha 不允许），缓存到 _PENDING_RUN_DAILY，
+    由 mod start_up 时 _replay_run_daily 重放。
     """
     time_rule = time if time is not None else kwargs.get("time_rule")
     if time_rule is None:
         time_rule = "before_trading"
-
-    from rqalpha.api import scheduler  # 调度器实例（已在 mod start_up 注入）
 
     def _wrapper(context, bar_dict=None):
         return func(context)
@@ -312,28 +325,55 @@ def run_daily(func, time=None, *args, **kwargs):
         _EVERY_BAR_CALLBACKS.append(func)
         return None
 
+    def _do(tr):
+        """聚宽允许全局调用 run_daily，但 rqalpha 调度器只允许在 init
+        上下文内注册。一律缓存到 _PENDING_RUN_DAILY，由 mod start_up
+        时的 _replay_run_daily 在正确上下文内重放注册。"""
+        _PENDING_RUN_DAILY.append((_wrapper, tr))
+
     if time_rule == "before_trading":
-        scheduler.run_daily(_wrapper, time_rule="before_trading")
+        _do("before_trading")
+        return None
+
+    if time_rule == "open":
+        # 聚宽 'open'：每天开盘时下单。rqalpha 盘前(before_trading)禁止下单，
+        # 故映射到 09:32（开盘第一分钟，明确盘中可下单）。
+        _do(9 * 60 + 32)
+        return None
+
+    if time_rule == "close":
+        # 聚宽 'close'：每天收盘时下单，映射到 15:00（收盘后，可下单）。
+        _do(15 * 60)
         return None
 
     if isinstance(time_rule, int):
-        scheduler.run_daily(_wrapper, time_rule=time_rule)
+        _do(time_rule)
         return None
 
     try:
         hh, mm = str(time_rule).split(":")
         hh, mm = int(hh), int(mm)
     except Exception:
-        scheduler.run_daily(_wrapper, time_rule="before_trading")
+        _do("before_trading")
         return None
-    # rqalpha 调度器的 time_rule 为「距零点分钟数」(minutes-since-midnight)
     minute = hh * 60 + mm
     if minute <= 9 * 60 + 31:
-        scheduler.run_daily(_wrapper, time_rule="before_trading")
+        _do("before_trading")
     else:
-        minute = min(minute, 15 * 60)  # 15:00 收盘，超出则对齐到收盘
-        scheduler.run_daily(_wrapper, time_rule=minute)
+        minute = min(minute, 15 * 60)
+        _do(minute)
     return None
+
+
+def _replay_run_daily():
+    """mod start_up 时重放全局 run_daily 调用（聚宽允许全局调用，rqalpha 要求在框架上下文内）。"""
+    while _PENDING_RUN_DAILY:
+        wrapper, tr = _PENDING_RUN_DAILY.pop(0)
+        try:
+            from rqalpha.api import scheduler
+            scheduler.run_daily(wrapper, time_rule=tr)
+        except Exception as e:
+            logger.warning("重放 run_daily 失败: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -450,15 +490,38 @@ _BAR_DTYPE = np.dtype([
 
 
 class _DayBarStore:
-    def __init__(self, bars):
-        self._bars = bars
+    """惰性加载日线：首次请求时从 DataManager 取数并缓存，避免构造期遍历 1600+ 标的。"""
+    def __init__(self, dm, data_start, data_end):
+        self._dm = dm
+        self._data_start = data_start
+        self._data_end = data_end
+        self._bars = {}
 
     def get_bars(self, order_book_id):
-        return self._bars.get(order_book_id, np.empty(0, dtype=_BAR_DTYPE))
+        if order_book_id in self._bars:
+            return self._bars[order_book_id]
+        # 惰性加载
+        try:
+            ddf = self._dm.fetch("get_daily", order_book_id,
+                                 self._data_start.strftime("%Y%m%d"),
+                                 self._data_end.strftime("%Y%m%d"))
+        except Exception:
+            ddf = None
+        if ddf is None or len(ddf) == 0:
+            arr = np.empty(0, dtype=_BAR_DTYPE)
+        else:
+            ddf = _normalize_daily(ddf)
+            ddf = ddf[(ddf["date"] >= self._data_start) & (ddf["date"] <= self._data_end)]
+            if ddf.empty:
+                arr = np.empty(0, dtype=_BAR_DTYPE)
+            else:
+                arr = _daily_to_recarray(ddf)
+        self._bars[order_book_id] = arr
+        return arr
 
     def get_date_range(self, order_book_id):
-        bars = self._bars.get(order_book_id)
-        if bars is None or len(bars) == 0:
+        bars = self.get_bars(order_book_id)
+        if len(bars) == 0:
             return 20050104, 20050104
         return int(bars["datetime"][0]), int(bars["datetime"][-1])
 
@@ -547,6 +610,16 @@ def _minute_to_recarray(minute_df):
     return arr
 
 
+
+class _MinuteBarStore:
+    """包装分钟线 dict，提供 get_bars 接口。"""
+    def __init__(self, bars):
+        self._bars = bars
+
+    def get_bars(self, order_book_id):
+        return self._bars.get(order_book_id, np.empty(0, dtype=_BAR_DTYPE))
+
+
 class JqDataSource:
     """基于 DataManager（原始缓存数据：real 1m + baostock 5min 插值 + 日线合成兜底）
     的 rqalpha 数据源。
@@ -561,43 +634,45 @@ class JqDataSource:
         self._universe = list(universe)
         self._start = pd.Timestamp(start).normalize()
         self._end = pd.Timestamp(end).normalize()
+        # 日线数据加载末端须严格超出回测末端：rqalpha 对基准/数据范围做严格校验
+        # （要求 data_end > backtest_end），否则报「基准数据结束日期 <= 回测结束日期」。
+        # 多取的这段（非交易日）不会被回放成交，仅用于满足范围校验。
+        self._data_end = self._end + pd.Timedelta(days=90)
         # 日线多取一段回看窗口：聚宽分析器需要 start-1 的基准价，策略动量需要 ~65 日回看
         self._data_start = self._start - pd.Timedelta(days=lookback_days)
 
-        self._day_bars = {}
+        # 惰性日线 store：首次请求时从 DataManager 加载并缓存
+        self._day_bar_store = _DayBarStore(dm, self._data_start, self._data_end)
+        self._prev_close = {}            # code -> {date_int(YYYYMMDD): 前收盘价}，供分钟涨跌停价
         self._minute_bars = {}            # 惰性构建的分钟 recarray 缓存（与 store 共享 dict）
         self._minute_lru = []            # 访问顺序，用于 LRU 回收
         self._minute_cache_cap = minute_cache_cap
         self._instruments = {}
         all_dates = set()
 
-        for code in self._universe:
+        # 预加载基准日线（rqalpha 校验基准数据范围）
+        if benchmark:
             try:
-                ddf = dm.fetch("get_daily", code, self._data_start.strftime("%Y%m%d"),
-                               self._end.strftime("%Y%m%d"))
-            except Exception:
-                ddf = None
-            if ddf is None or len(ddf) == 0:
-                continue
-            ddf = _normalize_daily(ddf)
-            ddf = ddf[(ddf["date"] >= self._data_start) & (ddf["date"] <= self._end)]
-            if ddf.empty:
-                continue
-            self._day_bars[code] = _daily_to_recarray(ddf)
-            self._instruments[code] = self._make_instrument(code)
-            for d in ddf["date"]:
-                if self._data_start <= pd.Timestamp(d).normalize() <= self._end:
-                    all_dates.add(pd.Timestamp(d).date())
-
-        if benchmark and benchmark not in self._day_bars:
-            try:
-                bdf = dm.fetch("get_daily", benchmark, self._data_start.strftime("%Y%m%d"),
-                               self._end.strftime("%Y%m%d"))
+                bdf = dm.fetch("get_daily", benchmark,
+                               self._data_start.strftime("%Y%m%d"),
+                               self._data_end.strftime("%Y%m%d"))
                 if bdf is not None and len(bdf):
                     bdf = _normalize_daily(bdf)
-                    bdf = bdf[(bdf["date"] >= self._data_start) & (bdf["date"] <= self._end)]
+                    bdf = bdf[(bdf["date"] >= self._data_start) & (bdf["date"] <= self._data_end)]
                     if not bdf.empty:
-                        self._day_bars[benchmark] = _daily_to_recarray(bdf)
+                        self._day_bar_store._bars[benchmark] = _daily_to_recarray(bdf)
+                        if "pre_close" in bdf.columns:
+                            _dints = (
+                                pd.DatetimeIndex(bdf["date"]).year * 10000
+                                + pd.DatetimeIndex(bdf["date"]).month * 100
+                                + pd.DatetimeIndex(bdf["date"]).day
+                            ).to_numpy(dtype=np.int64)
+                            self._prev_close[benchmark] = dict(
+                                zip(_dints.tolist(), bdf["pre_close"].astype(float).to_numpy().tolist())
+                            )
+                        for d in bdf["date"]:
+                            all_dates.add(pd.Timestamp(d).date())
+                        # 创建基准 instrument
                         self._instruments[benchmark] = self._make_instrument(benchmark)
             except Exception:
                 pass
@@ -607,8 +682,8 @@ class JqDataSource:
         self._day_bar_stores = {}
         self._minute_bar_stores = {}
         self._calendar_stores = {}
-        self.register_day_bar_store(INSTRUMENT_TYPE.CS, _DayBarStore(self._day_bars), market=MARKET.CN)
-        self.register_minute_bar_store(INSTRUMENT_TYPE.CS, _DayBarStore(self._minute_bars), market=MARKET.CN)
+        self.register_day_bar_store(INSTRUMENT_TYPE.CS, self._day_bar_store, market=MARKET.CN)
+        self.register_minute_bar_store(INSTRUMENT_TYPE.CS, _MinuteBarStore(self._minute_bars), market=MARKET.CN)
         self.register_calendar_store(TRADING_CALENDAR_TYPE.CN_STOCK, _CalendarStore(self._trading_dates))
 
     # ---- 惰性分钟线（LRU 回收） ----
@@ -660,7 +735,8 @@ class JqDataSource:
     def get_instrument(self, order_book_id):
         ins = self._instruments.get(order_book_id)
         if ins is None:
-            raise NotImplementedError("unknown instrument: {}".format(order_book_id))
+            ins = self._make_instrument(order_book_id)
+            self._instruments[order_book_id] = ins
         return ins
 
     def get_instrument_history(self, order_book_id, dt):
@@ -672,8 +748,14 @@ class JqDataSource:
                 ins = self._instruments.get(i)
                 if ins is not None:
                     yield ins
+                else:
+                    yield self._make_instrument(i)
         else:
-            yield from self._instruments.values()
+            # rqalpha 会调用此方法（无参）来构建内部标的注册表，必须返回完整 universe
+            all_codes = set(self._universe)
+            all_codes.update(self._instruments.keys())
+            for code in all_codes:
+                yield self.get_instrument(code)
 
     # ---- calendar ----
     def get_trading_calendars(self):
@@ -876,6 +958,21 @@ def _patch_rqalpha_objects():
                 pass
             return env.trading_dt.date()
         StrategyContext.previous_date = property(_prev)
+
+    # 让 context.universe 可读写（聚宽允许策略设置自己的 universe，rqalpha 只读）
+    _orig_universe = getattr(StrategyContext, "universe", None)
+    def _get_universe(self):
+        if hasattr(self, "_user_universe"):
+            return self._user_universe
+        if _orig_universe is not None:
+            try:
+                return _orig_universe.fget(self)
+            except Exception:
+                return []
+        return []
+    def _set_universe(self, val):
+        self._user_universe = list(val)
+    StrategyContext.universe = property(_get_universe, _set_universe)
 
 
 # ---------------------------------------------------------------------------

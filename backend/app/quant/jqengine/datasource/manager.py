@@ -1,20 +1,34 @@
 """数据源优先级调度 + 自动降级 + 缓存管理器。"""
 
+import logging
 import os
 
 import pandas as pd
 from dotenv import set_key
 
-from app.quant.jqengine.datasource.cache import DataCache
-from app.quant.jqengine.datasource.tushare_src import TushareSource
-from app.quant.jqengine.datasource.mootdx_src import MootdxSource
-from app.quant.jqengine.datasource.astock_src import AStockSource
-from app.quant.jqengine.datasource.baostock_src import BaostockSource, interpolate_5min_to_1min
-from app.quant.jqengine.datasource.minute_synth import SyntheticMinuteSource
-from app.quant.jqengine.datasource.base import DataSourceError
-from app.quant.jqengine.config import CONFIG, REPO_ROOT
+logger = logging.getLogger("jqengine.dm")
+
+from .cache import DataCache
+from .tushare_src import TushareSource
+from .mootdx_src import MootdxSource
+from .astock_src import AStockSource
+from .baostock_src import BaostockSource, interpolate_5min_to_1min
+from .minute_synth import SyntheticMinuteSource
+from .base import DataSourceError
+from ..config import CONFIG, REPO_ROOT
 
 SOURCES = {"tushare": TushareSource, "mootdx": MootdxSource, "astock": AStockSource}
+
+# --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
+_data_manager_instance = None
+
+
+def get_data_manager(token=None, cache=None):
+    """获取 DataManager 单例实例。"""
+    global _data_manager_instance
+    if _data_manager_instance is None:
+        _data_manager_instance = DataManager(token=token, cache=cache)
+    return _data_manager_instance
 
 
 class DataManager:
@@ -39,11 +53,17 @@ class DataManager:
         self.sources["baostock"] = BaostockSource()
         self._minute_mem = {}
         self._daily_mem = {}
+        self._money_memo = {}  # (codes_tuple, count) -> 全量成交额明细 DataFrame
         # 分钟线滑窗：回测中不持有整个回测区间的分钟数据，只保留最近 N 天，
         # 既省内存又避免每次按需加载都展开整段历史（见 get_minute / _ensure_minute_windowed）
         self.minute_lookback = pd.Timedelta(days=15)
         self._minute_cov = {}  # code -> (lo_ts, hi_ts) 已覆盖区间
         self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
+        # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
+        # 避免 tushare 对 ETF 永远返回空却每次都先试（慢且无意义）。
+        self._src_fail = {}
+        self._demote_threshold = 3
+        self._demoted = set()
 
     def set_minute_window(self, start, end):
         """设定分钟线展开区间（回测前调用），避免生成超长历史。
@@ -117,6 +137,12 @@ class DataManager:
         for jq_code, (_, key) in best.items():
             df = all_daily[key]
             if df is not None and not df.empty:
+                # 预计算 trade_dt 列（date 对象），避免 get_daily_money_cached
+                # 每天对每只重复 pd.to_datetime（全市场 1600+ 只 × 130 天极慢）。
+                if "trade_dt" not in df.columns and "trade_date" in df.columns:
+                    df = df.copy()
+                    df["trade_dt"] = pd.to_datetime(
+                        df["trade_date"].astype(str)).dt.date
                 self._daily_mem[f"get_daily_{jq_code}"] = df
                 count += 1
         print(f"[preload] 日线: {count} 只ETF, {len(best)} 缓存键")
@@ -131,8 +157,14 @@ class DataManager:
             start_date = args[2] if len(args) > 2 else None
             return self.get_minute(code, end_date, start_date)
         cache_key = f"{method}_{args[0] if args else ''}"
+        # C3：daily 本地优先。_daily_mem 命中即返回；未命中或覆盖不足时，
+        # cache.get 会调 loader 回源（mootdx/tushare）并落盘。回测中
+        # preload_daily 已预加载全量日线，此处一般命中内存。
         if cache_key in self._daily_mem:
-            return self._daily_mem[cache_key]
+            mem = self._daily_mem[cache_key]
+            if mem is not None and not (hasattr(mem, "empty") and mem.empty):
+                return mem
+            del self._daily_mem[cache_key]
         last_err = ""
         for name in self._priority():
             src = self.sources[name]
@@ -142,18 +174,49 @@ class DataManager:
                     df = self.cache.get(
                         "daily", f"{name}_{code}",
                         lambda s=src: getattr(s, method)(*args, **kwargs),
+                        *(args[1:3] if len(args) > 1 else []),
                     )
                     if df is None or (hasattr(df, "empty") and df.empty):
                         raise DataSourceError(f"{name} 空数据")
                     self._daily_mem[cache_key] = df
+                    self._src_fail[name] = 0  # 该源成功取数，重置连续失败计数
                     return df
                 result = getattr(src, method)(*args, **kwargs)
                 self._daily_mem[cache_key] = result
+                self._src_fail[name] = 0
                 return result
             except Exception as e:
                 last_err = f"{name}: {e}"
+                self._src_fail[name] = self._src_fail.get(name, 0) + 1
+                self._maybe_demote(name)
                 continue
         raise DataSourceError(f"所有数据源失败: {last_err}")
+
+    def _maybe_demote(self, name):
+        """某数据源连续取数失败达阈值 -> 降到优先级末位并持久化到 .env。
+
+        典型场景：tushare 对 ETF 日线始终返回空，前几次逐标的联网试探既慢又无意义；
+        累计失败达阈值后自动把该源挪到最后，后续取数直接走 mootdx/astock，并把新
+        顺序写回 .env，使后续运行也受益。已降级或本就在末位则跳过。
+        """
+        if name in self._demoted:
+            return
+        if self._src_fail.get(name, 0) < self._demote_threshold:
+            return
+        order = self._priority()
+        if name not in order or order[-1] == name:
+            self._demoted.add(name)
+            return
+        new_order = [n for n in order if n != name] + [name]
+        self.set_priority(new_order)
+        self._demoted.add(name)
+        import logging
+        logging.warning(
+            "[DataManager] 数据源 %s 连续 %d 次取数失败，已降级到末位优先级并持久化: %s",
+            name, self._src_fail[name], new_order,
+        )
+        print(f"[DataManager] {name} 连续 {self._src_fail[name]} 次取数失败，"
+              f"已降级到末位优先级并写入 .env: {new_order}")
 
     def get_minute(self, code, end_date=None, start_date=None):
         """返回分钟线（真实优先 + 合成补齐），按 end_date/start_date 切片。
@@ -163,24 +226,41 @@ class DataManager:
         ``start_date`` 仅用于最终切片，不改变加载窗口。
         """
         as_of = end_date or start_date
-        df = self._ensure_minute_windowed(code, as_of)
+        try:
+            df = self._ensure_minute_windowed(code, as_of)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"[DataManager] 分钟数据加载异常: {code} 在 {as_of}: {e}"
+            ) from e
         if df is None or (hasattr(df, "empty") and df.empty):
-            return pd.DataFrame()
+            raise RuntimeError(
+                f"[DataManager] 分钟数据为空: {code} 在 {as_of} 时无可用分钟数据"
+            )
         return self._slice_minute(df, end_date, start_date)
 
     def get_minute_feed(self, code, start, end):
         """桥接器时钟 feed 专用：加载并缓存**整段回测区间**的分钟线。
 
         与 :meth:`get_minute` 的滑窗不同，feed 需覆盖全部回测区间以驱动回放，
-        因此按完整窗口加载（仅 1~2 只标的）。
+        因此按完整窗口加载（仅 1~2 只标的）。窗口上界用回测 end（而非 today），
+        避免 full=True 用 today 超出 5min.db 覆盖而被迫回源 baostock 网络。
         """
         df = self._minute_mem.get(code)
         if df is None:
-            df = self._load_minute_merged(code, full=True)
+            # 加载整段回测区间 [start, end] 的分钟线（feed 仅 1~2 只标的）。
+            # 窗口上界用 end（≤5min.db 覆盖），避免 full=True 用 today 超界回源。
+            lo_ts = pd.Timestamp(start)
+            hi_ts = pd.Timestamp(end)
+            bs = self._load_baostock_minute(code, lo_ts, hi_ts, None)
+            df = bs
             self._minute_mem[code] = df
-            self._minute_cov[code] = (pd.Timestamp(start), pd.Timestamp(end))
+            self._minute_cov[code] = (lo_ts, hi_ts)
         if df is None or (hasattr(df, "empty") and df.empty):
-            return pd.DataFrame()
+            raise RuntimeError(
+                f"[DataManager] 分钟数据为空(feed): {code} 在 {start}~{end} 区间无可用分钟数据"
+            )
         return self._slice_minute(df, end, start)
 
     def _ensure_minute_windowed(self, code, as_of):
@@ -196,13 +276,37 @@ class DataManager:
         if df is not None and not (hasattr(df, "empty") and df.empty):
             return df
         as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
-        df = self._load_minute_merged(code, as_of=as_of_ts, full=True)
+        df = self._load_minute_merged(code, as_of=as_of_ts, full=False)
         if df is not None and not df.empty:
             self._minute_mem[code] = df
             win = self.minute_source.window
             if win:
                 self._minute_cov[code] = (win[0], win[1])
         return df
+
+    def preload_minute_for_pool(self, codes, as_of=None):
+        """批量预热分钟线缓存：一次性加载 codes 中所有标的的全区间分钟数据到 _minute_mem。
+
+        在策略构建好合并池后调用（如 `midday_routine` 后），使后续
+        `get_price(..., frequency='1m')` 直接命中内存缓存，避免热路径联网/磁盘 IO。
+        """
+        as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
+        logger.info("[DataManager] 开始预热分钟线缓存，标的数=%d", len(codes))
+        for code in codes:
+            if code in self._minute_mem:
+                continue
+            try:
+                # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
+                # 超出 5min.db 覆盖范围而被迫回源 baostock 网络。
+                df = self._ensure_minute_windowed(code, as_of_ts)
+                if df is not None and not (hasattr(df, "empty") and df.empty):
+                    self._minute_mem[code] = df
+                    win = self.minute_source.window
+                    if win:
+                        self._minute_cov[code] = (win[0], win[1])
+            except Exception as e:
+                logger.warning("预热分钟线失败 %s: %s", code, e)
+        logger.info("[DataManager] 分钟线预热完成，已缓存 %d 只", len(self._minute_mem))
 
     def get_minute_price_at(self, code, dt):
         """取某标的截至 ``dt`` 的最后一分钟收盘价（供实时价/下单价，O(1) 切片）。
@@ -271,15 +375,24 @@ class DataManager:
                 baostock = self._load_baostock_minute(code, lo_ts, bs_hi, all_5min)
                 if baostock is not None and not baostock.empty:
                     layers.append(baostock)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.warning("[DataManager] baostock分钟数据获取失败 %s: %s", code, e)
 
         if not layers:
-            # 无真实分钟数据：回退到日线确定性合成（仅作兜底）
-            synth = self.minute_source.get_minute(code, win_end0, win_start0)
-            if synth is None or synth.empty:
-                return pd.DataFrame()
-            layers.append(synth)
+            # 三源皆无（mootdx/baostock 均失败）→ 最后兜底：日线合成分钟。
+            # 仅内存使用、绝不落盘（C2：非真实源数据不写库）。确定性、可复现。
+            try:
+                synth = self.minute_source.get_minute(code, hi_ts, lo_ts)
+                if synth is not None and not synth.empty:
+                    return synth
+            except Exception as e:
+                import logging
+                logging.warning("[DataManager] 日线合成兜底失败 %s: %s", code, e)
+            raise RuntimeError(
+                f"[DataManager] 分钟数据获取失败: {code} 在 {lo_ts.date()}~{hi_ts.date()} "
+                f"区间内 mootdx/baostock 均失败且日线合成兜底也失败。"
+            )
 
         numeric_cols = ["open", "high", "low", "close", "volume", "money", "amount"]
         # 以所有层的索引并集为基底；后加入的层（baostock 5 分钟）覆盖先前的层，
@@ -314,31 +427,43 @@ class DataManager:
         else:
             cached = self.cache.peek("5min", key5)
         covers = (cached is not None and not cached.empty
-                  and cached.index.min() <= lo_ts
-                  and cached.index.max() >= hi_ts)
+                  and cached.index.max() >= hi_ts
+                  and cached.index.min() <= lo_ts)
         if covers:
-            df5 = cached
-        else:
-            try:
-                fresh = self.sources["baostock"].get_5min(
-                    code,
-                    lo_ts.strftime("%Y-%m-%d"),
-                    hi_ts.strftime("%Y-%m-%d"),
-                )
-            except Exception:
-                fresh = None
+            # 5min.db 连续覆盖整个请求区间 → 直接插值返回（不落盘，C2）。
+            return interpolate_5min_to_1min(cached)
+        # C1 绝对约束：本地 5min 未覆盖请求区间时，回源 baostock 补齐缺失段
+        # （之前为躲"每只卡 2.7s"而跳过回源，导致早期/缺口数据缺失，违反约束）。
+        # 回源结果合并写回 5min.db（真实数据可落盘，C1）；插值出的 1m 仍不落盘（C2）。
+        try:
+            bs = self.sources.get("baostock")
+            if bs is None:
+                raise DataSourceError("baostock 源不可用")
+            # 回源整个请求区间（baostock 单次查询代价固定，合并写库后下次命中本地）
+            fresh = bs.get_5min(code, lo_ts.strftime("%Y-%m-%d"),
+                                 hi_ts.strftime("%Y-%m-%d"))
             if fresh is not None and not fresh.empty:
                 if cached is not None and not cached.empty:
-                    fresh = fresh.combine_first(cached)
-                self.cache.put("5min", key5, fresh)
-                df5 = fresh
-            else:
-                df5 = cached
-        if df5 is None or df5.empty:
-            return None
-        # 13:10 / 14:55 等恰为 5 分钟整点，插值在边界处等于 5 分钟收盘，结果精确；
-        # 其余时刻线性插值。插值结果仅运行时使用，不写库。
-        return interpolate_5min_to_1min(df5)
+                    merged = pd.concat([cached, fresh]).sort_index()
+                    merged = merged[~merged.index.duplicated(keep="last")]
+                else:
+                    merged = fresh
+                try:
+                    self.cache.put("5min", key5, merged)
+                except Exception as e:
+                    import logging
+                    logging.warning("[DataManager] baostock 5min 落盘失败 %s: %s", code, e)
+                return interpolate_5min_to_1min(merged)
+        except Exception as e:
+            import logging
+            logging.warning("[DataManager] baostock 回源 5min 失败 %s: %s", code, e)
+        # 回源失败且本地有截断段 → 退化为截断插值（仍尽量给数据，而非返回 None）
+        if cached is not None and not cached.empty:
+            df5 = cached
+            if cached.index.min() > lo_ts:
+                df5 = cached.loc[cached.index >= lo_ts]
+            return interpolate_5min_to_1min(df5)
+        return None
 
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
         """缺口感知的真实分钟线获取（本地基底 + mootdx 仅补后续缺口）。
@@ -363,28 +488,49 @@ class DataManager:
                 # 仅补本地之后的缺口，避免覆盖本地较早的真实 1 分钟
                 try:
                     fresh = self.sources["mootdx"].get_minute(code)
-                except Exception:
+                except Exception as e:
+                    import logging
+                    logging.warning("[DataManager] mootdx回源补充缺口失败 %s: %s", code, e)
                     fresh = None
                 if fresh is not None and not fresh.empty:
                     fresh = fresh[fresh.index > local_end]
                     if not fresh.empty:
                         combined = pd.concat([local, fresh]).sort_index()
                         combined = combined[~combined.index.duplicated(keep="last")]
-                        self.cache.put("minute", real_key, combined)
+                        # C1 绝对约束：本地缺失段由 mootdx 真实获取后必须落盘，
+                        # 下次回测直接命中本地，避免反复联网。仅真实 1m 落盘，
+                        # 插值(5m)数据绝不写库（见 _load_baostock_minute / C2）。
+                        try:
+                            self.cache.put("minute", real_key, combined)
+                        except Exception as e:
+                            import logging
+                            logging.warning("[DataManager] real_ 落盘失败 %s: %s", code, e)
                         self._minute_real_cov[code] = (
                             combined.index.min(), combined.index.max())
                         return combined
             return local
         cov = self._minute_real_cov.get(code)
         if cov is not None and hi_ts < cov[0]:
-            # 请求区间整体早于 mootdx 能提供的最早日期，回源也取不到 → 跳过
+            # 请求区间整体早于 mootdx 能提供的最早日期，回源也取不到 -> 跳过
+            return None
+        # C1.b：mootdx 仅覆盖近 ~3 个月。请求末尾早于此范围 -> mootdx 取不到，
+        # 跳过交 baostock 5min 插值（C1.b）。
+        mootdx_floor = pd.Timestamp.now() - pd.Timedelta(days=95)
+        if hi_ts < mootdx_floor:
             return None
         try:
             df = self.sources["mootdx"].get_minute(code)
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.warning("[DataManager] mootdx首次获取分钟数据失败 %s: %s", code, e)
             return None
         if df is not None and not df.empty:
-            self.cache.put("minute", real_key, df)
+            # C1 绝对约束：mootdx 真实获取的 1m 必须落盘，供后续回测复用。
+            try:
+                self.cache.put("minute", real_key, df)
+            except Exception as e:
+                import logging
+                logging.warning("[DataManager] real_ 首次落盘失败 %s: %s", code, e)
             self._minute_real_cov[code] = (df.index.min(), df.index.max())
             return df
         return None
@@ -407,6 +553,103 @@ class DataManager:
         # 策略内调用：仅需近期分钟（当日量/近 N 分趋势），截取末 5 日
         lo = max(0, df.index.searchsorted(end - pd.Timedelta(days=5), side="left"))
         return df.iloc[lo:hi + 1]
+
+    def preload_minute_for_pool(self, codes, as_of):
+        """批量预加载分钟线到内存缓存（供策略午盘动量计算使用）。
+
+        直接调用 ``_ensure_minute_windowed`` 对每个代码全量加载，填充
+        ``_minute_mem`` 字典。后续 ``get_price(frequency='1m')`` 即可命中缓存。
+        """
+        as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
+        loaded = 0
+        for code in codes:
+            try:
+                # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
+                # 超出 5min.db 覆盖范围而被迫回源 baostock 网络。
+                df = self._ensure_minute_windowed(code, as_of_ts)
+                if df is not None and not df.empty:
+                    loaded += 1
+            except Exception as e:
+                logger.warning("预加载分钟线失败 %s: %s", code, e)
+        logger.info("分钟线池预加载完成: 成功 %d/%d", loaded, len(codes))
+
+    def get_daily_money_cached(self, codes, end_date, count=3):
+        """从缓存直接取日线成交额，避免走 get_price 链路。
+
+        返回 DataFrame(columns=['code','time','money'])，仅包含有数据的行。
+
+        性能：历史日线不变，对固定 ``codes``+``count`` 的全量明细只算一次后
+        memo 化；后续每日调用仅按 ``end_date`` 切片（O(行数)），避免回测中
+        每天对全市场 1600+ 只重复 to_datetime/过滤（原 ~1.1s/天 → 累计数分钟）。
+        """
+        memo_key = (tuple(sorted(codes)), count)
+        full = self._money_memo.get(memo_key)
+        if full is None:
+            full = self._build_money_full(codes, count)
+            self._money_memo[memo_key] = full
+        if full is None or full.empty:
+            return pd.DataFrame(columns=["code", "time", "money"])
+        end_dt = pd.Timestamp(end_date).date()
+        return full[full["time"].dt.date <= end_dt]
+
+    def _build_money_full(self, codes, count=3):
+        """构建全量成交额明细（不按 end_date 过滤），结果 memo 化复用。
+
+        列：``code`` / ``time``(Timestamp) / ``money``。仅含成交额>0 的行。
+        """
+        out_rows = []
+        for code in codes:
+            try:
+                # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘。
+                ddf = self._daily_mem.get("get_daily_" + code)
+                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
+                    for src in ("mootdx", "astock", "tushare"):
+                        cached = self.cache.peek("daily", f"{src}_{code}")
+                        if cached is not None and not (hasattr(cached, "empty") and cached.empty):
+                            ddf = cached
+                            break
+                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
+                    # 本地全源缺失 -> 回源获取（C3：daily 必须真实，不得跳过）
+                    try:
+                        ddf = self.fetch("get_daily", code)
+                    except Exception:
+                        continue
+                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
+                    continue
+                # daily_mem/preload 已预存 trade_dt 列（date 对象），直接复用。
+                if "trade_dt" not in ddf.columns:
+                    ddf = ddf.copy()
+                    ddf["trade_dt"] = pd.to_datetime(
+                        ddf["trade_date"].astype(str)).dt.date
+                trade_dt = ddf["trade_dt"]
+                sub = ddf.tail(count)
+                if sub.empty:
+                    continue
+                money_col = sub["money"] if "money" in sub.columns else sub.get("amount")
+                amt_col = sub["amount"] if "amount" in sub.columns else None
+                if money_col is None and amt_col is not None:
+                    money_col = amt_col
+                elif money_col is not None and amt_col is not None:
+                    money_col = money_col.fillna(amt_col)
+                if money_col is None:
+                    continue
+                mvals = money_col.astype(float).to_numpy()
+                valid_mask = mvals > 0
+                if not valid_mask.any():
+                    continue
+                sub_idx = sub.index.to_numpy()[valid_mask]
+                sub_m = mvals[valid_mask]
+                for ridx, mv in zip(sub_idx, sub_m):
+                    out_rows.append({
+                        "code": code,
+                        "time": pd.Timestamp(trade_dt.loc[ridx]),
+                        "money": float(mv)
+                    })
+            except Exception:
+                continue
+        if not out_rows:
+            return pd.DataFrame(columns=["code", "time", "money"])
+        return pd.DataFrame(out_rows)
 
     def set_priority(self, order):
         CONFIG["DATASOURCE_PRIORITY"] = [o for o in order if o in SOURCES]
