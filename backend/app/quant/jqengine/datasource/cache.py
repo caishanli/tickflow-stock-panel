@@ -18,7 +18,7 @@ import time
 
 import pandas as pd
 
-from app.quant.jqengine.config import CONFIG
+from ..config import CONFIG
 
 
 class DataCache:
@@ -32,6 +32,7 @@ class DataCache:
     def _conn(self, freq):
         if freq not in self._conns:
             path = self._db_path(freq)
+            os.makedirs(self.root, exist_ok=True)
             conn = sqlite3.connect(path)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS cache ("
@@ -59,17 +60,60 @@ class DataCache:
             return pd.read_parquet(p)
         return None
 
-    def get(self, freq, code, loader):
-        """命中缓存返回 DataFrame；未命中调用 loader 取数并写库。
+    @staticmethod
+    def _covers(df, start=None, end=None):
+        """缓存 DataFrame 是否覆盖 [start, end] 区间。
 
-        优先 DB；DB 缺失时回退旧 parquet 文件并写回 DB；都无则调用 loader。
+        不覆盖（末端早于 end，或起始晚于 start）即视为失效，需回源补齐。
+        注意：``end`` 常是策略传入的「全集」哨兵（如 20300101），属未来日期，
+        永远不可能被缓存覆盖，此时不应据此判失效，否则会触发全量回源并把
+        mootdx 的分钟数据误当日线写入（见 ``put`` 的频率校验）。仅当 end 落在
+        过去（≤ 今天）且确实未被覆盖时才判失效。
+        """
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return False
+        last = first = None
+        if "trade_date" in df.columns:
+            last, first = str(df["trade_date"].max()), str(df["trade_date"].min())
+        elif "date" in df.columns:
+            last, first = str(df["date"].max()), str(df["date"].min())
+        elif isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+            last, first = str(df.index.max().date()), str(df.index.min().date())
+        else:
+            return True  # 未知结构，保守命中，避免无限回源
+        if end:
+            try:
+                end_ts = pd.Timestamp(end).date()
+                # 未来哨兵/全集日期：缓存不可能覆盖，视作已覆盖，不据此失效
+                if end_ts <= pd.Timestamp.now().date():
+                    if pd.Timestamp(last).date() < end_ts:
+                        return False
+            except Exception:
+                return True
+        if start:
+            try:
+                if pd.Timestamp(first).date() > pd.Timestamp(start).date():
+                    return False
+            except Exception:
+                return True
+        return True
+
+    def get(self, freq, code, loader, start=None, end=None):
+        """命中缓存返回 DataFrame；未命中或覆盖不足时调用 loader 取数并写库。
+
+        优先 DB；DB 缺失时回退旧 parquet 文件并写回 DB；都无或区间不足则回源。
+        关键修复：不再对“本地有但不完整”的缓存睁一只眼，覆盖不足即视为失效、
+        回源补齐，避免回测使用被冻结的过期数据。
         """
         conn = self._conn(freq)
         row = conn.execute("SELECT data FROM cache WHERE key=?", (code,)).fetchone()
         if row is not None:
-            return self._deserialize(row[0])
+            df = self._deserialize(row[0])
+            if self._covers(df, start, end):
+                return df
+            # 覆盖不足：旧缓存失效，丢弃并回源
         df = self._from_parquet(freq, code)
-        if df is not None and not df.empty:
+        if df is not None and not df.empty and self._covers(df, start, end):
             self.put(freq, code, df)
             return df
         df = loader()

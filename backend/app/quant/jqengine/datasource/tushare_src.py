@@ -18,6 +18,25 @@ def _to_ts_code(code):
     return code
 
 
+def _daily_apis(code):
+    """按代码类型返回应尝试的 Tushare 日线接口顺序。
+
+    ETF/LOF -> fund_daily；指数 -> index_daily；股票 -> daily。
+    首选接口空数据时按顺序回退，覆盖分类边界的模糊情形。
+    """
+    sym, market = (code.split(".", 1) + [""])[:2] if "." in code else (code, "")
+    market = market.upper()
+    is_sh = market in ("XSHG", "SH", "SSE")
+    is_sz = market in ("XSHE", "SZ", "SZSE")
+    if (is_sh and sym.startswith("000")) or (is_sz and sym.startswith("399")):
+        return ["index_daily", "fund_daily", "daily"]
+    if (is_sh and sym[:2] in ("50", "51", "52", "56", "58")) or (
+        is_sz and sym[:2] in ("15", "16", "18")
+    ):
+        return ["fund_daily", "index_daily", "daily"]
+    return ["daily", "fund_daily", "index_daily"]
+
+
 class TushareSource(DataSource):
     name = "tushare"
 
@@ -35,12 +54,17 @@ class TushareSource(DataSource):
 
     def get_daily(self, code, start, end):
         pro = self._api()
-        df = pro.daily(ts_code=_to_ts_code(code),
-                       start_date=str(start).replace("-", ""),
-                       end_date=str(end).replace("-", ""))
-        if df is None or df.empty:
-            raise DataSourceError("Tushare 无日线数据")
-        return df.sort_values("trade_date").reset_index(drop=True)
+        ts_code = _to_ts_code(code)
+        s = str(start).replace("-", "")
+        e = str(end).replace("-", "")
+        for api in _daily_apis(code):
+            try:
+                df = getattr(pro, api)(ts_code=ts_code, start_date=s, end_date=e)
+            except Exception:
+                continue
+            if df is not None and not df.empty:
+                return df.sort_values("trade_date").reset_index(drop=True)
+        raise DataSourceError("Tushare 无日线数据")
 
     def get_minute(self, code, date):
         pro = self._api()

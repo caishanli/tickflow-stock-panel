@@ -9,12 +9,22 @@
 import argparse
 import os
 import sys
+import warnings
+
+# 抑制 pandas/numpy 等第三方库在热循环（每日×全池动量计算）中触发的大量
+# warning（每次格式化 + 读源码行极慢），避免回测多耗数分钟。
+warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.quant.rqalpha_bridge import run_jq_backtest
+from dotenv import load_dotenv
 
-REPO = "/home/ubuntu/quant-daydayup"
+load_dotenv()
+
+from app.quant.rqalpha_bridge import run_jq_backtest
+from app.quant import jqcompat as _jqcompat
+
+REPO = os.environ.get("WUFU_REPO", "/home/caisl/五福闹新春-v5.2")
 
 
 def main():
@@ -23,7 +33,7 @@ def main():
     ap.add_argument("--end", default="2026-07-08")
     ap.add_argument(
         "--strategy",
-        default=os.path.join(REPO, "strategy", "五福闹新春-v5.2", "wufu-v5.2.py"),
+        default=os.path.join(REPO, "wufu-v5.2.py"),
     )
     ap.add_argument("--out", default=os.path.join("data", "quant_sim", "jqwufu"))
     ap.add_argument("--cash", type=float, default=100000.0)
@@ -32,7 +42,14 @@ def main():
     ap.add_argument("--benchmark", default="510300.XSHG")
     ap.add_argument("--minute_cache_cap", type=int, default=800)
     ap.add_argument("--log_level", default="error")
+    ap.add_argument(
+        "--prev-close",
+        action="store_true",
+        help="current_price 用昨收（方案A：对齐聚宽 13:10 last_price≈昨收）",
+    )
     args = ap.parse_args()
+
+    _jqcompat.set_use_prev_close(args.prev_close)
 
     params = {
         "start": args.start,

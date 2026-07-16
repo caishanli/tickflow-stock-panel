@@ -41,8 +41,16 @@ def run_loop(account_id: str, provider: QuantDataProvider | None = None,
                     if df is not None and not df.empty:
                         col = "close" if "close" in df.columns else df.columns[-1]
                         prices[c] = float(df[col].iloc[-1])
-                except Exception:
-                    continue
+                    else:
+                        raise RuntimeError(
+                            f"[runner] 持仓 {c} 分钟数据获取失败: get_minute返回空"
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[runner] 持仓 {c} 分钟数据获取异常: {e}"
+                    ) from e
             state["dt"] = str(datetime.datetime.now())
             matcher.step(state, prices)
             save_state(account_id, state)

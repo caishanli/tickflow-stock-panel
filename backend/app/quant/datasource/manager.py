@@ -79,7 +79,27 @@ class QuantDataProvider:
         return df
 
     def get_minute(self, code, date):
-        return self.minute_source.get_minute(code, date)
+        # 尝试真实分钟数据源（mootdx/baostock），失败则报错
+        import logging
+        for src_name in ("mootdx", "baostock"):
+            src = self.sources.get(src_name)
+            if src is None:
+                continue
+            try:
+                if src_name == "mootdx":
+                    df = src.get_minute(code)
+                    if df is not None and not df.empty:
+                        return df
+                elif src_name == "baostock":
+                    df = src.get_5min(code, date, date)
+                    if df is not None and not df.empty:
+                        return interpolate_5min_to_1min(df)
+            except Exception as e:
+                logging.warning("[QuantDataProvider] %s获取分钟数据失败 %s: %s", src_name, code, e)
+        raise RuntimeError(
+            f"[QuantDataProvider] 持仓 {code} 分钟数据获取失败: "
+            f"所有真实数据源（mootdx/baostock）均返回空或异常"
+        )
 
     def get_stock_list(self):
         return self._fetch_noarg("get_stock_list")

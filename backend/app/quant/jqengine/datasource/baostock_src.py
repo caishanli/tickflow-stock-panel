@@ -3,6 +3,8 @@
 mootdx 仅提供最近约92天1分钟线，baostock 提供5分钟线可覆盖更早历史。
 每根5分钟K线拆成5根1分钟：OHLC线性插值，volume/amount均分。
 """
+import threading
+
 import pandas as pd
 
 from .base import DataSource, DataSourceError
@@ -23,7 +25,7 @@ def _parse_time(time_str):
 
 
 def interpolate_5min_to_1min(df_5min):
-    """将5分钟K线插值为1分钟K线。
+    """将5分钟K线插值为1分钟K线（向量化实现）。
 
     每根5分钟bar -> 5根1分钟bar:
     - open: 第1根=open, 后4根=close方向线性插值
@@ -34,36 +36,34 @@ def interpolate_5min_to_1min(df_5min):
     if df_5min is None or df_5min.empty:
         return pd.DataFrame()
 
-    rows = []
-    for _, bar in df_5min.iterrows():
-        ts = bar.name
-        o = float(bar["open"])
-        c = float(bar["close"])
-        h = float(bar["high"])
-        low = float(bar["low"])
-        v = float(bar.get("volume", 0))
-        a = float(bar.get("amount", 0))
+    import numpy as np
+    n = len(df_5min)
+    o = df_5min["open"].to_numpy(dtype=np.float64)
+    c = df_5min["close"].to_numpy(dtype=np.float64)
+    h = df_5min["high"].to_numpy(dtype=np.float64)
+    low = df_5min["low"].to_numpy(dtype=np.float64)
+    v = df_5min["volume"].to_numpy(dtype=np.float64) if "volume" in df_5min.columns else np.zeros(n)
+    a = df_5min["amount"].to_numpy(dtype=np.float64) if "amount" in df_5min.columns else np.zeros(n)
 
-        for i in range(5):
-            t = ts - pd.Timedelta(minutes=4 - i)
-            frac = (i + 1) / 5.0
-            close_i = o + (c - o) * frac
-            open_i = o if i == 0 else o + (c - o) * (i / 5.0)
-            rows.append({
-                "datetime": t,
-                "open": round(open_i, 4),
-                "close": round(close_i, 4),
-                "high": h,
-                "low": low,
-                "volume": v / 5.0,
-                "amount": a / 5.0,
-                "money": a / 5.0,
-            })
+    ts = df_5min.index.to_numpy().astype("datetime64[s]")
+    offsets = np.array([-4, -3, -2, -1, 0], dtype="timedelta64[m]")   # (5,)
+    t_1m = (ts[:, None] + offsets).ravel()                            # (n*5,) 升序
 
-    out = pd.DataFrame(rows)
-    out.index = pd.to_datetime(out["datetime"])
-    out.index.name = "datetime"
-    out = out.drop(columns=["datetime"])
+    frac_c = np.array([1, 2, 3, 4, 5], dtype=np.float64) / 5.0       # close 插值系数
+    frac_o = np.array([0, 1, 2, 3, 4], dtype=np.float64) / 5.0       # open 插值系数
+    spread = (c - o)[:, None]
+    close_1m = (o[:, None] + spread * frac_c).ravel()
+    open_1m = (o[:, None] + spread * frac_o).ravel()
+
+    out = pd.DataFrame({
+        "open": np.round(open_1m, 4),
+        "close": np.round(close_1m, 4),
+        "high": np.repeat(h, 5),
+        "low": np.repeat(low, 5),
+        "volume": np.repeat(v / 5.0, 5),
+        "amount": np.repeat(a / 5.0, 5),
+        "money": np.repeat(a / 5.0, 5),
+    }, index=pd.DatetimeIndex(t_1m, name="datetime"))
     return out.sort_index()
 
 
@@ -85,30 +85,56 @@ class BaostockSource(DataSource):
     def _to_symbol(self, code):
         return _to_baostock_code(code)
 
-    def get_5min(self, code, start, end):
-        """拉取5分钟K线，返回 DatetimeIndex DataFrame。"""
+    def get_5min(self, code, start, end, timeout=240):
+        """拉取5分钟K线，返回 DatetimeIndex DataFrame。
+
+        注意: baostock 的 ``query_history_k_data_plus`` 在请求提交后，
+        ``rs.next()`` 逐行取数阶段可能因服务端不回包而**永久阻塞**。这里把
+        整个取数过程放进守护线程并加超时，超时即抛 ``DataSourceError``，
+        由上层降级到缓存/下一数据源，避免回测整体卡死。
+        """
         self._ensure_login()
         import baostock as bs
 
         symbol = self._to_symbol(code)
-        rs = bs.query_history_k_data_plus(
-            symbol,
-            "date,time,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="5",
-            adjustflag="2",
-        )
-        if rs.error_code != "0":
-            raise DataSourceError(f"baostock query failed: {rs.error_msg}")
+        _res = {}
 
-        rows = []
-        while rs.next():
-            rows.append(rs.get_row_data())
+        def _worker():
+            try:
+                rs = bs.query_history_k_data_plus(
+                    symbol,
+                    "date,time,open,high,low,close,volume,amount",
+                    start_date=start,
+                    end_date=end,
+                    frequency="5",
+                    adjustflag="2",
+                )
+                _res["err"] = rs.error_code
+                _res["fields"] = list(rs.fields)
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                _res["rows"] = rows
+            except Exception as e:  # noqa: BLE001
+                _res["err"] = f"exc:{e}"
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            raise DataSourceError(
+                f"baostock 取数超时({timeout}s): {code} {start}~{end}"
+            )
+        if str(_res.get("err", "unknown")).startswith("exc:"):
+            raise DataSourceError(f"baostock 取数异常: {_res['err']}")
+        if _res.get("err") != "0":
+            raise DataSourceError(f"baostock query failed: {_res.get('err')}")
+
+        rows = _res.get("rows") or []
         if not rows:
             raise DataSourceError("baostock 无5分钟数据")
 
-        df = pd.DataFrame(rows, columns=rs.fields)
+        df = pd.DataFrame(rows, columns=_res.get("fields") or ["date","time","open","high","low","close","volume","amount"])
         for col in ("open", "high", "low", "close", "volume", "amount"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df.index = df["time"].apply(_parse_time)

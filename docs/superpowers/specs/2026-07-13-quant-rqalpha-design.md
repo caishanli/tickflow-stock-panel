@@ -31,6 +31,7 @@
 | 前端更新方式 | 短轮询只读接口（回测 1–2s、模拟盘 3–5s），与 quant-daydayup 一致 |
 | 实时盘进程模型 | **独立进程**（类 quant-daydayup 的 pm2/nohup 守护），非 APScheduler 内置 job |
 | 策略代码编辑器 | **CodeMirror**（@uiw/react-codemirror，轻量） |
+| 分钟数据绝对约束 | **C1** 有 1m 用 1m；无 1m 用 5m 插值；本地有就用本地，本地没有就用 mootdx/baostock 获取再存本地（禁止"本地无就放弃/不回源"）。**C2** 插值数据只用于当次计算，**绝不写 `minute.db`**；只有真实获取的 1m/5m 才落盘。**C3** 回测区间不偷偷裁剪起点，缺失段按 C1 回源/插值补齐。详见根目录 `CONSTRAINTS.md`。 |
 
 ## 3. 后端架构
 
