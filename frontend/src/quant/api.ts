@@ -20,6 +20,9 @@ export const exportStrategy = (id: string) => j(`/strategies/${id}/export`)
 export const importStrategy = (name: string, code: string) =>
   j('/strategies/import', { method: 'POST', body: JSON.stringify({ name, code }) })
 
+export const listStrategiesWithLatest = () => j('/strategies/with-latest')
+export const listBacktests = (strategyId?: string) =>
+  j(`/backtest/runs${strategyId ? `?strategy_id=${encodeURIComponent(strategyId)}` : ''}`)
 export const runBacktest = (p: any) => j('/backtest/run', { method: 'POST', body: JSON.stringify(p) })
 export const getBacktestStatus = (id: string) => j(`/backtest/${id}/status`)
 export const getBacktestEquity = (id: string) => j(`/backtest/${id}/equity`)
