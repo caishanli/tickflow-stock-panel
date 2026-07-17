@@ -27,6 +27,7 @@ class StrategyIn(BaseModel):
 
 
 class BacktestIn(BaseModel):
+    name: str = ""
     strategy_id: str = ""
     strategy_code: str = ""
     symbols: list[str] = []
@@ -115,6 +116,54 @@ def backtest_trades(run_id: str):
 @router.get("/backtest/{run_id}/logs")
 def backtest_logs(run_id: str):
     return {"data": db.get_logs(run_id)}
+
+
+@router.get("/backtest/runs")
+def backtest_runs(limit: int = 50):
+    return {"data": db.list_runs(limit)}
+
+
+@router.get("/backtest/{run_id}/stream")
+async def backtest_stream(run_id: str):
+    """SSE：按事件类型增量推送 log/trade/equity/status。
+
+    查 quant.db 增量（按 rowid 偏移），避免跨进程队列。前端用 EventSource
+    接收；断线后凭 /equity /logs /trades 轮询恢复历史。
+    """
+    import asyncio
+    import json as _json
+
+    from fastapi.responses import StreamingResponse
+
+    if not db.get_run(run_id):
+        raise HTTPException(404, "not found")
+
+    async def gen():
+        off_log = db.get_max_log_id(run_id)
+        off_trade = db.get_max_trade_id(run_id)
+        off_equity = db.get_max_equity_id(run_id)
+        while True:
+            r = db.get_run(run_id)
+            status = r["status"] if r else "unknown"
+            # status 事件（每次都推，便于前端感知结束）
+            yield f"event: status\ndata: {_json.dumps({'status': status, 'metrics': (r or {}).get('metrics_json')}, ensure_ascii=False)}\n\n"
+            for row in db.get_equity_after(run_id, off_equity):
+                off_equity = row["rowid"]
+                d = {k: row[k] for k in ("dt", "value", "benchmark", "cash", "positions_value")}
+                yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
+            for row in db.get_trades_after(run_id, off_trade):
+                off_trade = row["rowid"]
+                d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
+                yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
+            for row in db.get_logs_after(run_id, off_log):
+                off_log = row["rowid"]
+                yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
+            if status in ("done", "failed"):
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @router.get("/backtest/{run_id}/trades.csv")
