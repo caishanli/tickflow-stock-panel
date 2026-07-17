@@ -29,8 +29,19 @@ def load_local_equity(local_dir):
     return eq
 
 
+def _read_fixture(fix_dir, name):
+    """读取聚宽 fixture，自动回退 gbk（部分文件为 GBK 编码）。"""
+    p = os.path.join(fix_dir, name)
+    for enc in ("utf-8", "gbk", "gb18030"):
+        try:
+            return pd.read_csv(p, encoding=enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return pd.read_csv(p)  # 最后放手一搏，保留原始错误
+
+
 def load_fixture_return(fix_dir, ret_name=FIXTURE_RET):
-    df = pd.read_csv(os.path.join(fix_dir, ret_name))
+    df = _read_fixture(fix_dir, ret_name)
     df["时间"] = pd.to_datetime(df["时间"])
     df = df.sort_values("时间")
     return df
@@ -71,7 +82,7 @@ def load_local_trades(local_dir):
 
 
 def load_fixture_trades(fix_dir, trd_name=FIXTURE_TRD):
-    df = pd.read_csv(os.path.join(fix_dir, trd_name))
+    df = _read_fixture(fix_dir, trd_name)
     # 聚宽格式含空行分隔同秒多笔；去掉全空行
     df = df.dropna(how="all")
     # 标的形如 "国防ETF(512670.XSHG)" -> 提取代码
