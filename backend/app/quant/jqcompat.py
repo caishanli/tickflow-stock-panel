@@ -123,6 +123,48 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
         fields = list(fields)
     end_dt = pd.Timestamp(end_date) if end_date is not None else env.trading_dt
 
+    # 批量路径：多标的 + 已知 count（策略动量/流动性主用）一次性切片，避免逐只
+    # 调用 history_bars 在 1000+ 标的上产生上万次函数与 searchsorted 开销。
+    # 同时一次性向量化构造 DataFrame（仅 1 次 to_datetime / concat），消除逐只
+    # _bars_to_long_df 在 2.3 万次调用上的 Python 与解析开销。
+    if len(codes) > 1 and (count is not None or start_date is not None):
+        try:
+            if count is not None:
+                _bc = int(count)
+            else:
+                _bc = _count_bars(start_date, end_dt, freq)
+            ds = env.data_source
+            bat = ds.history_bars_batch(codes, _bc, freq, _actual_fields(fields), end_dt)
+            _tlist, _clist, _flist = [], [], {f: [] for f in fields}
+            for code in codes:
+                bars = bat.get(code)
+                if bars is None or len(bars) == 0:
+                    continue
+                n = len(bars)
+                _tlist.append(np.asarray(bars["datetime"], dtype="int64"))
+                _clist.append(code)
+                for f in fields:
+                    actual = "total_turnover" if f == "money" else f
+                    _flist[f].append(
+                        np.asarray(bars[actual]) if actual in bars.dtype.names
+                        else np.full(n, np.nan))
+            if _tlist:
+                times = np.concatenate(_tlist)
+                data = {
+                    "time": pd.to_datetime(times.astype(str), format="%Y%m%d%H%M%S"),
+                    "code": np.repeat(np.array(_clist, dtype=object), [len(t) for t in _tlist]),
+                }
+                for f in fields:
+                    data[f] = np.concatenate(_flist[f])
+                out = pd.DataFrame(data)
+                if start_date is not None:
+                    sd = pd.Timestamp(start_date)
+                    out = out[(out["time"] >= sd) & (out["time"] <= end_dt)]
+                return out
+            return pd.DataFrame(columns=["time", "code"] + fields)
+        except Exception as e:
+            logger.debug("get_price 批量路径失败，回退逐只: %s", e)
+
     frames = []
     for code in codes:
         if _instrument(code) is None:
@@ -504,6 +546,36 @@ class _DayBarStore:
         self._bars[order_book_id] = arr
         return arr
 
+    def preload(self, all_daily, codes, data_start=None, data_end=None):
+        """一次性把内存缓存中的日线铺进 _bars，避免回测中逐标的 fetch（SQLite）。
+
+        all_daily: cache.get_all("daily") 返回的 {key: DataFrame}（已全在内存）。
+        codes: 标的 order_book_id 列表（形如 512670.XSHG）。缓存 key 为
+        'astock_<code>'，回退到 '<code>'；命中即转 recarray 直接写入 _bars。
+        """
+        ds = data_start if data_start is not None else self._data_start
+        de = data_end if data_end is not None else self._data_end
+        for code in codes:
+            if code in self._bars:
+                continue
+            df = all_daily.get("astock_" + code)
+            if df is None:
+                df = all_daily.get("tushare_" + code)
+            if df is None:
+                df = all_daily.get("baostock_" + code)
+            if df is None:
+                df = all_daily.get(code)
+            if df is None or getattr(df, "empty", True):
+                self._bars[code] = np.empty(0, dtype=_BAR_DTYPE)
+                continue
+            ddf = _normalize_daily(df)
+            ddf = ddf[(ddf["date"] >= ds) & (ddf["date"] <= de)]
+            if ddf.empty:
+                arr = np.empty(0, dtype=_BAR_DTYPE)
+            else:
+                arr = _daily_to_recarray(ddf)
+            self._bars[code] = arr
+
     def get_date_range(self, order_book_id):
         bars = self.get_bars(order_book_id)
         if len(bars) == 0:
@@ -520,12 +592,10 @@ class _CalendarStore:
 
 
 def _normalize_daily(df):
-    df = df.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
         for c in ("datetime", "date", "trade_date", "time"):
             if c in df.columns:
-                df[c] = pd.to_datetime(df[c], errors="coerce")
-                df = df.set_index(c)
+                df = df.set_index(pd.to_datetime(df[c], errors="coerce"))
                 break
     df = df[~df.index.isna()].sort_index()
     o = df["open"].astype(float)
@@ -558,7 +628,12 @@ def _daily_to_recarray(df):
     if n == 0:
         return np.empty(0, dtype=_BAR_DTYPE)
     arr = np.zeros(n, dtype=_BAR_DTYPE)
-    arr["datetime"] = df["date"].map(lambda d: int(pd.Timestamp(d).strftime("%Y%m%d")) * 1000000).to_numpy()
+    _idx = pd.DatetimeIndex(df["date"])
+    arr["datetime"] = (
+        _idx.year.astype("int64") * 10000
+        + _idx.month.astype("int64") * 100
+        + _idx.day.astype("int64")
+    ) * 1000000
     arr["open"] = df["open"].to_numpy(dtype=np.float64)
     arr["close"] = df["close"].to_numpy(dtype=np.float64)
     arr["high"] = df["high"].to_numpy(dtype=np.float64)
@@ -576,7 +651,15 @@ def _minute_to_recarray(minute_df):
     df = minute_df.sort_index()
     n = len(df)
     arr = np.zeros(n, dtype=_BAR_DTYPE)
-    arr["datetime"] = df.index.map(lambda d: int(pd.Timestamp(d).strftime("%Y%m%d%H%M%S"))).to_numpy()
+    _idx = pd.DatetimeIndex(df.index)
+    arr["datetime"] = (
+        _idx.year.astype("int64") * 10000000000
+        + _idx.month.astype("int64") * 100000000
+        + _idx.day.astype("int64") * 1000000
+        + _idx.hour.astype("int64") * 10000
+        + _idx.minute.astype("int64") * 100
+        + _idx.second.astype("int64")
+    ).to_numpy(dtype=np.uint64)
     arr["open"] = df["open"].to_numpy(dtype=np.float64)
     arr["close"] = df["close"].to_numpy(dtype=np.float64)
     arr["high"] = df["high"].to_numpy(dtype=np.float64)
@@ -635,22 +718,33 @@ class JqDataSource:
         self._instruments = {}
         all_dates = set()
 
+        # 全量日线内存缓存（一次性取出，供日历并集与日线预加载复用，避免回测中
+        # 逐标的 fetch 触发 SQLite 查询；聚宽同类数据常驻内存，这是本地慢的主因）。
+        try:
+            _all_daily = dm.cache.get_all("daily")
+        except Exception:
+            _all_daily = {}
+
         # 交易日历来源：直接用缓存里所有日线数据的日期并集（不依赖单个标的
         # fetch，避免 offline 模式下缓存未命中即 raise 导致日历为空、回测报
         # "区间内无数据"）。
-        try:
-            _all_daily = dm.cache.get_all("daily")
-            for _k, _df in _all_daily.items():
-                if _df is None or getattr(_df, "empty", True):
-                    continue
-                _col = "date" if "date" in _df.columns else (
-                    "trade_date" if "trade_date" in _df.columns else None)
-                if _col is None:
-                    continue
-                for _d in _df[_col]:
-                    all_dates.add(pd.Timestamp(_d).date())
-        except Exception:
-            pass
+        for _k, _df in _all_daily.items():
+            if _df is None or getattr(_df, "empty", True):
+                continue
+            _col = "date" if "date" in _df.columns else (
+                "trade_date" if "trade_date" in _df.columns else None)
+            if _col is None:
+                continue
+            for _d in _df[_col]:
+                all_dates.add(pd.Timestamp(_d).date())
+
+        # 日线预加载：把内存缓存直接铺进 _DayBarStore._bars，回测期间 get_price
+        # / history 全部命中内存，零 SQLite、零重复 _normalize_daily。
+        _preload_codes = list(self._universe)
+        if benchmark:
+            _preload_codes.append(benchmark)
+        self._day_bar_store.preload(_all_daily, _preload_codes,
+                                    self._data_start, self._data_end)
 
         # 预加载基准日线（rqalpha 校验基准数据范围）
         if benchmark:
@@ -798,6 +892,38 @@ class JqDataSource:
             return bars[["datetime", fields] if fields != "datetime" else ["datetime"]]
         wanted = ["datetime"] + [f for f in fields if f != "datetime" and f in bars.dtype.names]
         return bars[wanted]
+
+    def history_bars_batch(self, codes, bar_count, frequency, fields, dt):
+        """批量取多标的切片（避免 get_price 逐只调用 history_bars 的上万次开销）。
+
+        返回 {code: bars}；bars 已按 fields 选取，与 history_bars 单只返回一致。
+        """
+        freq = _norm_freq(frequency)
+        dt_int = np.uint64(_dt_to_int(dt, freq))
+        out = {}
+        for code in codes:
+            ins = _instrument(code)
+            if ins is None:
+                out[code] = None
+                continue
+            try:
+                bars = self._all_bars_of(ins, freq)
+            except Exception:
+                bars = None
+            if bars is None or len(bars) <= 0:
+                out[code] = None
+                continue
+            i = bars["datetime"].searchsorted(dt_int, side="right")
+            left = i - bar_count if i >= bar_count else 0
+            bars = bars[left:i]
+            if fields is not None:
+                if isinstance(fields, str):
+                    bars = bars[["datetime", fields] if fields != "datetime" else ["datetime"]]
+                else:
+                    wanted = ["datetime"] + [f for f in fields if f != "datetime" and f in bars.dtype.names]
+                    bars = bars[wanted]
+            out[code] = bars
+        return out
 
     def get_bar(self, instrument, dt, frequency="1d"):
         freq = _norm_freq(frequency)
