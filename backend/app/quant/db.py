@@ -14,7 +14,7 @@ _DB_PATH: str | None = None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS backtest_runs (
-    id TEXT PRIMARY KEY, strategy_id TEXT, params_json TEXT, status TEXT,
+    id TEXT PRIMARY KEY, strategy_id TEXT, name TEXT, params_json TEXT, status TEXT,
     metrics_json TEXT, created_at TEXT DEFAULT (datetime('now')),
     finished_at TEXT, error TEXT);
 CREATE TABLE IF NOT EXISTS backtest_equity (
@@ -50,6 +50,10 @@ def init_db(path: str | None = None) -> None:
     conn = sqlite3.connect(_DB_PATH)
     try:
         conn.executescript(_SCHEMA)
+        # 兼容旧库：若 backtest_runs 尚无 name 列则补加
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(backtest_runs)")}
+        if "name" not in cols:
+            conn.execute("ALTER TABLE backtest_runs ADD COLUMN name TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -64,22 +68,23 @@ def get_conn() -> sqlite3.Connection:
 
 
 # ---- 回测 ----
-def insert_run(run_id, strategy_id, params_json, status="queued"):
+def insert_run(run_id, strategy_id, name, params_json, status="queued"):
     with get_conn() as c:
         c.execute(
-            "INSERT INTO backtest_runs(id,strategy_id,params_json,status) VALUES(?,?,?,?)",
-            (run_id, strategy_id, params_json, status),
+            "INSERT INTO backtest_runs(id,strategy_id,name,params_json,status) VALUES(?,?,?,?,?)",
+            (run_id, strategy_id, name, params_json, status),
         )
 
 
-def upsert_run(run_id, strategy_id, params_json, status="running"):
+def upsert_run(run_id, strategy_id, name, params_json, status="running"):
     """插入回测记录；若 run_id 已存在（如 API 已建 'queued' 行）则更新，避免 UNIQUE 冲突。"""
     with get_conn() as c:
         c.execute(
-            "INSERT INTO backtest_runs(id,strategy_id,params_json,status) VALUES(?,?,?,?) "
+            "INSERT INTO backtest_runs(id,strategy_id,name,params_json,status) VALUES(?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET "
-            "status=excluded.status, strategy_id=excluded.strategy_id, params_json=excluded.params_json",
-            (run_id, strategy_id, params_json, status),
+            "status=excluded.status, strategy_id=excluded.strategy_id, name=excluded.name, "
+            "params_json=excluded.params_json",
+            (run_id, strategy_id, name, params_json, status),
         )
 
 
@@ -114,6 +119,35 @@ def bulk_insert_equity(run_id, rows):
         )
 
 
+def insert_equity_row(run_id, dt, value, benchmark, cash, positions_value):
+    """单日收益实时写入（每日收盘钩子调用）。"""
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO backtest_equity(run_id,dt,value,benchmark,cash,positions_value) "
+            "VALUES(?,?,?,?,?,?)",
+            (run_id, dt, value, benchmark, cash, positions_value),
+        )
+
+
+def get_equity_after(run_id, offset=0):
+    """返回 rowid > offset 的收益行（SSE 增量用）。"""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, dt, value, benchmark, cash, positions_value "
+            "FROM backtest_equity WHERE run_id=? AND rowid > ? ORDER BY rowid",
+            (run_id, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_max_equity_id(run_id):
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT MAX(rowid) AS m FROM backtest_equity WHERE run_id=?", (run_id,)
+        ).fetchone()
+    return row["m"] or 0
+
+
 def get_equity(run_id):
     with get_conn() as c:
         rows = c.execute(
@@ -141,6 +175,25 @@ def get_trades(run_id):
     return [dict(r) for r in rows]
 
 
+def get_trades_after(run_id, offset=0):
+    """返回 rowid > offset 的成交行（SSE 增量用）。"""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, ts, code, action, price, amount, pnl, pnl_pct, commission "
+            "FROM backtest_trades WHERE run_id=? AND rowid > ? ORDER BY rowid",
+            (run_id, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_max_trade_id(run_id):
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT MAX(rowid) AS m FROM backtest_trades WHERE run_id=?", (run_id,)
+        ).fetchone()
+    return row["m"] or 0
+
+
 def insert_log(run_id, ts, level, message):
     with get_conn() as c:
         c.execute(
@@ -156,6 +209,25 @@ def get_logs(run_id):
             (run_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_logs_after(run_id, offset=0):
+    """返回 rowid > offset 的日志行（SSE 增量用）。"""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, ts, level, message FROM backtest_logs "
+            "WHERE run_id=? AND rowid > ? ORDER BY rowid",
+            (run_id, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_max_log_id(run_id):
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT MAX(rowid) AS m FROM backtest_logs WHERE run_id=?", (run_id,)
+        ).fetchone()
+    return row["m"] or 0
 
 
 def delete_run(run_id):
