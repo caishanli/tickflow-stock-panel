@@ -28,6 +28,7 @@ def submit_backtest(params: dict) -> str:
     db.insert_run(
         run_id,
         params.get("strategy_id", ""),
+        params.get("name", ""),
         json.dumps(params, ensure_ascii=False),
         "queued",
     )
