@@ -92,7 +92,10 @@ class DataCache:
                 return True
         if start:
             try:
-                if pd.Timestamp(first).date() > pd.Timestamp(start).date():
+                # 仅当数据起始晚于请求结束（数据完全在请求区间之后）才视为失效；
+                # 请求起始早于数据起始（如回看窗口早于数据上市日）不失效——数据
+                # 从 first 起已覆盖回测区间，回源会因 offline 失败导致基准缺失。
+                if end and pd.Timestamp(first).date() > pd.Timestamp(end).date():
                     return False
             except Exception:
                 return True

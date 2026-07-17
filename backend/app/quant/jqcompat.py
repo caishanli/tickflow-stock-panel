@@ -40,7 +40,7 @@ _UNIVERSE = []                    # ETF 代码列表（get_all_securities 返回
 _NAMES = {}                       # code -> display_name
 _BENCHMARK = "000300.XSHG"
 _EVERY_BAR_CALLBACKS = []         # 'every_bar' 调度回调
-_PENDING_RUN_DAILY = []           # 全局 run_daily 缓存（mod start_up 时重放）
+_DAILY_AT = {}                      # (hour, minute) -> 聚宽 run_daily(time='HH:MM') 回调
 
 
 def _set_current_bar_dict(bd):
@@ -279,17 +279,26 @@ class OrderCost:
 # ---- log shim ----
 class _Log:
     def info(self, *a, **k):
+        try:
+            with open("/tmp/wufu_dbg.log", "a", encoding="utf-8") as _f:
+                _f.write("[INFO] " + " ".join(str(x) for x in a) + "\n")
+                _f.flush()
+        except Exception:
+            pass
         logger.info(*a)
 
     def warn(self, *a, **k):
+        print("[策略WARN]", *a)
         logger.warning(*a)
 
     warning = warn
 
     def error(self, *a, **k):
+        print("[策略ERROR]", *a)
         logger.error(*a)
 
     def debug(self, *a, **k):
+        print("[策略DEBUG]", *a)
         logger.debug(*a)
 
     def set_level(self, *a, **k):
@@ -325,55 +334,31 @@ def run_daily(func, time=None, *args, **kwargs):
         _EVERY_BAR_CALLBACKS.append(func)
         return None
 
-    def _do(tr):
-        """聚宽允许全局调用 run_daily，但 rqalpha 调度器只允许在 init
-        上下文内注册。一律缓存到 _PENDING_RUN_DAILY，由 mod start_up
-        时的 _replay_run_daily 在正确上下文内重放注册。"""
-        _PENDING_RUN_DAILY.append((_wrapper, tr))
-
+    # 把各语义时间归一为具体 (hour, minute)，注册到分钟级 BAR 事件，
+    # 由 bar 缓存 mod 的 _on_bar 在对应分钟触发（绕过 rqalpha scheduler
+    # 的 ON_INIT 阶段限制，且不受全局调用时机影响）。
     if time_rule == "before_trading":
-        _do("before_trading")
-        return None
-
-    if time_rule == "open":
-        # 聚宽 'open'：每天开盘时下单。rqalpha 盘前(before_trading)禁止下单，
-        # 故映射到 09:32（开盘第一分钟，明确盘中可下单）。
-        _do(9 * 60 + 32)
-        return None
-
-    if time_rule == "close":
-        # 聚宽 'close'：每天收盘时下单，映射到 15:00（收盘后，可下单）。
-        _do(15 * 60)
-        return None
-
-    if isinstance(time_rule, int):
-        _do(time_rule)
-        return None
-
-    try:
-        hh, mm = str(time_rule).split(":")
-        hh, mm = int(hh), int(mm)
-    except Exception:
-        _do("before_trading")
-        return None
-    minute = hh * 60 + mm
-    if minute <= 9 * 60 + 31:
-        _do("before_trading")
+        hm = (9, 31)
+    elif time_rule == "open":
+        hm = (9, 32)
+    elif time_rule == "close":
+        hm = (15, 0)
+    elif isinstance(time_rule, int):
+        hm = divmod(max(0, min(time_rule, 15 * 60)), 60)
     else:
-        minute = min(minute, 15 * 60)
-        _do(minute)
+        try:
+            hh, mm = str(time_rule).split(":")
+            hm = (int(hh), int(mm))
+        except Exception:
+            hm = (9, 31)
+    _DAILY_AT.setdefault(hm, []).append(func)
     return None
 
 
 def _replay_run_daily():
-    """mod start_up 时重放全局 run_daily 调用（聚宽允许全局调用，rqalpha 要求在框架上下文内）。"""
-    while _PENDING_RUN_DAILY:
-        wrapper, tr = _PENDING_RUN_DAILY.pop(0)
-        try:
-            from rqalpha.api import scheduler
-            scheduler.run_daily(wrapper, time_rule=tr)
-        except Exception as e:
-            logger.warning("重放 run_daily 失败: %s", e)
+    """兼容层保留接口（聚宽全局 run_daily 已在 exec 时直接注册到分钟事件，
+    不再需要 init 内重放）。保留为空操作以避免历史调用报错。"""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +635,23 @@ class JqDataSource:
         self._instruments = {}
         all_dates = set()
 
+        # 交易日历来源：直接用缓存里所有日线数据的日期并集（不依赖单个标的
+        # fetch，避免 offline 模式下缓存未命中即 raise 导致日历为空、回测报
+        # "区间内无数据"）。
+        try:
+            _all_daily = dm.cache.get_all("daily")
+            for _k, _df in _all_daily.items():
+                if _df is None or getattr(_df, "empty", True):
+                    continue
+                _col = "date" if "date" in _df.columns else (
+                    "trade_date" if "trade_date" in _df.columns else None)
+                if _col is None:
+                    continue
+                for _d in _df[_col]:
+                    all_dates.add(pd.Timestamp(_d).date())
+        except Exception:
+            pass
+
         # 预加载基准日线（rqalpha 校验基准数据范围）
         if benchmark:
             try:
@@ -878,6 +880,77 @@ class JqDataSource:
 
 
 # ---------------------------------------------------------------------------
+# context/positions 代理：模拟聚宽持仓语义
+# ---------------------------------------------------------------------------
+# 聚宽 context.portfolio.positions 仅含 total_amount>0 的持仓；rqalpha 卖出后
+# 仍保留 total_amount=0 的项。策略按 positions.keys() 判断持仓会导致"卖出后误判
+# 仍持仓"从而同日不买入。这里包装 positions 过滤掉 0 持仓项，对齐聚宽语义。
+class _PositionsView:
+    def __init__(self, real):
+        self._real = real
+
+    def _active(self):
+        out = {}
+        try:
+            items = self._real.items()
+        except Exception:
+            items = [(k, self._real[k]) for k in self._real.keys()]
+        for k, pos in items:
+            try:
+                if getattr(pos, "total_amount", 0) and pos.total_amount > 0:
+                    out[k] = pos
+            except Exception:
+                out[k] = pos
+        return out
+
+    def keys(self):
+        return self._active().keys()
+
+    def values(self):
+        return self._active().values()
+
+    def items(self):
+        return self._active().items()
+
+    def __iter__(self):
+        return iter(self._active().keys())
+
+    def __len__(self):
+        return len(self._active())
+
+    def __contains__(self, key):
+        return key in self._active()
+
+    def __getitem__(self, key):
+        return self._active()[key]
+
+    def get(self, key, default=None):
+        return self._active().get(key, default)
+
+
+class _PortfolioView:
+    def __init__(self, real):
+        self._real = real
+        self._pos_view = _PositionsView(getattr(real, "positions", None))
+
+    def __getattr__(self, name):
+        if name == "positions":
+            return self._pos_view
+        return getattr(self._real, name)
+
+
+class _ContextProxy:
+    def __init__(self, real):
+        self._real = real
+        self._pf_view = _PortfolioView(getattr(real, "portfolio", None))
+
+    def __getattr__(self, name):
+        if name == "portfolio":
+            return self._pf_view
+        return getattr(self._real, name)
+
+
+# ---------------------------------------------------------------------------
 # bar 缓存 + every_bar 调度 mod
 # ---------------------------------------------------------------------------
 def _install_barcache_mod():
@@ -890,12 +963,21 @@ def _install_barcache_mod():
             def start_up(self, env, mod_config):
                 def _on_bar(event):
                     _set_current_bar_dict(getattr(event, "bar_dict", None))
-                    uctx = getattr(getattr(env, "user_strategy", None), "user_context", None)
+                    _real_ctx = getattr(getattr(env, "user_strategy", None), "user_context", None)
+                    uctx = _ContextProxy(_real_ctx) if _real_ctx is not None else None
+                    dt = getattr(env, "trading_dt", None)
+                    hm = (dt.hour, dt.minute) if dt is not None else None
                     for cb in list(_EVERY_BAR_CALLBACKS):
                         try:
                             cb(uctx)
                         except Exception as e:
                             logger.debug("every_bar 回调异常: %s", e)
+                    if hm is not None:
+                        for cb in _DAILY_AT.get(hm, []):
+                            try:
+                                cb(uctx)
+                            except Exception as e:
+                                logger.warning("daily_at(%s) 回调异常: %s", hm, e)
 
                 env.event_bus.add_listener(EVENT.BAR, _on_bar)
 
@@ -990,6 +1072,11 @@ def _register_jq_apis():
     start_up 运行较晚，会兜底重新注册，确保策略 `from jqdata import *` 拿到的是
     我们的实现。
     """
+    # 聚宽全局上下文对象 g：策略用 g.xxx = yyy 在全局持久共享状态。
+    class _GlobalContext:
+        pass
+    _GLOBAL_G = _GlobalContext()
+
     global _JQDATA_MOD
     if _JQDATA_MOD is None:
         # 假 jqdata 模块，使 `from jqdata import *` 注入我们的兼容 shim。
@@ -999,6 +1086,7 @@ def _register_jq_apis():
         sys.modules["jqdata"] = _JQDATA_MOD
 
     _shims = [
+        ("g", _GLOBAL_G),
         ("get_price", get_price),
         ("get_all_securities", get_all_securities),
         ("get_current_data", get_current_data),

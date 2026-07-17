@@ -57,11 +57,7 @@ def tdx_client(market='std'):
             except Exception:
                 continue
     try:
-        return Quotes.factory(market=market)                # fallback 1（裸 factory 实测可用）
-    except Exception:
-        pass
-    try:
-        return Quotes.factory(market=market, bestip=True)   # fallback 2
+        return Quotes.factory(market=market)                # 裸 factory（实测可用且不选速）
     except Exception as e:
         raise RuntimeError(
             "所有 mootdx 服务器均不可达。海外网络通常全部超时（TCP 7709），"
@@ -94,33 +90,16 @@ class MootdxSource(DataSource):
     def _rotate_server(self, to_bestip=False):
         """换服务器重建客户端（运行时取数超时/失败兜底）。
 
-        - to_bestip=False：换到 _TDX_SERVERS 下一个 TCP 可达的显式服务器；
-        - to_bestip=True：回退 mootdx 自带 bestip（实测裸 factory 已能
-          工作，bestip 仅作最后兜底）。
+        统一使用裸 ``Quotes.factory(market="std")``：实测对所有标的可用且快，
+        且**不会触发 mootdx 的 bestip 测速选服（会卡死）**。bestip 兜底已禁用。
         返回新客户端；全部失败返回 None。
         """
         from mootdx.quotes import Quotes
-        if to_bestip:
-            try:
-                self._client = Quotes.factory(market="std", bestip=True)
-                return self._client
-            except Exception:
-                return None
-        n = len(_TDX_SERVERS)
-        for step in range(1, n + 1):
-            idx = (self._server_idx + step) % n
-            ip, port = _TDX_SERVERS[idx]
-            if not _probe(ip, port):
-                continue
-            try:
-                client = Quotes.factory(market="std", server=(ip, port))
-                self._server_idx = idx
-                self._client = client
-                return client
-            except Exception:
-                continue
-        # 显式列表用尽 → 回退 bestip
-        return self._rotate_server(to_bestip=True)
+        try:
+            self._client = Quotes.factory(market="std")
+            return self._client
+        except Exception:
+            return None
 
     def _with_server_retry(self, fn, empty_ok=False):
         """执行取数 ``fn``，超时/返回空时按 _TDX_SERVERS 轮询换服务器重试。
@@ -144,10 +123,10 @@ class MootdxSource(DataSource):
             t.start()
             t.join(10)
             if t.is_alive():
-                self._rotate_server(to_bestip=(attempt == attempts - 1))
+                self._rotate_server()
                 continue
             if "err" in box:
-                self._rotate_server(to_bestip=(attempt == attempts - 1))
+                self._rotate_server()
                 continue
             df = box.get("df")
             if df is None or (not empty_ok and (hasattr(df, "empty") and df.empty)):

@@ -85,15 +85,20 @@ class SyntheticMinuteSource:
         if daily.empty:
             return pd.DataFrame()
         if not isinstance(daily.index, pd.DatetimeIndex):
-            col = None
-            for c in ("datetime", "trade_date", "date", "time"):
-                if c in daily.columns:
-                    col = c
-                    break
-            if col is not None:
-                daily = daily.copy()
-                daily[col] = pd.to_datetime(daily[col], errors="coerce")
-                daily = daily.set_index(col)
+            daily = daily.copy()
+            try:
+                daily.index = pd.to_datetime(daily.index, errors="coerce")
+            except Exception:
+                pass
+            if not isinstance(daily.index, pd.DatetimeIndex):
+                col = None
+                for c in ("datetime", "trade_date", "date", "time"):
+                    if c in daily.columns:
+                        col = c
+                        break
+                if col is not None:
+                    daily[col] = pd.to_datetime(daily[col], errors="coerce")
+                    daily = daily.set_index(col)
         daily = daily.sort_index()
         frames = []
         for t, row in daily.iterrows():

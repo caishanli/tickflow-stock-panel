@@ -100,8 +100,28 @@ class QuantRQAlphaDataSource:
         self._instruments: dict = {}
         all_dates = set()
 
+        # 交易日历来源：直接用缓存里所有日线数据的日期并集（不依赖
+        # provider.get_daily，避免 offline 模式下缓存未命中即 raise 导致
+        # 日历为空、回测报"区间内无数据"）。
+        try:
+            _all_daily = provider.cache.get_all("daily")
+            for _k, _df in _all_daily.items():
+                if _df is None or getattr(_df, "empty", True):
+                    continue
+                _col = "date" if "date" in _df.columns else (
+                    "trade_date" if "trade_date" in _df.columns else None)
+                if _col is None:
+                    continue
+                for _d in _df[_col]:
+                    all_dates.add(pd.Timestamp(_d).date())
+        except Exception:
+            pass
+
         for code in symbols:
-            df = provider.get_daily(code, start, end)
+            try:
+                df = provider.get_daily(code, start, end)
+            except Exception:
+                df = None
             if df is None or len(df) == 0:
                 continue
             self._bars[code] = self._df_to_recarray(df)
@@ -186,6 +206,7 @@ class QuantRQAlphaDataSource:
     def available_data_range(self, frequency):
         if not self._trading_dates:
             return _dt.date.min, _dt.date.max
+        print(f"[DBG] available_data_range end={self._trading_dates[-1]} n={len(self._trading_dates)}")
         return self._trading_dates[0], self._trading_dates[-1]
 
     def get_yield_curve(self, start_date, end_date, tenor=None):
@@ -635,7 +656,19 @@ def run_jq_backtest(strategy_path: str, params: dict,
     # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
     # 等开关不一致（策略侧单例默认 True 会仍走 mootdx 实时分钟线网络）。
     dm = get_data_manager()
-    dm._use_real_minute = True  # 回测保留 mootdx 实时分钟线（本地缓存优先，保证收益对齐基线）
+    # 确保 tushare token 生效（单例可能在 .env 加载前已创建，导致 token 为空）
+    import os as _os
+    _tok = _os.environ.get("TUSHARE_TOKEN") or CONFIG.get("TUSHARE_TOKEN", "")
+    if _tok and dm.sources.get("tushare") is not None:
+        try:
+            dm.sources["tushare"].token = _tok
+            import tushare as ts
+            ts.set_token(_tok)
+        except Exception:
+            pass
+    # 回测使用真实 1 分钟数据（real_ 基底），缺口由 baostock 5 分钟插值补齐。
+    dm._use_real_minute = True
+    dm._offline = True
     dm.preload_daily()
     dm.set_minute_window(start, end)
 
@@ -687,8 +720,6 @@ def run_jq_backtest(strategy_path: str, params: dict,
     #  故 jqcompat 先缓存、init 时再重放。）
     universe_literal = ",\n".join('        "{}"'.format(c) for c in fixed_pools)
     inject = (
-        "    from app.quant.jqcompat import _replay_run_daily\n"
-        "    _replay_run_daily()\n"
         "    update_universe([\n{}\n    ])"
     ).format(universe_literal)
     if _re.search(r"def initialize\s*\(", strategy_text):

@@ -59,6 +59,7 @@ class DataManager:
         self.minute_lookback = pd.Timedelta(days=15)
         self._minute_cov = {}  # code -> (lo_ts, hi_ts) 已覆盖区间
         self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
+        self._offline = False       # 回测离线模式：本地优先，缺失不联网回源
         # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
         # 避免 tushare 对 ETF 永远返回空却每次都先试（慢且无意义）。
         self._src_fail = {}
@@ -163,8 +164,19 @@ class DataManager:
         if cache_key in self._daily_mem:
             mem = self._daily_mem[cache_key]
             if mem is not None and not (hasattr(mem, "empty") and mem.empty):
-                return mem
+                # 内存命中仍需检查是否覆盖请求区间：preload 可能加载了截断的本地
+                # 日线（如某 ETF 本地只到 1/30），若不检查覆盖会误当完整返回，
+                # 导致 6-7 月数据缺失、候选池错位。未覆盖则删除内存缓存，走
+                # 下方 cache.get 回源补齐。
+                req_start = args[1] if len(args) > 1 else None
+                req_end = args[2] if len(args) > 2 else None
+                if DataCache._covers(mem, req_start, req_end):
+                    return mem
             del self._daily_mem[cache_key]
+        if self._offline:
+            # 回测离线：本地缺失即视为无数据，不联网回源（避免 mootdx 选服务器
+            # 联网超时卡死；缺数据的标的由策略侧容忍/跳过）。
+            raise DataSourceError(f"离线模式本地缺失: {cache_key}")
         last_err = ""
         for name in self._priority():
             src = self.sources[name]
@@ -187,6 +199,10 @@ class DataManager:
                 return result
             except Exception as e:
                 last_err = f"{name}: {e}"
+                if getattr(self, "_dbg_demote", False):
+                    import traceback as _tb
+                    print(f"[DBG-FETCH-FAIL] {name} {method} {args[:2]} :: {e}")
+                    _tb.print_exc()
                 self._src_fail[name] = self._src_fail.get(name, 0) + 1
                 self._maybe_demote(name)
                 continue
@@ -235,9 +251,8 @@ class DataManager:
                 f"[DataManager] 分钟数据加载异常: {code} 在 {as_of}: {e}"
             ) from e
         if df is None or (hasattr(df, "empty") and df.empty):
-            raise RuntimeError(
-                f"[DataManager] 分钟数据为空: {code} 在 {as_of} 时无可用分钟数据"
-            )
+            # 缺失标的返回空 DataFrame（不 raise），让策略侧/feed 跳过而非中止回测。
+            return pd.DataFrame()
         return self._slice_minute(df, end_date, start_date)
 
     def get_minute_feed(self, code, start, end):
@@ -258,9 +273,8 @@ class DataManager:
             self._minute_mem[code] = df
             self._minute_cov[code] = (lo_ts, hi_ts)
         if df is None or (hasattr(df, "empty") and df.empty):
-            raise RuntimeError(
-                f"[DataManager] 分钟数据为空(feed): {code} 在 {start}~{end} 区间无可用分钟数据"
-            )
+            # feed 缺失标的返回空 DataFrame，rqalpha 跳过该标的而非中止回测。
+            return pd.DataFrame()
         return self._slice_minute(df, end, start)
 
     def _ensure_minute_windowed(self, code, as_of):
@@ -389,10 +403,8 @@ class DataManager:
             except Exception as e:
                 import logging
                 logging.warning("[DataManager] 日线合成兜底失败 %s: %s", code, e)
-            raise RuntimeError(
-                f"[DataManager] 分钟数据获取失败: {code} 在 {lo_ts.date()}~{hi_ts.date()} "
-                f"区间内 mootdx/baostock 均失败且日线合成兜底也失败。"
-            )
+            # 三源皆缺：返回 None（不 raise），让上层 feed 跳过该标的而非中止回测。
+            return None
 
         numeric_cols = ["open", "high", "low", "close", "volume", "money", "amount"]
         # 以所有层的索引并集为基底；后加入的层（baostock 5 分钟）覆盖先前的层，
@@ -432,6 +444,11 @@ class DataManager:
         if covers:
             # 5min.db 连续覆盖整个请求区间 → 直接插值返回（不落盘，C2）。
             return interpolate_5min_to_1min(cached)
+        if self._offline:
+            # 离线：5min 未完整覆盖且不联网，退化为已缓存段的插值（缺失段留空）
+            if cached is not None and not cached.empty:
+                return interpolate_5min_to_1min(cached.loc[cached.index >= lo_ts])
+            return None
         # C1 绝对约束：本地 5min 未覆盖请求区间时，回源 baostock 补齐缺失段
         # （之前为躲"每只卡 2.7s"而跳过回源，导致早期/缺口数据缺失，违反约束）。
         # 回源结果合并写回 5min.db（真实数据可落盘，C1）；插值出的 1m 仍不落盘（C2）。
@@ -486,12 +503,16 @@ class DataManager:
             local_end = local.index.max()
             if hi_ts > local_end:
                 # 仅补本地之后的缺口，避免覆盖本地较早的真实 1 分钟
-                try:
-                    fresh = self.sources["mootdx"].get_minute(code)
-                except Exception as e:
-                    import logging
-                    logging.warning("[DataManager] mootdx回源补充缺口失败 %s: %s", code, e)
-                    fresh = None
+                fresh = None
+                if self._offline:
+                    pass  # 离线：不联网补缺口
+                else:
+                    try:
+                        fresh = self.sources["mootdx"].get_minute(code)
+                    except Exception as e:
+                        import logging
+                        logging.warning("[DataManager] mootdx回源补充缺口失败 %s: %s", code, e)
+                        fresh = None
                 if fresh is not None and not fresh.empty:
                     fresh = fresh[fresh.index > local_end]
                     if not fresh.empty:
@@ -511,12 +532,10 @@ class DataManager:
             return local
         cov = self._minute_real_cov.get(code)
         if cov is not None and hi_ts < cov[0]:
-            # 请求区间整体早于 mootdx 能提供的最早日期，回源也取不到 -> 跳过
+            # 请求区间整体早于已知最早日期，回源也取不到 -> 跳过
             return None
-        # C1.b：mootdx 仅覆盖近 ~3 个月。请求末尾早于此范围 -> mootdx 取不到，
-        # 跳过交 baostock 5min 插值（C1.b）。
-        mootdx_floor = pd.Timestamp.now() - pd.Timedelta(days=95)
-        if hi_ts < mootdx_floor:
+        if self._offline:
+            # 离线：完全缺失的标的不再联网回源，直接返回 None 由上层跳过
             return None
         try:
             df = self.sources["mootdx"].get_minute(code)

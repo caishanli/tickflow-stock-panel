@@ -146,9 +146,67 @@ class BaostockSource(DataSource):
         df5 = self.get_5min(code, start, end)
         return interpolate_5min_to_1min(df5)
 
-    # 以下接口 baostock 不作为主力源，仅满足基类
-    def get_daily(self, code, start, end):
-        raise DataSourceError("baostock daily 由 mootdx 覆盖")
+    # baostock 前复权日线：因子较全，对齐聚宽前复权价（tushare adj 对部分
+    # 新股 ETF 复权因子缺失，会返回未复权价导致除权跳变）。
+    def get_daily(self, code, start, end, timeout=120):
+        self._ensure_login()
+        import baostock as bs
+
+        symbol = self._to_symbol(code)
+        # baostock 需要 YYYY-MM-DD 格式
+        def _norm(d):
+            d = str(d).replace("-", "").strip()
+            return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else str(d)
+        s = _norm(start)
+        e = _norm(end)
+        _res = {}
+
+        def _worker():
+            try:
+                rs = bs.query_history_k_data_plus(
+                    symbol,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=s,
+                    end_date=e,
+                    frequency="d",
+                    adjustflag="1",  # 前复权
+                )
+                _res["err"] = rs.error_code
+                _res["fields"] = list(rs.fields)
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                _res["rows"] = rows
+            except Exception as ex:  # noqa: BLE001
+                _res["err"] = f"exc:{ex}"
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            raise DataSourceError(
+                f"baostock 日线取数超时({timeout}s): {code} {start}~{end}"
+            )
+        if str(_res.get("err", "unknown")).startswith("exc:"):
+            raise DataSourceError(f"baostock 日线取数异常: {_res['err']}")
+        if _res.get("err") != "0":
+            raise DataSourceError(f"baostock 日线 query failed: {_res.get('err')}")
+
+        rows = _res.get("rows") or []
+        if not rows:
+            raise DataSourceError("baostock 无日线数据")
+
+        cols = _res.get("fields") or [
+            "date", "open", "high", "low", "close", "volume", "amount"]
+        df = pd.DataFrame(rows, columns=cols)
+        for col in ("open", "high", "low", "close", "volume", "amount"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # 列名对齐 tushare 源（trade_date 等），供 cache 统一存储
+        df = df.rename(columns={"date": "trade_date"})
+        df["trade_date"] = df["trade_date"].astype(str)
+        df = df.sort_values("trade_date").reset_index(drop=True)
+        return df
 
     def get_minute(self, code, date):
         return self.get_minute_1min(code, date, date)

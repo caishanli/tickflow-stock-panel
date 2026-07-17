@@ -57,14 +57,25 @@ class TushareSource(DataSource):
         ts_code = _to_ts_code(code)
         s = str(start).replace("-", "")
         e = str(end).replace("-", "")
-        for api in _daily_apis(code):
-            try:
-                df = getattr(pro, api)(ts_code=ts_code, start_date=s, end_date=e)
-            except Exception:
-                continue
-            if df is not None and not df.empty:
-                return df.sort_values("trade_date").reset_index(drop=True)
-        raise DataSourceError("Tushare 无日线数据")
+        import time as _t
+        last_err = None
+        for attempt in range(4):
+            for api in _daily_apis(code):
+                try:
+                    # ETF/股票用前复权(qfq)以对齐聚宽前复权价；指数无复权参数。
+                    kwargs = {"ts_code": ts_code, "start_date": s, "end_date": e}
+                    if api in ("fund_daily", "daily"):
+                        kwargs["adj"] = "qfq"
+                    df = getattr(pro, api)(**kwargs)
+                except Exception as e2:
+                    last_err = e2
+                    continue
+                if df is not None and not df.empty:
+                    return df.sort_values("trade_date").reset_index(drop=True)
+            # 限频/空结果：退避重试
+            if attempt < 3:
+                _t.sleep(0.5 * (attempt + 1))
+        raise DataSourceError("Tushare 无日线数据: %s" % last_err)
 
     def get_minute(self, code, date):
         pro = self._api()
