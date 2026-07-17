@@ -30,6 +30,16 @@ from rqalpha.model.instrument import Instrument
 from . import db
 from .config import CONFIG, QuantConfig
 
+try:
+    from rqalpha import subscribe_event
+    from rqalpha.core.events import EVENT
+except Exception:  # noqa: BLE001
+    subscribe_event = None
+    EVENT = None
+
+
+_LIVE_RUN_ID = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -377,6 +387,120 @@ _install_bridge_mod()
 
 
 # ---------------------------------------------------------------------------
+# 实时写库 mod（LiveStreamMod）：运行期把日志/收益/交易即时落 quant.db，
+# 供 SSE 增量推送。结果 DB 始终是最新真值，SSE 断线后可凭轮询接口恢复。
+# ---------------------------------------------------------------------------
+def _install_live_mod():
+    if "rqalpha_mod_quantlive" in sys.modules:
+        return
+
+    mod = types.ModuleType("rqalpha_mod_quantlive")
+
+    def load_mod():
+        from rqalpha.interface import AbstractMod
+
+        class _LiveHandler(logging.Handler):
+            def emit(self, record):
+                if _LIVE_RUN_ID is None:
+                    return
+                try:
+                    db.insert_log(_LIVE_RUN_ID, _now(), record.levelname, self.format(record))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        class _LiveMod(AbstractMod):
+            def start_up(self, env, mod_config):
+                self._env = env
+                self._handlers = []
+                if EVENT is not None:
+                    env.event_bus.add_listener(EVENT.AFTER_TRADING, self._on_after_trading)
+                    env.event_bus.add_listener(EVENT.TRADE, self._on_trade)
+                # 捕获策略日志：经 jqcompat.LIVE_SINK 实时写库（最稳，绕开
+                # logbook/stdlib 路由差异）；同时挂一个 stdlib handler 作备份。
+                try:
+                    import logging as _logging
+
+                    import app.quant.jqcompat as _jq
+
+                    _jq.LIVE_SINK = lambda level, msg: (
+                        db.insert_log(_LIVE_RUN_ID, _now(), level, msg)
+                        if _LIVE_RUN_ID is not None else None
+                    )
+                    self._handlers.append(("sink", _jq, None))
+
+                    h = _LiveHandler()
+                    h.setLevel(_logging.INFO)
+                    h.setFormatter(_logging.Formatter("%(message)s"))
+                    _jq.logger.setLevel(_logging.INFO)
+                    _jq.logger.addHandler(h)
+                    self._handlers.append(("logging", _jq.logger, h))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def _on_after_trading(self, event):
+                if _LIVE_RUN_ID is None:
+                    return
+                try:
+                    acct = self._env.portfolio.stock_account
+                    dt = event.trading_dt
+                    dt_s = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
+                    db.insert_equity_row(
+                        _LIVE_RUN_ID, dt_s,
+                        float(getattr(acct, "total_value", 0.0) or 0.0),
+                        1.0,
+                        float(getattr(acct, "cash", 0.0) or 0.0),
+                        float(getattr(acct, "market_value", 0.0) or 0.0),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("live equity 写入失败")
+
+            def _on_trade(self, event):
+                if _LIVE_RUN_ID is None:
+                    return
+                try:
+                    t = event.trade
+                    dt = t.datetime
+                    ts = dt.strftime("%Y-%m-%d %H:%M") if hasattr(dt, "strftime") else str(dt)
+                    db.insert_trade(
+                        _LIVE_RUN_ID, ts,
+                        str(t.order_book_id),
+                        str(t.side),
+                        float(getattr(t, "last_price", 0.0) or 0.0),
+                        float(getattr(t, "last_quantity", 0.0) or 0.0),
+                        0.0, 0.0,
+                        float(getattr(t, "transaction_cost", 0.0) or 0.0),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("live trade 写入失败")
+
+            def tear_down(self, *args):
+                for kind, target, h in getattr(self, "_handlers", []):
+                    try:
+                        if kind == "sink":
+                            target.LIVE_SINK = None
+                        elif kind == "logging":
+                            target.removeHandler(h)
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._handlers = []
+
+        return _LiveMod()
+
+    mod.load_mod = load_mod
+    mod.__config__ = {
+        "base": {},
+        "mod": {"sys_risk": {}},
+        "extra": {},
+        "priority": 50,
+    }
+    sys.modules["rqalpha_mod_quantlive"] = mod
+
+
+_install_live_mod()
+
+
+
+# ---------------------------------------------------------------------------
 # provider：从 bundle 目录读 CSV（无网络）
 # ---------------------------------------------------------------------------
 class _BundleProvider:
@@ -403,11 +527,19 @@ class _BundleProvider:
 def _extract_metrics(result):
     try:
         summary = result["sys_analyser"]["summary"]
+
+        def _num(v):
+            v = float(v if v is not None else 0.0)
+            # NaN/Inf 不是合法 JSON，转 None 避免前端 JSON.parse 失败
+            if v != v or v in (float("inf"), float("-inf")):
+                return None
+            return v
+
         return {
-            "total_return": float(summary.get("total_returns") or 0.0),
-            "annualized": float(summary.get("annualized_returns") or 0.0),
-            "sharpe": float(summary.get("sharpe") or 0.0),
-            "max_drawdown": float(summary.get("max_drawdown") or 0.0),
+            "total_return": _num(summary.get("total_returns")),
+            "annualized": _num(summary.get("annualized_returns")),
+            "sharpe": _num(summary.get("sharpe")),
+            "max_drawdown": _num(summary.get("max_drawdown")),
         }
     except Exception:
         return {}
@@ -496,11 +628,17 @@ def _dt_dir() -> str:
 
 
 def run_backtest(strategy_code: str, params: dict, provider=None, db_path: str | None = None) -> dict:
-    """跑回测并写 quant.db。返回 {run_id, metrics}。"""
+    """跑回测并写 quant.db。返回 {run_id, metrics}。
+
+    运行期由 LiveStreamMod 实时写日志/收益/交易；结束时仅兜底补写
+    （若实时钩子未触发），并落 metrics + status=done/failed。
+    """
+    global _LIVE_RUN_ID
     if db_path:
         db.init_db(db_path)
     run_id = params.get("run_id") or uuid.uuid4().hex[:8]
-    db.upsert_run(run_id, params.get("strategy_id", ""), json.dumps(params, ensure_ascii=False), "running")
+    db.upsert_run(run_id, params.get("strategy_id", ""), params.get("name", ""), json.dumps(params, ensure_ascii=False), "running")
+    _LIVE_RUN_ID = run_id
     try:
         from rqalpha import run as rq_run
 
@@ -510,15 +648,19 @@ def run_backtest(strategy_code: str, params: dict, provider=None, db_path: str |
         _set_pending_data_source(ds)
 
         config = _build_config(params)
+        config.setdefault("mod", {})["quantlive"] = {"enabled": True}
         result = rq_run(config, source_code=strategy_code)
 
         metrics = _extract_metrics(result)
         equity = _extract_equity(result)
         trades = _extract_trades(result)
 
-        db.bulk_insert_equity(run_id, equity)
-        for t in trades:
-            db.insert_trade(run_id, *t)
+        # 兜底：仅当实时钩子未写入时才全量补写（避免重复）
+        if not db.get_equity(run_id):
+            db.bulk_insert_equity(run_id, equity)
+        if not db.get_trades(run_id):
+            for t in trades:
+                db.insert_trade(run_id, *t)
         db.update_run(
             run_id, "done",
             metrics_json=json.dumps(metrics, ensure_ascii=False),
@@ -530,6 +672,8 @@ def run_backtest(strategy_code: str, params: dict, provider=None, db_path: str |
         db.insert_log(run_id, _now(), "ERROR", str(e))
         db.update_run(run_id, "failed", error=str(e)[:500], finished_at=_now())
         return {"run_id": run_id, "error": str(e)}
+    finally:
+        _LIVE_RUN_ID = None
 
 
 def run_backtest_on_bundle(bundle_dir, strategy_code, params, db_path=None) -> dict:
@@ -803,7 +947,7 @@ def run_jq_backtest(strategy_path: str, params: dict,
 
         if db_path:
             run_id = params.get("run_id") or _re.sub(r"\W+", "", strategy_path).lower()[:16]
-            db.upsert_run(run_id, params.get("strategy_id", "wufu"), json.dumps(params, ensure_ascii=False), "done")
+            db.upsert_run(run_id, params.get("strategy_id", "wufu"), params.get("name", ""), json.dumps(params, ensure_ascii=False), "done")
             db.bulk_insert_equity(run_id, equity)
             for t in trades:
                 db.insert_trade(run_id, *t)

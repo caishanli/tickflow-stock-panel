@@ -46,7 +46,7 @@ def test_run_on_existing_run_row_upserts(tmp_path):
     db_path = str(tmp_path / "q.db")
     db.init_db(db_path)
     # 模拟 service.submit_backtest 已先插入一行
-    db.insert_run("t2", "", "{}", "queued")
+    db.insert_run("t2", "", "", "{}", "queued")
 
     res = run_backtest_on_bundle(
         bundle_dir="tests/quant/fixtures/mini_bundle",

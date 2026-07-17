@@ -10,7 +10,7 @@ def _fresh():
 def test_backtest_run_lifecycle():
     p = _fresh()
     db.init_db(p)
-    db.insert_run("r1", "s1", '{"a":1}', "queued")
+    db.insert_run("r1", "s1", "", '{"a":1}', "queued")
     assert db.get_run("r1")["status"] == "queued"
     db.bulk_insert_equity("r1", [("2024-01-02", 1.0, 1.0, 0.9, 0.1)])
     db.insert_trade("r1", "2024-01-02 09:30", "600000.XSHG", "BUY", 10.0, 100, 0.0, 0.0, 0.0)

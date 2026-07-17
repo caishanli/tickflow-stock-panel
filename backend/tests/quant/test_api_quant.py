@@ -34,6 +34,7 @@ def client(tmp_path, monkeypatch):
         lambda params: db.insert_run(
             (params.get("run_id") or "run123"),
             params.get("strategy_id", ""),
+            params.get("name", ""),
             __import__("json").dumps(params, ensure_ascii=False),
             "queued",
         ) or "run123",
