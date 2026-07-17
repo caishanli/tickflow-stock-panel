@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from .. import db
 from ..config import CONFIG
 from ..service import (
-    submit_backtest, account_create, account_start, account_pause, account_reset,
+    submit_backtest, terminate_backtest, account_create, account_start, account_pause,
+    account_reset,
 )
 from ..strategies.store import (
     list_strategies, get_strategy, save_strategy, delete_strategy,
@@ -91,6 +92,8 @@ def import_one_strategy(body: StrategyIn):
 @router.post("/backtest/run")
 def run_backtest(body: BacktestIn):
     params = body.model_dump()
+    # frequency 显式透传给桥接层（rqalpha_bridge 侧消费，按其支持的取值执行）
+    params["frequency"] = body.frequency or "daily"
     run_id = submit_backtest(params)
     return {"data": {"run_id": run_id, "status": "queued"}}
 
@@ -119,16 +122,28 @@ def backtest_logs(run_id: str):
 
 
 @router.get("/backtest/runs")
-def backtest_runs(limit: int = 50):
-    return {"data": db.list_runs(limit)}
+def backtest_runs(limit: int = 50, strategy_id: str | None = None):
+    rows = db.list_runs(limit)
+    if strategy_id:
+        rows = [r for r in rows if r.get("strategy_id") == strategy_id]
+    return {"data": rows}
+
+
+@router.get("/strategies/with-latest")
+def strategies_with_latest():
+    return {"data": db.list_strategies_with_latest()}
 
 
 @router.get("/backtest/{run_id}/stream")
-async def backtest_stream(run_id: str):
+async def backtest_stream(run_id: str, since_id: int | None = None,
+                          last_id: int | None = None):
     """SSE：按事件类型增量推送 log/trade/equity/status。
 
     查 quant.db 增量（按 rowid 偏移），避免跨进程队列。前端用 EventSource
     接收；断线后凭 /equity /logs /trades 轮询恢复历史。
+    M12：前端"先轮询历史、再开 SSE"时可传 since_id/last_id（快照的 max rowid），
+    从断点续推，避免建连间隙写入的行（rowid ≤ 建连 max）既不在快照也不推送而丢失；
+    不传时保持现行为（只推建连后的新行）。
     """
     import asyncio
     import json as _json
@@ -139,9 +154,10 @@ async def backtest_stream(run_id: str):
         raise HTTPException(404, "not found")
 
     async def gen():
-        off_log = db.get_max_log_id(run_id)
-        off_trade = db.get_max_trade_id(run_id)
-        off_equity = db.get_max_equity_id(run_id)
+        start = since_id if since_id is not None else last_id
+        off_log = db.get_max_log_id(run_id) if start is None else start
+        off_trade = db.get_max_trade_id(run_id) if start is None else start
+        off_equity = db.get_max_equity_id(run_id) if start is None else start
         while True:
             r = db.get_run(run_id)
             status = r["status"] if r else "unknown"
@@ -158,7 +174,8 @@ async def backtest_stream(run_id: str):
             for row in db.get_logs_after(run_id, off_log):
                 off_log = row["rowid"]
                 yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
-            if status in ("done", "failed"):
+            # 终态（含 run 行被删的 unknown）：推完剩余增量后正常关闭流
+            if status in ("done", "failed", "unknown"):
                 return
             await asyncio.sleep(0.5)
 
@@ -182,7 +199,10 @@ def backtest_trades_csv(run_id: str):
 
 @router.post("/backtest/{run_id}/terminate")
 def backtest_terminate(run_id: str):
-    db.update_run(run_id, "failed", error="terminated")
+    if not db.get_run(run_id):
+        raise HTTPException(404, "not found")
+    # M5：先按 pid 杀子进程组，再把 run 置 failed（不再只改 DB 状态）
+    terminate_backtest(run_id)
     return {"data": None}
 
 

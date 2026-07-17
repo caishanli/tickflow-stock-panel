@@ -5,6 +5,7 @@ DuckDB/Parquet 数据层完全隔离。sqlite3 为标准库，无额外依赖。
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 
@@ -54,6 +55,11 @@ def init_db(path: str | None = None) -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(backtest_runs)")}
         if "name" not in cols:
             conn.execute("ALTER TABLE backtest_runs ADD COLUMN name TEXT")
+        # 兼容旧库：若尚无 pid 列则补加（M5：子进程 pid 落库，terminate/reset 按 pid 杀进程组）
+        for table in ("backtest_runs", "sim_accounts"):
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if "pid" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN pid INTEGER")
         conn.commit()
     finally:
         conn.close()
@@ -96,6 +102,12 @@ def update_run(run_id, status, metrics_json=None, error=None, finished_at=None):
         )
 
 
+def set_run_pid(run_id, pid):
+    """回测子进程 pid 落库（M5：terminate 按 pid 杀进程组）。"""
+    with get_conn() as c:
+        c.execute("UPDATE backtest_runs SET pid=? WHERE id=?", (pid, run_id))
+
+
 def get_run(run_id):
     with get_conn() as c:
         row = c.execute("SELECT * FROM backtest_runs WHERE id=?", (run_id,)).fetchone()
@@ -108,6 +120,41 @@ def list_runs(limit=50):
             "SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_strategies_with_latest():
+    """策略列表聚合：每个策略一行 + 最新一次回测的指标/周期/次数。"""
+    with get_conn() as c:
+        strat_rows = c.execute(
+            "SELECT id, name FROM strategies ORDER BY updated_at DESC"
+        ).fetchall()
+        out = []
+        for s in strat_rows:
+            sid = s["id"]
+            count = c.execute(
+                "SELECT COUNT(*) AS n FROM backtest_runs WHERE strategy_id=?", (sid,)
+            ).fetchone()["n"]
+            latest = c.execute(
+                "SELECT id, status, params_json, metrics_json, created_at "
+                "FROM backtest_runs WHERE strategy_id=? ORDER BY created_at DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            item = {"id": sid, "name": s["name"], "run_count": count, "latest": None}
+            if latest:
+                p = {}
+                try:
+                    p = json.loads(latest["params_json"] or "{}")
+                except Exception:
+                    p = {}
+                item["latest"] = {
+                    "run_id": latest["id"],
+                    "status": latest["status"],
+                    "start": p.get("start"),
+                    "end": p.get("end"),
+                    "metrics_json": latest["metrics_json"],
+                }
+            out.append(item)
+        return out
 
 
 def bulk_insert_equity(run_id, rows):
@@ -289,13 +336,29 @@ def upsert_sim_state(account_id, cash, positions_json, net_value, pnl, start_cas
         )
 
 
+def _json_or(raw, default):
+    """JSON 解析容错：空串/坏串回退默认值，避免读状态崩溃。"""
+    try:
+        return json.loads(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
 def read_sim_state(account_id):
+    """读取模拟盘 live 状态。
+
+    M1：positions_json/stop_loss_log_json 解析成 positions/stop_loss_log 对象键，
+    与 protocol.save_state 的写入侧命名对齐，保证 save→read 往返持仓不丢。
+    """
     with get_conn() as c:
         row = c.execute("SELECT * FROM sim_state WHERE account_id=?", (account_id,)).fetchone()
-    return dict(row) if row else {
+    state = dict(row) if row else {
         "cash": 0.0, "positions_json": "{}", "net_value": 0.0, "pnl": 0.0,
         "start_cash": 0.0, "stop_loss_log_json": "[]", "dt": None,
     }
+    state["positions"] = _json_or(state.get("positions_json"), {})
+    state["stop_loss_log"] = _json_or(state.get("stop_loss_log_json"), [])
+    return state
 
 
 def insert_sim_snapshot(account_id, dt, net_value, cash, positions_value, pnl, pnl_pct):
