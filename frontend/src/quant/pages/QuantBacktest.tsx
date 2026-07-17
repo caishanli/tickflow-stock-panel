@@ -71,7 +71,7 @@ function BacktestList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
         subtitle="RQAlpha · 聚宽式策略 · 实时 SSE"
         right={
           <button onClick={onNew}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-accent text-base text-xs font-medium hover:bg-accent/90 transition-colors">
+            className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn bg-accent text-base text-xs font-medium hover:bg-accent/90 transition-colors">
             <Plus className="h-4 w-4" />新建
           </button>
         }
