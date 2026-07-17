@@ -160,8 +160,11 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
                 if start_date is not None:
                     sd = pd.Timestamp(start_date)
                     out = out[(out["time"] >= sd) & (out["time"] <= end_dt)]
+                out = _fallback_volume_daily(out, codes, freq, fields, end_dt)
                 return out
-            return pd.DataFrame(columns=["time", "code"] + fields)
+            out_empty = _fallback_volume_daily(
+                pd.DataFrame(columns=["time", "code"] + fields), codes, freq, fields, end_dt)
+            return out_empty
         except Exception as e:
             logger.debug("get_price 批量路径失败，回退逐只: %s", e)
 
@@ -190,8 +193,50 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
             frames.append(df)
 
     if not frames:
-        return pd.DataFrame(columns=["time", "code"] + fields)
+        return _fallback_volume_daily(
+            pd.DataFrame(columns=["time", "code"] + fields), codes, freq, fields, end_dt)
     out = pd.concat(frames, ignore_index=True)
+    out = _fallback_volume_daily(out, codes, freq, fields, end_dt)
+    return out
+
+
+def _fallback_volume_daily(out, codes, freq, fields, end_dt):
+    """当日 1 分钟成交量缺失时，降级用日线当日成交量。
+
+    聚宽的当日成交量 == 日线成交量（分钟量之和），故等价；避免免费源历史分钟
+    缺失导致成交量过滤把所有标的误杀（早期回测区间无分钟数据）。仅在请求
+    字段仅为 volume 的 1m 模式下触发，不影响 OHLC 等其他分钟取数。
+    """
+    if freq != "1m" or fields != ["volume"]:
+        return out
+    try:
+        ds = Environment.get_instance().data_source
+        store = getattr(ds, "_day_bar_store", None)
+        if store is None:
+            return out
+    except Exception:
+        return out
+    target = int(pd.Timestamp(end_dt).strftime("%Y%m%d"))
+    have = set(out["code"].tolist()) if not out.empty else set()
+    add = []
+    for code in codes:
+        if code in have:
+            continue
+        try:
+            bars = store.get_bars(code)
+            if bars is None or len(bars) == 0:
+                continue
+            di = (bars["datetime"] // 1000000).astype("int64")
+            m = di == target
+            if not m.any():
+                continue
+            v = float(bars["volume"][m][-1])
+            add.append({"time": pd.Timestamp(end_dt), "code": code, "volume": v})
+        except Exception:
+            continue
+    if add:
+        add_df = pd.DataFrame(add)
+        out = pd.concat([out, add_df], ignore_index=True) if not out.empty else add_df
     return out
 
 
