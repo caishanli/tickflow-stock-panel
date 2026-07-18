@@ -43,8 +43,8 @@ export function QuantBacktest() {
   const [view, setView] = useState<'list' | 'editor'>('list')
   const [selStrategy, setSelStrategy] = useState<string | null>(null)
 
-  const openNew = () => {
-    const d: any = api.saveStrategy(null, '未命名策略', '# 新策略\n')
+  const openNew = async () => {
+    const d: any = await api.saveStrategy(null, '未命名策略', '# 新策略\n')
     setSelStrategy(d.id); setView('editor')
   }
   const openStrategy = (id: string) => { setSelStrategy(id); setView('editor') }
