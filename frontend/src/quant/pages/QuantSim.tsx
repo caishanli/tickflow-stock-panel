@@ -1,10 +1,11 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Plus, Play, Square, RotateCcw } from 'lucide-react'
 import * as api from '../api'
+import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
 
 /** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
@@ -167,24 +168,44 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
   pauseMut: any
   resetMut: any
 }) {
+  const qc = useQueryClient()
   const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs'>('trades')
-  // 实时轮询（模拟盘 4s）
+  // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
   const { data: st } = useQuery({
     queryKey: ['quant', 'sim', aid, 'status'], queryFn: () => api.getSimStatus(aid),
-    refetchInterval: 4000,
   })
   const { data: eq } = useQuery({
     queryKey: ['quant', 'sim', aid, 'equity'], queryFn: () => api.getSimEquity(aid),
-    refetchInterval: 4000,
   })
   const { data: tr } = useQuery({
     queryKey: ['quant', 'sim', aid, 'trades'], queryFn: () => api.getSimTrades(aid),
-    refetchInterval: 4000,
   })
   const { data: logs } = useQuery({
     queryKey: ['quant', 'sim', aid, 'logs'], queryFn: () => api.getSimLogs(aid),
-    refetchInterval: 4000,
   })
+
+  const appendTo = (key: any[], row: any, sig?: (r: any) => string) => {
+    qc.setQueryData(key, (prev: any[]) => {
+      const arr = Array.isArray(prev) ? prev : []
+      if (sig && arr.some((r) => sig(r) === sig(row))) return arr
+      return [...arr, row]
+    })
+  }
+
+  useEffect(() => {
+    if (!aid) return
+    const es = openSimStream(aid, {
+      onStatus: (s) => qc.setQueryData(['quant', 'sim', aid, 'status'], (prev: any) => ({
+        ...(prev || {}), account: { ...(prev?.account || {}), status: s.status }, state: s.state,
+      })),
+      onEquity: (e) => appendTo(['quant', 'sim', aid, 'equity'], e, (r) => String(r.dt)),
+      onTrade: (t) => appendTo(['quant', 'sim', aid, 'trades'], t,
+        (r) => `${r.ts}|${r.code}|${r.action}|${r.price}`),
+      onLog: (l) => appendTo(['quant', 'sim', aid, 'logs'], l,
+        (r) => `${r.ts}|${r.level}|${r.message}`),
+    })
+    return () => { es.close() }
+  }, [aid, qc])
 
   const acct = st?.account ?? {}
   const state = st?.state ?? {}

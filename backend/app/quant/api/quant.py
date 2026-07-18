@@ -270,6 +270,48 @@ def sim_status(aid: str):
                      "stop_loss": db.get_sim_stoploss(aid)}}
 
 
+@router.get("/sim/accounts/{aid}/stream")
+def sim_stream(aid: str, since_id: int | None = None):
+    """模拟盘实时增量推送（SSE）：status/log/trade/equity 事件。
+
+    与 backtest_stream 同机制：按 rowid 偏移增量推送，避免前端每 4s 全量轮询。
+    """
+    from fastapi.responses import StreamingResponse
+    import asyncio
+    import json as _json
+
+    if not db.get_sim_account(aid):
+        raise HTTPException(404, "not found")
+
+    async def gen():
+        start = since_id
+        off_log = db.get_max_sim_log_id(aid) if start is None else start
+        off_trade = db.get_max_sim_trade_id(aid) if start is None else start
+        off_eq = db.get_max_sim_snapshot_id(aid) if start is None else start
+        while True:
+            acct = db.get_sim_account(aid)
+            status = acct.get("status") if acct else "unknown"
+            yield f"event: status\ndata: {_json.dumps({'status': status, 'state': db.read_sim_state(aid)}, ensure_ascii=False)}\n\n"
+            for row in db.get_sim_snapshots_after(aid, off_eq):
+                off_eq = row["rowid"]
+                d = {k: row[k] for k in ("dt", "net_value", "cash", "positions_value", "pnl", "pnl_pct")}
+                yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
+            for row in db.get_sim_trades_after(aid, off_trade):
+                off_trade = row["rowid"]
+                d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
+                yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
+            for row in db.get_sim_logs_after(aid, off_log):
+                off_log = row["rowid"]
+                yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
+            # 终态（停止/删除/未知）推完增量后关闭流
+            if status in ("stopped", "cancelled", "deleted", "unknown"):
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @router.get("/sim/accounts/{aid}/equity")
 def sim_equity(aid: str):
     return {"data": db.get_sim_snapshots(aid)}
