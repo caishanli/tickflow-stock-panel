@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { PageHeader } from '@/components/PageHeader'
 import { Modal } from '@/components/Modal'
 import { DatePicker } from '@/components/DatePicker'
@@ -130,6 +130,30 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const [advOpen, setAdvOpen] = useState(false)
   const [histOpen, setHistOpen] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
+  const [leftPct, setLeftPct] = useState(50)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const dragging = useRef(false)
+
+  const startDrag = () => {
+    dragging.current = true
+    const onMove = (e: MouseEvent) => {
+      if (!dragging.current || !bodyRef.current) return
+      const r = bodyRef.current.getBoundingClientRect()
+      const pct = ((e.clientX - r.left) / r.width) * 100
+      setLeftPct(Math.min(75, Math.max(25, pct)))
+    }
+    const onUp = () => {
+      dragging.current = false
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }
 
   useEffect(() => {
     if (strategy?.data) {
@@ -261,15 +285,21 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         </div>
       </header>
 
-      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_28rem] overflow-hidden">
-        <div className="p-3 flex flex-col overflow-hidden">
+      <div ref={bodyRef} className="flex-1 min-h-0 flex overflow-hidden">
+        <div className="p-3 flex flex-col overflow-hidden" style={{ width: `${leftPct}%` }}>
           <div className={`${SECTION_TITLE} mb-2`}><FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)</div>
           <div className="flex-1 min-h-0 rounded-card border border-border overflow-hidden">
             <CodeEditor value={code} onChange={setCode} height="100%" />
           </div>
         </div>
 
-        <div className="border-l border-border flex flex-col overflow-hidden">
+        <div
+          onMouseDown={startDrag}
+          className="w-1 shrink-0 cursor-col-resize bg-border hover:bg-accent/60 transition-colors"
+          title="拖动调整宽度"
+        />
+
+        <div className="flex-1 min-w-0 border-l border-border flex flex-col overflow-hidden">
           <div className="p-3 grid grid-cols-4 gap-2 shrink-0">
             <MetricCard label="收益率" value={fmtPct(metrics.total_return)} tone={tone(metrics.total_return)} />
             <MetricCard label="年化" value={fmtPct(metrics.annualized)} tone={tone(metrics.annualized)} />
