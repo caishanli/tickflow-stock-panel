@@ -156,8 +156,10 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
     document.body.style.userSelect = 'none'
   }
 
+  const seeded = useRef(false)
   useEffect(() => {
-    if (strategy?.data) {
+    if (strategy?.data && !seeded.current) {
+      seeded.current = true
       setName(strategy.data.name || '')
       setCode(strategy.data.code || '')
     }
