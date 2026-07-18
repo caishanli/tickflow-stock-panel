@@ -305,6 +305,17 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const errLogs = filterErrorLogs(Array.isArray(logs) ? logs : [])
   const hasError = errLogs.length > 0
 
+  const editorBoxRef = useRef<HTMLDivElement>(null)
+  const [editorH, setEditorH] = useState(320)
+  useEffect(() => {
+    const el = editorBoxRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => { setEditorH(el.clientHeight) })
+    ro.observe(el)
+    setEditorH(el.clientHeight)
+    return () => ro.disconnect()
+  }, [])
+
   return (
     <div className="flex flex-col h-full">
       <header className="px-4 py-3 border-b border-border flex items-center gap-2 flex-wrap">
@@ -388,10 +399,8 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       <div ref={bodyRef} className="flex-1 min-h-0 flex overflow-hidden">
         <div className="p-3 flex flex-col overflow-hidden" style={{ width: `${leftPct}%` }}>
           <div className={`${SECTION_TITLE} mb-2`}><FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)</div>
-          <div className="relative flex-1 min-h-0 rounded-card border border-border overflow-hidden">
-            <div className="absolute inset-0">
-              <CodeEditor value={code} onChange={setCode} height="100%" />
-            </div>
+          <div ref={editorBoxRef} className="relative flex-1 min-h-0 rounded-card border border-border overflow-hidden">
+            <CodeEditor value={code} onChange={setCode} height={editorH} />
           </div>
         </div>
 
