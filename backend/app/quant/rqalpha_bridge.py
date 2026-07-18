@@ -1156,6 +1156,13 @@ def run_jq_backtest(strategy_path: str, params: dict,
         # dm 是进程级单例：恢复 offline 开关，避免污染同进程后续调用方
         # （如实盘/策略侧需要联网回源的路径）。
         dm._offline = _prev_offline
+        global _LIVE_RUN_ID
+        _LIVE_RUN_ID = None
+        try:
+            import app.quant.jqcompat as _jqcompat_mod
+            _jqcompat_mod.LIVE_SINK = None
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
@@ -1273,6 +1280,20 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
         "extra": {"log_level": params.get("log_level", "error")},
     }
 
+    # 实时日志落库：聚宽策略的 log.info 经 jqcompat._Log -> LIVE_SINK 写 quant.db，
+    # 否则前端日志标签始终为空。复用 rqalpha 路径的全局 run_id 与 sink 钩子。
+    global _LIVE_RUN_ID
+    run_id = params.get("run_id") or _re.sub(r"\W+", "", strategy_path).lower()[:16]
+    _LIVE_RUN_ID = run_id
+    try:
+        import app.quant.jqcompat as _jqcompat_mod
+        _jqcompat_mod.LIVE_SINK = (
+            lambda level, msg: db.insert_log(run_id, _now(), level, msg)
+            if _LIVE_RUN_ID is not None else None
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     out_dir = params.get("out_dir") or os.path.join(CONFIG.runtime_dir, "jqwufu")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1292,11 +1313,19 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
 
         try:
             summary = result["sys_analyser"]["summary"]
+
+            def _num(v):
+                v = float(v if v is not None else 0.0)
+                # NaN/Inf 不是合法 JSON，转 None 避免前端 JSON.parse 失败
+                if v != v or v in (float("inf"), float("-inf")):
+                    return None
+                return v
+
             metrics = {
-                "total_return": float(summary.get("total_returns") or 0.0),
-                "annualized": float(summary.get("annualized_returns") or 0.0),
-                "sharpe": float(summary.get("sharpe") or 0.0),
-                "max_drawdown": float(summary.get("max_drawdown") or 0.0),
+                "total_return": _num(summary.get("total_returns")),
+                "annualized": _num(summary.get("annualized_returns")),
+                "sharpe": _num(summary.get("sharpe")),
+                "max_drawdown": _num(summary.get("max_drawdown")),
             }
         except Exception:
             metrics = {}
@@ -1310,6 +1339,9 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             db.bulk_insert_equity(run_id, equity)
             for t in trades:
                 db.insert_trade(run_id, *t)
+            db.update_run(run_id, "done",
+                          metrics_json=json.dumps(metrics, ensure_ascii=False),
+                          finished_at=_now())
 
         return {
             "trades_csv": tr_path,

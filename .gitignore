@@ -120,3 +120,4 @@ TickFlowStockPanel-macos*.zip
 backend/jqdata/
 backend/runtime/
 backend/app/quant/jqengine/data/
+.superpowers/
