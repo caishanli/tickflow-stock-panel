@@ -62,8 +62,24 @@ export function QuantBacktest() {
 }
 
 function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: string) => void }) {
+  const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['quant', 'strategies', 'latest'], queryFn: () => api.listStrategiesWithLatest() })
   const list = (data ?? []) as any[]
+  const [page, setPage] = useState(1)
+  const [delId, setDelId] = useState<string | null>(null)
+  const PAGE_SIZE = 15
+
+  const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const pageItems = list.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+
+  const delMut = useMutation({
+    mutationFn: () => api.deleteStrategy(delId as string),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] })
+      setDelId(null)
+    },
+  })
 
   return (
     <div className="flex flex-col h-full">
@@ -88,13 +104,14 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                 <th className="px-3 py-2 font-normal text-right">最大回撤</th>
                 <th className="px-3 py-2 font-normal text-right">夏普比率</th>
                 <th className="px-3 py-2 font-normal text-right">回测次数</th>
+                <th className="px-3 py-2 font-normal text-right">操作</th>
               </tr>
             </thead>
             <tbody className="text-foreground">
-              {list.length === 0 && (
-                <tr><td colSpan={6} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
+              {pageItems.length === 0 && (
+                <tr><td colSpan={7} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
               )}
-              {list.map((s) => {
+              {pageItems.map((s) => {
                 const m = pickMetrics(s.latest?.metrics_json)
                 const period = s.latest ? `${s.latest.start ?? ''} ~ ${s.latest.end ?? ''}` : '—'
                 return (
@@ -106,13 +123,45 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                     <td className={`px-3 py-2 text-right num ${tone(m.max_drawdown ? -m.max_drawdown : null)}`}>{m.max_drawdown == null ? '—' : fmtPct(-m.max_drawdown)}</td>
                     <td className={`px-3 py-2 text-right num ${tone(m.sharpe)}`}>{fmtNum(m.sharpe)}</td>
                     <td className={`px-3 py-2 text-right num ${tone(null)}`}>{s.run_count}</td>
+                    <td className="px-3 py-2 text-right" onClick={e => e.stopPropagation()}>
+                      <button onClick={() => setDelId(s.id)}
+                        className="inline-flex items-center gap-1 text-bear hover:underline text-xs">
+                        <Trash2 className="h-3.5 w-3.5" />删除
+                      </button>
+                    </td>
                   </tr>
                 )
               })}
             </tbody>
           </table>
         </div>
+
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between mt-3 text-xs text-muted">
+            <span>共 {list.length} 条 · 第 {safePage}/{totalPages} 页</span>
+            <div className="flex items-center gap-1">
+              <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={safePage <= 1}
+                className="px-2.5 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors">上一页</button>
+              <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={safePage >= totalPages}
+                className="px-2.5 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors">下一页</button>
+            </div>
+          </div>
+        )}
       </div>
+
+      {delId && (
+        <Modal onClose={() => setDelId(null)} ariaLabel="确认删除策略">
+          <div className="p-5 space-y-4">
+            <h3 className="text-sm font-medium text-foreground">删除策略</h3>
+            <p className="text-xs text-muted">确定删除该策略及其全部回测记录？此操作不可恢复。</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setDelId(null)} className="px-3 py-1.5 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">取消</button>
+              <button onClick={() => delMut.mutate()} disabled={delMut.isPending}
+                className="px-3 py-1.5 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 transition-colors disabled:opacity-50">删除</button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }
