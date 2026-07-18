@@ -4,10 +4,13 @@ export interface Metrics {
   annualized: number | null
   sharpe: number | null
   max_drawdown: number | null
+  win_rate: number | null
+  profit_loss_ratio: number | null
+  trade_count: number | null
 }
 
 export function pickMetrics(raw: any): Metrics {
-  if (!raw) return { total_return: null, annualized: null, sharpe: null, max_drawdown: null }
+  if (!raw) return { total_return: null, annualized: null, sharpe: null, max_drawdown: null, win_rate: null, profit_loss_ratio: null, trade_count: null }
   let m: any = raw
   if (typeof raw === 'string') {
     try { m = JSON.parse(raw) } catch { m = {} }
@@ -17,6 +20,9 @@ export function pickMetrics(raw: any): Metrics {
     annualized: num(m.annualized ?? m.annual_return),
     sharpe: num(m.sharpe),
     max_drawdown: num(m.max_drawdown),
+    win_rate: num(m.win_rate),
+    profit_loss_ratio: num(m.profit_loss_ratio),
+    trade_count: num(m.trade_count),
   }
 }
 

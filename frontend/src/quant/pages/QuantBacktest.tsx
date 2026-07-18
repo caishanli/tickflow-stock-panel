@@ -4,7 +4,7 @@ import { Modal } from '@/components/Modal'
 import { DatePicker } from '@/components/DatePicker'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity,
+  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History,
 } from 'lucide-react'
 import * as api from '../api'
 import { openBacktestStream } from '../stream'
@@ -121,14 +121,15 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const qc = useQueryClient()
   const { data: strategy } = useQuery({ queryKey: ['quant', 'strategy', strategyId], queryFn: () => api.getStrategy(strategyId) })
 
-  const [tab, setTab] = useState<'edit' | 'detail' | 'runs'>('edit')
   const [code, setCode] = useState<string>('')
   const [name, setName] = useState<string>('')
   const [form, setForm] = useState<FormState>(DEFAULT_FORM)
   const [liveRunId, setLiveRunId] = useState<string | null>(null)
   const [selRunId, setSelRunId] = useState<string | null>(null)
   const [liveOn, setLiveOn] = useState(true)
-  const [logTab, setLogTab] = useState<'log' | 'trade'>('log')
+  const [logTab, setLogTab] = useState<'log' | 'error' | 'trade'>('log')
+  const [advOpen, setAdvOpen] = useState(false)
+  const [histOpen, setHistOpen] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
 
   useEffect(() => {
@@ -152,7 +153,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         fee: +form.fee, slippage: +form.slippage, capital: +form.capital,
       })
     },
-    onSuccess: (d: any) => { setLiveRunId(d.run_id); setSelRunId(d.run_id); setTab('detail'); qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] }) },
+    onSuccess: (d: any) => { setLiveRunId(d.run_id); setSelRunId(d.run_id); qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] }) },
   })
 
   const runId = selRunId ?? liveRunId
@@ -177,15 +178,44 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const metrics = pickMetrics(status?.data?.metrics_json)
   const equityData: any[] = Array.isArray(equity?.data) ? equity.data : []
   const runList: any[] = Array.isArray(runs?.data) ? runs.data : []
+  const excess = computeExcess(equityData)
+  const errLogs = filterErrorLogs(Array.isArray(logs?.data) ? logs.data : [])
+  const hasError = errLogs.length > 0
 
   return (
     <div className="flex flex-col h-full">
-      <header className="px-4 py-3 border-b border-border flex items-center gap-3 flex-wrap">
+      <header className="px-4 py-3 border-b border-border flex items-center gap-2 flex-wrap">
         <button onClick={onBack} className="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-btn border border-border bg-base text-secondary hover:text-foreground transition-colors">
           <ArrowLeft className="h-4 w-4" />列表
         </button>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="策略名称"
-          className="h-9 w-48 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+          className="h-9 w-44 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+        <input value={form.symbols} onChange={e => setForm({ ...form, symbols: e.target.value })} placeholder="标的池(逗号分隔)"
+          className="h-9 flex-1 min-w-[12rem] rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+        <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} placeholder="开始" buttonClassName="h-9 justify-between" className="w-36" />
+        <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} placeholder="结束" buttonClassName="h-9 justify-between" className="w-36" />
+        <input type="number" value={form.capital} onChange={e => setForm({ ...form, capital: +e.target.value })} placeholder="初始金额"
+          className="h-9 w-28 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+        <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}
+          className="h-9 w-24 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50">
+          <option value="daily">daily</option>
+          <option value="1m">1m</option>
+        </select>
+        <div className="relative">
+          <button onClick={() => { setAdvOpen(o => !o); setHistOpen(false) }} title="高级参数"
+            className={`inline-flex items-center gap-1 h-9 px-2.5 rounded-btn border border-border text-xs ${advOpen ? 'text-accent' : 'text-secondary hover:text-foreground'} transition-colors`}>
+            <Settings2 className="h-3.5 w-3.5" />高级
+          </button>
+          {advOpen && (
+            <div className="absolute z-20 right-0 top-11 w-64 rounded-card border border-border bg-surface p-3 space-y-2 shadow-xl">
+              <div className="text-[10px] uppercase tracking-wide text-muted">手续费</div>
+              <input type="number" step="0.0001" value={form.fee} onChange={e => setForm({ ...form, fee: +e.target.value })} className={INPUT_CLS} />
+              <div className="text-[10px] uppercase tracking-wide text-muted">滑点</div>
+              <input type="number" step="0.0001" value={form.slippage} onChange={e => setForm({ ...form, slippage: +e.target.value })} className={INPUT_CLS} />
+              <button onClick={() => { saveStrategy(); setAdvOpen(false) }} className="w-full h-9 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">保存策略</button>
+            </div>
+          )}
+        </div>
         <button onClick={() => runMut.mutate(true)} disabled={!code || runMut.isPending}
           className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
           <Play className="h-3.5 w-3.5" />编译运行
@@ -203,111 +233,81 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
             <Activity className="h-3.5 w-3.5" />{liveOn ? '实时' : '暂停'}
           </button>
         )}
-        <div className="ml-auto flex items-center gap-1">
-          <TabBtn active={tab === 'edit'} onClick={() => setTab('edit')}>编辑策略</TabBtn>
-          <TabBtn active={tab === 'detail'} onClick={() => setTab('detail')}>回测详情</TabBtn>
-          <TabBtn active={tab === 'runs'} onClick={() => setTab('runs')}>回测列表</TabBtn>
+        <div className="relative ml-auto">
+          <button onClick={() => { setHistOpen(o => !o); setAdvOpen(false) }} className="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors">
+            <History className="h-3.5 w-3.5" />历史{runList.length > 0 ? `(${runList.length})` : ''}
+          </button>
+          {histOpen && (
+            <div className="absolute z-20 right-0 top-11 w-72 rounded-card border border-border bg-surface p-2 shadow-xl max-h-80 overflow-auto">
+              {runList.length === 0 && <div className="px-2 py-4 text-xs text-muted text-center">暂无回测</div>}
+              {runList.map((r) => {
+                const p = (() => { try { return JSON.parse(r.params_json || '{}') } catch { return {} } })()
+                const m = pickMetrics(r.metrics_json)
+                const active = (selRunId ?? liveRunId) === r.id
+                return (
+                  <button key={r.id} onClick={() => { setSelRunId(r.id); setHistOpen(false) }}
+                    className={`w-full text-left px-2 py-1.5 rounded-btn text-xs flex items-center justify-between gap-2 ${active ? 'bg-elevated text-foreground' : 'text-secondary hover:text-foreground hover:bg-elevated/60'}`}>
+                    <span className="num">{`${p.start ?? ''} ~ ${p.end ?? ''}`}</span>
+                    <span className={`num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</span>
+                  </button>
+                )
+              })}
+              {selRunId && (
+                <button onClick={() => { setSelRunId(null); setHistOpen(false) }} className="w-full mt-1 px-2 py-1.5 rounded-btn text-xs text-muted hover:text-foreground border-t border-border">回到当前回测</button>
+              )}
+            </div>
+          )}
         </div>
       </header>
 
-      <div className="flex-1 overflow-hidden">
-        {tab === 'edit' && (
-          <div className="h-full grid grid-cols-1 lg:grid-cols-[1fr_20rem] overflow-hidden">
-            <div className="p-4 overflow-hidden flex flex-col">
-              <div className={`${SECTION_TITLE} mb-2`}><FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)</div>
-              <div className="flex-1 rounded-card border border-border overflow-hidden min-h-0">
-                <CodeEditor value={code} onChange={setCode} />
-              </div>
-            </div>
-            <div className="border-l border-border p-4 overflow-auto space-y-3">
-              <div className={`${SECTION_TITLE}`}><Activity className="h-3.5 w-3.5" />回测参数</div>
-              <input value={form.symbols} onChange={e => setForm({ ...form, symbols: e.target.value })} placeholder="标的池(逗号分隔)" className={INPUT_CLS} />
-              <div className="grid grid-cols-2 gap-2">
-                <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} placeholder="开始" buttonClassName="w-full justify-between" />
-                <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} placeholder="结束" buttonClassName="w-full justify-between" />
-                <input type="number" value={form.capital} onChange={e => setForm({ ...form, capital: +e.target.value })} placeholder="初始金额" className={INPUT_CLS} />
-                <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })} className={INPUT_CLS}>
-                  <option value="daily">daily</option>
-                  <option value="1m">1m</option>
-                </select>
-              </div>
-              <button onClick={() => saveStrategy()} className="w-full h-9 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">保存策略</button>
-            </div>
+      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_28rem] overflow-hidden">
+        <div className="p-3 flex flex-col overflow-hidden">
+          <div className={`${SECTION_TITLE} mb-2`}><FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)</div>
+          <div className="flex-1 min-h-0 rounded-card border border-border overflow-hidden">
+            <CodeEditor value={code} onChange={setCode} height="100%" />
           </div>
-        )}
+        </div>
 
-        {tab === 'detail' && (
-          <div className="h-full p-4 overflow-auto space-y-4">
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <MetricCard label="收益率" value={fmtPct(metrics.total_return)} tone={tone(metrics.total_return)} />
-              <MetricCard label="年化" value={fmtPct(metrics.annualized)} tone={tone(metrics.annualized)} />
-              <MetricCard label="夏普" value={fmtNum(metrics.sharpe)} tone={tone(metrics.sharpe)} />
-              <MetricCard label="最大回撤" value={metrics.max_drawdown == null ? '—' : fmtPct(-metrics.max_drawdown)} tone={tone(metrics.max_drawdown ? -metrics.max_drawdown : null)} />
-            </div>
-            <div className="rounded-card border border-border bg-surface">
-              <div className="px-4 pt-3 text-xs text-foreground font-medium">收益曲线（策略 / 基准）</div>
-              {runId && equityData.length > 0 ? (
-                <EquityChart equity={equityData} />
-              ) : (
-                <div className="h-[260px] grid place-items-center text-xs text-muted">{runId ? '暂无净值数据' : '运行回测后展示实时曲线'}</div>
-              )}
-            </div>
-            <div className="rounded-card border border-border bg-surface overflow-hidden">
-              <div className="flex items-center gap-1 px-2 pt-2">
-                <TabBtn active={logTab === 'log'} onClick={() => setLogTab('log')}>日志</TabBtn>
-                <TabBtn active={logTab === 'trade'} onClick={() => setLogTab('trade')}>交易记录</TabBtn>
-                <div className="ml-auto flex items-center gap-3 pr-2">
-                  {runId && <a href={api.getBacktestCsvUrl(runId)} className="inline-flex items-center gap-1 text-xs text-accent hover:underline"><Download className="h-3.5 w-3.5" />CSV</a>}
-                  {runId && <button onClick={() => setConfirmDel(true)} className="inline-flex items-center gap-1 text-xs text-bear hover:underline"><Trash2 className="h-3.5 w-3.5" />删除</button>}
-                </div>
-              </div>
-              <div className="p-3">
-                {logTab === 'log' ? (
-                  <LogList logs={Array.isArray(logs?.data) ? logs.data : []} />
-                ) : (
-                  <TradeTable trades={Array.isArray(trades?.data) ? trades.data : []} />
-                )}
-              </div>
-            </div>
+        <div className="border-l border-border flex flex-col overflow-hidden">
+          <div className="p-3 grid grid-cols-4 gap-2 shrink-0">
+            <MetricCard label="收益率" value={fmtPct(metrics.total_return)} tone={tone(metrics.total_return)} />
+            <MetricCard label="年化" value={fmtPct(metrics.annualized)} tone={tone(metrics.annualized)} />
+            <MetricCard label="夏普" value={fmtNum(metrics.sharpe)} tone={tone(metrics.sharpe)} />
+            <MetricCard label="最大回撤" value={metrics.max_drawdown == null ? '—' : fmtPct(-metrics.max_drawdown)} tone={tone(metrics.max_drawdown ? -metrics.max_drawdown : null)} />
+            <MetricCard label="超额收益" value={excess == null ? '—' : fmtPct(excess)} tone={tone(excess)} />
+            <MetricCard label="胜率" value={fmtPct(metrics.win_rate)} tone={tone(metrics.win_rate)} />
+            <MetricCard label="盈亏比" value={fmtNum(metrics.profit_loss_ratio)} tone={tone(metrics.profit_loss_ratio)} />
+            <MetricCard label="交易次数" value={metrics.trade_count == null ? (runId ? String(Array.isArray(trades?.data) ? trades.data.length : 0) : '—') : String(metrics.trade_count)} tone="text-foreground" />
           </div>
-        )}
 
-        {tab === 'runs' && (
-          <div className="h-full p-4 overflow-auto">
-            <div className="rounded-card border border-border bg-surface overflow-hidden">
-              <table className="w-full text-xs">
-                <thead className="text-muted bg-elevated/40">
-                  <tr className="text-left">
-                    <th className="px-3 py-2 font-normal">回测周期</th>
-                    <th className="px-3 py-2 font-normal text-right">收益率</th>
-                    <th className="px-3 py-2 font-normal text-right">最大回撤</th>
-                    <th className="px-3 py-2 font-normal text-right">夏普</th>
-                    <th className="px-3 py-2 font-normal">状态</th>
-                  </tr>
-                </thead>
-                <tbody className="text-foreground">
-                  {runList.length === 0 && (
-                    <tr><td colSpan={5} className="px-3 py-8 text-center text-muted">暂无回测</td></tr>
-                  )}
-                  {runList.map((r) => {
-                    const p = (() => { try { return JSON.parse(r.params_json || '{}') } catch { return {} } })()
-                    const m = pickMetrics(r.metrics_json)
-                    return (
-                      <tr key={r.id} onClick={() => { setSelRunId(r.id); setTab('detail') }}
-                        className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                        <td className="px-3 py-2 text-muted num">{`${p.start ?? ''} ~ ${p.end ?? ''}`}</td>
-                        <td className={`px-3 py-2 text-right num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</td>
-                        <td className={`px-3 py-2 text-right num ${tone(m.max_drawdown ? -m.max_drawdown : null)}`}>{m.max_drawdown == null ? '—' : fmtPct(-m.max_drawdown)}</td>
-                        <td className={`px-3 py-2 text-right num ${tone(m.sharpe)}`}>{fmtNum(m.sharpe)}</td>
-                        <td className={`px-3 py-2 ${statusTone(r.status)}`}>{r.status}</td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
+          <div className="flex-1 min-h-[220px] mx-3 rounded-card border border-border bg-surface">
+            <div className="px-4 pt-3 text-xs text-foreground font-medium">收益曲线（策略 / 基准）</div>
+            {runId && equityData.length > 0 ? (
+              <EquityChart equity={equityData} />
+            ) : (
+              <div className="h-[260px] grid place-items-center text-xs text-muted">{runId ? '暂无净值数据' : '运行回测后展示实时曲线'}</div>
+            )}
+          </div>
+
+          <div className="h-[220px] mt-3 mx-3 mb-3 rounded-card border border-border bg-surface flex flex-col overflow-hidden">
+            <div className="flex items-center gap-1 px-2 pt-2 shrink-0">
+              <TabBtn active={logTab === 'log'} onClick={() => setLogTab('log')}>日志</TabBtn>
+              <TabBtn active={logTab === 'error'} onClick={() => setLogTab('error')}>
+                错误{hasError && <span className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-bear align-middle" />}
+              </TabBtn>
+              <TabBtn active={logTab === 'trade'} onClick={() => setLogTab('trade')}>交易记录</TabBtn>
+              <div className="ml-auto flex items-center gap-3 pr-2">
+                {runId && <a href={api.getBacktestCsvUrl(runId)} className="inline-flex items-center gap-1 text-xs text-accent hover:underline"><Download className="h-3.5 w-3.5" />CSV</a>}
+                {runId && <button onClick={() => setConfirmDel(true)} className="inline-flex items-center gap-1 text-xs text-bear hover:underline"><Trash2 className="h-3.5 w-3.5" />删除</button>}
+              </div>
+            </div>
+            <div className="flex-1 overflow-auto p-3">
+              {logTab === 'log' && <LogList logs={Array.isArray(logs?.data) ? logs.data : []} />}
+              {logTab === 'error' && <LogList logs={errLogs} />}
+              {logTab === 'trade' && <TradeTable trades={Array.isArray(trades?.data) ? trades.data : []} />}
             </div>
           </div>
-        )}
+        </div>
       </div>
 
       {confirmDel && runId && (
@@ -325,6 +325,28 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       )}
     </div>
   )
+}
+
+function computeExcess(equity: any[]): number | null {
+  if (!equity || equity.length === 0) return null
+  const first = equity[0], last = equity[equity.length - 1]
+  const fv = Number(first.value), lb = Number(last.value)
+  const fb = Number(first.benchmark), lbb = Number(last.benchmark)
+  if (!(fv > 0) || !(fb > 0)) return null
+  return (lb / fv) - (lbb / fb)
+}
+
+function isErrorLog(l: any): boolean {
+  if (l && typeof l === 'object' && l.level) {
+    const lv = String(l.level).toUpperCase()
+    if (lv === 'ERROR' || lv === 'CRITICAL' || lv === 'EXCEPTION') return true
+  }
+  const s = typeof l === 'string' ? l : (l && typeof l.message === 'string' ? l.message : '')
+  return /error|exception|traceback|错误/i.test(s)
+}
+
+function filterErrorLogs(logs: any[]): any[] {
+  return logs.filter(isErrorLog)
 }
 
 function shiftDays(dateStr: string, days: number): string {
