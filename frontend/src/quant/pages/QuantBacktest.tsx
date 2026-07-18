@@ -291,16 +291,27 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const { data: logs } = useQuery({ queryKey: ['quant', 'bt', runId, 'logs'], queryFn: () => api.getBacktestLogs(runId as string), enabled: !!runId })
   const { data: runs } = useQuery({ queryKey: ['quant', 'bt', 'runs', strategyId], queryFn: () => api.listBacktests(strategyId), refetchInterval: 5000 })
 
+  // SSE 增量直接追加到缓存，避免每次事件都整表重新拉取（否则运行中日志
+  // 洪流会触发数百次 /logs /equity 轮询）。首拉历史由上面的 useQuery 完成。
+  const appendTo = (key: any[], row: any, sig?: (r: any) => string) => {
+    qc.setQueryData(key, (prev: any[]) => {
+      const arr = Array.isArray(prev) ? prev : []
+      if (sig && arr.some((r) => sig(r) === sig(row))) return arr
+      return [...arr, row]
+    })
+  }
+
   useEffect(() => {
     if (!runId || !liveOn) return
     const es = openBacktestStream(runId, {
-      onEquity: () => qc.invalidateQueries({ queryKey: ['quant', 'bt', runId, 'equity'] }),
-      onTrade: () => qc.invalidateQueries({ queryKey: ['quant', 'bt', runId, 'trades'] }),
-      onLog: () => qc.invalidateQueries({ queryKey: ['quant', 'bt', runId, 'logs'] }),
-      onStatus: () => {
-        qc.invalidateQueries({ queryKey: ['quant', 'bt', runId, 'status'] })
-        qc.invalidateQueries({ queryKey: ['quant', 'bt', 'runs', strategyId] })
-      },
+      onEquity: (e) => appendTo(['quant', 'bt', runId, 'equity'], e, (r) => String(r.dt)),
+      onTrade: (t) => appendTo(['quant', 'bt', runId, 'trades'], t,
+        (r) => `${r.ts}|${r.code}|${r.action}|${r.price}`),
+      onLog: (l) => appendTo(['quant', 'bt', runId, 'logs'], l,
+        (r) => `${r.ts}|${r.level}|${r.message}`),
+      onStatus: (s) => qc.setQueryData(['quant', 'bt', runId, 'status'], (prev: any) => ({
+        ...(prev || {}), status: s.status, metrics_json: s.metrics ?? (prev || {}).metrics_json,
+      })),
     })
     return () => { es.close() }
   }, [runId, liveOn, qc])
