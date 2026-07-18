@@ -169,7 +169,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
     try {
       await api.saveStrategy(strategyId, name, code)
       qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] })
-      toast('策略已保存', 'success')
+      toast('策略已保存', 'success', 'top')
     } catch (e: any) {
       toast(e?.message ? `保存失败: ${e.message}` : '保存失败', 'error')
     }
