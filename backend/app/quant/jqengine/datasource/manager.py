@@ -416,7 +416,7 @@ class DataManager:
 
         与 :meth:`get_minute` 的滑窗不同，feed 需覆盖全部回测区间以驱动回放，
         因此按完整窗口加载（仅 1~2 只标的）。窗口上界用回测 end（而非 today），
-        避免超出 5min.db 覆盖而被迫回源 baostock 网络。
+        避免超出本地 5min 缓存覆盖而被迫回源 baostock 网络。
 
         H6a 修复：feed 改走 :meth:`_load_minute_merged` 三源合并（real_ 真实
         1 分钟基底 + baostock 5 分钟插值补缺口），兑现 rqalpha_bridge "回测
@@ -530,7 +530,7 @@ class DataManager:
         for code in codes:
             try:
                 # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
-                # 超出 5min.db 覆盖范围而被迫回源 baostock 网络。
+                # 超出本地 5min 缓存覆盖范围而被迫回源 baostock 网络。
                 df = self._ensure_minute_windowed(code, as_of_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     loaded += 1
@@ -567,7 +567,7 @@ class DataManager:
                             as_of=None, full=False, lo_hi=None):
         """三源合并（缺口感知）：本地基底 + mootdx 补后续缺口 + baostock 补前序缺口。
 
-        - 本地 ``minute.db`` 里的真实 1 分钟：查到多少用多少（基底）；
+        - 本地分钟缓存（``minute/real_<code>.parquet``）里的真实 1 分钟：查到多少用多少（基底）；
         - 本地数据**之后**的缺口 → 回源 mootdx 获取（见 ``_load_real_minute``）；
         - 本地数据**之前**的缺口 → baostock 5 分钟插值成 1 分钟补齐；
         - 5 分钟线与 1 分钟线在缺口边界重叠的时间点：以 5 分钟线为准；
@@ -645,8 +645,8 @@ class DataManager:
     def _load_baostock_minute(self, code, lo_ts, hi_ts, all_5min):
         """baostock 5 分钟线的本地优先获取 + 运行时插值。
 
-        本地 ``5min.db`` 命中且覆盖请求区间 → 直接用；否则从 baostock 回源
-        （仅拉取缺失区间），与已缓存区间合并后落盘 ``5min.db``；插值出的 1 分钟
+        本地 5min 缓存命中且覆盖请求区间 → 直接用；否则从 baostock 回源
+        （仅拉取缺失区间），与已缓存区间合并后落盘本地 5min 缓存；插值出的 1 分钟
         只在本进程内使用、**不落盘**（避免数据库膨胀）。
 
         注意: 缓存按 code 单键存储，若只缓存过局部区间(如某次只取了 4 月)，
@@ -676,7 +676,7 @@ class DataManager:
                   and cached.index.max() >= hi_ts
                   and cached.index.min() <= lo_ts)
         if covers:
-            # 5min.db 连续覆盖整个请求区间 → 直接插值返回（不落盘，C2）。
+            # 本地 5min 缓存连续覆盖整个请求区间 → 直接插值返回（不落盘，C2）。
             return interpolate_5min_to_1min(_clip(cached))
         if self._offline:
             # 离线：5min 未完整覆盖且不联网，退化为已缓存段的插值（缺失段留空）
@@ -685,7 +685,7 @@ class DataManager:
             return None
         # C1 绝对约束：本地 5min 未覆盖请求区间时，回源 baostock 补齐缺失段
         # （之前为躲"每只卡 2.7s"而跳过回源，导致早期/缺口数据缺失，违反约束）。
-        # 回源结果合并写回 5min.db（真实数据可落盘，C1）；插值出的 1m 仍不落盘（C2）。
+        # 回源结果合并写回本地 5min 缓存（真实数据可落盘，C1）；插值出的 1m 仍不落盘（C2）。
         try:
             bs = self.sources.get("baostock")
             if bs is None:

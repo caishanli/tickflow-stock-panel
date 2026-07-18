@@ -1,4 +1,4 @@
-"""验证 minute.db 的 real_<code> 在断裂日是否被聚宽数据填充。"""
+"""验证本地分钟缓存的 real_<code> 在断裂日是否被聚宽数据填充。"""
 import os
 import sys
 

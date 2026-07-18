@@ -40,6 +40,7 @@ export const resetAccount = (id: string) => j(`/sim/accounts/${id}/reset`, { met
 export const getSimStatus = (id: string) => j(`/sim/accounts/${id}/status`)
 export const getSimEquity = (id: string) => j(`/sim/accounts/${id}/equity`)
 export const getSimTrades = (id: string) => j(`/sim/accounts/${id}/trades`)
+export const getSimLogs = (id: string) => j(`/sim/accounts/${id}/logs`)
 
 export const getDatasource = () => j('/datasource')
 export const saveDatasourcePriority = (priority: string[]) =>

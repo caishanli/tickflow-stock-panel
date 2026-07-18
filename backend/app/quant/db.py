@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     updated_at TEXT DEFAULT (datetime('now')));
 CREATE TABLE IF NOT EXISTS sim_accounts (
     id TEXT PRIMARY KEY, name TEXT, capital REAL, stop_loss REAL, status TEXT,
+    strategy_id TEXT, start_date TEXT, frequency TEXT DEFAULT 'minute',
     created_at TEXT DEFAULT (datetime('now')), started_at TEXT);
 CREATE TABLE IF NOT EXISTS sim_state (
     account_id TEXT PRIMARY KEY, cash REAL, positions_json TEXT, net_value REAL,
@@ -42,6 +43,8 @@ CREATE TABLE IF NOT EXISTS sim_trades (
     pnl REAL, pnl_pct REAL, commission REAL);
 CREATE TABLE IF NOT EXISTS sim_stop_loss (
     account_id TEXT, ts TEXT, code TEXT, action TEXT, price REAL, pnl_pct REAL);
+CREATE TABLE IF NOT EXISTS sim_logs (
+    account_id TEXT, ts TEXT, level TEXT, message TEXT);
 """
 
 
@@ -60,6 +63,17 @@ def init_db(path: str | None = None) -> None:
             cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             if "pid" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN pid INTEGER")
+        # 兼容旧库：sim_accounts 补 strategy_id 列（策略驱动模拟盘绑定策略用）
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sim_accounts)")}
+        if "strategy_id" not in cols:
+            conn.execute("ALTER TABLE sim_accounts ADD COLUMN strategy_id TEXT")
+        # 兼容旧库：sim_accounts 补 start_date 列（开始模拟日期：早于今日则历史补跑）
+        if "start_date" not in cols:
+            conn.execute("ALTER TABLE sim_accounts ADD COLUMN start_date TEXT")
+        # 兼容旧库：sim_accounts 补 frequency 列（运行频率 minute/daily）
+        if "frequency" not in cols:
+            conn.execute(
+                "ALTER TABLE sim_accounts ADD COLUMN frequency TEXT DEFAULT 'minute'")
         conn.commit()
     finally:
         conn.close()
@@ -290,11 +304,14 @@ def delete_run(run_id):
 
 
 # ---- 模拟盘 ----
-def insert_sim_account(account_id, name, capital, stop_loss, status="created"):
+def insert_sim_account(account_id, name, capital, stop_loss, status="created",
+                       strategy_id="", start_date="", frequency="minute"):
     with get_conn() as c:
         c.execute(
-            "INSERT INTO sim_accounts(id,name,capital,stop_loss,status) VALUES(?,?,?,?,?)",
-            (account_id, name, capital, stop_loss, status),
+            "INSERT INTO sim_accounts(id,name,capital,stop_loss,status,strategy_id,"
+            "start_date,frequency) VALUES(?,?,?,?,?,?,?,?)",
+            (account_id, name, capital, stop_loss, status, strategy_id, start_date,
+             frequency),
         )
 
 
@@ -316,8 +333,13 @@ def get_sim_account(account_id):
 
 
 def list_sim_accounts():
+    """账户列表：联 sim_state 带最新净值/盈亏（列表页展示用，无状态行为 NULL）。"""
     with get_conn() as c:
-        rows = c.execute("SELECT * FROM sim_accounts ORDER BY created_at").fetchall()
+        rows = c.execute(
+            "SELECT a.*, s.net_value AS net_value, s.pnl AS pnl "
+            "FROM sim_accounts a LEFT JOIN sim_state s ON s.account_id = a.id "
+            "ORDER BY a.created_at"
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -414,8 +436,29 @@ def get_sim_stoploss(account_id):
     return [dict(r) for r in rows]
 
 
+def insert_sim_log(account_id, ts, level, message):
+    """模拟盘运行日志（策略 log.* 与 runner 事件）落库。"""
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO sim_logs(account_id,ts,level,message) VALUES(?,?,?,?)",
+            (account_id, ts, level, message),
+        )
+
+
+def get_sim_logs(account_id, limit=500):
+    """按时间正序返回最近 limit 条日志。"""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT ts,level,message FROM sim_logs WHERE account_id=? "
+            "ORDER BY rowid DESC LIMIT ?",
+            (account_id, limit),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 def delete_sim_account(account_id):
     with get_conn() as c:
         c.execute("DELETE FROM sim_accounts WHERE id=?", (account_id,))
-        for t in ("sim_state", "sim_equity_snapshots", "sim_trades", "sim_stop_loss"):
+        for t in ("sim_state", "sim_equity_snapshots", "sim_trades", "sim_stop_loss",
+                  "sim_logs"):
             c.execute(f"DELETE FROM {t} WHERE account_id=?", (account_id,))

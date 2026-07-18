@@ -20,7 +20,8 @@ def _script(name: str) -> str:
     )
 
 
-_SIM_CHILD_TABLES = ("sim_state", "sim_equity_snapshots", "sim_trades", "sim_stop_loss")
+_SIM_CHILD_TABLES = ("sim_state", "sim_equity_snapshots", "sim_trades", "sim_stop_loss",
+                     "sim_logs")
 
 
 def kill_process_group(pid) -> bool:
@@ -76,9 +77,11 @@ def terminate_backtest(run_id: str) -> None:
     db.update_run(run_id, "failed", error="terminated")
 
 
-def account_create(name: str, capital: float, stop_loss: float) -> str:
+def account_create(name: str, capital: float, stop_loss: float, strategy_id: str = "",
+                   start_date: str = "", frequency: str = "minute") -> str:
     aid = uuid.uuid4().hex[:8]
-    db.insert_sim_account(aid, name, float(capital), float(stop_loss), "created")
+    db.insert_sim_account(aid, name, float(capital), float(stop_loss), "created",
+                          strategy_id, start_date, frequency)
     return aid
 
 
