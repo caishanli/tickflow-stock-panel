@@ -1,6 +1,8 @@
 """live_feed：实时帧合并 / 价格快照 / 单源失败降级 / 收盘真实分钟落盘（C1/C2 口径）。"""
 from __future__ import annotations
 
+import os
+
 import pandas as pd
 import pytest
 
@@ -105,3 +107,25 @@ def test_persist_real_skips_empty_frames():
     dm = _DM(_Mootdx({}))
     live_feed.persist_real(dm, {"510300.XSHG": pd.DataFrame(), "159915.XSHE": None})
     assert dm.cache.store == {}
+
+
+def test_persist_real_sequential_calls_preserve_union():
+    """多进程连续落盘（串行模拟）：后一次基于前一次的落盘结果合并，不丢 bar。"""
+    dm = _DM(_Mootdx({}))
+    early = _frame(["2026-07-17 09:31", "2026-07-17 10:00"], [10.1, 10.2])
+    late = _frame(["2026-07-17 14:59", "2026-07-17 15:00"], [10.4, 10.5])
+    live_feed.persist_real(dm, {"510300.XSHG": early})
+    live_feed.persist_real(dm, {"510300.XSHG": late})
+    out = dm.cache.store["real_510300.XSHG"]
+    assert len(out) == 4  # 两批 bar 全部保留
+
+
+def test_file_lock_excludes_second_holder(tmp_path):
+    """_file_lock 互斥：持锁期间第二把非阻塞 flock 应被拒（POSIX 语义）。"""
+    if os.name == "nt":
+        pytest.skip("flock 语义仅 POSIX")
+    import fcntl
+    path = tmp_path / "x.lock"
+    with (live_feed._file_lock(str(path)), open(path, "a+b") as f,
+          pytest.raises(BlockingIOError)):
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
