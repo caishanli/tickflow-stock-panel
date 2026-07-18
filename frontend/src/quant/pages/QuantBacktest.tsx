@@ -63,7 +63,7 @@ export function QuantBacktest() {
 
 function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: string) => void }) {
   const { data } = useQuery({ queryKey: ['quant', 'strategies', 'latest'], queryFn: () => api.listStrategiesWithLatest() })
-  const list = (data?.data ?? []) as any[]
+  const list = (data ?? []) as any[]
 
   return (
     <div className="flex flex-col h-full">
@@ -158,10 +158,10 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
 
   const seeded = useRef(false)
   useEffect(() => {
-    if (strategy?.data && !seeded.current) {
+    if (strategy && !seeded.current) {
       seeded.current = true
-      setName(strategy.data.name || '')
-      setCode(strategy.data.code || '')
+      setName(strategy.name || '')
+      setCode(strategy.code || '')
     }
   }, [strategy])
 
@@ -208,12 +208,12 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
     return () => { es.close() }
   }, [runId, liveOn, qc])
 
-  const lastStatus = status?.data ? (status.data.state ?? status.data.status) : undefined
-  const metrics = pickMetrics(status?.data?.metrics_json)
-  const equityData: any[] = Array.isArray(equity?.data) ? equity.data : []
-  const runList: any[] = Array.isArray(runs?.data) ? runs.data : []
+  const lastStatus = status ? (status.state ?? status.status) : undefined
+  const metrics = pickMetrics(status?.metrics_json)
+  const equityData: any[] = Array.isArray(equity) ? equity : []
+  const runList: any[] = Array.isArray(runs) ? runs : []
   const excess = computeExcess(equityData)
-  const errLogs = filterErrorLogs(Array.isArray(logs?.data) ? logs.data : [])
+  const errLogs = filterErrorLogs(Array.isArray(logs) ? logs : [])
   const hasError = errLogs.length > 0
 
   return (
@@ -321,7 +321,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
             <MetricCard label="超额收益" value={excess == null ? '—' : fmtPct(excess)} tone={tone(excess)} />
             <MetricCard label="胜率" value={fmtPct(metrics.win_rate)} tone={tone(metrics.win_rate)} />
             <MetricCard label="盈亏比" value={fmtNum(metrics.profit_loss_ratio)} tone={tone(metrics.profit_loss_ratio)} />
-            <MetricCard label="交易次数" value={metrics.trade_count == null ? (runId ? String(Array.isArray(trades?.data) ? trades.data.length : 0) : '—') : String(metrics.trade_count)} tone="text-foreground" />
+            <MetricCard label="交易次数" value={metrics.trade_count == null ? (runId ? String(Array.isArray(trades) ? trades.length : 0) : '—') : String(metrics.trade_count)} tone="text-foreground" />
           </div>
 
           <div className="flex-1 min-h-[220px] mx-3 rounded-card border border-border bg-surface">
@@ -346,9 +346,9 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
               </div>
             </div>
             <div className="flex-1 overflow-auto p-3">
-              {logTab === 'log' && <LogList logs={Array.isArray(logs?.data) ? logs.data : []} />}
+              {logTab === 'log' && <LogList logs={Array.isArray(logs) ? logs : []} />}
               {logTab === 'error' && <LogList logs={errLogs} />}
-              {logTab === 'trade' && <TradeTable trades={Array.isArray(trades?.data) ? trades.data : []} />}
+              {logTab === 'trade' && <TradeTable trades={Array.isArray(trades) ? trades : []} />}
             </div>
           </div>
         </div>
