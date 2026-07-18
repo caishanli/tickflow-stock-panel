@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { PageHeader } from '@/components/PageHeader'
 import { Modal } from '@/components/Modal'
+import { toast } from '@/components/Toast'
 import { DatePicker } from '@/components/DatePicker'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -162,7 +163,15 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
     }
   }, [strategy])
 
-  const saveStrategy = () => api.saveStrategy(strategyId, name, code)
+  const saveStrategy = async () => {
+    try {
+      await api.saveStrategy(strategyId, name, code)
+      qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] })
+      toast('策略已保存', 'success')
+    } catch (e: any) {
+      toast(e?.message ? `保存失败: ${e.message}` : '保存失败', 'error')
+    }
+  }
 
   const runMut = useMutation({
     mutationFn: (short: boolean) => {
