@@ -49,7 +49,10 @@ class FactorConfig:
     end: date
     n_groups: int = 5
     rebalance: Literal["daily", "weekly", "monthly"] = "monthly"
+    # 组内加权方式: equal=等权; factor_weight=按因子值加权 (减组内最小值后归一, 兼容负因子值)
     weight: Literal["equal", "factor_weight"] = "equal"
+    # 调仓成本: 每个调仓点按全量换仓 (换手=1) 扣双边成本 (fees_pct + slippage_bps/1e4) × 2;
+    # 多空组合两腿 (多头/空头各 50% 仓位) 合计扣一次, 在 _calc_long_short 统一扣除。
     fees_pct: float = 0.0002
     slippage_bps: float = 5.0
     asset_type: str = "stock"
@@ -245,14 +248,18 @@ class FactorBacktestService:
         all_dates = sorted(panel["date"].unique().to_list())
 
         if rebalance == "weekly":
-            # 调仓日 = 每周一
+            # 调仓日 = 每周首个交易日 (按 ISO 年-周分组取首个)。
+            # 原口径"每周一"在周一休市的周没有调仓日, 两周收益被并成一个周期,
+            # 污染 Sharpe/回撤; 与 monthly 分支 (每月首个交易日) 口径对齐。
+            seen_weeks: set[tuple[int, int]] = set()
             rebalance_dates = set()
-            for d in all_dates:
-                if hasattr(d, "weekday"):
-                    wd = d.weekday()
+            for d in sorted(all_dates):
+                if hasattr(d, "isocalendar"):
+                    yw = d.isocalendar()[:2]
                 else:
-                    wd = _dt.date.fromisoformat(str(d)).weekday()
-                if wd == 0:  # Monday
+                    yw = _dt.date.fromisoformat(str(d)).isocalendar()[:2]
+                if yw not in seen_weeks:
+                    seen_weeks.add(yw)
                     rebalance_dates.add(d)
         else:  # monthly
             # 调仓日 = 每月首个交易日
@@ -364,13 +371,33 @@ class FactorBacktestService:
 
     @staticmethod
     def _calc_group_nav(panel: pl.DataFrame, config: FactorConfig) -> list[dict]:
-        """计算分组净值曲线 — 只在调仓日更新净值。"""
-        # 只保留有下期收益的行 (= 调仓日)
-        group_ret = (
-            panel.filter(pl.col("_next_return").is_not_null() & pl.col("_group").is_not_null())
-            .group_by(["date", "_group"])
-            .agg(pl.col("_next_return").mean().alias("group_return"))
-        )
+        """计算分组净值曲线 — 只在调仓日更新净值。
+
+        每个调仓点按全量换仓 (换手率=1) 从当期收益扣除双边成本
+        (fees_pct + slippage_bps/1e4) × 2; 该期无成员的组不更新净值也不计费。
+        weight='factor_weight' 时组内按因子值加权: 因子值减组内最小值后归一
+        (兼容负因子值; 组内因子全相等时权重和为 0, 退化为等权)。
+        """
+        if config.weight == "factor_weight" and config.factor_name in panel.columns:
+            # 组内因子值加权: shifted = 因子值 - 组内最小值 (>=0), 权重 = shifted / Σshifted
+            shifted = pl.col(config.factor_name) - pl.col(config.factor_name).min()
+            group_ret = (
+                panel.filter(pl.col("_next_return").is_not_null() & pl.col("_group").is_not_null())
+                .group_by(["date", "_group"])
+                .agg(
+                    pl.when(shifted.sum() > 0)
+                    .then((pl.col("_next_return") * shifted).sum() / shifted.sum())
+                    .otherwise(pl.col("_next_return").mean())
+                    .alias("group_return")
+                )
+            )
+        else:
+            # 只保留有下期收益的行 (= 调仓日)
+            group_ret = (
+                panel.filter(pl.col("_next_return").is_not_null() & pl.col("_group").is_not_null())
+                .group_by(["date", "_group"])
+                .agg(pl.col("_next_return").mean().alias("group_return"))
+            )
 
         # pivot: date × group
         pivot = group_ret.pivot(index="date", columns="_group", values="group_return").sort("date")
@@ -380,6 +407,9 @@ class FactorBacktestService:
 
         group_cols = sorted([c for c in pivot.columns if c != "date"], key=FactorBacktestService._group_sort_key)
 
+        # 调仓成本: 全量换仓 (换手=1) 的双边成本, 每个调仓点从当期收益中扣除
+        rebalance_cost = (float(config.fees_pct) + float(config.slippage_bps) / 1e4) * 2
+
         # 累乘净值曲线
         result: list[dict] = []
         nav_values: dict[str, float] = {c: 1.0 for c in group_cols}
@@ -387,8 +417,12 @@ class FactorBacktestService:
         for row in pivot.iter_rows(named=True):
             entry: dict = {"date": str(row["date"])[:10]}
             for c in group_cols:
-                ret = float(row[c]) if row[c] is not None else 0.0
-                nav_values[c] *= (1 + ret)
+                if row[c] is None:
+                    # 该期该组无成员: 净值不变, 不计调仓成本
+                    entry[c] = round(nav_values[c], 4)
+                    continue
+                ret = float(row[c])
+                nav_values[c] *= (1 + ret - rebalance_cost)
                 entry[c] = round(nav_values[c], 4)
             result.append(entry)
 
@@ -462,7 +496,13 @@ class FactorBacktestService:
     def _calc_long_short(
         group_nav: list[dict], config: FactorConfig,
     ) -> tuple[list[dict], dict]:
-        """多空组合: 做多最高组 + 做空最低组。"""
+        """多空组合: 做多最高组 + 做空最低组。
+
+        每个调仓点两腿 (多头顶组 / 空头底组, 各 50% 仓位, 全量换仓) 合计扣一次
+        双边成本 (fees_pct + slippage_bps/1e4) × 2。注意必须在多空口径统一扣,
+        不能只靠分组净值传导: 分组净值中的成本对空头腿符号相反
+        (底组净值跌更多 → 空头反而多赚), 直接组合会漏计空头腿成本。
+        """
         if not group_nav:
             return [], {}
 
@@ -475,6 +515,9 @@ class FactorBacktestService:
 
         top_col = group_cols[-1]  # Q5 (最高)
         bottom_col = group_cols[0]  # Q1 (最低)
+
+        # 两腿调仓成本: 0.5×cost (多头腿) + 0.5×cost (空头腿) = cost
+        ls_cost = (float(config.fees_pct) + float(config.slippage_bps) / 1e4) * 2
 
         # 独立计算 top 和 bottom 的日收益，然后合成
         ls_value = 1.0
@@ -492,8 +535,8 @@ class FactorBacktestService:
             top_ret = (top_nav / prev_top - 1) if prev_top > 0 else 0.0
             # bottom 组收益 (做空 = 取反)
             bot_ret = -(bot_nav / prev_bot - 1) if prev_bot > 0 else 0.0
-            # 多空组合收益
-            ls_ret = (top_ret + bot_ret) / 2  # 各分配 50% 资金
+            # 多空组合收益: 各分配 50% 资金, 扣两腿调仓成本
+            ls_ret = (top_ret + bot_ret) / 2 - ls_cost
             ls_value *= (1 + ls_ret)
 
             prev_top = top_nav

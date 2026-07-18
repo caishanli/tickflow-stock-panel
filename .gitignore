@@ -45,6 +45,8 @@ backend/data/**
 !backend/data/.gitkeep
 data/**
 !data/.gitkeep
+backend/app/data/**
+!backend/app/data/.gitkeep
 # data/ 下所有内容(含 ext_data 概念/行业)均不入库:
 #   - 用户运行时数据 (K线/财务/自选/回测等) 本就不该进 git
 #   - 概念/行业改为「首次启动自动从远程接口拉取」(见 app/services/ext_presets.py)
@@ -88,6 +90,13 @@ docs/zhihu/
 # ===== 用户自定义策略(私有,不开源) =====
 data/strategies/custom/
 
+# ===== quant (rqalpha 回测/模拟盘) =====
+data/quant_strategies/
+data/quant_bundle/
+data/quant_sim/
+data/quant.db
+data/quant.db-journal
+
 # ===== 临时 / 调试产物 =====
 backend._recheck*.py
 backend/_verify*.py
@@ -106,3 +115,8 @@ packaging/installed_run.log
 TickFlowStockPanel.app/
 TickFlowStockPanel-macos*.dmg
 TickFlowStockPanel-macos*.zip
+
+# ===== quant jqengine 数据缓存(DB symlinks) =====
+backend/jqdata/
+backend/runtime/
+backend/app/quant/jqengine/data/

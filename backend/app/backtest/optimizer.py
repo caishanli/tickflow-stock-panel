@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,17 @@ VALID_OBJECTIVES = {
     "total_return", "annual_return", "sharpe", "sortino", "calmar",
     "win_rate", "profit_factor", "max_drawdown", "mc_maxdd_p50", "mc_maxdd_p95",
     "avg_pnl", "median_pnl", "n_trades", "avg_holding_days",
+}
+
+# full 模式 (全候选独立执行, 见 engine._calc_independent_candidate_result) stats 中
+# 存在的可优化目标。与 position 模式差异: full 无账户净值曲线, 不产出
+# annual_return / calmar / avg_pnl / median_pnl / avg_holding_days。
+# 这些目标在 full 下 objective_value 恒 -inf → best_params=None 且无报错 (静默全灭),
+# 故跑网格前直接校验拒绝 (不做 avg_pnl→avg_return 之类别名映射: 两种模式口径不同,
+# 强行映射会让最优参数建立在不可比的指标上, 比报错更容易误用)。
+_FULL_MODE_OBJECTIVES = {
+    "total_return", "sharpe", "sortino", "win_rate", "profit_factor",
+    "max_drawdown", "mc_maxdd_p50", "mc_maxdd_p95", "n_trades",
 }
 
 
@@ -60,8 +72,11 @@ def _candidates_for(param_id: str, spec, pmeta: dict) -> list:
             raise ValueError(f"参数 '{param_id}' 的 max < min")
         step = float(step)
         # 整数计数生成候选, 避免浮点累加误差丢端点 (如 0.1/0.1 步长)。
-        n_steps = round((hi - lo) / step)
+        # step 不整除 [lo,hi] 时末值落不到 max → 显式补上 max 端点, 且不超界。
+        n_steps = math.floor((hi - lo) / step + 1e-9)
         raw = [round(lo + i * step, 10) for i in range(n_steps + 1)]
+        if raw[-1] < hi - 1e-9:
+            raw.append(round(hi, 10))
     else:
         raise ValueError(f"参数 '{param_id}' 的网格 spec 必须是列表或 {{min,max,step}} 字典")
 
@@ -210,6 +225,18 @@ class StrategyOptimizer:
         t0 = time.perf_counter()
         if cfg.objective not in VALID_OBJECTIVES:
             raise ValueError(f"不支持的优化目标 '{cfg.objective}', 可选: {sorted(VALID_OBJECTIVES)}")
+        # full 模式的 stats 键集合与 position 不同 (见 _FULL_MODE_OBJECTIVES 注释):
+        # 目标在该模式不存在时 objective_value 恒 -inf → best_params=None 且无报错 (静默全灭),
+        # 故跑网格前直接拒绝并列出该模式可用目标。
+        mode = str(cfg.backtest_kwargs.get("mode") or "position")
+        if mode == "full" and cfg.objective not in _FULL_MODE_OBJECTIVES:
+            raise ValueError(
+                f"优化目标 '{cfg.objective}' 在 full 模式的 stats 中不存在 "
+                f"(full 为全候选独立执行口径, 无账户净值), 该模式可用目标: {sorted(_FULL_MODE_OBJECTIVES)}"
+            )
+        # direction 只认 max/min; 其他值以前会静默按 max 处理, 属于配置错误, 直接拒绝。
+        if cfg.direction is not None and cfg.direction not in ("max", "min"):
+            raise ValueError(f"direction 只能是 'max'/'min' (或 None 自动推断), 收到: {cfg.direction!r}")
         direction = cfg.direction or default_direction(cfg.objective)
         _validate_backtest_kwargs(cfg.backtest_kwargs)
 

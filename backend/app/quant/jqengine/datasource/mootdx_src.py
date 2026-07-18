@@ -1,0 +1,360 @@
+"""mootdx (通达信) 数据源实现。"""
+
+import socket
+import pandas as pd
+
+from mootdx.quotes import Quotes
+from mootdx.utils import get_stock_market
+from .base import DataSource, DataSourceError
+
+
+def _to_symbol(code):
+    """平台代码 -> mootdx 6位纯数字代码。"""
+    return code.split(".")[0]
+
+
+def _is_index(code):
+    """判断是否为指数代码（000xxx.SH / 399xxx.SZ）。"""
+    pure = code.split(".")[0]
+    return pure.startswith("399") or (pure.startswith("000") and len(pure) == 6) \
+        and not pure.startswith("0000")
+
+
+# 显式 mootdx 行情服务器列表（TCP 7709）。顺序探测，用第一个可达的，
+# 规避 0.11.x BESTIP.HQ 空串 bug；海外网络通常全部超时，此时回退
+# 到 mootdx 自带 bestip 测速 / 裸 factory。
+_TDX_SERVERS = [
+    ('119.97.185.59', 7709), ('124.70.133.119', 7709), ('116.205.183.150', 7709),
+    ('123.60.73.44', 7709), ('116.205.163.254', 7709), ('121.36.225.169', 7709),
+    ('123.60.70.228', 7709), ('124.71.9.153', 7709), ('110.41.147.114', 7709),
+    ('124.71.187.122', 7709),
+]
+
+
+def _probe(ip, port, timeout=2.0):
+    """TCP 握手探测，判断服务器是否可达。"""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def tdx_client(market='std'):
+    """
+    创建 mootdx 客户端，规避 0.11.x BESTIP.HQ 空串 bug。
+    顺序兜底，保证 IP 列表老化/换网时仍能工作：
+      1) 顺序探测 _TDX_SERVERS，用第一个 TCP 可达的显式 server
+         （不做数据探活：某服务器对 510300 无数据不代表对其他标的
+         也无数据，数据为空由上层 _with_server_retry 换服务器兜底）；
+      2) 显式列表全不可达 → 回退 mootdx 自带 bestip 测速选优；
+      3) 再不行 → 回退裸 factory（老用户 config 已有可用 BESTIP 时成立）；
+      4) 仍失败 → 抛 RuntimeError，明确报错而非死等。
+    """
+    for ip, port in _TDX_SERVERS:
+        if _probe(ip, port):
+            try:
+                return Quotes.factory(market=market, server=(ip, port))
+            except Exception:
+                continue
+    try:
+        return Quotes.factory(market=market)                # 裸 factory（实测可用且不选速）
+    except Exception as e:
+        raise RuntimeError(
+            "所有 mootdx 服务器均不可达。海外网络通常全部超时（TCP 7709），"
+            "请走国内代理或更新 _TDX_SERVERS 列表。原始错误：%s" % e
+        )
+
+
+# 证券名称缓存（内存级，跨回测复用；另落盘 data/.stock_names_cache.json）
+_STOCK_NAMES_CACHE = None
+
+
+class MootdxSource(DataSource):
+    name = "mootdx"
+
+    def __init__(self, token=""):
+        self._client = None
+        self._server_idx = -1  # 当前使用的 _TDX_SERVERS 下标（-1=尚未显式选定）
+        # xdxr 除权除息记录进程内缓存（code -> rows/None）：除权信息在回测
+        # 期间不变，避免同一标的重复网络往返；查询失败缓存 None（保持 raw）
+        self._xdxr_cache = {}
+
+    def _api(self):
+        if self._client is None:
+            try:
+                from mootdx.quotes import Quotes
+                # 裸 factory（自动选速）实测对全市场标的都能取到数据且快，
+                # 作为默认客户端；显式 _TDX_SERVERS 仅作失败时的轮换兜底。
+                self._client = Quotes.factory(market="std")
+            except Exception as e:
+                raise DataSourceError(f"mootdx 初始化失败: {e}")
+        return self._client
+
+    def _rotate_server(self, to_bestip=False):
+        """换服务器重建客户端（运行时取数超时/失败兜底）。
+
+        统一使用裸 ``Quotes.factory(market="std")``：实测对所有标的可用且快，
+        且**不会触发 mootdx 的 bestip 测速选服（会卡死）**。bestip 兜底已禁用。
+        返回新客户端；全部失败返回 None。
+        """
+        from mootdx.quotes import Quotes
+        try:
+            self._client = Quotes.factory(market="std")
+            return self._client
+        except Exception:
+            return None
+
+    def _with_server_retry(self, fn, empty_ok=False):
+        """执行取数 ``fn``，超时/返回空时按 _TDX_SERVERS 轮询换服务器重试。
+
+        - fn 内阻塞超过 15s 视为超时（线程守护，超时即换服务器）；
+        - 返回 None/空 且 ``empty_ok=False`` 也触发换服务器；
+        - 列表用尽后回退到 bestip/factory 兜底客户端（_api 重建）。
+        返回 (df, err)：成功 df 非 None，失败二者皆 None/err 说明。
+        """
+        import threading
+        attempts = len(_TDX_SERVERS) + 1  # 显式列表各一次 + 末次 bestip/factory 兜底
+        for attempt in range(attempts):
+            c = self._api()
+            box = {}
+            def _run():
+                try:
+                    box["df"] = fn(c)
+                except Exception as e:
+                    box["err"] = e
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(10)
+            if t.is_alive():
+                self._rotate_server()
+                continue
+            if "err" in box:
+                self._rotate_server()
+                continue
+            df = box.get("df")
+            if df is None or (not empty_ok and (hasattr(df, "empty") and df.empty)):
+                self._rotate_server(to_bestip=(attempt == attempts - 1))
+                continue
+            return df, None
+        return None, "mootdx 所有服务器均超时/无数据"
+
+    def get_daily(self, code, start, end):
+        """通达信日线：原始价取数后尝试用 xdxr 除权除息因子换算前复权。
+
+        返回帧 ``attrs`` 标注口径元数据：``source="mootdx"``，
+        ``adj="qfq"``（前复权换算成功）或 ``"raw"``（指数无复权概念 /
+        xdxr 无记录 / 换算失败，保持通达信原始不复权价）。raw 帧由
+        manager 混源防护（_pick_daily_frame）让位给其他源的前复权帧。
+        """
+        sym = _to_symbol(code)
+        def _fn(c):
+            if _is_index(code):
+                return c.index_bars(symbol=sym, frequency=9)
+            return c.bars(symbol=sym, frequency=9)
+        df, err = self._with_server_retry(_fn)
+        if df is None or df.empty:
+            raise DataSourceError(f"mootdx 无日线数据 ({err})")
+        # 兼容 JQ 字段名：成交额 = amount -> money；成交量 = vol -> volume
+        if "amount" in df.columns:
+            df["money"] = df["amount"]
+        if "vol" in df.columns and "volume" not in df.columns:
+            df["volume"] = df["vol"]
+        if "volume" in df.columns:
+            df["volume"] = df["volume"] * 100
+        df.attrs["source"] = "mootdx"
+        df.attrs["adj"] = "raw"
+        if not _is_index(code):
+            qfq = self._to_qfq(df, sym)
+            if qfq is not None:
+                df = qfq
+        return df
+
+    def _xdxr_rows(self, sym):
+        """取通达信除权除息(xdxr)记录（进程内缓存，同一代码只查一次）。
+
+        mootdx 0.11.x 底层为 tdxpy，``TdxHq_API.get_xdxr_info(market, code)``
+        返回全部历史除权行（category==1 为除权除息：fenhong=每10股红利(元)、
+        songzhuangu=每10股送转、peigu=每10股配股、peigujia=配股价）。
+        无记录返回 []、失败返回 None，调用方据此保持 raw 口径。
+        """
+        if sym in self._xdxr_cache:
+            return self._xdxr_cache[sym]
+        try:
+            market = int(get_stock_market(sym))
+            rows, _ = self._with_server_retry(
+                lambda c: c.client.get_xdxr_info(market, sym), empty_ok=True)
+        except Exception:
+            rows = None
+        self._xdxr_cache[sym] = rows
+        return rows
+
+    def _to_qfq(self, df, sym):
+        """用 xdxr 因子把 raw 日线换算为前复权（最新口径），失败返回 None。
+
+        标准除权参考价公式：除权价 = (昨收 - 每股红利 + 配股价×每股配股)
+        / (1 + 每股送转 + 每股配股)；前复权因子 = 除权价 / 昨收，对除权日
+        之前的 OHLC 逐次累乘。只调整价格列，volume/money 保持原始（与聚宽
+        get_price fq="pre" 口径一致：价格复权、量额不复权）。
+
+        局限：除权日早于帧内首个交易日时，前一收盘价不在帧内、该次因子
+        无法计算（跳过）——帧内全部行统一差该因子，不影响收益率序列的
+        相对关系，但绝对价与最新口径存在固定偏差。
+        """
+        if not isinstance(df.index, pd.DatetimeIndex) or "close" not in df.columns:
+            return None
+        rows = self._xdxr_rows(sym)
+        if not rows:
+            return None
+        close = pd.to_numeric(df["close"], errors="coerce")
+        factors = []
+        for r in rows:
+            if r.get("category") != 1:
+                continue  # 只处理除权除息（分红/送转/配股），股本变动类不影响价
+            fh = float(r.get("fenhong") or 0) / 10.0      # 每股现金红利(元)
+            sg = float(r.get("songzhuangu") or 0) / 10.0  # 每股送转
+            pg = float(r.get("peigu") or 0) / 10.0        # 每股配股
+            pgj = float(r.get("peigujia") or 0)           # 配股价
+            if fh == 0 and sg == 0 and pg == 0:
+                continue
+            try:
+                ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
+            except Exception:
+                continue
+            prev = close.loc[close.index < ex_dt].dropna()
+            if prev.empty:
+                continue  # 前一收盘价不在帧内，因子无法计算（见 docstring 局限）
+            prev_close = float(prev.iloc[-1])
+            if prev_close <= 0:
+                continue
+            ex_price = (prev_close - fh + pgj * pg) / (1.0 + sg + pg)
+            if ex_price <= 0:
+                continue
+            factors.append((ex_dt, ex_price / prev_close))
+        if not factors:
+            return None
+        df = df.copy()
+        adj = pd.Series(1.0, index=df.index)
+        for ex_dt, f in factors:
+            adj.loc[adj.index < ex_dt] *= f
+        for col in ("open", "high", "low", "close"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce") * adj
+        df.attrs["adj"] = "qfq"
+        return df
+
+    def get_minute(self, code, date="", max_bars=30000):
+        """历史 1 分钟 K 线：mootdx 单次最多约 800 根，按 ``start`` 分页回看。
+
+        ``max_bars`` 上限防止对"无数据/长期停牌"标的空转 400 页（每页一次
+        阻塞式 socket 调用，单只可卡数分钟）；达到上限即停止分页。
+        取数超时/返回空时自动按 _TDX_SERVERS 轮询换服务器重试。
+        """
+        sym = _to_symbol(code)
+        box = {}
+        def _fn(c):
+            # 先试拉 1 页判断是否有数据：无数据立即失败，避免对停牌标的
+            # 空转 400 页。
+            first = c.bars(symbol=sym, frequency=8, start=0, offset=800)
+            if first is None or first.empty:
+                raise DataSourceError("mootdx 无分钟数据")
+            box["c"] = c
+            return first
+        first, err = self._with_server_retry(_fn)
+        if first is None:
+            raise DataSourceError(f"mootdx 无分钟数据 ({err})")
+        c = box.get("c")
+        frames = [first]
+        fetched = len(first)
+        start = 800
+        offset = 800
+        for _ in range(399):
+            if fetched >= max_bars:
+                break
+            try:
+                df = c.bars(symbol=sym, frequency=8, start=start, offset=offset)
+            except Exception:
+                break
+            if df is None or df.empty:
+                break
+            frames.append(df)
+            fetched += len(df)
+            if len(df) < offset:
+                break
+            start += offset
+        if not frames:
+            raise DataSourceError("mootdx 无分钟数据")
+        out = pd.concat(frames)
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        if "vol" in out.columns and "volume" not in out.columns:
+            out["volume"] = out["vol"]
+        if "amount" in out.columns and "money" not in out.columns:
+            out["money"] = out["amount"]
+        out.index.name = "datetime"
+        if "datetime" in out.columns:
+            out = out.drop(columns=["datetime"])
+        return out
+
+    def get_index_realtime(self, codes):
+        raise DataSourceError("mootdx 暂不支持指数实时")
+
+    def get_etf_list(self):
+        raise DataSourceError("mootdx 未配置ETF池，请优先使用Tushare")
+
+    def get_stock_names(self):
+        """返回 {code: name} 字典，名称来自通达信行情（与聚宽 display_name 一致）。
+
+        证券名称在回测期间不变，且仅供展示。每次回测都通过 TDX 网络拉全量
+        名录代价极高（单次回测 ~15s），故在内存 + 本地文件做缓存：进程内只取
+        一次，跨进程/跨回测直接命中本地缓存，避免重复网络往返。不影响行情正确性。
+        """
+        import json
+        import os
+
+        global _STOCK_NAMES_CACHE
+        if _STOCK_NAMES_CACHE is not None:
+            return _STOCK_NAMES_CACHE
+        cache_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "data", ".stock_names_cache.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    _STOCK_NAMES_CACHE = json.load(f)
+                return _STOCK_NAMES_CACHE
+            except Exception:
+                pass
+        c = self._api()
+        out = {}
+        for market in (0, 1):
+            try:
+                df = c.stocks(market=market)
+                if df is None or df.empty:
+                    continue
+                for _, row in df.iterrows():
+                    code = str(row["code"]).strip()
+                    name = str(row["name"]).replace("\x00", "").strip()
+                    out[code] = name
+            except Exception:
+                continue
+        _STOCK_NAMES_CACHE = out
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+        except Exception:
+            pass
+        return out
+
+    def get_stock_list(self):
+        raise DataSourceError("mootdx 未配置股票池，请优先使用Tushare")
+
+    def get_us_index(self):
+        raise DataSourceError("mootdx 不支持美股")
+
+    def test_connection(self):
+        try:
+            self._api()
+            return True, "mootdx 连接正常"
+        except Exception as e:
+            return False, str(e)

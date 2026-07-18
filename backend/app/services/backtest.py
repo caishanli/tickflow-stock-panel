@@ -4,10 +4,11 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
 import numpy as np
@@ -19,6 +20,10 @@ from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
+
+# 指标预热窗口 (日历日): 与 factor.FACTOR_WARMUP_DAYS / strategy.py warmup 对齐,
+# 保证 MA60 类信号在正式区间开头就有足够历史 (60 交易日 ≈ 84 日历日, 120 留足余量)。
+_INDICATOR_WARMUP_DAYS = 120
 
 # vectorbt 是 optional extras(见 pyproject.toml).未装时只有 backtest 不可用,其他功能正常.
 _vbt = None
@@ -117,6 +122,13 @@ _SIGNAL_COLS: dict[SignalKind, str] = {
     "volume_surge": "signal_volume_surge",
 }
 
+# 风控类 SignalKind 不是面板信号列, 混进 entries/exits 时给出明确报错提示 (旧行为静默跳过)
+_KIND_PARAM_HINTS: dict[str, str] = {
+    "stop_loss": "请改用 stop_loss_pct 参数",
+    "max_hold": "请改用 max_hold_days 参数",
+    "trailing_stop": "trailing_stop 回测暂未实现",
+}
+
 
 class BacktestService:
     def __init__(self, repo: KlineRepository) -> None:
@@ -133,7 +145,12 @@ class BacktestService:
 
         **全项目唯一从 Polars 转 pandas 的边界**(§7.4 / ADR-19)。
         asset_type='etf' 时读 ETF enriched。
+
+        加载窗口向前扩 _INDICATOR_WARMUP_DAYS 个日历日做指标预热, compute_all 之后
+        再过滤回 [start,end] — 否则 MA60 类指标/信号在区间开头约 3 个月静默缺失
+        (且对过滤后数据重算指标也不等于全历史口径)。
         """
+        warmup_start = start - timedelta(days=_INDICATOR_WARMUP_DAYS)
         try:
             from app.tickflow.repository import enriched_dirname
             enriched_glob = str(self.repo.store.data_dir / enriched_dirname(asset_type) / "**" / "*.parquet")
@@ -141,7 +158,7 @@ class BacktestService:
                 scan_enriched_parquet(enriched_glob)
                 .filter(
                     (pl.col("symbol").is_in(symbols))
-                    & (pl.col("date") >= start)
+                    & (pl.col("date") >= warmup_start)
                     & (pl.col("date") <= end)
                 )
                 .sort(["date", "symbol"])
@@ -154,9 +171,14 @@ class BacktestService:
         if df.is_empty():
             return pd.DataFrame()
 
-        # 即时计算指标 + 信号
+        # 即时计算指标 + 信号 (在含预热窗口的数据上计算)
         from app.indicators.pipeline import compute_all
         df = compute_all(df)
+
+        # 预热段只参与指标计算, 裁回正式区间
+        df = df.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        if df.is_empty():
+            return pd.DataFrame()
 
         # 选择需要的列
         needed_cols = [
@@ -184,6 +206,8 @@ class BacktestService:
         """从面板构造 [date × symbol] 的布尔信号矩阵。"""
         if not kinds or panel.empty:
             return pd.DataFrame()
+        # 未实现/非信号列的 kind 直接报错, 不再静默跳过
+        self._validate_signal_kinds(kinds)
 
         # pivot 成 [date × symbol] 形式
         result = None
@@ -198,15 +222,82 @@ class BacktestService:
             elif kind == "rsi_overbought":
                 mat = (panel.pivot(index="date", columns="symbol", values="rsi_14")
                        > config.rsi_overbought_threshold)
-            # stop_loss / trailing / max_hold 通过 vectorbt 参数处理,不参与信号矩阵
 
             if mat is not None:
                 result = mat if result is None else (result | mat)
         return result if result is not None else pd.DataFrame()
 
+    @classmethod
+    def _validate_signal_kinds(cls, kinds: list[str]) -> None:
+        """entries/exits 中出现未实现/非信号列的 kind 时抛 ValueError 说明。
+
+        stop_loss / max_hold 有对应参数路径, trailing_stop 暂未实现;
+        旧行为是静默跳过, 用户以为生效了风控实际没有。"""
+        for kind in kinds:
+            if kind in _SIGNAL_COLS or kind in ("rsi_oversold", "rsi_overbought"):
+                continue
+            hint = _KIND_PARAM_HINTS.get(kind)
+            if hint is not None:
+                raise ValueError(f"信号 '{kind}' 不支持作为买卖信号: {hint}")
+            raise ValueError(f"未知信号: '{kind}'")
+
+    # vectorbt OSS 没有按笔计时止损 (td_stop 是 vectorbtpro 功能), 用迭代退出矩阵逼近:
+    # 先跑一遍拿实际成交的入场点, 只对实际建仓的入场在 entry+max_hold_days 处补强制退出点。
+    # (旧实现对所有信号行补退出点, 含持仓期被忽略的重复信号 — 同 bar entry+exit 会被
+    #  vectorbt 双双丢弃, 设了 max_hold_days 后零成交; 且 iloc 链式赋值在 CoW 下静默失效。)
+    # 强制退出 bar 上的入场信号要一并抹掉 (持仓期 entry 本就无效, 不抹会把强制退出也吞掉)。
+    # 强制退出可能解锁新的入场, 迭代到退出矩阵稳定为止 (防御性上限 _MAX_HOLD_ITERATIONS)。
+    _MAX_HOLD_ITERATIONS = 8
+
+    def _run_with_max_hold(self, vbt, pf_kwargs: dict, max_hold_days: int):
+        """带 max_hold_days 时间退出的 from_signals, 返回最终 Portfolio。"""
+        entries: pd.DataFrame = pf_kwargs["entries"]
+        base_exits: pd.DataFrame = pf_kwargs["exits"]
+        n_bars = len(entries.index)
+        forced = np.zeros((n_bars, len(entries.columns)), dtype=bool)
+        for _ in range(self._MAX_HOLD_ITERATIONS):
+            forced_df = pd.DataFrame(forced, index=entries.index, columns=entries.columns)
+            pf_kwargs["entries"] = entries & ~forced_df
+            pf_kwargs["exits"] = base_exits | forced_df
+            pf = vbt.Portfolio.from_signals(**pf_kwargs)
+            new_forced = np.zeros_like(forced)
+            for col_i, bar_i in self._actual_entry_positions(pf, entries):
+                end_i = min(bar_i + max_hold_days, n_bars - 1)
+                if end_i > bar_i:
+                    new_forced[end_i, col_i] = True
+            if np.array_equal(new_forced, forced):
+                return pf  # 退出矩阵稳定, 当前 pf 即最终结果
+            forced = new_forced
+        # 未收敛兜底 (理论上单调扩张必收敛, 这里只是防御迭代上限)
+        logger.warning("max_hold_days 退出矩阵 %d 轮未收敛, 使用最后一轮结果", self._MAX_HOLD_ITERATIONS)
+        forced_df = pd.DataFrame(forced, index=entries.index, columns=entries.columns)
+        pf_kwargs["entries"] = entries & ~forced_df
+        pf_kwargs["exits"] = base_exits | forced_df
+        return vbt.Portfolio.from_signals(**pf_kwargs)
+
+    @staticmethod
+    def _actual_entry_positions(pf, entries: pd.DataFrame) -> list[tuple[int, int]]:
+        """从 Portfolio 的成交订单提取实际建仓位置: [(col_idx, bar_idx)]。"""
+        records = pf.orders.records_readable
+        if records.empty:
+            return []
+        buys = records[records["Side"] == "Buy"]
+        col_pos = {c: i for i, c in enumerate(entries.columns)}
+        bar_pos = {t: i for i, t in enumerate(entries.index)}
+        positions: list[tuple[int, int]] = []
+        for col, ts in zip(buys["Column"], buys["Timestamp"]):
+            c = col_pos.get(col)
+            i = bar_pos.get(ts)
+            if c is not None and i is not None:
+                positions.append((c, i))
+        return positions
+
     def run(self, config: BacktestConfig) -> BacktestResult:
         vbt = _get_vbt()
         run_id = uuid.uuid4().hex[:10]
+
+        # 快速校验: 未实现/非信号列的 kind 直接报错 (旧行为静默跳过)
+        self._validate_signal_kinds(config.entries + config.exits)
 
         panel = self._load_panel(config.symbols, config.start, config.end, config.asset_type)
         if panel.empty:
@@ -269,19 +360,10 @@ class BacktestService:
             )
             if config.stop_loss_pct is not None:
                 pf_kwargs["sl_stop"] = abs(config.stop_loss_pct)
-            if config.max_hold_days is not None:
-                # vectorbt 没有内置 max-hold;用时间退出近似:
-                # 在 max_hold_days 后强制 exit
-                exits_idx = entries.copy()
-                for col in entries.columns:
-                    entry_rows = np.where(entries[col].values)[0]
-                    for i in entry_rows:
-                        end_i = min(i + config.max_hold_days, len(entries) - 1)
-                        if end_i > i:
-                            exits_idx.iloc[end_i][col] = True
-                pf_kwargs["exits"] = (exits | exits_idx).astype(bool)
-
-            pf = vbt.Portfolio.from_signals(**pf_kwargs)
+            if config.max_hold_days:
+                pf = self._run_with_max_hold(vbt, pf_kwargs, config.max_hold_days)
+            else:
+                pf = vbt.Portfolio.from_signals(**pf_kwargs)
         except Exception as e:  # noqa: BLE001
             logger.exception("vectorbt backtest failed")
             return BacktestResult(
@@ -321,9 +403,11 @@ class BacktestService:
                     "symbol": t.get("Column", t.get("Symbol", "")),
                     "entry_date": str(t.get("Entry Timestamp", t.get("Entry Date", ""))),
                     "exit_date": str(t.get("Exit Timestamp", t.get("Exit Date", ""))),
-                    "entry_price": float(t.get("Avg Entry Price", t.get("Avg. Entry Price", 0))),
-                    "exit_price": float(t.get("Avg Exit Price", t.get("Avg. Exit Price", 0))),
-                    "pnl_pct": float(t.get("Return", t.get("PnL %", 0))),
+                    # NaN/inf 清洗为 None: 期末未平仓交易 Return/均价可能是 NaN,
+                    # 否则 asdict 后会产出非法 JSON token
+                    "entry_price": _finite_or_none(t.get("Avg Entry Price", t.get("Avg. Entry Price", 0))),
+                    "exit_price": _finite_or_none(t.get("Avg Exit Price", t.get("Avg. Exit Price", 0))),
+                    "pnl_pct": _finite_or_none(t.get("Return", t.get("PnL %", 0))),
                     "duration": str(t.get("Duration", "")),
                 }
                 for t in trades
@@ -356,15 +440,19 @@ class BacktestService:
         return result
 
     def _persist(self, result: BacktestResult) -> None:
-        out_dir = settings.data_dir / "backtest_results"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # 用 polars 写一份汇总
-        summary = pl.DataFrame({
-            "run_id": [result.run_id],
-            "stats_json": [str(result.stats)],
-            "n_trades": [len(result.trades)],
-        })
-        summary.write_parquet(out_dir / f"run_id={result.run_id}.parquet")
+        # 落盘只是快照: 失败记日志, 不让已算完的回测 500
+        try:
+            out_dir = settings.data_dir / "backtest_results"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # 用 polars 写一份汇总 (stats 走 json.dumps 保证可 JSON 序列化)
+            summary = pl.DataFrame({
+                "run_id": [result.run_id],
+                "stats_json": [json.dumps(result.stats, ensure_ascii=False, default=str)],
+                "n_trades": [len(result.trades)],
+            })
+            summary.write_parquet(out_dir / f"run_id={result.run_id}.parquet")
+        except Exception:  # noqa: BLE001
+            logger.exception("backtest persist failed (run_id=%s)", result.run_id)
 
     def get_result(self, run_id: str) -> BacktestResult | None:
         # Phase 1:只保留近似落盘,完整结果保存在内存的近期 cache 中
@@ -388,10 +476,22 @@ def _config_to_dict(c: BacktestConfig) -> dict:
 
 
 def _json_safe(v):
+    # NaN/inf 统一清洗为 None, 避免序列化出非法 JSON token
+    if isinstance(v, float) and not np.isfinite(v):
+        return None
     if isinstance(v, (int, float, str, bool)) or v is None:
         return v
     if isinstance(v, (np.floating, np.integer)):
-        return float(v) if not np.isnan(float(v)) else None
+        return float(v) if np.isfinite(float(v)) else None
     if hasattr(v, "isoformat"):
         return v.isoformat()
     return str(v)
+
+
+def _finite_or_none(v) -> float | None:
+    """转 float; NaN/inf/不可转 → None (避免 asdict 后产出非法 JSON token)。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
