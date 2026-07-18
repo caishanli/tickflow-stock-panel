@@ -59,6 +59,11 @@ def post_strategy(body: StrategyIn):
     return {"data": save_strategy(uuid.uuid4().hex[:8], body.name, body.code)}
 
 
+@router.get("/strategies/with-latest")
+def strategies_with_latest():
+    return {"data": db.list_strategies_with_latest()}
+
+
 @router.get("/strategies/{sid}")
 def get_one_strategy(sid: str):
     s = get_strategy(sid)
@@ -127,11 +132,6 @@ def backtest_runs(limit: int = 50, strategy_id: str | None = None):
     if strategy_id:
         rows = [r for r in rows if r.get("strategy_id") == strategy_id]
     return {"data": rows}
-
-
-@router.get("/strategies/with-latest")
-def strategies_with_latest():
-    return {"data": db.list_strategies_with_latest()}
 
 
 @router.get("/backtest/{run_id}/stream")
