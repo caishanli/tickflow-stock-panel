@@ -1,159 +1,427 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import ReactECharts from 'echarts-for-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { ArrowLeft, Plus, Play, Square, RotateCcw } from 'lucide-react'
 import * as api from '../api'
-import { AccountDialog } from './AccountDialog'
+import { AccountDialog, type AccountForm } from './AccountDialog'
+
+/** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
+function cssVar(name: string, fallback: string) {
+  if (typeof window === 'undefined') return fallback
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return v || fallback
+}
+
+function statusTone(s: string | undefined) {
+  if (s === 'running') return 'text-accent'
+  if (s === 'failed') return 'text-bear'
+  if (s === 'paused') return 'text-warning'
+  return 'text-muted'
+}
+
+const STATUS_LABEL: Record<string, string> = {
+  created: '未启动', running: '运行中', paused: '已暂停', failed: '失败',
+}
+
+const FREQ_LABEL: Record<string, string> = { minute: '分钟级', daily: '日频' }
+
+function fmtNum(v: any, digits = 2) {
+  return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '—'
+}
+
+function fmtPct(v: any) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
+  return `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}%`
+}
 
 export function QuantSim() {
   const qc = useQueryClient()
-  const { data: accounts } = useQuery({ queryKey: ['quant', 'sim', 'accounts'], queryFn: api.listAccounts })
+  const [view, setView] = useState<'list' | 'detail'>('list')
   const [sel, setSel] = useState<string | null>(null)
   const [dialog, setDialog] = useState(false)
 
-  const startMut = useMutation({ mutationFn: () => api.startAccount(sel!), onSuccess: () => qc.invalidateQueries({ queryKey: ['quant', 'sim', 'accounts'] }) })
-  const pauseMut = useMutation({ mutationFn: () => api.pauseAccount(sel!), onSuccess: () => qc.invalidateQueries({ queryKey: ['quant', 'sim', 'accounts'] }) })
-  const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: () => qc.invalidateQueries({ queryKey: ['quant', 'sim', 'accounts'] }) })
-  const createMut = useMutation({ mutationFn: (b: any) => api.createAccount(b), onSuccess: () => { setDialog(false); qc.invalidateQueries({ queryKey: ['quant', 'sim', 'accounts'] }) } })
+  const { data: accounts } = useQuery({
+    queryKey: ['quant', 'sim', 'accounts'], queryFn: api.listAccounts,
+    refetchInterval: view === 'list' ? 5000 : false,
+  })
+  const { data: strategies } = useQuery({ queryKey: ['quant', 'strategies'], queryFn: api.listStrategies })
+  const strategyName = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const s of strategies ?? []) m.set(s.id, s.name || s.id)
+    return (id: string) => m.get(id) || id || '—'
+  }, [strategies])
 
-  // 实时轮询（模拟盘 4s）
-  const { data: st } = useQuery({ queryKey: ['quant', 'sim', sel, 'status'], queryFn: () => api.getSimStatus(sel!), enabled: !!sel, refetchInterval: 4000 })
-  const { data: eq } = useQuery({ queryKey: ['quant', 'sim', sel, 'equity'], queryFn: () => api.getSimEquity(sel!), enabled: !!sel, refetchInterval: 4000 })
-  const { data: tr } = useQuery({ queryKey: ['quant', 'sim', sel, 'trades'], queryFn: () => api.getSimTrades(sel!), enabled: !!sel, refetchInterval: 4000 })
+  const invalidate = () => qc.invalidateQueries({ queryKey: ['quant', 'sim'] })
+  const startMut = useMutation({ mutationFn: () => api.startAccount(sel!), onSuccess: invalidate })
+  const pauseMut = useMutation({ mutationFn: () => api.pauseAccount(sel!), onSuccess: invalidate })
+  const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: invalidate })
+  const createMut = useMutation({
+    mutationFn: (b: AccountForm) => api.createAccount(b),
+    onSuccess: () => { setDialog(false); invalidate() },
+  })
 
-  const positions = st?.state?.positions ?? {}
-  const posEntries = Object.entries(positions)
+  const openDetail = (id: string) => { setSel(id); setView('detail') }
 
   return (
     <div className="flex flex-col h-full">
-      <PageHeader title="量化模拟盘" subtitle="实时盘 / 离线回放" right={
-        <button onClick={() => setDialog(true)} className="px-3 h-9 rounded-lg bg-accent text-white text-xs">新建账户</button>
-      } />
-      <div className="flex-1 grid grid-cols-[320px_1fr] overflow-hidden">
-        <aside className="border-r border-border p-3 space-y-2 overflow-auto">
-          {(accounts ?? []).length === 0 && (
-            <div className="text-xs text-muted px-1 py-2">暂无账户，点击右上角新建</div>
-          )}
-          {(accounts ?? []).map((a: any) => (
-            <button key={a.id} onClick={() => setSel(a.id)}
-              className={`w-full flex items-center justify-between rounded-card border px-3 h-10 text-xs ${sel === a.id ? 'border-accent' : 'border-border bg-surface'}`}>
-              <span className="text-foreground truncate">{a.name}</span>
-              <span className="text-muted">{a.status}</span>
+      <PageHeader title="量化模拟盘" subtitle="策略驱动的实时模拟交易" />
+      {view === 'list' ? (
+        <SimList
+          accounts={accounts ?? []}
+          strategyName={strategyName}
+          onNew={() => setDialog(true)}
+          onOpen={openDetail}
+        />
+      ) : (
+        <SimDetail
+          aid={sel!}
+          strategyName={strategyName}
+          onBack={() => setView('list')}
+          startMut={startMut}
+          pauseMut={pauseMut}
+          resetMut={resetMut}
+        />
+      )}
+      <AccountDialog open={dialog} onClose={() => setDialog(false)}
+        onSave={(b) => createMut.mutate(b)} saving={createMut.isPending} />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 列表视图
+// ---------------------------------------------------------------------------
+
+function SimList({ accounts, strategyName, onNew, onOpen }: {
+  accounts: any[]
+  strategyName: (id: string) => string
+  onNew: () => void
+  onOpen: (id: string) => void
+}) {
+  return (
+    <div className="flex-1 overflow-auto p-4 space-y-3">
+      <div className="flex items-center">
+        <button onClick={onNew}
+          className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent text-white text-xs">
+          <Plus size={14} />新建模拟
+        </button>
+      </div>
+      {accounts.length === 0 ? (
+        <EmptyState title="暂无模拟账户" hint="点击左上角「新建模拟」创建一个" />
+      ) : (
+        <div className="rounded-card border border-border bg-surface overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="text-muted border-b border-border">
+              <tr className="text-left">
+                <th className="px-3 py-2.5 font-normal w-10">#</th>
+                <th className="px-3 py-2.5 font-normal">名称</th>
+                <th className="px-3 py-2.5 font-normal">策略</th>
+                <th className="px-3 py-2.5 font-normal">开始日期</th>
+                <th className="px-3 py-2.5 font-normal">频率</th>
+                <th className="px-3 py-2.5 font-normal">状态</th>
+                <th className="px-3 py-2.5 font-normal text-right">净值</th>
+                <th className="px-3 py-2.5 font-normal text-right">收益率</th>
+              </tr>
+            </thead>
+            <tbody className="text-foreground">
+              {accounts.map((a: any, i: number) => {
+                const ret = typeof a.net_value === 'number' && a.capital
+                  ? a.net_value / a.capital - 1 : null
+                return (
+                  <tr key={a.id} onClick={() => onOpen(a.id)}
+                    className="border-t border-border/60 hover:bg-elevated/60 cursor-pointer">
+                    <td className="px-3 py-2.5 text-muted">{i + 1}</td>
+                    <td className="px-3 py-2.5">{a.name}</td>
+                    <td className="px-3 py-2.5 text-muted">{strategyName(a.strategy_id)}</td>
+                    <td className="px-3 py-2.5 text-muted">{a.start_date || '—'}</td>
+                    <td className="px-3 py-2.5 text-muted">{FREQ_LABEL[a.frequency] ?? a.frequency ?? '分钟级'}</td>
+                    <td className={`px-3 py-2.5 ${statusTone(a.status)}`}>
+                      {STATUS_LABEL[a.status] ?? a.status}
+                    </td>
+                    <td className="px-3 py-2.5 text-right num">{fmtNum(a.net_value)}</td>
+                    <td className={`px-3 py-2.5 text-right num ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>
+                      {fmtPct(ret)}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 详情视图
+// ---------------------------------------------------------------------------
+
+function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: {
+  aid: string
+  strategyName: (id: string) => string
+  onBack: () => void
+  startMut: any
+  pauseMut: any
+  resetMut: any
+}) {
+  const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs'>('trades')
+  // 实时轮询（模拟盘 4s）
+  const { data: st } = useQuery({
+    queryKey: ['quant', 'sim', aid, 'status'], queryFn: () => api.getSimStatus(aid),
+    refetchInterval: 4000,
+  })
+  const { data: eq } = useQuery({
+    queryKey: ['quant', 'sim', aid, 'equity'], queryFn: () => api.getSimEquity(aid),
+    refetchInterval: 4000,
+  })
+  const { data: tr } = useQuery({
+    queryKey: ['quant', 'sim', aid, 'trades'], queryFn: () => api.getSimTrades(aid),
+    refetchInterval: 4000,
+  })
+  const { data: logs } = useQuery({
+    queryKey: ['quant', 'sim', aid, 'logs'], queryFn: () => api.getSimLogs(aid),
+    refetchInterval: 4000,
+  })
+
+  const acct = st?.account ?? {}
+  const state = st?.state ?? {}
+  const positions: Record<string, any> = state?.positions ?? {}
+  const posEntries = Object.entries(positions)
+  const positionsValue = posEntries.reduce(
+    (s, [, p]) => s + (Number(p.amount) || 0) * (Number(p.price) || 0), 0)
+  const ret = typeof state?.net_value === 'number' && state?.start_cash
+    ? state.net_value / state.start_cash - 1 : null
+
+  const curve = useMemo(() => {
+    const accent = cssVar('--accent', '#3b82f6')
+    const data: any[] = Array.isArray(eq) ? eq : []
+    return {
+      animation: false,
+      grid: { left: 64, right: 16, top: 16, bottom: 32 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: cssVar('--surface', '#1e293b'),
+        borderColor: cssVar('--border', '#334155'),
+        textStyle: { color: cssVar('--foreground', '#e2e8f0'), fontSize: 12 },
+      },
+      xAxis: {
+        type: 'category',
+        data: data.map((d) => String(d.dt ?? '')),
+        axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10, hideOverlap: true },
+        axisLine: { lineStyle: { color: cssVar('--border', '#334155') } },
+        axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        scale: true,
+        axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10 },
+        splitLine: { lineStyle: { color: cssVar('--border', '#334155') } },
+      },
+      dataZoom: [
+        { type: 'inside' },
+        { type: 'slider', height: 14, bottom: 6, borderColor: cssVar('--border', '#334155'), textStyle: { color: cssVar('--muted', '#94a3b8'), fontSize: 10 } },
+      ],
+      series: [{
+        name: '净值',
+        type: 'line',
+        data: data.map((d) => Number(d.net_value ?? 0)),
+        symbol: 'none',
+        lineStyle: { color: accent, width: 2 },
+        areaStyle: {
+          color: {
+            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [{ offset: 0, color: accent + '26' }, { offset: 1, color: accent + '03' }],
+          },
+        },
+      }],
+    } as any
+  }, [eq])
+
+  const tradeList: any[] = Array.isArray(tr) ? tr : []
+  const stopLossList: any[] = Array.isArray(st?.stop_loss) ? st.stop_loss : []
+  const logList: any[] = Array.isArray(logs) ? logs : []
+
+  return (
+    <div className="flex-1 overflow-auto p-4 space-y-4">
+      {/* 顶栏：返回 + 账户信息 + 控制 */}
+      <div className="flex items-center gap-3 flex-wrap rounded-card border border-border bg-surface px-4 py-2.5">
+        <button onClick={onBack}
+          className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg bg-elevated text-foreground text-xs">
+          <ArrowLeft size={14} />返回列表
+        </button>
+        <span className="text-sm font-medium text-foreground">{acct.name ?? '—'}</span>
+        <span className={`text-xs ${statusTone(acct.status)}`}>
+          {STATUS_LABEL[acct.status] ?? acct.status ?? '—'}
+        </span>
+        <span className="text-xs text-muted">
+          策略 {strategyName(acct.strategy_id)} · {FREQ_LABEL[acct.frequency] ?? '分钟级'}
+          {acct.start_date ? ` · 自 ${acct.start_date}` : ''}
+        </span>
+        <div className="ml-auto flex gap-2">
+          <button onClick={() => startMut.mutate()} disabled={startMut.isPending || acct.status === 'running'}
+            className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-accent text-white text-xs disabled:opacity-50">
+            <Play size={13} />启动
+          </button>
+          <button onClick={() => pauseMut.mutate()} disabled={pauseMut.isPending || acct.status !== 'running'}
+            className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
+            <Square size={13} />暂停
+          </button>
+          <button onClick={() => resetMut.mutate()} disabled={resetMut.isPending}
+            className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
+            <RotateCcw size={13} />重置
+          </button>
+        </div>
+      </div>
+
+      {/* 指标卡 */}
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">净值</div>
+          <div className="text-sm font-medium text-foreground num">{fmtNum(state?.net_value)}</div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">现金</div>
+          <div className="text-sm font-medium text-foreground num">{fmtNum(state?.cash)}</div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">持仓市值</div>
+          <div className="text-sm font-medium text-foreground num">{fmtNum(positionsValue)}</div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">盈亏</div>
+          <div className={`text-sm font-medium num ${typeof state?.pnl === 'number' && state.pnl < 0 ? 'text-bear' : 'text-bull'}`}>
+            {fmtNum(state?.pnl)}
+          </div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">收益率</div>
+          <div className={`text-sm font-medium num ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>
+            {fmtPct(ret)}
+          </div>
+        </div>
+      </div>
+
+      {/* 净值曲线 */}
+      <div className="rounded-card border border-border bg-surface">
+        <div className="px-4 pt-3 text-xs text-foreground font-medium">净值曲线</div>
+        {Array.isArray(eq) && eq.length > 0 ? (
+          <ReactECharts option={curve} style={{ height: 300 }} notMerge />
+        ) : (
+          <div className="h-[300px] grid place-items-center text-xs text-muted">
+            暂无净值数据（启动后开始累计）
+          </div>
+        )}
+      </div>
+
+      {/* 持仓 */}
+      <div className="rounded-card border border-border bg-surface overflow-hidden">
+        <div className="px-4 pt-3 pb-2 text-xs text-foreground font-medium">持仓 ({posEntries.length})</div>
+        {posEntries.length > 0 ? (
+          <div className="overflow-auto max-h-60">
+            <table className="w-full text-xs">
+              <thead className="text-muted sticky top-0 bg-surface">
+                <tr className="text-left">
+                  <th className="px-3 py-1.5 font-normal">标的</th>
+                  <th className="px-3 py-1.5 font-normal text-right">数量</th>
+                  <th className="px-3 py-1.5 font-normal text-right">成本</th>
+                  <th className="px-3 py-1.5 font-normal text-right">现价</th>
+                  <th className="px-3 py-1.5 font-normal text-right">市值</th>
+                  <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                </tr>
+              </thead>
+              <tbody className="text-foreground">
+                {posEntries.map(([sym, p]: any) => {
+                  const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
+                  const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
+                  return (
+                    <tr key={sym} className="border-t border-border/60">
+                      <td className="px-3 py-1.5">{sym}</td>
+                      <td className="px-3 py-1.5 text-right num">{p.amount}</td>
+                      <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
+                      <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
+                      <td className="px-3 py-1.5 text-right num">{fmtNum(value)}</td>
+                      <td className={`px-3 py-1.5 text-right num ${pnlPct == null ? '' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
+                        {fmtPct(pnlPct)}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="px-4 pb-4 text-xs text-muted">暂无持仓</div>
+        )}
+      </div>
+
+      {/* Tab：成交记录 / 止损日志 / 运行日志 */}
+      <div className="rounded-card border border-border bg-surface overflow-hidden">
+        <div className="flex gap-1 px-3 pt-3 pb-2 border-b border-border/60">
+          {([['trades', `成交记录 (${tradeList.length})`],
+             ['stoploss', `止损日志 (${stopLossList.length})`],
+             ['logs', `运行日志 (${logList.length})`]] as const).map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)}
+              className={`px-3 h-8 rounded-btn text-xs ${tab === k ? 'bg-accent text-white' : 'text-muted hover:text-foreground'}`}>
+              {label}
             </button>
           ))}
-        </aside>
-        <section className="p-4 space-y-4 overflow-auto">
-          {!sel ? <EmptyState title="选择一个账户" hint="或新建模拟盘账户" /> : (
-            <>
-              <div className="flex gap-2">
-                <button onClick={() => startMut.mutate()} disabled={startMut.isPending} className="px-3 h-9 rounded-lg bg-accent text-white text-xs disabled:opacity-50">启动</button>
-                <button onClick={() => pauseMut.mutate()} disabled={pauseMut.isPending} className="px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">暂停</button>
-                <button onClick={() => resetMut.mutate()} disabled={resetMut.isPending} className="px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">重置</button>
+        </div>
+        {tab === 'trades' && (
+          tradeList.length > 0 ? (
+            <div className="overflow-auto max-h-64">
+              <table className="w-full text-xs">
+                <thead className="text-muted sticky top-0 bg-surface">
+                  <tr className="text-left">
+                    <th className="px-3 py-1.5 font-normal">时间</th>
+                    <th className="px-3 py-1.5 font-normal">标的</th>
+                    <th className="px-3 py-1.5 font-normal">方向</th>
+                    <th className="px-3 py-1.5 font-normal text-right">价格</th>
+                    <th className="px-3 py-1.5 font-normal text-right">数量</th>
+                    <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                  </tr>
+                </thead>
+                <tbody className="text-foreground">
+                  {[...tradeList].reverse().map((t: any, i: number) => (
+                    <tr key={i} className="border-t border-border/60">
+                      <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
+                      <td className="px-3 py-1.5">{t.code ?? ''}</td>
+                      <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
+                        {t.action === 'BUY' ? '买入' : '卖出'}
+                      </td>
+                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
+                      <td className="px-3 py-1.5 text-right num">{t.amount}</td>
+                      <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                        {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <div className="px-4 py-4 text-xs text-muted">暂无成交</div>
+        )}
+        {tab === 'stoploss' && (
+          <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+            {stopLossList.length > 0 ? stopLossList.map((l: any, i: number) => (
+              <div key={i}>
+                {`${l.ts ?? ''} ${l.code ?? ''} ${l.action ?? ''} @ ${l.price ?? ''} (${typeof l.pnl_pct === 'number' ? (l.pnl_pct * 100).toFixed(2) + '%' : ''})`}
               </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                <div className="rounded-card border border-border bg-surface px-3 py-2">
-                  <div className="text-[10px] text-muted">净值</div>
-                  <div className="text-sm font-medium text-foreground">{st?.state?.net_value ?? '—'}</div>
-                </div>
-                <div className="rounded-card border border-border bg-surface px-3 py-2">
-                  <div className="text-[10px] text-muted">现金</div>
-                  <div className="text-sm font-medium text-foreground">{st?.state?.cash ?? '—'}</div>
-                </div>
-                <div className="rounded-card border border-border bg-surface px-3 py-2">
-                  <div className="text-[10px] text-muted">盈亏</div>
-                  <div className={`text-sm font-medium ${typeof st?.state?.pnl === 'number' && st.state.pnl < 0 ? 'text-bear' : 'text-bull'}`}>{st?.state?.pnl ?? '—'}</div>
-                </div>
-                <div className="rounded-card border border-border bg-surface px-3 py-2">
-                  <div className="text-[10px] text-muted">持仓数</div>
-                  <div className="text-sm font-medium text-foreground">{posEntries.length}</div>
-                </div>
+            )) : <div className="text-muted">暂无触发</div>}
+          </div>
+        )}
+        {tab === 'logs' && (
+          <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+            {logList.length > 0 ? [...logList].reverse().map((l: any, i: number) => (
+              <div key={i} className={l.level === 'error' ? 'text-bear' : l.level === 'warn' ? 'text-warning' : ''}>
+                {`[${l.level ?? 'info'}] ${l.ts ?? ''} ${l.message ?? ''}`}
               </div>
-
-              <div className="rounded-card border border-border bg-surface overflow-hidden">
-                <div className="px-4 pt-3 pb-2 text-xs text-foreground font-medium">持仓</div>
-                {posEntries.length > 0 ? (
-                  <div className="overflow-auto max-h-60">
-                    <table className="w-full text-xs">
-                      <thead className="text-muted sticky top-0 bg-surface">
-                        <tr className="text-left">
-                          <th className="px-3 py-1.5 font-normal">标的</th>
-                          <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                          <th className="px-3 py-1.5 font-normal text-right">成本</th>
-                          <th className="px-3 py-1.5 font-normal text-right">市值</th>
-                        </tr>
-                      </thead>
-                      <tbody className="text-foreground">
-                        {posEntries.map(([sym, p]: any) => (
-                          <tr key={sym} className="border-t border-border/60">
-                            <td className="px-3 py-1.5">{sym}</td>
-                            <td className="px-3 py-1.5 text-right">{p.quantity ?? p.qty ?? ''}</td>
-                            <td className="px-3 py-1.5 text-right">{p.cost ?? ''}</td>
-                            <td className="px-3 py-1.5 text-right">{p.value ?? ''}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="px-4 pb-4 text-xs text-muted">暂无持仓</div>
-                )}
-              </div>
-
-              <div className="rounded-card border border-border bg-base p-3">
-                <div className="text-xs text-foreground font-medium mb-2">止损日志 ({st?.stop_loss?.length ?? 0})</div>
-                <div className="max-h-48 overflow-auto space-y-0.5 text-[11px] text-muted font-mono">
-                  {(st?.stop_loss ?? []).length > 0 ? (st.stop_loss as any[]).map((l, i) => (
-                    <div key={i}>{typeof l === 'string' ? l : JSON.stringify(l)}</div>
-                  )) : <div className="text-muted">暂无触发</div>}
-                </div>
-              </div>
-
-              <div className="rounded-card border border-border bg-surface overflow-hidden">
-                <div className="px-4 pt-3 pb-2 text-xs text-foreground font-medium">成交记录</div>
-                {Array.isArray(tr) && tr.length > 0 ? (
-                  <div className="overflow-auto max-h-60">
-                    <table className="w-full text-xs">
-                      <thead className="text-muted sticky top-0 bg-surface">
-                        <tr className="text-left">
-                          <th className="px-3 py-1.5 font-normal">时间</th>
-                          <th className="px-3 py-1.5 font-normal">标的</th>
-                          <th className="px-3 py-1.5 font-normal">方向</th>
-                          <th className="px-3 py-1.5 font-normal text-right">价格</th>
-                          <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                        </tr>
-                      </thead>
-                      <tbody className="text-foreground">
-                        {tr.map((t: any, i: number) => (
-                          <tr key={i} className="border-t border-border/60">
-                            <td className="px-3 py-1.5 text-muted">{String(t.datetime ?? t.time ?? t.date ?? '')}</td>
-                            <td className="px-3 py-1.5">{t.symbol ?? t.code ?? ''}</td>
-                            <td className={`px-3 py-1.5 ${t.side === 'buy' || t.side === 'BUY' ? 'text-bull' : 'text-bear'}`}>{t.side ?? ''}</td>
-                            <td className="px-3 py-1.5 text-right">{t.price ?? ''}</td>
-                            <td className="px-3 py-1.5 text-right">{t.quantity ?? t.qty ?? ''}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="px-4 pb-4 text-xs text-muted">暂无成交</div>
-                )}
-              </div>
-
-              {Array.isArray(eq) && eq.length > 0 && (
-                <div className="rounded-card border border-border bg-surface">
-                  <div className="px-4 pt-3 text-xs text-foreground font-medium">净值曲线</div>
-                  <div className="h-[300px] grid place-items-center text-xs text-muted">
-                    数据点 {eq.length}（详见离线回放图形）
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </section>
+            )) : <div className="text-muted">暂无日志</div>}
+          </div>
+        )}
       </div>
-      <AccountDialog open={dialog} onClose={() => setDialog(false)} onSave={(b) => createMut.mutate(b)} />
     </div>
   )
 }
