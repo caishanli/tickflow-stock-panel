@@ -499,17 +499,22 @@ function filterErrorLogs(logs: any[]): any[] {
 function extractUniverse(code: string): string[] {
   if (!code) return []
   const out = new Set<string>()
-  const patterns = [
-    /context\.universe\s*=\s*\[([^\]]*)\]/g,
-    /set_universe\s*\(\s*\[([^\]]*)\]\s*\)/g,
-    /g\.security\s*=\s*\[([^\]]*)\]/g,
+  const explicit = [
+    /context\.universe\s*=\s*\[([\s\S]*?)\]/g,
+    /set_universe\s*\(\s*\[([\s\S]*?)\]\s*\)/g,
+    /g\.security\s*=\s*\[([\s\S]*?)\]/g,
   ]
-  for (const re of patterns) {
+  for (const re of explicit) {
     let m: RegExpExecArray | null
     while ((m = re.exec(code))) {
       m[1].split(',').map(s => s.trim().replace(/['"]/g, '')).filter(Boolean)
         .forEach(s => out.add(s))
     }
+  }
+  // 兜底：策略常用自定义股票池变量（如 g.global_etf_pool = [...]），
+  // 直接抓取代码中所有形如 123456.XSHG / 123456.XSHE 的标的代码
+  for (const m of code.matchAll(/['"](\d{6}\.(?:XSHG|XSHE))['"]/g)) {
+    out.add(m[1])
   }
   return [...out]
 }
