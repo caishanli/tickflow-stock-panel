@@ -8,6 +8,15 @@ function cssVar(name: string, fallback: string) {
   return v || fallback
 }
 
+// --accent 在 Tailwind v4 下是 "217 91% 60%" 这种 HSL 分量（无 hsl() 包裹），
+// 拼接十六进制 alpha 会得到非法颜色，导致 echarts addColorStop 抛错。
+function hslColor(base: string, alpha?: number) {
+  const b = base.trim()
+  const inner = /^(?:hsl|hsla|rgb|rgba)?\(?\s*(.*?)\s*\)?$/.exec(b)?.[1] ?? b
+  if (alpha === undefined) return `hsl(${inner})`
+  return `hsl(${inner} / ${alpha})`
+}
+
 interface Props {
   status: any
   equity: any
@@ -60,13 +69,13 @@ export function BacktestResult({ status, equity, trades, logs }: Props) {
           type: 'line',
           data: nav,
           symbol: 'none',
-          lineStyle: { color: accent, width: 2 },
+          lineStyle: { color: hslColor(accent), width: 2 },
           areaStyle: {
             color: {
               type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
               colorStops: [
-                { offset: 0, color: accent + '26' },
-                { offset: 1, color: accent + '03' },
+                { offset: 0, color: hslColor(accent, 0.15) },
+                { offset: 1, color: hslColor(accent, 0.01) },
               ],
             },
           },
