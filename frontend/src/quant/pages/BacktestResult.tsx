@@ -5,16 +5,29 @@ import ReactECharts from 'echarts-for-react'
 function cssVar(name: string, fallback: string) {
   if (typeof window === 'undefined') return fallback
   const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
-  return v || fallback
+  if (!v || v === 'undefined' || v === 'null') return fallback
+  return v
 }
 
-// --accent 在 Tailwind v4 下是 "217 91% 60%" 这种 HSL 分量（无 hsl() 包裹），
-// 拼接十六进制 alpha 会得到非法颜色，导致 echarts addColorStop 抛错。
-function hslColor(base: string, alpha?: number) {
-  const b = base.trim()
-  const inner = /^(?:hsl|hsla|rgb|rgba)?\(?\s*(.*?)\s*\)?$/.exec(b)?.[1] ?? b
-  if (alpha === undefined) return `hsl(${inner})`
-  return `hsl(${inner} / ${alpha})`
+// 把任意颜色基值转成 echarts 可用的合法 CSS 颜色（HSL 分量/hsl()/#hex 均兼容）。
+function toColor(base: string, alpha?: number): string {
+  let b = (base || '').trim()
+  if (!b || b === 'undefined' || b === 'null') b = '#3b82f6'
+  const hexAlpha = (hex: string, a: number) => {
+    const h = hex.replace('#', '')
+    const n = h.length === 3 ? h.split('').map((c) => c + c).join('') : h
+    const r = parseInt(n.slice(0, 2), 16)
+    const g = parseInt(n.slice(2, 4), 16)
+    const bl = parseInt(n.slice(4, 6), 16)
+    return `rgba(${r}, ${g}, ${bl}, ${a})`
+  }
+  if (/^#|^rgba?\(|^hsla?\(/i.test(b)) {
+    if (alpha === undefined) return b
+    if (b.startsWith('#')) return hexAlpha(b, alpha)
+    return b.replace(/\)$/, ` / ${alpha})`)
+  }
+  if (alpha === undefined) return `hsl(${b})`
+  return `hsl(${b} / ${alpha})`
 }
 
 interface Props {
@@ -33,7 +46,11 @@ function statusTone(s: string | undefined) {
 
 export function BacktestResult({ status, equity, trades, logs }: Props) {
   const curve = useMemo(() => {
-    const accent = cssVar('--accent', '#3b82f6')
+    const accent = toColor(cssVar('--accent', '#3b82f6'))
+    const muted = toColor(cssVar('--muted', '#94a3b8'))
+    const surface = toColor(cssVar('--surface', '#1e293b'))
+    const border = toColor(cssVar('--border', '#334155'))
+    const foreground = toColor(cssVar('--foreground', '#e2e8f0'))
     const data: any[] = Array.isArray(equity) ? equity : []
     const dates = data.map((d) => String(d.date ?? d.datetime ?? d.time ?? '').slice(0, 10))
     const values = data.map((d) => Number(d.value ?? d.equity ?? d.nav ?? 0))
@@ -45,37 +62,37 @@ export function BacktestResult({ status, equity, trades, logs }: Props) {
       grid: { left: 56, right: 16, top: 16, bottom: 32 },
       tooltip: {
         trigger: 'axis',
-        backgroundColor: cssVar('--surface', '#1e293b'),
-        borderColor: cssVar('--border', '#334155'),
-        textStyle: { color: cssVar('--foreground', '#e2e8f0'), fontSize: 12 },
+        backgroundColor: surface,
+        borderColor: border,
+        textStyle: { color: foreground, fontSize: 12 },
       },
       xAxis: {
         type: 'category',
         data: dates,
-        axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10, hideOverlap: true },
-        axisLine: { lineStyle: { color: cssVar('--border', '#334155') } },
+        axisLabel: { color: muted, fontSize: 10, hideOverlap: true },
+        axisLine: { lineStyle: { color: border } },
         axisTick: { show: false },
       },
       yAxis: {
         type: 'value',
         scale: true,
-        axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10 },
-        splitLine: { lineStyle: { color: cssVar('--border', '#334155') } },
+        axisLabel: { color: muted, fontSize: 10 },
+        splitLine: { lineStyle: { color: border } },
       },
-      dataZoom: [{ type: 'inside' }, { type: 'slider', height: 14, bottom: 6, borderColor: cssVar('--border', '#334155'), textStyle: { color: cssVar('--muted', '#94a3b8'), fontSize: 10 } }],
+      dataZoom: [{ type: 'inside' }, { type: 'slider', height: 14, bottom: 6, borderColor: border, textStyle: { color: muted, fontSize: 10 } }],
       series: [
         {
           name: '净值',
           type: 'line',
           data: nav,
           symbol: 'none',
-          lineStyle: { color: hslColor(accent), width: 2 },
+          lineStyle: { color: accent, width: 2 },
           areaStyle: {
             color: {
               type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
               colorStops: [
-                { offset: 0, color: hslColor(accent, 0.15) },
-                { offset: 1, color: hslColor(accent, 0.01) },
+                { offset: 0, color: toColor(accent, 0.15) },
+                { offset: 1, color: toColor(accent, 0.01) },
               ],
             },
           },
