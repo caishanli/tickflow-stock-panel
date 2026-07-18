@@ -267,14 +267,17 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const runMut = useMutation({
     mutationFn: (short: boolean) => {
       saveStrategy()
-      const end = form.end
-      const start = short && end ? shiftDays(end, -7) : form.start
-      return api.runBacktest({
+      const end = form.end.trim()
+      const start = short && end ? shiftDays(end, -7) : form.start.trim()
+      const payload: any = {
         name, strategy_id: strategyId, strategy_code: code,
         symbols: extractUniverse(code),
-        start, end, frequency: form.frequency,
+        frequency: form.frequency,
         fee: +form.fee, slippage: +form.slippage, capital: +form.capital,
-      })
+      }
+      if (start) payload.start = start
+      if (end) payload.end = end
+      return api.runBacktest(payload)
     },
     onSuccess: (d: any) => { setLiveRunId(d.run_id); setSelRunId(d.run_id); qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] }) },
   })

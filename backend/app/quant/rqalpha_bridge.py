@@ -1119,8 +1119,8 @@ def run_jq_backtest(strategy_path: str, params: dict,
         strategy_text = f.read()
 
     benchmark = params.get("benchmark", "510300.XSHG")
-    start = params.get("start", "2026-01-01")
-    end = params.get("end", "2026-07-08")
+    start = (params.get("start") or "").strip() or "2026-01-01"
+    end = (params.get("end") or "").strip() or "2026-07-08"
 
     # ---- 构造 DataManager，加载原始缓存（离线，无网络回源） ----
     # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
