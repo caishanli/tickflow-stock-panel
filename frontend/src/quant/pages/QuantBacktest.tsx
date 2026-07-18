@@ -4,7 +4,7 @@ import { Modal } from '@/components/Modal'
 import { DatePicker } from '@/components/DatePicker'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History,
+  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History, Save,
 } from 'lucide-react'
 import * as api from '../api'
 import { openBacktestStream } from '../stream'
@@ -189,6 +189,10 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         </button>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="策略名称"
           className="h-9 w-44 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+        <button onClick={saveStrategy} disabled={!name.trim() || !code}
+          className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
+          <Save className="h-3.5 w-3.5" />保存策略
+        </button>
         <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} label="开始" placeholder="选择日期" buttonClassName="h-9 justify-between w-44" />
         <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} label="结束" placeholder="选择日期" buttonClassName="h-9 justify-between w-44" />
         <input type="number" value={form.capital} onChange={e => setForm({ ...form, capital: +e.target.value })} placeholder="初始金额"
