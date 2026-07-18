@@ -1,9 +1,9 @@
-"""补齐历史 5 分钟线（baostock）到 5min.db，供早期回测区间的当日成交量计算。
+"""补齐历史 5 分钟线（baostock）到本地 5min 缓存，供早期回测区间的当日成交量计算。
 
 用法:
   python scripts/backfill_5min.py --start 20260315 --end 20260716 [--sleep 0.05]
 
-仅补齐 5min.db 中缺失的区间；已覆盖的不重拉。带线程超时（baostock 源内部已处理）。
+仅补齐本地 5min 缓存中缺失的区间；已覆盖的不重拉。带线程超时（baostock 源内部已处理）。
 """
 import os
 import sys

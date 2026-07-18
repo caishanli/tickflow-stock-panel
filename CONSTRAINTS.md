@@ -9,15 +9,15 @@
 
 ### C1.a 近 3 个月区间（mootdx 能覆盖的近期）
 
-1. **本地 `minute.db` 的 `real_<code>` 有 -> 用本地；**
-2. **本地没有 -> 用 mootdx 获取真实 1min，并存回 `minute.db`。**
+1. **本地分钟缓存（`minute/real_<code>.parquet`）有 -> 用本地；**
+2. **本地没有 -> 用 mootdx 获取真实 1min，并存回本地分钟缓存。**
 3. 此区间**必须用真实 1min**，不得用 5min 插值、不得用日线合成替代。
 
 ### C1.b 超过近 3 个月区间（mootdx 取不到的早期）
 
-1. **本地 `minute.db` 的 `real_<code>` 有 -> 用本地真实 1min；**
-2. **本地 1min 没有 -> 用本地 `5min.db` 的 5min 数据插值成 1min；**
-3. **本地 5min 也没有 -> 用 baostock 获取 5min，存回 `5min.db`，再插值成 1min。**
+1. **本地分钟缓存的 `real_<code>` 有 -> 用本地真实 1min；**
+2. **本地 1min 没有 -> 用本地 5min 缓存（`5min/baostock_5min_<code>.parquet`）的 5min 数据插值成 1min；**
+3. **本地 5min 也没有 -> 用 baostock 获取 5min，存回本地 5min 缓存，再插值成 1min。**
 
 ### 禁止的行为
 
@@ -25,18 +25,18 @@
 - ❌ 禁止用日线合成（`minute_synth`）替代"本应从 mootdx/baostock 取到的真实数据"。
   日线合成仅在三源（本地1m + mootdx + baostock5m）**全部失败**时作最后兜底。
 
-## C2 - 插值数据不落盘 minute.db
+## C2 - 插值数据不落盘分钟缓存
 
-由 5 分钟插值得到的 1 分钟数据，**只用于当次回测内存计算，绝不写入 `minute.db`**。
-- ✅ 允许落盘：mootdx 真实 1min -> `minute.db` 的 `real_<code>`；
-  baostock 真实 5min -> `5min.db` 的 `baostock_5min_<code>`。
+由 5 分钟插值得到的 1 分钟数据，**只用于当次回测内存计算，绝不写入本地分钟缓存**。
+- ✅ 允许落盘：mootdx 真实 1min -> 本地分钟缓存的 `real_<code>`；
+  baostock 真实 5min -> 本地 5min 缓存的 `baostock_5min_<code>`。
 - ❌ 禁止落盘：5min 插值出的 1min、日线合成的 1min。
 - 原因：插值数据若落盘 `real_` 键，下次被误当真实分钟，导致收益不可复现。
 
 ## C3 - daily 数据必须真实
 
 1. **daily 数据必须是真实行情，不得合成/插值。**
-2. 本地 `daily.db` 有 -> 用本地；本地没有 -> 用 mootdx/tushare 获取并落盘。
+2. 本地日线缓存（`daily/<源>_<code>.parquet`）有 -> 用本地；本地没有 -> 用 mootdx/tushare 获取并落盘。
 3. mootdx 可获取近 3 个月日线；tushare 可获取更长历史日线。两者均为真实源。
 4. 禁止"daily 绝不回源"的优化路径——本地缺失即回源。
 
@@ -48,3 +48,5 @@
 ---
 *首次确立：2026-07-16。来源：用户口述绝对约束。*
 *"1、mootdx有近3个月左右的1min数据，因此近3个月的数据必须是真实的，本地缓存了就用本地，本地没有就用mootdx去获取；2、超过近3个月的min数据，如果本地没有，就用本地5min数据去插值，如果本地没有就用baostock去获取并存本地；3、daily数据必须是真实的，mootdx可以获取到。"*
+
+*2026-07-18：行情缓存由 SQLite（daily/minute/5min.db）迁移为每键 parquet（`{freq}/{key}.parquet`，zstd），上文存储名称随之更新，约束语义不变。*

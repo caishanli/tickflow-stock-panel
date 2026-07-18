@@ -31,6 +31,7 @@ from . import db
 from .config import CONFIG, QuantConfig
 # 涨跌停幅度分档公共函数（与 jqcompat 同口径复用，避免两处各写一份分档规则）
 from .jqcompat import _is_st_name, _limit_rate
+from .jqengine.config import CONFIG as _JQ_ENGINE_CONFIG
 
 # rqalpha 6.2.1 兼容补丁：sys_analyser tear_down 仍使用 pandas 3 已移除的
 # 'mode.use_inf_as_na' 选项（pd.option_context 直接抛 OptionError，导致有成交的
@@ -954,9 +955,9 @@ def _clean_etf_name(name: str) -> str:
 
 # ETF 名录快照：同一策略回测结果可复现（避免每次启动实时拉取 tushare/mootdx
 # 导致宇宙随时间漂移）。快照内容不含缓存并集（缓存并集在加载时并入）。
+# 与行情缓存同目录（jqengine DATA_DIR，默认仓库根 data/quant_kline）。
 _ETF_UNIVERSE_SNAPSHOT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "jqengine", "data",
-    "etf_universe_snapshot.json")
+    _JQ_ENGINE_CONFIG["DATA_DIR"], "etf_universe_snapshot.json")
 _ETF_SNAPSHOT_MAX_AGE = _dt.timedelta(days=7)
 
 

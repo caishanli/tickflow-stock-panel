@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""预下载 五福闹新春-v5.2 回测所需行情到本地缓存（daily.db / 5min.db）。
+"""预下载 五福闹新春-v5.2 回测所需行情到本地缓存（daily / 5min parquet）。
 
 从 wufu-v5.2.py 抽取固定 ETF 池（全球+中国），并补齐基准/指数/防御 ETF，
 用 DataManager（tushare 日线 + baostock 5分钟插值）拉取并落盘，使回测离线可复现。
