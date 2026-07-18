@@ -14,7 +14,7 @@ function cssVar(name: string, fallback: string) {
 // - fallback 是 #hex；也可能直接是 hsl()/rgb() 字符串。
 // 非法/缺失值统一退回安全蓝。
 function toColor(base: string, alpha?: number): string {
-  let b = (base || '').trim()
+  let b = typeof base === 'string' ? base.trim() : ''
   if (!b || b === 'undefined' || b === 'null') b = '#3b82f6'
   const hexAlpha = (hex: string, a: number) => {
     const h = hex.replace('#', '')
@@ -33,7 +33,9 @@ function toColor(base: string, alpha?: number): string {
   }
   // HSL 分量 "217 91% 60%"
   if (alpha === undefined) return `hsl(${b})`
-  return `hsl(${b} / ${alpha})`
+  const out = `hsl(${b} / ${alpha})`
+  // 兜底：极端情况下（如 b 仍非法）退回安全蓝，避免 echarts addColorStop 抛错
+  return /^(hsl|hsla|rgb|rgba|#)/i.test(out) ? out : '#3b82f6'
 }
 
 export function EquityChart({ equity }: { equity: any[] }) {

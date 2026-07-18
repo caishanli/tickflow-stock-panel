@@ -11,7 +11,7 @@ function cssVar(name: string, fallback: string) {
 
 // 把任意颜色基值转成 echarts 可用的合法 CSS 颜色（HSL 分量/hsl()/#hex 均兼容）。
 function toColor(base: string, alpha?: number): string {
-  let b = (base || '').trim()
+  let b = typeof base === 'string' ? base.trim() : ''
   if (!b || b === 'undefined' || b === 'null') b = '#3b82f6'
   const hexAlpha = (hex: string, a: number) => {
     const h = hex.replace('#', '')
@@ -27,7 +27,8 @@ function toColor(base: string, alpha?: number): string {
     return b.replace(/\)$/, ` / ${alpha})`)
   }
   if (alpha === undefined) return `hsl(${b})`
-  return `hsl(${b} / ${alpha})`
+  const out = `hsl(${b} / ${alpha})`
+  return /^(hsl|hsla|rgb|rgba|#)/i.test(out) ? out : '#3b82f6'
 }
 
 interface Props {
