@@ -182,7 +182,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       const start = short && end ? shiftDays(end, -7) : form.start
       return api.runBacktest({
         name, strategy_id: strategyId, strategy_code: code,
-        symbols: [],
+        symbols: extractUniverse(code),
         start, end, frequency: form.frequency,
         fee: +form.fee, slippage: +form.slippage, capital: +form.capital,
       })
@@ -299,8 +299,10 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       <div ref={bodyRef} className="flex-1 min-h-0 flex overflow-hidden">
         <div className="p-3 flex flex-col overflow-hidden" style={{ width: `${leftPct}%` }}>
           <div className={`${SECTION_TITLE} mb-2`}><FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)</div>
-          <div className="flex-1 min-h-0 rounded-card border border-border overflow-hidden">
-            <CodeEditor value={code} onChange={setCode} height="100%" />
+          <div className="relative flex-1 min-h-0 rounded-card border border-border overflow-hidden">
+            <div className="absolute inset-0">
+              <CodeEditor value={code} onChange={setCode} height="100%" />
+            </div>
           </div>
         </div>
 
@@ -389,6 +391,26 @@ function isErrorLog(l: any): boolean {
 
 function filterErrorLogs(logs: any[]): any[] {
   return logs.filter(isErrorLog)
+}
+
+// 从策略代码里提取标的池（context.universe = [...] / set_universe([...])），
+// 用于回填后端 symbols 参数以正确预加载日线数据。无显式标的池时返回空数组。
+function extractUniverse(code: string): string[] {
+  if (!code) return []
+  const out = new Set<string>()
+  const patterns = [
+    /context\.universe\s*=\s*\[([^\]]*)\]/g,
+    /set_universe\s*\(\s*\[([^\]]*)\]\s*\)/g,
+    /g\.security\s*=\s*\[([^\]]*)\]/g,
+  ]
+  for (const re of patterns) {
+    let m: RegExpExecArray | null
+    while ((m = re.exec(code))) {
+      m[1].split(',').map(s => s.trim().replace(/['"]/g, '')).filter(Boolean)
+        .forEach(s => out.add(s))
+    }
+  }
+  return [...out]
 }
 
 function shiftDays(dateStr: string, days: number): string {
