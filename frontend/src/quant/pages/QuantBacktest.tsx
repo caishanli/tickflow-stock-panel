@@ -26,7 +26,6 @@ function statusTone(s: string | undefined) {
 }
 
 interface FormState {
-  symbols: string
   start: string
   end: string
   frequency: string
@@ -36,7 +35,7 @@ interface FormState {
 }
 
 const DEFAULT_FORM: FormState = {
-  symbols: '600000.XSHG', start: '', end: '', frequency: 'daily',
+  start: '', end: '', frequency: 'daily',
   fee: 0.0003, slippage: 0.001, capital: 100000,
 }
 
@@ -148,7 +147,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       const start = short && end ? shiftDays(end, -7) : form.start
       return api.runBacktest({
         name, strategy_id: strategyId, strategy_code: code,
-        symbols: form.symbols.split(',').map(s => s.trim()).filter(Boolean),
+        symbols: [],
         start, end, frequency: form.frequency,
         fee: +form.fee, slippage: +form.slippage, capital: +form.capital,
       })
@@ -190,10 +189,8 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         </button>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="策略名称"
           className="h-9 w-44 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
-        <input value={form.symbols} onChange={e => setForm({ ...form, symbols: e.target.value })} placeholder="标的池(逗号分隔)"
-          className="h-9 flex-1 min-w-[12rem] rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
-        <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} placeholder="开始" buttonClassName="h-9 justify-between" className="w-36" />
-        <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} placeholder="结束" buttonClassName="h-9 justify-between" className="w-36" />
+        <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} label="开始" placeholder="选择日期" buttonClassName="h-9 justify-between w-44" />
+        <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} label="结束" placeholder="选择日期" buttonClassName="h-9 justify-between w-44" />
         <input type="number" value={form.capital} onChange={e => setForm({ ...form, capital: +e.target.value })} placeholder="初始金额"
           className="h-9 w-28 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
         <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}

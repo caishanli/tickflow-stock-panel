@@ -16,6 +16,7 @@ interface DatePickerProps {
   min?: string
   max?: string
   placeholder?: string
+  label?: string
   className?: string
   buttonClassName?: string
   align?: 'left' | 'right'
@@ -45,6 +46,7 @@ export function DatePicker({
   min,
   max,
   placeholder = '选择日期',
+  label,
   className = '',
   buttonClassName = '',
   align = 'right',
@@ -152,7 +154,7 @@ export function DatePicker({
     cells.push({ day: d, cur: false, dateStr: ds, disabled: !!min && ds < min || !!max && ds > max })
   }
 
-  const displayLabel = value || placeholder
+  const prefix = label ? <span className="text-muted shrink-0">{label}</span> : null
   const today = todayStr()
 
   return (
@@ -166,8 +168,9 @@ export function DatePicker({
           bg-elevated hover:border-accent/50 text-xs text-foreground num
           focus:outline-none focus:border-accent/60 transition-colors duration-150 cursor-pointer ${buttonClassName}`}
       >
-        <Calendar className="h-3.5 w-3.5 text-accent" />
-        <span className={value ? undefined : 'text-muted'}>{displayLabel}</span>
+        <Calendar className="h-3.5 w-3.5 text-accent shrink-0" />
+        {prefix}
+        <span className={value ? undefined : 'text-muted'}>{value || (label ? '' : placeholder)}</span>
       </button>
 
       {/* 弹出日历 — Portal 到 body, 逃逸祖先 overflow 裁剪与 framer-motion transform 包含块 */}
