@@ -1,5 +1,6 @@
 """Tushare 数据源实现。"""
 
+import pandas as pd
 import tushare as ts
 
 from .base import DataSource, DataSourceError
@@ -37,6 +38,35 @@ def _daily_apis(code):
     return ["daily", "fund_daily", "index_daily"]
 
 
+def _detect_adj(df, api):
+    """推断 tushare 日线帧的实际复权口径（``df.attrs["adj"]`` 取值）。
+
+    - ``index_daily`` 无复权参数，指数价格无复权概念 → ``"raw"``；
+    - ``fund_daily``/``daily`` 请求了 ``adj="qfq"``，声明口径为前复权。
+      但 tushare 对部分新股 ETF 复权因子缺失时会静默返回未复权价（除权日
+      出现未修正跳变）。这里用 pre_close 链校验：复权生效时
+      ``close/pre_close - 1 ≈ pct_chg/100`` 对每行成立；存在显著偏离的行
+      即说明因子缺失、帧实际未复权 → 保守标 ``"raw"``，由 manager 混源
+      防护让位给其他源的前复权帧。缺 pre_close/pct_chg 列无法校验时，
+      按声明口径标 ``"qfq"``。
+    """
+    if api == "index_daily":
+        return "raw"
+    if "pre_close" not in df.columns or "pct_chg" not in df.columns:
+        return "qfq"
+    close = pd.to_numeric(df["close"], errors="coerce")
+    pre = pd.to_numeric(df["pre_close"], errors="coerce")
+    pct = pd.to_numeric(df["pct_chg"], errors="coerce")
+    valid = (pre > 0) & close.notna() & pct.notna()
+    if not valid.any():
+        return "qfq"
+    chain = (close[valid] / pre[valid] - 1.0) * 100.0
+    # pct_chg 为百分数（2 位小数）；容差 0.05 个百分点只抓除权级跳变
+    if (chain - pct[valid]).abs().max() > 0.05:
+        return "raw"
+    return "qfq"
+
+
 class TushareSource(DataSource):
     name = "tushare"
 
@@ -53,6 +83,12 @@ class TushareSource(DataSource):
         return self._pro
 
     def get_daily(self, code, start, end):
+        """按代码类型取日线（ETF/股票前复权、指数原始价）。
+
+        返回帧 ``attrs`` 标注口径元数据：``source="tushare"``，``adj`` 由
+        :func:`_detect_adj` 推断——``"qfq"``（前复权生效）或 ``"raw"``
+        （指数 / 复权因子缺失静默返回未复权价，经 pre_close 链校验识别）。
+        """
         pro = self._api()
         ts_code = _to_ts_code(code)
         s = str(start).replace("-", "")
@@ -71,7 +107,10 @@ class TushareSource(DataSource):
                     last_err = e2
                     continue
                 if df is not None and not df.empty:
-                    return df.sort_values("trade_date").reset_index(drop=True)
+                    df = df.sort_values("trade_date").reset_index(drop=True)
+                    df.attrs["source"] = "tushare"
+                    df.attrs["adj"] = _detect_adj(df, api)
+                    return df
             # 限频/空结果：退避重试
             if attempt < 3:
                 _t.sleep(0.5 * (attempt + 1))

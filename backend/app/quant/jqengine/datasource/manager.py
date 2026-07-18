@@ -2,6 +2,7 @@
 
 import logging
 import os
+from collections import OrderedDict
 
 import pandas as pd
 from dotenv import set_key
@@ -31,6 +32,121 @@ def get_data_manager(token=None, cache=None):
     return _data_manager_instance
 
 
+class _MinuteLRU(OrderedDict):
+    """有界 LRU 分钟帧缓存（code -> DataFrame）。
+
+    M11 修复：原 ``_minute_mem`` 为无界 dict，分钟帧被永久持有，外部 LRU
+    驱逐不释放内存（数百只 ETF × 全窗口 1m 帧可达 GB 级）。现命中
+    （``__getitem__``/``get``）即移到队首；写入超出容量时从队尾逐出最久
+    未用项，帧引用随之释放，并通过 ``on_evict`` 回调通知（DataManager
+    借此同步清理 ``_minute_cov`` 覆盖区间元数据）。
+
+    对外读取接口与普通 dict 一致（``get`` / ``in`` / ``len`` / 真值判断），
+    api.py 等直接读 ``mgr._minute_mem`` 的调用方无需改动。
+    """
+
+    def __init__(self, cap=800, on_evict=None):
+        super().__init__()
+        self.cap = max(1, int(cap))
+        self._on_evict = on_evict
+
+    def __getitem__(self, key):
+        val = super().__getitem__(key)
+        self.move_to_end(key)
+        return val
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.cap:
+            k, v = self.popitem(last=False)
+            if self._on_evict is not None:
+                self._on_evict(k, v)
+
+
+def _ensure_money_yuan(df, src_name):
+    """保证日线帧带 ``money`` 列（单位：元）。
+
+    各数据源 amount 单位不一：tushare pro.daily/fund_daily 的 ``amount`` 是
+    **千元**（实测 510300 amount=4,039,507 ≈ close×vol(手)×100/1000，与聚宽
+    全市场成交额口径一致），mootdx/baostock/astock 为元；mootdx 源已自带
+    money(元)（见 mootdx_src.get_daily 的 amount→money 映射）。未归一时直接
+    把 amount 当元用会让全市场成交额聚合小 1000 倍（实测本地 41.7 亿 vs 聚宽
+    4967 亿），流动性门槛/池过滤全面失真。
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    if "money" in df.columns:
+        return df
+    if "amount" not in df.columns:
+        return df
+    factor = 1000.0 if src_name == "tushare" else 1.0
+    df = df.copy()
+    df["money"] = pd.to_numeric(df["amount"], errors="coerce") * factor
+    return df
+
+
+def _ensure_volume_shares(df, src_name):
+    """保证日线帧带 ``volume`` 列（单位：股）。
+
+    与 :func:`_ensure_money_yuan` 同模式：tushare pro.daily/fund_daily 的
+    ``vol`` 单位是**手**（1 手=100 股），归一为 ``volume``(股)（保留原
+    ``vol`` 列）；mootdx 源内已 vol×100→volume(股)（见
+    mootdx_src.get_daily），baostock/astock 的 volume 单位即为股（astock
+    实测小 ETF 约 5e7 量级），已有 ``volume`` 列的帧不动。
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    if "volume" in df.columns:
+        return df
+    if "vol" not in df.columns:
+        return df
+    factor = 100.0 if src_name == "tushare" else 1.0
+    df = df.copy()
+    df["volume"] = pd.to_numeric(df["vol"], errors="coerce") * factor
+    return df
+
+
+def _infer_adj(df, src_name):
+    """推断日线帧的复权口径：优先读 ``df.attrs["adj"]``（各源 get_daily
+    已标注）；旧缓存帧（pickle/parquet）没有 attrs，按源名回退推断——
+    tushare 请求 adj="qfq" 按 "qfq"、mootdx 通达信原始价按 "raw"、
+    baostock 日线 adjustflag="1" 按 "qfq"、其余（如 astock）按 "unknown"。
+    """
+    adj = getattr(df, "attrs", None)
+    adj = adj.get("adj") if adj else None
+    if adj:
+        return adj
+    return {"tushare": "qfq", "mootdx": "raw",
+            "baostock": "qfq"}.get(src_name, "unknown")
+
+
+def _pick_daily_frame(candidates):
+    """同一代码多源缓存并存时的选帧：按优先级取第一个非 raw 帧，全 raw 才用 raw。
+
+    背景：mootdx 为通达信原始不复权价（raw），tushare/baostock 为前复权
+    （qfq）；若只按源优先级选帧，同一回测内价格帧可能来自 qfq 源而 money
+    帧来自 raw 源，复权口径混乱。``candidates`` 为 ``(pri, src_name, key,
+    df)`` 元组、已按优先级升序；"非 raw" 含 qfq/unknown（unknown 可能是
+    前复权，raw 一定不是）。返回选中的元组；无候选返回 None。
+    """
+    first_raw = None
+    for cand in candidates:
+        if _infer_adj(cand[3], cand[1]) == "raw":
+            if first_raw is None:
+                first_raw = cand
+            continue
+        return cand
+    return first_raw
+
+
 class DataManager:
     """按 ``DATASOURCE_PRIORITY`` 顺序尝试各数据源，单源失败自动降级到下一级。
 
@@ -38,7 +154,7 @@ class DataManager:
     重复读取不重复请求接口。
     """
 
-    def __init__(self, token=None, cache=None):
+    def __init__(self, token=None, cache=None, minute_mem_cap=None):
         self.cache = cache or DataCache()
         tok = token if token is not None else CONFIG["TUSHARE_TOKEN"]
         self.sources = {
@@ -51,13 +167,26 @@ class DataManager:
         )
         # baostock 仅作分钟中间层（5分钟插值），不进入日线优先级链
         self.sources["baostock"] = BaostockSource()
-        self._minute_mem = {}
+        self._minute_cov = {}  # code -> (lo_ts, hi_ts) 缓存帧已覆盖区间
+        # M11 修复：分钟帧内存缓存改为有界 LRU（原无界 dict 永久持有帧，
+        # 数百只 ETF × 全窗口 1m 帧可达 GB 级）。容量取 minute_mem_cap 参数
+        # 或 MINUTE_MEM_CAP 环境变量，默认 800（与 scripts/run_jq_rqalpha.py
+        # --minute_cache_cap 默认值一致）；驱逐时连带清掉覆盖区间元数据。
+        if minute_mem_cap is None:
+            try:
+                minute_mem_cap = int(os.getenv("MINUTE_MEM_CAP", "") or 800)
+            except (TypeError, ValueError):
+                minute_mem_cap = 800
+        self._minute_mem = _MinuteLRU(
+            cap=minute_mem_cap,
+            on_evict=lambda k, _v: self._minute_cov.pop(k, None))
         self._daily_mem = {}
-        self._money_memo = {}  # (codes_tuple, count) -> 全量成交额明细 DataFrame
+        # _daily_mem 数据版本号：每次写入/删除递增，money memo 键含版本据此失效
+        self._daily_ver = 0
+        self._money_memo = {}  # (codes_tuple, daily_ver) -> 全量成交额明细 DataFrame
         # 分钟线滑窗：回测中不持有整个回测区间的分钟数据，只保留最近 N 天，
         # 既省内存又避免每次按需加载都展开整段历史（见 get_minute / _ensure_minute_windowed）
         self.minute_lookback = pd.Timedelta(days=15)
-        self._minute_cov = {}  # code -> (lo_ts, hi_ts) 已覆盖区间
         self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
         self._offline = False       # 回测离线模式：本地优先，缺失不联网回源
         # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
@@ -69,13 +198,18 @@ class DataManager:
     def set_minute_window(self, start, end):
         """设定分钟线展开区间（回测前调用），避免生成超长历史。
 
-        注意：只重置分钟线缓存(_minute_mem)，不清空日线缓存(_daily_mem)。
-        日线数据与分钟窗口无关；若在此清空 _daily_mem，会使 preload_daily()
-        预加载的 1628 只ETF日线失效，导致回测首日 get_price 批量日线查询
-        返回空、策略退化为防御模式(511880)，与聚宽参考产生系统性偏离。
+        注意：只重置分钟线缓存(_minute_mem)及其覆盖区间元数据(_minute_cov)，
+        不清空日线缓存(_daily_mem)。日线数据与分钟窗口无关；若在此清空
+        _daily_mem，会使 preload_daily() 预加载的 1628 只ETF日线失效，
+        导致回测首日 get_price 批量日线查询返回空、策略退化为防御模式
+        (511880)，与聚宽参考产生系统性偏离。
+        H6c 修复：旧实现的 _minute_cov 不随缓存重置而清空，新窗口下会拿
+        旧窗口的覆盖区间误判命中；现随帧一并清空。
         """
         self.minute_source.window = (pd.Timestamp(start), pd.Timestamp(end))
-        self._minute_mem = {}
+        # clear() 而非重新赋值：保持 _minute_mem 对象身份（LRU 实例）不变
+        self._minute_mem.clear()
+        self._minute_cov.clear()
 
     @staticmethod
     def _to_jq_code(code):
@@ -107,7 +241,8 @@ class DataManager:
                 if df is not None and not df.empty:
                     self._minute_mem[code] = df
                     if win:
-                        self._minute_cov[code] = (win[0], win[1])
+                        # 记录实际覆盖区间（上界归一到当日 15:00），供命中校验
+                        self._minute_cov[code] = (win[0], self._hi_eff(win[1]))
                     count += 1
             except Exception:
                 continue
@@ -116,37 +251,51 @@ class DataManager:
     def preload_daily(self):
         """一次性加载全部日线缓存到内存，避免回测中逐文件读取。
 
-        一条查询把整库日线缓存读入内存，按数据源优先级为每只标的选最优缓存，
-        存入 _daily_mem。
+        一条查询把整库日线缓存读入内存，同一代码多源缓存并存时按数据源
+        优先级 + 复权口径选帧（:func:`_pick_daily_frame`：优先非 raw 的
+        前复权帧，全 raw 才用 raw，保证回测内复权口径尽量统一），存入
+        _daily_mem。
         """
         all_daily = self.cache.get_all("daily")
         if not all_daily:
             print("[preload] 日线缓存为空")
             return
         priority = self._priority()
-        # 按优先级为每只 ETF 选最优缓存
-        best = {}  # jq_code -> (pri_idx, key)
+        # 收集每只标的的全部源候选帧（按优先级升序），交由 _pick_daily_frame
+        # 做"qfq 优先于 raw"的混源防护选帧（空帧不参与候选）
+        cands = {}  # jq_code -> [(pri_idx, src_name, key, df)]
         for key, df in all_daily.items():
             if "_" not in key:
                 continue
             src_name, raw_code = key.split("_", 1)
+            if df is None or (hasattr(df, "empty") and df.empty):
+                continue
             jq_code = self._to_jq_code(raw_code)
             pri = priority.index(src_name) if src_name in priority else len(priority)
-            if jq_code not in best or pri < best[jq_code][0]:
-                best[jq_code] = (pri, key)
+            cands.setdefault(jq_code, []).append((pri, src_name, key, df))
         count = 0
-        for jq_code, (_, key) in best.items():
-            df = all_daily[key]
-            if df is not None and not df.empty:
-                # 预计算 trade_dt 列（date 对象），避免 get_daily_money_cached
-                # 每天对每只重复 pd.to_datetime（全市场 1600+ 只 × 130 天极慢）。
-                if "trade_dt" not in df.columns and "trade_date" in df.columns:
-                    df = df.copy()
-                    df["trade_dt"] = pd.to_datetime(
-                        df["trade_date"].astype(str)).dt.date
-                self._daily_mem[f"get_daily_{jq_code}"] = df
-                count += 1
-        print(f"[preload] 日线: {count} 只ETF, {len(best)} 缓存键")
+        for jq_code, lst in cands.items():
+            lst.sort(key=lambda c: c[0])
+            picked = _pick_daily_frame(lst)
+            if picked is None:
+                continue
+            src_name, key, df = picked[1], picked[2], picked[3]
+            # 预计算 trade_dt 列（date 对象），避免 get_daily_money_cached
+            # 每天对每只重复 pd.to_datetime（全市场 1600+ 只 × 130 天极慢）。
+            if "trade_dt" not in df.columns and "trade_date" in df.columns:
+                df = df.copy()
+                df["trade_dt"] = pd.to_datetime(
+                    df["trade_date"].astype(str)).dt.date
+            # 成交额单位归一（tushare amount 为千元 → 元），下游
+            # get_daily_money_cached / total_turnover 统一用 money(元)
+            df = _ensure_money_yuan(df, src_name)
+            # 成交量单位归一（tushare vol 为手 ×100 → 股），与 money 同模式
+            df = _ensure_volume_shares(df, src_name)
+            self._daily_mem[f"get_daily_{jq_code}"] = df
+            count += 1
+        # 日线内存已整体刷新：递增数据版本号，使 money memo 按新版本键重建
+        self._daily_ver += 1
+        print(f"[preload] 日线: {count} 只ETF, {len(cands)} 缓存键")
 
     def _priority(self):
         return [s for s in CONFIG["DATASOURCE_PRIORITY"] if s in self.sources]
@@ -173,6 +322,7 @@ class DataManager:
                 if DataCache._covers(mem, req_start, req_end):
                     return mem
             del self._daily_mem[cache_key]
+            self._daily_ver += 1  # 日线内存有删除，money memo 旧版本键失效
         if self._offline:
             # 回测离线：本地缺失即视为无数据，不联网回源（避免 mootdx 选服务器
             # 联网超时卡死；缺数据的标的由策略侧容忍/跳过）。
@@ -190,11 +340,17 @@ class DataManager:
                     )
                     if df is None or (hasattr(df, "empty") and df.empty):
                         raise DataSourceError(f"{name} 空数据")
+                    # 与 preload 同口径：成交额单位归一为 money(元)、
+                    # 成交量单位归一为 volume(股)
+                    df = _ensure_money_yuan(df, name)
+                    df = _ensure_volume_shares(df, name)
                     self._daily_mem[cache_key] = df
+                    self._daily_ver += 1  # 日线内存有写入，money memo 旧版本键失效
                     self._src_fail[name] = 0  # 该源成功取数，重置连续失败计数
                     return df
                 result = getattr(src, method)(*args, **kwargs)
                 self._daily_mem[cache_key] = result
+                self._daily_ver += 1
                 self._src_fail[name] = 0
                 return result
             except Exception as e:
@@ -260,67 +416,128 @@ class DataManager:
 
         与 :meth:`get_minute` 的滑窗不同，feed 需覆盖全部回测区间以驱动回放，
         因此按完整窗口加载（仅 1~2 只标的）。窗口上界用回测 end（而非 today），
-        避免 full=True 用 today 超出 5min.db 覆盖而被迫回源 baostock 网络。
+        避免超出 5min.db 覆盖而被迫回源 baostock 网络。
+
+        H6a 修复：feed 改走 :meth:`_load_minute_merged` 三源合并（real_ 真实
+        1 分钟基底 + baostock 5 分钟插值补缺口），兑现 rqalpha_bridge "回测
+        使用真实 1 分钟数据" 的承诺；原实现只走 _load_baostock_minute，整段
+        区间都是 5 分钟插值，``_use_real_minute`` 开关在 feed 路径完全失效。
+        H6c 修复：命中缓存前校验覆盖区间包含 [start, end]，覆盖不足重新合并，
+        不再"先到先得"。
         """
-        df = self._minute_mem.get(code)
+        lo_ts = pd.Timestamp(start)
+        hi_ts = pd.Timestamp(end)
+        hi_eff = self._hi_eff(hi_ts)
+        df = self._minute_cached(code, lo_ts, hi_eff)
         if df is None:
             # 加载整段回测区间 [start, end] 的分钟线（feed 仅 1~2 只标的）。
-            # 窗口上界用 end（≤5min.db 覆盖），避免 full=True 用 today 超界回源。
-            lo_ts = pd.Timestamp(start)
-            hi_ts = pd.Timestamp(end)
-            bs = self._load_baostock_minute(code, lo_ts, hi_ts, None)
-            df = bs
-            self._minute_mem[code] = df
-            self._minute_cov[code] = (lo_ts, hi_ts)
+            df = self._load_minute_merged(code, lo_hi=(lo_ts, hi_ts))
+            if df is not None and not df.empty:
+                self._minute_mem[code] = df
+                self._minute_cov[code] = (lo_ts, hi_eff)
         if df is None or (hasattr(df, "empty") and df.empty):
             # feed 缺失标的返回空 DataFrame，rqalpha 跳过该标的而非中止回测。
             return pd.DataFrame()
         return self._slice_minute(df, end, start)
 
-    def _ensure_minute_windowed(self, code, as_of):
-        """确保 ``_minute_mem[code]`` 已加载（首次按需加载后永久缓存）。
+    @staticmethod
+    def _hi_eff(hi_ts):
+        """窗口上界归一化：纯日期（午夜）上界扩到当日 15:00 以包含当天分钟
+        bar（与 :meth:`_slice_minute` 口径一致）；带时分秒的精确上界不变。"""
+        hi_ts = pd.Timestamp(hi_ts)
+        if hi_ts == hi_ts.normalize():
+            return hi_ts + pd.Timedelta(hours=15)
+        return hi_ts
 
-        回测中某标的第一次被取分钟数据时才合成/加载，之后永久复用，避免在
-        热路径里反复重建。``minute_lookback`` 仅用于 ``full=False`` 的滑窗加载
-        （长周期回测可借此只展开最近一段），短周期回测下全量加载与滑窗等价，
-        故此处默认全量加载一次即可，代价与回测区间长度成正比而非与时间推进次数
-        成正比。
+    def _minute_window(self, as_of=None, full=False, lo_hi=None):
+        """计算分钟加载窗口 [lo_ts, hi_ts]。
+
+        ``lo_hi`` 显式指定时优先（feed 整段区间）；``full`` 展开整个回测
+        窗口；否则取截至 ``as_of`` 最近 ``minute_lookback`` 天（滑窗，默认）。
+        """
+        if lo_hi is not None:
+            return pd.Timestamp(lo_hi[0]), pd.Timestamp(lo_hi[1])
+        if self.minute_source.window:
+            win_start0 = self.minute_source.window[0]
+            win_end0 = self.minute_source.window[1]
+        else:
+            win_start0 = pd.Timestamp.today() - pd.Timedelta(days=400)
+            win_end0 = pd.Timestamp.today()
+        if full:
+            return win_start0, win_end0
+        hi_ts = pd.Timestamp(as_of) if as_of is not None else win_end0
+        lo_ts = hi_ts - self.minute_lookback
+        if lo_ts < win_start0:
+            lo_ts = win_start0
+        return lo_ts, hi_ts
+
+    def _minute_cached(self, code, lo_ts, hi_eff):
+        """覆盖校验命中：缓存帧的已覆盖区间完整包含 [lo_ts, hi_eff] 才返回，
+        否则返回 None（调用方须重新加载/合并）。
+
+        H6c 修复：原读侧命中即返回、不校验覆盖区间，同一标的的数据口径
+        取决于访问顺序（先到先得）；加校验后同参数回测结果与访问顺序无关、
+        可复现。
         """
         df = self._minute_mem.get(code)
-        if df is not None and not (hasattr(df, "empty") and df.empty):
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return None
+        cov = self._minute_cov.get(code)
+        if cov is None or cov[0] > lo_ts or cov[1] < hi_eff:
+            return None
+        return df
+
+    def _ensure_minute_windowed(self, code, as_of):
+        """确保 ``_minute_mem[code]`` 的缓存帧覆盖 as_of 对应滑窗，命中即返回。
+
+        滑窗为 [as_of - minute_lookback, as_of]（下界不早于回测窗口起点）。
+        H6c 修复：原实现"首次按需加载后永久复用"、命中不校验覆盖区间，同一
+        标的的数据口径取决于访问顺序；现按 _minute_cov 校验覆盖：覆盖才命中，
+        否则重新按滑窗合并加载（窗口随 as_of 前移而滑动）。
+        as_of 归一到日（上界扩到当日 15:00），同一交易日内的重复调用直接
+        命中，不会逐 bar 重载；日内分钟级切片由调用方按精确 dt 自行截取。
+        """
+        if as_of is not None:
+            as_of_ts = pd.Timestamp(as_of).normalize()
+        else:
+            win = self.minute_source.window
+            as_of_ts = win[1] if win else pd.Timestamp.now().normalize()
+        lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=False)
+        hi_eff = self._hi_eff(hi_ts)
+        df = self._minute_cached(code, lo_ts, hi_eff)
+        if df is not None:
             return df
-        as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
         df = self._load_minute_merged(code, as_of=as_of_ts, full=False)
         if df is not None and not df.empty:
             self._minute_mem[code] = df
-            win = self.minute_source.window
-            if win:
-                self._minute_cov[code] = (win[0], win[1])
+            self._minute_cov[code] = (lo_ts, hi_eff)
         return df
 
     def preload_minute_for_pool(self, codes, as_of=None):
-        """批量预热分钟线缓存：一次性加载 codes 中所有标的的全区间分钟数据到 _minute_mem。
+        """批量预热分钟线缓存：把 codes 中所有标的的分钟数据加载到 _minute_mem。
 
         在策略构建好合并池后调用（如 `midday_routine` 后），使后续
         `get_price(..., frequency='1m')` 直接命中内存缓存，避免热路径联网/磁盘 IO。
+        （重复定义合并：原 :301 与 :576 两份实现，后者覆盖前者；保留行为更完整
+        的一份——``as_of`` 可缺省、逐标的失败仅告警。）
+        H6c 修复：原实现对 ``code in _minute_mem`` 的标的直接跳过，滑窗前移后
+        旧帧覆盖不足仍被复用；现交给 _ensure_minute_windowed 做覆盖校验，
+        覆盖不足的标的会重新加载，保证池内帧始终覆盖 as_of。
         """
         as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
         logger.info("[DataManager] 开始预热分钟线缓存，标的数=%d", len(codes))
+        loaded = 0
         for code in codes:
-            if code in self._minute_mem:
-                continue
             try:
                 # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
                 # 超出 5min.db 覆盖范围而被迫回源 baostock 网络。
                 df = self._ensure_minute_windowed(code, as_of_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
-                    self._minute_mem[code] = df
-                    win = self.minute_source.window
-                    if win:
-                        self._minute_cov[code] = (win[0], win[1])
+                    loaded += 1
             except Exception as e:
                 logger.warning("预热分钟线失败 %s: %s", code, e)
-        logger.info("[DataManager] 分钟线预热完成，已缓存 %d 只", len(self._minute_mem))
+        logger.info("[DataManager] 分钟线预热完成: 成功 %d/%d，已缓存 %d 只",
+                    loaded, len(codes), len(self._minute_mem))
 
     def get_minute_price_at(self, code, dt):
         """取某标的截至 ``dt`` 的最后一分钟收盘价（供实时价/下单价，O(1) 切片）。
@@ -332,7 +549,9 @@ class DataManager:
         dt_ts = pd.Timestamp(dt)
         df = self._minute_mem.get(code)
         cov = self._minute_cov.get(code)
-        if df is None or (hasattr(df, "empty") and df.empty) or cov is None or dt_ts > cov[1]:
+        # H6c：dt 越出缓存帧覆盖区间（无论早晚）都重新按滑窗加载
+        if (df is None or (hasattr(df, "empty") and df.empty) or cov is None
+                or dt_ts > cov[1] or dt_ts < cov[0]):
             df = self._ensure_minute_windowed(code, dt_ts)
         if df is None or (hasattr(df, "empty") and df.empty):
             return None
@@ -345,7 +564,7 @@ class DataManager:
             return None
 
     def _load_minute_merged(self, code, all_min=None, all_5min=None,
-                            as_of=None, full=False):
+                            as_of=None, full=False, lo_hi=None):
         """三源合并（缺口感知）：本地基底 + mootdx 补后续缺口 + baostock 补前序缺口。
 
         - 本地 ``minute.db`` 里的真实 1 分钟：查到多少用多少（基底）；
@@ -355,28 +574,26 @@ class DataManager:
         - 三源皆无 → 日线合成兜底（仅兜底，确定性）。
 
         ``all_min`` / ``all_5min`` 可选，传入 ``cache.get_all`` 的结果以跳过逐键查询。
-        ``as_of``/``full``：``full`` 展开整段回测区间（feed 用）；否则只展开截至
+        ``lo_hi`` 显式指定加载窗口 [lo, hi]（feed 整段区间用），优先级最高；
+        否则 ``full`` 展开整段回测区间（feed 用），``full=False`` 只展开截至
         ``as_of`` 最近 ``minute_lookback`` 天（滑窗，默认）。
+
+        H6b 修复：各层及合并结果统一裁剪到请求窗口 [lo, hi] 闭区间——原实现
+        real_ 本地帧与 baostock 插值帧都可延伸到窗口上界之外（回测末端之后），
+        造成未来数据泄漏。
         """
-        if self.minute_source.window:
-            win_start0 = self.minute_source.window[0]
-            win_end0 = self.minute_source.window[1]
-        else:
-            win_start0 = pd.Timestamp.today() - pd.Timedelta(days=400)
-            win_end0 = pd.Timestamp.today()
-        if full:
-            lo_ts, hi_ts = win_start0, win_end0
-        else:
-            hi_ts = pd.Timestamp(as_of) if as_of is not None else win_end0
-            lo_ts = hi_ts - self.minute_lookback
-            if lo_ts < win_start0:
-                lo_ts = win_start0
+        lo_ts, hi_ts = self._minute_window(as_of=as_of, full=full, lo_hi=lo_hi)
+        hi_eff = self._hi_eff(hi_ts)
         use_real = getattr(self, "_use_real_minute", True)
 
         layers = []
         real_start = None
         if use_real:
             real = self._load_real_minute(code, lo_ts, hi_ts, all_min)
+            if real is not None and not real.empty:
+                # H6b：real_ 本地帧可延伸到窗口之外（缓存随"今天"推移增长），
+                # 先裁到 [lo, hi] 再并入，避免越界/未来数据进入合并结果。
+                real = real.loc[(real.index >= lo_ts) & (real.index <= hi_eff)]
             if real is not None and not real.empty:
                 layers.append(real)
                 real_start = real.index.min()
@@ -399,7 +616,8 @@ class DataManager:
             try:
                 synth = self.minute_source.get_minute(code, hi_ts, lo_ts)
                 if synth is not None and not synth.empty:
-                    return synth
+                    # H6b：合成兜底同样不得越出请求窗口
+                    return synth.loc[(synth.index >= lo_ts) & (synth.index <= hi_eff)]
             except Exception as e:
                 import logging
                 logging.warning("[DataManager] 日线合成兜底失败 %s: %s", code, e)
@@ -420,7 +638,9 @@ class DataManager:
             for col in numeric_cols:
                 if col in layer.columns:
                     merged.loc[layer.index, col] = layer[col]
-        return merged.sort_index()
+        merged = merged.sort_index()
+        # H6b：合并结果裁剪到请求窗口 [lo, hi] 闭区间（防越界/未来泄漏）。
+        return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
 
     def _load_baostock_minute(self, code, lo_ts, hi_ts, all_5min):
         """baostock 5 分钟线的本地优先获取 + 运行时插值。
@@ -432,22 +652,36 @@ class DataManager:
         注意: 缓存按 code 单键存储，若只缓存过局部区间(如某次只取了 4 月)，
         后续请求早期区间时必须重新回源并合并，否则会拿错区间的数据，导致
         早期 1 分钟缺口无法被 baostock 补齐。
+
+        H6b 修复：所有返回路径在插值前统一把 5 分钟帧裁到请求窗口 [lo, hi]
+        闭区间。原离线兜底只卡下界（``cached.index >= lo_ts``），导致：
+        1) merged 路径中 baostock 层延伸进 real_ 真实段，把重叠区间覆盖成
+        插值（实测预热帧中 real 段只剩最后 6 个交易日）；
+        2) 帧可延伸到请求上界之外（回测末端之后），泄漏未来数据。
         """
         key5 = f"baostock_5min_{code}"
         if all_5min is not None:
             cached = all_5min.get(key5)
         else:
             cached = self.cache.peek("5min", key5)
+        lo_ts = pd.Timestamp(lo_ts)
+        hi_ts = pd.Timestamp(hi_ts)
+        hi_clip = self._hi_eff(hi_ts)
+
+        def _clip(df5):
+            # H6b：裁到请求窗口 [lo, hi] 闭区间（hi 为纯日期时含当日 15:00）
+            return df5.loc[(df5.index >= lo_ts) & (df5.index <= hi_clip)]
+
         covers = (cached is not None and not cached.empty
                   and cached.index.max() >= hi_ts
                   and cached.index.min() <= lo_ts)
         if covers:
             # 5min.db 连续覆盖整个请求区间 → 直接插值返回（不落盘，C2）。
-            return interpolate_5min_to_1min(cached)
+            return interpolate_5min_to_1min(_clip(cached))
         if self._offline:
             # 离线：5min 未完整覆盖且不联网，退化为已缓存段的插值（缺失段留空）
             if cached is not None and not cached.empty:
-                return interpolate_5min_to_1min(cached.loc[cached.index >= lo_ts])
+                return interpolate_5min_to_1min(_clip(cached))
             return None
         # C1 绝对约束：本地 5min 未覆盖请求区间时，回源 baostock 补齐缺失段
         # （之前为躲"每只卡 2.7s"而跳过回源，导致早期/缺口数据缺失，违反约束）。
@@ -470,16 +704,13 @@ class DataManager:
                 except Exception as e:
                     import logging
                     logging.warning("[DataManager] baostock 5min 落盘失败 %s: %s", code, e)
-                return interpolate_5min_to_1min(merged)
+                return interpolate_5min_to_1min(_clip(merged))
         except Exception as e:
             import logging
             logging.warning("[DataManager] baostock 回源 5min 失败 %s: %s", code, e)
         # 回源失败且本地有截断段 → 退化为截断插值（仍尽量给数据，而非返回 None）
         if cached is not None and not cached.empty:
-            df5 = cached
-            if cached.index.min() > lo_ts:
-                df5 = cached.loc[cached.index >= lo_ts]
-            return interpolate_5min_to_1min(df5)
+            return interpolate_5min_to_1min(_clip(cached))
         return None
 
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
@@ -573,59 +804,64 @@ class DataManager:
         lo = max(0, df.index.searchsorted(end - pd.Timedelta(days=5), side="left"))
         return df.iloc[lo:hi + 1]
 
-    def preload_minute_for_pool(self, codes, as_of):
-        """批量预加载分钟线到内存缓存（供策略午盘动量计算使用）。
-
-        直接调用 ``_ensure_minute_windowed`` 对每个代码全量加载，填充
-        ``_minute_mem`` 字典。后续 ``get_price(frequency='1m')`` 即可命中缓存。
-        """
-        as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
-        loaded = 0
-        for code in codes:
-            try:
-                # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
-                # 超出 5min.db 覆盖范围而被迫回源 baostock 网络。
-                df = self._ensure_minute_windowed(code, as_of_ts)
-                if df is not None and not df.empty:
-                    loaded += 1
-            except Exception as e:
-                logger.warning("预加载分钟线失败 %s: %s", code, e)
-        logger.info("分钟线池预加载完成: 成功 %d/%d", loaded, len(codes))
-
     def get_daily_money_cached(self, codes, end_date, count=3):
         """从缓存直接取日线成交额，避免走 get_price 链路。
 
-        返回 DataFrame(columns=['code','time','money'])，仅包含有数据的行。
+        返回 DataFrame(columns=['code','time','money'])：每只标的为
+        ``end_date``（含）之前最近 ``count`` 个交易日的成交额明细，
+        仅包含有数据的行。
 
-        性能：历史日线不变，对固定 ``codes``+``count`` 的全量明细只算一次后
-        memo 化；后续每日调用仅按 ``end_date`` 切片（O(行数)），避免回测中
-        每天对全市场 1600+ 只重复 to_datetime/过滤（原 ~1.1s/天 → 累计数分钟）。
+        H7 修复：原实现先在 _build_money_full 里对每只的整段日线缓存
+        ``tail(count)``、memo 化该截断帧，再按 ``time<=end_date`` 过滤——
+        缓存随"今天"延伸后，回测期内任何过去的 end_date 都被 tail 截空
+        （实测 4 个回测期 end_date 全返回 0 行），策略流动性过滤静默失效。
+        现改为 memo 缓存**未截断**的全量明细（键含日线数据版本号），每次
+        调用先按 end_date 过滤、再 per-code 取最近 count 行。
+
+        性能：全量明细对固定 ``codes``+数据版本只算一次；后续每日调用仅
+        过滤 + per-code tail（O(行数)），避免回测中每天对全市场 1600+ 只
+        重复 to_datetime/过滤（原 ~1.1s/天 → 累计数分钟）。
         """
-        memo_key = (tuple(sorted(codes)), count)
+        memo_key = (tuple(sorted(codes)), self._daily_ver)
         full = self._money_memo.get(memo_key)
         if full is None:
-            full = self._build_money_full(codes, count)
+            full = self._build_money_full(codes)
+            # 旧版本/旧 codes 的 memo 已无引用价值，清掉避免随版本号累积
+            self._money_memo.clear()
             self._money_memo[memo_key] = full
         if full is None or full.empty:
             return pd.DataFrame(columns=["code", "time", "money"])
         end_dt = pd.Timestamp(end_date).date()
-        return full[full["time"].dt.date <= end_dt]
+        sub = full[full["time"].dt.date <= end_dt]
+        if sub.empty:
+            return pd.DataFrame(columns=["code", "time", "money"])
+        # full 已按 (code, time) 升序，groupby tail 即每只 end_date 前最近 count 行
+        return sub.groupby("code", sort=False).tail(count)
 
-    def _build_money_full(self, codes, count=3):
-        """构建全量成交额明细（不按 end_date 过滤），结果 memo 化复用。
+    def _build_money_full(self, codes):
+        """构建全量成交额明细（不截断、不按 end_date 过滤），结果 memo 化复用。
 
-        列：``code`` / ``time``(Timestamp) / ``money``。仅含成交额>0 的行。
+        列：``code`` / ``time``(Timestamp) / ``money``，按 (code, time) 升序，
+        仅含成交额>0 的行。H7 修复：此处不再 ``tail(count)`` 截断——截断推迟
+        到 get_daily_money_cached 按 end_date 过滤之后 per-code 进行。
         """
-        out_rows = []
+        frames = []
         for code in codes:
             try:
                 # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘。
                 ddf = self._daily_mem.get("get_daily_" + code)
                 if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
-                    for src in ("mootdx", "astock", "tushare"):
+                    # peek 兜底顺序与 preload/fetch 一致复用 _priority()：
+                    # 原硬编码 ("mootdx","astock","tushare") 与 preload 的
+                    # (tushare,mootdx,astock) 矛盾——同一代码价格帧来自
+                    # tushare(前复权) 而 money 帧可能来自 mootdx(不复权)
+                    for src in self._priority():
                         cached = self.cache.peek("daily", f"{src}_{code}")
                         if cached is not None and not (hasattr(cached, "empty") and cached.empty):
-                            ddf = cached
+                            # 与 preload 同口径：tushare amount(千元)/vol(手)
+                            # 归一为 money(元)/volume(股)
+                            ddf = _ensure_money_yuan(cached, src)
+                            ddf = _ensure_volume_shares(ddf, src)
                             break
                 if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
                     # 本地全源缺失 -> 回源获取（C3：daily 必须真实，不得跳过）
@@ -640,35 +876,31 @@ class DataManager:
                     ddf = ddf.copy()
                     ddf["trade_dt"] = pd.to_datetime(
                         ddf["trade_date"].astype(str)).dt.date
-                trade_dt = ddf["trade_dt"]
-                sub = ddf.tail(count)
-                if sub.empty:
-                    continue
-                money_col = sub["money"] if "money" in sub.columns else sub.get("amount")
-                amt_col = sub["amount"] if "amount" in sub.columns else None
-                if money_col is None and amt_col is not None:
+                money_col = ddf["money"] if "money" in ddf.columns else None
+                amt_col = ddf["amount"] if "amount" in ddf.columns else None
+                if money_col is None:
                     money_col = amt_col
-                elif money_col is not None and amt_col is not None:
+                elif amt_col is not None:
                     money_col = money_col.fillna(amt_col)
                 if money_col is None:
                     continue
-                mvals = money_col.astype(float).to_numpy()
-                valid_mask = mvals > 0
-                if not valid_mask.any():
+                # 统一转 numpy 再组帧，避免 ddf 非 RangeIndex 时索引对齐错位
+                sub = pd.DataFrame({
+                    "time": pd.to_datetime(ddf["trade_dt"]).to_numpy(),
+                    "money": money_col.astype(float).to_numpy(),
+                })
+                sub = sub[sub["money"] > 0]
+                if sub.empty:
                     continue
-                sub_idx = sub.index.to_numpy()[valid_mask]
-                sub_m = mvals[valid_mask]
-                for ridx, mv in zip(sub_idx, sub_m):
-                    out_rows.append({
-                        "code": code,
-                        "time": pd.Timestamp(trade_dt.loc[ridx]),
-                        "money": float(mv)
-                    })
+                sub = sub.copy()
+                sub["code"] = code
+                frames.append(sub[["code", "time", "money"]])
             except Exception:
                 continue
-        if not out_rows:
+        if not frames:
             return pd.DataFrame(columns=["code", "time", "money"])
-        return pd.DataFrame(out_rows)
+        full = pd.concat(frames, ignore_index=True)
+        return full.sort_values(["code", "time"], kind="stable").reset_index(drop=True)
 
     def set_priority(self, order):
         CONFIG["DATASOURCE_PRIORITY"] = [o for o in order if o in SOURCES]

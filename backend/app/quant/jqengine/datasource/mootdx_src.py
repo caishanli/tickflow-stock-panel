@@ -4,6 +4,7 @@ import socket
 import pandas as pd
 
 from mootdx.quotes import Quotes
+from mootdx.utils import get_stock_market
 from .base import DataSource, DataSourceError
 
 
@@ -75,6 +76,9 @@ class MootdxSource(DataSource):
     def __init__(self, token=""):
         self._client = None
         self._server_idx = -1  # 当前使用的 _TDX_SERVERS 下标（-1=尚未显式选定）
+        # xdxr 除权除息记录进程内缓存（code -> rows/None）：除权信息在回测
+        # 期间不变，避免同一标的重复网络往返；查询失败缓存 None（保持 raw）
+        self._xdxr_cache = {}
 
     def _api(self):
         if self._client is None:
@@ -136,6 +140,13 @@ class MootdxSource(DataSource):
         return None, "mootdx 所有服务器均超时/无数据"
 
     def get_daily(self, code, start, end):
+        """通达信日线：原始价取数后尝试用 xdxr 除权除息因子换算前复权。
+
+        返回帧 ``attrs`` 标注口径元数据：``source="mootdx"``，
+        ``adj="qfq"``（前复权换算成功）或 ``"raw"``（指数无复权概念 /
+        xdxr 无记录 / 换算失败，保持通达信原始不复权价）。raw 帧由
+        manager 混源防护（_pick_daily_frame）让位给其他源的前复权帧。
+        """
         sym = _to_symbol(code)
         def _fn(c):
             if _is_index(code):
@@ -151,6 +162,85 @@ class MootdxSource(DataSource):
             df["volume"] = df["vol"]
         if "volume" in df.columns:
             df["volume"] = df["volume"] * 100
+        df.attrs["source"] = "mootdx"
+        df.attrs["adj"] = "raw"
+        if not _is_index(code):
+            qfq = self._to_qfq(df, sym)
+            if qfq is not None:
+                df = qfq
+        return df
+
+    def _xdxr_rows(self, sym):
+        """取通达信除权除息(xdxr)记录（进程内缓存，同一代码只查一次）。
+
+        mootdx 0.11.x 底层为 tdxpy，``TdxHq_API.get_xdxr_info(market, code)``
+        返回全部历史除权行（category==1 为除权除息：fenhong=每10股红利(元)、
+        songzhuangu=每10股送转、peigu=每10股配股、peigujia=配股价）。
+        无记录返回 []、失败返回 None，调用方据此保持 raw 口径。
+        """
+        if sym in self._xdxr_cache:
+            return self._xdxr_cache[sym]
+        try:
+            market = int(get_stock_market(sym))
+            rows, _ = self._with_server_retry(
+                lambda c: c.client.get_xdxr_info(market, sym), empty_ok=True)
+        except Exception:
+            rows = None
+        self._xdxr_cache[sym] = rows
+        return rows
+
+    def _to_qfq(self, df, sym):
+        """用 xdxr 因子把 raw 日线换算为前复权（最新口径），失败返回 None。
+
+        标准除权参考价公式：除权价 = (昨收 - 每股红利 + 配股价×每股配股)
+        / (1 + 每股送转 + 每股配股)；前复权因子 = 除权价 / 昨收，对除权日
+        之前的 OHLC 逐次累乘。只调整价格列，volume/money 保持原始（与聚宽
+        get_price fq="pre" 口径一致：价格复权、量额不复权）。
+
+        局限：除权日早于帧内首个交易日时，前一收盘价不在帧内、该次因子
+        无法计算（跳过）——帧内全部行统一差该因子，不影响收益率序列的
+        相对关系，但绝对价与最新口径存在固定偏差。
+        """
+        if not isinstance(df.index, pd.DatetimeIndex) or "close" not in df.columns:
+            return None
+        rows = self._xdxr_rows(sym)
+        if not rows:
+            return None
+        close = pd.to_numeric(df["close"], errors="coerce")
+        factors = []
+        for r in rows:
+            if r.get("category") != 1:
+                continue  # 只处理除权除息（分红/送转/配股），股本变动类不影响价
+            fh = float(r.get("fenhong") or 0) / 10.0      # 每股现金红利(元)
+            sg = float(r.get("songzhuangu") or 0) / 10.0  # 每股送转
+            pg = float(r.get("peigu") or 0) / 10.0        # 每股配股
+            pgj = float(r.get("peigujia") or 0)           # 配股价
+            if fh == 0 and sg == 0 and pg == 0:
+                continue
+            try:
+                ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
+            except Exception:
+                continue
+            prev = close.loc[close.index < ex_dt].dropna()
+            if prev.empty:
+                continue  # 前一收盘价不在帧内，因子无法计算（见 docstring 局限）
+            prev_close = float(prev.iloc[-1])
+            if prev_close <= 0:
+                continue
+            ex_price = (prev_close - fh + pgj * pg) / (1.0 + sg + pg)
+            if ex_price <= 0:
+                continue
+            factors.append((ex_dt, ex_price / prev_close))
+        if not factors:
+            return None
+        df = df.copy()
+        adj = pd.Series(1.0, index=df.index)
+        for ex_dt, f in factors:
+            adj.loc[adj.index < ex_dt] *= f
+        for col in ("open", "high", "low", "close"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce") * adj
+        df.attrs["adj"] = "qfq"
         return df
 
     def get_minute(self, code, date="", max_bars=30000):

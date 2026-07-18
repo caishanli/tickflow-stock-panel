@@ -14,7 +14,7 @@ from typing import Callable, Literal
 import numpy as np
 import polars as pl
 
-from app.backtest.engine import BacktestEngine, MatcherConfig, SimResult
+from app.backtest.engine import BacktestEngine, MatcherConfig
 from app.strategy.engine import StrategyEngine, StrategyDef
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,8 @@ class StrategyBacktestResult:
     strategy_info: dict = field(default_factory=dict)
     elapsed_ms: float = 0.0
     error: str | None = None
+    # 非致命问题提示 (未知信号名/order_by 忽略 score 过滤等), 随结果带回前端
+    warnings: list[str] = field(default_factory=list)
 
 
 class StrategyBacktestService:
@@ -107,23 +109,30 @@ class StrategyBacktestService:
         basic_filter = self._effective_basic_filter(s, overrides)
         entry_signals = self._effective_signals(overrides, "entry_signals", s.entry_signals)
         exit_signals = self._effective_signals(overrides, "exit_signals", s.exit_signals)
-        stop_loss = self._override_value(overrides, "stop_loss", s.stop_loss)
-        take_profit = self._normalize_pct(
+        # 风控参数统一语义: None/""/0 → None (关闭); 非零数值才走 _normalize_pct 钳制。
+        # (旧陷阱: stop_loss 直接透传不规范化, override=0 → 止损线=成本价, 次日几乎必触发白亏双边费用;
+        #  take_profit=0/trailing_stop=0 则被 _normalize_pct 钳成最紧档)
+        stop_loss = self._normalize_risk_pct(
+            self._override_value(overrides, "stop_loss", s.stop_loss),
+            0.005,
+            0.5,
+        )
+        take_profit = self._normalize_risk_pct(
             self._override_value(overrides, "take_profit", getattr(s, "take_profit", None)),
             0.01,
             5.0,
         )
-        trailing_stop = self._normalize_pct(
+        trailing_stop = self._normalize_risk_pct(
             self._override_value(overrides, "trailing_stop", getattr(s, "trailing_stop", None)),
             0.005,
             0.5,
         )
-        trailing_take_profit_activate = self._normalize_pct(
+        trailing_take_profit_activate = self._normalize_risk_pct(
             self._override_value(overrides, "trailing_take_profit_activate", getattr(s, "trailing_take_profit_activate", None)),
             0.01,
             2.0,
         )
-        trailing_take_profit_drawdown = self._normalize_pct(
+        trailing_take_profit_drawdown = self._normalize_risk_pct(
             self._override_value(overrides, "trailing_take_profit_drawdown", getattr(s, "trailing_take_profit_drawdown", None)),
             0.005,
             0.5,
@@ -135,6 +144,14 @@ class StrategyBacktestService:
             overrides.get("score_min"),
             overrides.get("score_max"),
         )
+        warnings: list[str] = []
+        # order_by 路径的 score 是原始因子值 (量纲任意, 如 amount ~1e8), 与 [0,100] 的
+        # score 过滤不兼容 (score_max=100 会筛掉全部候选 → 零成交) → 忽略 score 过滤并告警。
+        if (score_min is not None or score_max is not None) and self._uses_order_by_score(s, overrides):
+            msg = "order_by 原始因子排序与 score_min/score_max 过滤不兼容, 已忽略 score 范围过滤"
+            logger.warning(msg)
+            warnings.append(msg)
+            score_min, score_max = None, None
 
         timing_ms: dict[str, float] = {}
 
@@ -179,10 +196,14 @@ class StrategyBacktestService:
         candidate_mask = basic_mask & candidate_filter_mask
         panel = self._apply_score(panel, s, overrides, universe_mask=candidate_mask)
 
-        entry_mask = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
+        entry_mask, unmatched_entry = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
         entry_mask = entry_mask & formal_range
-        raw_exit_mask = self._build_signal_mask(panel, exit_signals, "_exit")
+        raw_exit_mask, unmatched_exit = self._build_signal_mask(panel, exit_signals, "_exit")
         exit_mask = raw_exit_mask & (self._date_range_mask(panel, config.start, load_end) if config.mode == "full" else formal_range)
+        # 未命中面板列的信号名 (拼写错误/未注册) 带回结果, 不再静默忽略;
+        # entry 侧若因此全空, 由下方 entry_mask.any() 检查兜底报错。
+        for sig in unmatched_entry + unmatched_exit:
+            warnings.append(f"信号 '{sig}' 在面板中不存在对应列, 已忽略 (请检查拼写或信号是否已注册)")
         timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
 
         if not entry_mask.any():
@@ -290,125 +311,7 @@ class StrategyBacktestService:
             per_symbol_stats=result.per_symbol_stats,
             strategy_info=strategy_info,
             elapsed_ms=round(elapsed, 1),
-        )
-
-    # ── 全量模拟 (选股能力统计, 不建组合不算净值) ──
-
-    def _run_full_simulation(
-        self,
-        panel: pl.DataFrame,
-        entry_mask: pl.Series,
-        holding_days: int,
-    ) -> SimResult:
-        """对 entry_mask 命中的全部候选, 算持有 N 天后的前瞻收益统计。
-
-        不受 max_positions/资金约束, 反映策略选股能力本身。
-        equity_curve 复用为"累计日均超额收益曲线"(基准归零)。
-        """
-        n = holding_days if holding_days and holding_days > 0 else 5
-
-        df = panel.with_columns([
-            entry_mask.cast(pl.Boolean).alias("_is_candidate"),
-            (pl.col("close").shift(-n).over("symbol") / pl.col("close") - 1).alias("_fwd_return"),
-        ]).filter(
-            pl.col("_is_candidate")
-            & pl.col("_fwd_return").is_not_null()
-            & pl.col("_fwd_return").is_not_nan()
-        )
-
-        if df.is_empty():
-            return self.engine._empty_result()
-
-        fwd = df["_fwd_return"].to_numpy()
-        wins = fwd[fwd > 0]
-        losses = fwd[fwd <= 0]
-        avg_win = float(wins.mean()) if wins.size else 0.0
-        avg_loss = abs(float(losses.mean())) if losses.size else 0.0
-
-        # 按日聚合: 当日候选的平均前瞻收益
-        daily = (
-            df.group_by("date").agg(
-                pl.col("_fwd_return").mean().alias("avg_ret"),
-                pl.col("_fwd_return").count().alias("n_cand"),
-            ).sort("date")
-        )
-
-        # 累计超额曲线: 每日复利平均收益 (基准归零, 故 equity 即累计策略收益)
-        equity_curve: list[dict] = []
-        equity = 1.0
-        peak = 1.0
-        drawdown_curve: list[dict] = []
-        for row in daily.iter_rows(named=True):
-            ret = float(row["avg_ret"] or 0.0)
-            equity *= (1 + ret)
-            peak = max(peak, equity)
-            dd = (equity - peak) / peak if peak > 0 else 0.0
-            d_str = str(row["date"])[:10]
-            equity_curve.append({
-                "date": d_str,
-                "value": round(equity, 4),
-                "positions": int(row["n_cand"]),
-            })
-            drawdown_curve.append({"date": d_str, "value": round(dd, 4)})
-
-        # 同期上证收益 (用 benchmark close 算)
-        benchmark_curve = self._build_benchmark_curve(
-            daily["date"].min(), daily["date"].max()
-        )
-        benchmark_return = 0.0
-        if benchmark_curve:
-            closes = [b["close"] for b in benchmark_curve if b.get("close")]
-            if len(closes) >= 2 and closes[0] > 0:
-                benchmark_return = closes[-1] / closes[0] - 1
-
-        total_return = equity - 1.0
-        max_dd = min((d["value"] for d in drawdown_curve), default=0.0)
-
-        # 日收益序列算 Sharpe (年化)
-        daily_rets = daily["avg_ret"].to_numpy()
-        sharpe = (
-            float(daily_rets.mean() / daily_rets.std() * np.sqrt(252))
-            if daily_rets.size > 1 and daily_rets.std() > 0 else 0.0
-        )
-
-        # 收益分布直方图: 按 [-20%, +20%] 分 21 档 (每档 2%), 超出归入首尾档
-        lo, hi, nbins = -0.20, 0.20, 20
-        clipped = np.clip(fwd, lo, hi)
-        counts, edges = np.histogram(clipped, bins=nbins, range=(lo, hi))
-        dist = [
-            {
-                "range": f"{(edges[i]*100):+.0f}~{(edges[i+1]*100):+.0f}%",
-                "count": int(counts[i]),
-                "ratio": round(float(counts[i] / fwd.size), 4) if fwd.size else 0.0,
-            }
-            for i in range(nbins)
-        ]
-
-        stats = {
-            "mode": "full",
-            "n_candidates": int(fwd.size),
-            "n_days": int(daily.height),
-            "avg_daily_candidates": round(float(daily["n_cand"].mean()), 1),
-            "avg_return": round(float(fwd.mean()), 4),
-            "median_return": round(float(np.median(fwd)), 4),
-            "win_rate": round(float(wins.size / fwd.size), 4) if fwd.size else 0.0,
-            "profit_factor": round(avg_win / avg_loss, 2) if avg_loss > 0 else None,
-            "best": round(float(fwd.max()), 4),
-            "worst": round(float(fwd.min()), 4),
-            "total_return": round(float(total_return), 4),
-            "max_drawdown": round(float(max_dd), 4),
-            "sharpe": round(sharpe, 2),
-            "benchmark_return": round(float(benchmark_return), 4),
-            "excess": round(float(total_return - benchmark_return), 4),
-            "return_distribution": dist,
-        }
-
-        return SimResult(
-            equity_curve=equity_curve,
-            drawdown_curve=drawdown_curve,
-            trades=[],
-            per_symbol_stats=[],
-            stats=stats,
+            warnings=warnings,
         )
 
     # ── 向量化信号生成 ──
@@ -476,14 +379,16 @@ class StrategyBacktestService:
         candidate_mask: pl.Series,
         s: StrategyDef,
         entry_signals: list[str],
-    ) -> pl.Series:
-        """向量化生成买入掩码：候选层 AND 买点层；无买点时只用策略候选层。"""
-        signal_mask = self._build_signal_mask(panel, entry_signals, "_entry_signal")
+    ) -> tuple[pl.Series, list[str]]:
+        """向量化生成买入掩码：候选层 AND 买点层；无买点时只用策略候选层。
+
+        返回 (mask, unmatched): unmatched 为 panel 中不存在对应列的信号名。"""
+        signal_mask, unmatched = self._build_signal_mask(panel, entry_signals, "_entry_signal")
         if entry_signals:
-            return candidate_mask & signal_mask
+            return candidate_mask & signal_mask, unmatched
         if s.filter_history_fn or s.filter_fn:
-            return candidate_mask
-        return pl.Series("_entry", [False] * len(panel), dtype=pl.Boolean)
+            return candidate_mask, unmatched
+        return pl.Series("_entry", [False] * len(panel), dtype=pl.Boolean), unmatched
 
     def _build_entry_mask(
         self,
@@ -494,25 +399,34 @@ class StrategyBacktestService:
     ) -> pl.Series:
         """兼容旧调用: 候选层 AND 买点层。"""
         candidate_mask = self._build_candidate_filter_mask(panel, s, params)
-        return self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
+        mask, _ = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
+        return mask
 
     @staticmethod
-    def _build_signal_mask(panel: pl.DataFrame, signals: list[str], name: str) -> pl.Series:
-        """向量化合并信号列，多个信号 OR。支持内置 signal_ 与自定义 csg_ 前缀。"""
+    def _build_signal_mask(panel: pl.DataFrame, signals: list[str], name: str) -> tuple[pl.Series, list[str]]:
+        """向量化合并信号列，多个信号 OR。支持内置 signal_ 与自定义 csg_ 前缀。
+
+        返回 (mask, unmatched): unmatched 为 panel 中不存在对应列的信号名
+        (拼写错误/信号未注册), 不再静默跳过 — 此处记 warning, 由调用方带回结果。"""
         masks: list[pl.Series] = []
+        unmatched: list[str] = []
         for sig in signals:
             # csg_ (自定义信号) 直接用；否则按 signal_ 解析
             col = sig if (sig.startswith("signal_") or sig.startswith("csg_")) else f"signal_{sig}"
             if col in panel.columns:
                 masks.append(panel[col].fill_null(False).cast(pl.Boolean))
+            else:
+                unmatched.append(sig)
+        if unmatched:
+            logger.warning("信号在面板中不存在对应列, 已忽略: %s", unmatched)
 
         if not masks:
-            return pl.Series(name, [False] * len(panel), dtype=pl.Boolean)
+            return pl.Series(name, [False] * len(panel), dtype=pl.Boolean), unmatched
 
         combined = masks[0]
         for m in masks[1:]:
             combined = combined | m
-        return combined
+        return combined, unmatched
 
     def _build_benchmark_curve(self, start: date, end: date) -> list[dict]:
         try:
@@ -572,6 +486,20 @@ class StrategyBacktestService:
         except (TypeError, ValueError):
             return None
         return min(max(pct, min_value), max_value)
+
+    @staticmethod
+    def _normalize_risk_pct(value, min_value: float, max_value: float) -> float | None:
+        """风控百分比统一语义: None/""/0 → None (关闭该风控); 非零数值才走 _normalize_pct 钳制。
+
+        避免 0 被 _normalize_pct 钳到最小值 (0 反成最紧档) 或透传成 0 止损线 (次日必触发)。"""
+        if value is None or value == "":
+            return None
+        try:
+            if float(value) == 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return StrategyBacktestService._normalize_pct(value, min_value, max_value)
 
     @staticmethod
     def _normalize_score_range(min_value, max_value) -> tuple[float | None, float | None]:
@@ -737,3 +665,20 @@ class StrategyBacktestService:
                 score_expr = pl.when(pl.col("_score_universe")).then(score_expr).otherwise(0.0)
             return _finish(work.with_columns(score_expr.alias("score")))
         return _finish(work.with_columns(pl.lit(0.0).alias("score")))
+
+    @staticmethod
+    def _uses_order_by_score(s: StrategyDef, overrides: dict | None) -> bool:
+        """判断最终 score 是否走 order_by 原始因子值路径 (而非 [0,100] 归一化评分)。
+
+        与 _apply_score 的 meta 级判定一致: scoring 权重有效 → 归一化评分;
+        否则 order_by 指定非 "score" 列 → score 即原始因子值 (量纲任意),
+        此时 score_min/score_max 的 [0,100] 过滤不适用。
+        """
+        scoring = dict(s.meta.get("scoring") or {})
+        scoring_overrides = (overrides or {}).get("scoring")
+        if scoring_overrides:
+            scoring.update(scoring_overrides)
+        if scoring and sum(scoring.values()) > 0:
+            return False
+        order_by = s.meta.get("order_by")
+        return bool(order_by and order_by != "score")

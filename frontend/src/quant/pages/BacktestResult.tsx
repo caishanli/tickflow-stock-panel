@@ -76,7 +76,13 @@ export function BacktestResult({ status, equity, trades, logs }: Props) {
   }, [equity])
 
   const statusValue: string = status?.state ?? status?.status ?? status?.phase ?? 'running'
-  const metrics = status?.metrics ?? status?.stats ?? status ?? {}
+  const _rawMetrics = status?.metrics_json ?? status?.metrics ?? status?.stats
+  let metrics: any = {}
+  if (typeof _rawMetrics === 'string') {
+    try { metrics = JSON.parse(_rawMetrics) } catch { metrics = {} }
+  } else if (_rawMetrics && typeof _rawMetrics === 'object') {
+    metrics = _rawMetrics
+  }
   const tradeList: any[] = Array.isArray(trades) ? trades : []
   const logList: any[] = Array.isArray(logs) ? logs : []
 

@@ -24,6 +24,14 @@ class AStockSource(DataSource):
         pass
 
     def get_daily(self, code, start, end):
+        """baidu kline 日线：原始字符串帧在此数值化，下游无需各自 astype。
+
+        返回帧 open/high/low/close/volume/amount 等列转 float、date 列解析
+        为 Timestamp；volume 实测单位为股（小 ETF 约 5e7 量级），无需换算；
+        amount 单位无法可靠判定，只数值化不归一。
+        ``attrs`` 标注 ``source="astock"``、``adj="unknown"``（baidu kline
+        复权口径无法可靠判定，混源防护中视为非 raw，优先于确定的 raw 帧）。
+        """
         sym = _to_symbol(code)
         start_time = str(start).replace("-", "")[:8]
         try:
@@ -39,6 +47,15 @@ class AStockSource(DataSource):
             df = pd.DataFrame(records, columns=keys)
         except Exception as e:
             raise DataSourceError(f"a-stock-data 日线解析失败: {e}")
+        # 数值化：date 列解析为 Timestamp，其余列（OHLC/volume/amount/ma*）
+        # 统一转 float，无法解析的置 NaN
+        for col in df.columns:
+            if col == "date":
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.attrs["source"] = "astock"
+        df.attrs["adj"] = "unknown"
         return df
 
     def get_minute(self, code, date):

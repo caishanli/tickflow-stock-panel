@@ -107,7 +107,9 @@ class BaostockSource(DataSource):
                     start_date=start,
                     end_date=end,
                     frequency="5",
-                    adjustflag="2",
+                    # 前复权，与日线 get_daily 的 adjustflag="1" 口径一致：
+                    # 原 "2"(后复权) 与日线前复权混用，除权日附近分钟/日线价脱节
+                    adjustflag="1",
                 )
                 _res["err"] = rs.error_code
                 _res["fields"] = list(rs.fields)
@@ -139,7 +141,11 @@ class BaostockSource(DataSource):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df.index = df["time"].apply(_parse_time)
         df.index.name = "datetime"
-        return df.drop(columns=["date", "time"])
+        df = df.drop(columns=["date", "time"])
+        # 口径元数据：adjustflag="1" 前复权（与日线一致）
+        df.attrs["source"] = "baostock"
+        df.attrs["adj"] = "qfq"
+        return df
 
     def get_minute_1min(self, code, start, end):
         """拉取5分钟并插值为1分钟。"""
@@ -206,6 +212,9 @@ class BaostockSource(DataSource):
         df = df.rename(columns={"date": "trade_date"})
         df["trade_date"] = df["trade_date"].astype(str)
         df = df.sort_values("trade_date").reset_index(drop=True)
+        # 口径元数据：adjustflag="1" 前复权（volume 单位股、amount 单位元）
+        df.attrs["source"] = "baostock"
+        df.attrs["adj"] = "qfq"
         return df
 
     def get_minute(self, code, date):
