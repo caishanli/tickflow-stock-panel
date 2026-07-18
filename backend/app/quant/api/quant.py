@@ -44,6 +44,9 @@ class AccountIn(BaseModel):
     name: str
     capital: float
     stop_loss: float = 0.03
+    strategy_id: str = ""
+    start_date: str = ""  # YYYY-MM-DD；早于今天则从该日起历史补跑后续实时，晚于今天则到日前空转
+    frequency: str = "minute"  # 运行频率：minute 逐分钟 / daily 每日一次（开盘首 bar 全量触发）
 
 
 # ---- 策略 ----
@@ -222,7 +225,18 @@ def sim_accounts():
 
 @router.post("/sim/accounts")
 def sim_accounts_post(body: AccountIn):
-    aid = account_create(body.name, body.capital, body.stop_loss)
+    if body.strategy_id and not get_strategy(body.strategy_id):
+        raise HTTPException(400, f"strategy not found: {body.strategy_id}")
+    if body.start_date:
+        import datetime as _dt
+        try:
+            _dt.date.fromisoformat(body.start_date)
+        except ValueError:
+            raise HTTPException(400, f"invalid start_date (expect YYYY-MM-DD): {body.start_date}")
+    if body.frequency not in ("minute", "daily"):
+        raise HTTPException(400, f"invalid frequency (expect minute/daily): {body.frequency}")
+    aid = account_create(body.name, body.capital, body.stop_loss, body.strategy_id,
+                         body.start_date, body.frequency)
     return {"data": db.get_sim_account(aid)}
 
 
@@ -249,7 +263,10 @@ def sim_status(aid: str):
     acct = db.get_sim_account(aid)
     if not acct:
         raise HTTPException(404, "not found")
-    return {"data": {"account": acct, "state": db.read_sim_state(aid),
+    sid = acct.get("strategy_id") or ""
+    strat = get_strategy(sid) if sid else None
+    return {"data": {"account": acct, "strategy_name": (strat or {}).get("name", ""),
+                     "state": db.read_sim_state(aid),
                      "stop_loss": db.get_sim_stoploss(aid)}}
 
 
@@ -261,6 +278,11 @@ def sim_equity(aid: str):
 @router.get("/sim/accounts/{aid}/trades")
 def sim_trades(aid: str):
     return {"data": db.get_sim_trades(aid)}
+
+
+@router.get("/sim/accounts/{aid}/logs")
+def sim_logs(aid: str, limit: int = 500):
+    return {"data": db.get_sim_logs(aid, limit)}
 
 
 # ---- 数据源 ----

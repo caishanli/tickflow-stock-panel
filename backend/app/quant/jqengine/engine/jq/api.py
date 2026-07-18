@@ -3,7 +3,17 @@
 在用户策略命名空间中注入本模块的函数，使原版聚宽策略（五福 ETF 轮动等）
 可直接粘贴运行。运行期状态集中放在 ``_state``，由 :mod:`loader` 在每次
 回测前重置。
+
+撮合口径（与 ``app.quant.simulate.matcher`` 对齐）：
+- 佣金双边收取（``_state["fee"]``，默认 CONFIG.fee_rate），无最低 5 元；
+- 印花税仅卖出收取（A股 0.05%，ETF 免征，`QUANT_SIM_STAMP_TAX` 可覆盖）；
+- 滑点双边（买 price*(1+slippage)，卖 price*(1-slippage)）；
+- 买入 100 股整手（向下取整）；
+- T+1：当日买入数量（Position.today_amount）当日不可卖，`on_new_day()` 清零；
+- 涨跌停：``_state["no_buy"]`` / ``_state["no_sell"]`` 集合（由驱动方按轮注入）。
 """
+
+import os
 
 import numpy as np
 import pandas as pd
@@ -15,6 +25,15 @@ from types import SimpleNamespace
 from .context import Context, G, Position
 from .portfolio import Portfolio
 from ...datasource.base import DataSourceError
+
+# 印花税率（仅卖出，股票 0.05%，ETF 免征；与 simulate.matcher 同口径同环境变量）
+DEFAULT_STAMP_TAX = float(os.environ.get("QUANT_SIM_STAMP_TAX", "0.0005"))
+
+
+def _is_etf(code):
+    """简单代码前缀判定：沪市 5 开头、深市 15/16 开头为基金（免印花税）。"""
+    num = (code or "").split(".")[0]
+    return num.startswith(("5", "15", "16"))
 
 _state = {
     "ctx": None,
@@ -477,29 +496,50 @@ def _live_price(security):
 
 
 def order(security, amount):
-    """按股数下单（正买负卖）。"""
+    """按股数下单（正买负卖）。
+
+    交易规则：买入 100 股整手；T+1（当日买入不可卖，卖出量按 closeable 截断）；
+    佣金双边 + 卖出印花税（非 ETF）；``_state["no_buy"]/["no_sell"]`` 禁买卖。
+    """
     ctx = _state["ctx"]
     p = ctx.portfolio
     price = _live_price(security)
     if price == 0 or amount == 0:
         return False
+    amount = int(amount)
+    if amount > 0:
+        amount = amount // 100 * 100  # A股/ETF 买入整手（100 股向下取整）
+        if amount <= 0 or security in (_state.get("no_buy") or ()):
+            return False  # 不足一手 / 涨停禁买
+    existing = p.positions.get(security)
+    prev_cost = float(existing.avg_cost or 0.0) if existing else 0.0
+    if amount < 0:
+        if security in (_state.get("no_sell") or ()):
+            return False  # 跌停/停牌禁卖
+        closeable = float(existing.closeable_amount) if existing else 0.0
+        amount = -min(-amount, closeable)  # T+1：卖出不超过可卖量
+        if amount == 0:
+            return False
     fee = _state["fee"]
     slip = _state["slippage"]
     fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
     fill = round(fill, 3)
     turnover = abs(amount) * fill
     fee_amount = round(turnover * fee, 2)
+    tax_amount = 0.0
     if amount > 0:
         cost = turnover + fee_amount
         if cost > p.cash:
             return False
     else:
-        cost = -(turnover - fee_amount)
+        tax_amount = 0.0 if _is_etf(security) else round(turnover * DEFAULT_STAMP_TAX, 2)
+        cost = -(turnover - fee_amount - tax_amount)
     pos = p.positions.setdefault(security, Position())
     if amount > 0:
         total_cost = pos.amount * pos.avg_cost + amount * fill
         pos.amount += amount
         pos.avg_cost = total_cost / pos.amount if pos.amount else 0.0
+        pos.today_amount = float(pos.today_amount or 0.0) + amount  # T+1 当日买入冻结
     else:
         pos.amount += amount
         if pos.amount <= 0:
@@ -509,8 +549,9 @@ def order(security, amount):
     pos.price = price
     p.cash -= cost
     _state["trades"].append({
-        "dt": ctx.current_dt, "code": security,
-        "amount": amount, "price": fill, "fee": fee_amount,
+        "dt": ctx.current_dt, "code": security, "side": "buy" if amount > 0 else "sell",
+        "amount": amount, "price": fill, "fee": fee_amount, "tax": tax_amount,
+        "avg_cost": prev_cost,
     })
     return True
 
@@ -546,6 +587,16 @@ def order_target_percent(security, percent):
     return True
 
 
+def _emit_sink(level, msg):
+    """策略日志外送（``_state["log_sink"]``，由模拟盘 bridge 注入写库）。"""
+    sink = _state.get("log_sink")
+    if sink:
+        try:
+            sink(level, msg)
+        except Exception:
+            pass
+
+
 class LogProxy:
     _levels = {"debug": 0, "info": 1, "warn": 2, "error": 3}
     _modules = {}
@@ -561,12 +612,14 @@ class LogProxy:
             ctx = _state.get("ctx")
             dt = ctx.current_dt if ctx else ""
             print(f"[STRATEGY {dt}] {msg}")
+            _emit_sink("info", msg)
 
     def warn(self, msg):
         if self._should("warn"):
             ctx = _state.get("ctx")
             dt = ctx.current_dt if ctx else ""
             print(f"[STRATEGY {dt}] [WARN] {msg}")
+            _emit_sink("warn", msg)
 
     def warning(self, msg):
         self.warn(msg)
@@ -576,12 +629,14 @@ class LogProxy:
             ctx = _state.get("ctx")
             dt = ctx.current_dt if ctx else ""
             print(f"[STRATEGY {dt}] [ERROR] {msg}")
+            _emit_sink("error", msg)
 
     def debug(self, msg):
         if self._should("debug"):
             ctx = _state.get("ctx")
             dt = ctx.current_dt if ctx else ""
             print(f"[STRATEGY {dt}] [DEBUG] {msg}")
+            _emit_sink("debug", msg)
 
     def info_format(self, fmt, *args):
         self.info(fmt % args if args else fmt)
@@ -601,8 +656,18 @@ def _reset(manager, fee, slippage, cash):
     ctx.portfolio = Portfolio(cash)
     _state.update(ctx=ctx, manager=manager, fee=fee, slippage=slippage,
                   daily=[], minute=[], records=[], trades=[],
-                  minute_prices={}, minute_mode=False)
+                  minute_prices={}, minute_mode=False,
+                  no_buy=set(), no_sell=set(), log_sink=None)
     return ctx
+
+
+def on_new_day():
+    """新交易日钩子：清零 T+1 当日买入冻结量，并清 current_data 静态日线缓存。"""
+    ctx = _state.get("ctx")
+    if ctx is not None and ctx.portfolio is not None:
+        for pos in ctx.portfolio.positions.values():
+            pos.today_amount = 0.0
+    clear_current_data_cache()
 
 
 def _state_snapshot():

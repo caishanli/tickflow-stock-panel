@@ -1,20 +1,36 @@
-"""模拟盘实时主循环（独立进程逻辑；由 scripts/run_quant_sim.py 调用）。"""
+"""模拟盘实时主循环（独立进程逻辑；由 scripts/run_quant_sim.py 调用）。
+
+两种模式（按账户是否绑定 strategy_id 分派）：
+- 策略驱动：加载聚宽式策略，交易时段每分钟喂实时行情并触发
+  run_daily / run_minute / handle_data，订单经 jqengine 单机引擎本地撮合
+  （``engine/jq/api.py``），成交/净值/日志实时落 quant.db；止损 Matcher 每轮巡检。
+- 看护（未绑策略）：仅对既有持仓做分钟级止损巡检（旧行为保留）。
+"""
 from __future__ import annotations
 
 import datetime
 import logging
 import time
 
+import pandas as pd
+
+from . import live_feed
 from .protocol import read_state, save_state, is_paused
 from .matcher import Matcher
 from .. import db
+from ..config import CONFIG
 from ..datasource.manager import QuantDataProvider
+from ..jqengine.engine.jq.context import Position
+from ..strategies.store import get_strategy
 
 log = logging.getLogger("app.quant.simulate.runner")
 
-POLL_INTERVAL = 60  # 交易时段巡检间隔（秒）：分钟级止损，同时避免猛打数据源
+POLL_INTERVAL = 60  # 看护模式巡检间隔（秒）：分钟级止损，同时避免猛打数据源
 IDLE_INTERVAL = 30  # 非交易时段空转间隔（秒）
 LIMIT_DOWN_PCT = -0.098  # 跌停判定阈值（主板 10% 留容差；科创/创业 20% 简化不细分）
+LIMIT_UP_PCT = 0.098     # 涨停判定阈值（禁买，与跌停同口径）
+TICK_OFFSET = 8          # 交易时段每分钟第 N 秒后触发，等刚收的 bar 可读
+SESSION_END_GRACE = datetime.time(15, 2)  # 15:00 收市 bar 的处理宽限（之后进收盘钩子）
 
 
 def in_trading(now=None):
@@ -24,6 +40,10 @@ def in_trading(now=None):
             or datetime.time(13, 0) <= t <= datetime.time(15, 0)) \
         and now.weekday() < 5  # M2：weekday 用传入的 now，而非真实当前时间
 
+
+# ---------------------------------------------------------------------------
+# 看护模式（无策略账户，旧行为保留）
+# ---------------------------------------------------------------------------
 
 def _last_price(df) -> float:
     col = "close" if "close" in df.columns else df.columns[-1]
@@ -78,15 +98,10 @@ def _step_once(account_id: str, provider: QuantDataProvider, matcher: Matcher,
                            (state["net_value"] / state["start_cash"] - 1) if state["start_cash"] else 0.0)
 
 
-def run_loop(account_id: str, provider: QuantDataProvider | None = None,
-             matcher: Matcher | None = None,
-             poll_interval: float = POLL_INTERVAL, idle_interval: float = IDLE_INTERVAL):
+def _run_watcher_loop(account_id: str, acct: dict, provider, matcher: Matcher,
+                      poll_interval: float, idle_interval: float):
+    """看护主循环：仅对既有持仓做分钟级止损巡检。"""
     provider = provider or QuantDataProvider()
-    acct = db.get_sim_account(account_id)
-    if not acct:
-        return
-    stop = acct.get("stop_loss") or 0.03
-    matcher = matcher or Matcher(stop, account_id=account_id)
     state = read_state(account_id)
     if not state.get("start_cash"):
         state["start_cash"] = float(acct.get("capital", 0.0))
@@ -106,3 +121,474 @@ def run_loop(account_id: str, provider: QuantDataProvider | None = None,
         raise
     db.update_sim_account(account_id, status="paused")
 
+
+# ---------------------------------------------------------------------------
+# 策略驱动模式
+# ---------------------------------------------------------------------------
+
+def _emit_log(account_id: str, level: str, message: str) -> None:
+    """模拟盘日志落 sim_logs（供 /sim/accounts/{aid}/logs 读取），失败仅告警。"""
+    try:
+        db.insert_sim_log(account_id, str(datetime.datetime.now()), level, message)
+    except Exception:  # noqa: BLE001
+        log.warning("[runner] 日志落库失败(%s): %s", level, message)
+
+
+def _load_engine():
+    """惰性加载 jqengine 单机引擎（看护模式不依赖）。"""
+    from ..jqengine.engine.jq import api as jq_api
+    from ..jqengine.engine.jq import loader as jq_loader
+    return jq_api, jq_loader
+
+
+def _make_dm():
+    """构造实时 DataManager（在线模式：允许联网回源；真实分钟优先）。"""
+    from ..jqengine.datasource.manager import get_data_manager
+
+    dm = get_data_manager()
+    dm._use_real_minute = True
+    dm._offline = False
+    tok = CONFIG.tushare_token
+    if tok and dm.sources.get("tushare") is not None:
+        try:
+            dm.sources["tushare"].token = tok
+            import tushare as ts
+            ts.set_token(tok)
+        except Exception:  # noqa: BLE001
+            log.warning("[runner] tushare token 注入失败", exc_info=True)
+    try:
+        dm.preload_daily()
+    except Exception as e:  # noqa: BLE001
+        log.warning("[runner] 日线预加载失败（策略取数将按需回源）: %s", e)
+    return dm
+
+
+def _is_trading_day(dm, today) -> bool:
+    """当日是否交易日：沪深300 指数日线末根日期 == 今日。取数失败降级 weekday 判定。"""
+    try:
+        start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
+        df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
+        if df is None or df.empty:
+            raise RuntimeError("指数日线为空")
+        idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
+        if idx is None:
+            dcol = next((c for c in ("date", "datetime", "time", "dt") if c in df.columns), None)
+            if dcol is None:
+                raise RuntimeError("指数日线无日期列")
+            idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
+        return bool(len(idx)) and pd.Timestamp(idx[-1]).date() == pd.Timestamp(today).date()
+    except Exception as e:  # noqa: BLE001
+        log.warning("[runner] 交易日判定失败，降级 weekday: %s", e)
+        return pd.Timestamp(today).weekday() < 5
+
+
+def _prev_close_dm(dm, code: str, today: str):
+    """昨收（涨跌停判定用）。取不到返回 None → 不判定。"""
+    try:
+        start = str(pd.Timestamp(today) - pd.Timedelta(days=45))[:10]
+        df = dm.fetch("get_daily", code, start, str(today))
+    except Exception:  # noqa: BLE001
+        return None
+    if df is None or df.empty:
+        return None
+    col = "close" if "close" in df.columns else df.columns[-1]
+    today_ts = pd.Timestamp(today).normalize()
+    if isinstance(df.index, pd.DatetimeIndex):
+        hist = df[df.index.normalize() < today_ts]
+        return float(hist[col].iloc[-1]) if not hist.empty else None
+    dcol = next((c for c in ("date", "datetime", "time", "dt", "day") if c in df.columns), None)
+    if dcol:
+        hist = df[df[dcol].astype(str).str[:10] < str(today)]
+        return float(hist[col].iloc[-1]) if not hist.empty else None
+    return float(df[col].iloc[-2]) if len(df) >= 2 else None
+
+
+def _restore_portfolio(ctx, st: dict) -> None:
+    """从 sim_state 恢复持仓与现金（崩溃续跑）。无持仓时保持初始组合。"""
+    pf = ctx.portfolio
+    for code, sp in (st.get("positions") or {}).items():
+        pf.positions[code] = Position(
+            amount=float(sp.get("amount", 0.0) or 0.0),
+            avg_cost=float(sp.get("avg_cost", 0.0) or 0.0),
+            price=float(sp.get("price", 0.0) or 0.0),
+            today_amount=float(sp.get("today_amount", 0.0) or 0.0),
+        )
+    pf.cash = float(st.get("cash", pf.cash) or 0.0)
+
+
+def _state_from_portfolio(ctx, state: dict) -> dict:
+    """portfolio → 旧 state dict（供 Matcher 巡检与 protocol.save_state 落库）。"""
+    state["positions"] = {
+        code: {
+            "amount": float(p.amount), "avg_cost": float(p.avg_cost),
+            "price": float(p.price),
+            "today_amount": float(getattr(p, "today_amount", 0.0) or 0.0),
+        }
+        for code, p in ctx.portfolio.positions.items()
+    }
+    state["cash"] = float(ctx.portfolio.cash)
+    return state
+
+
+def _apply_matcher_result(ctx, state: dict) -> None:
+    """Matcher 止损卖出结果回写 portfolio（Matcher 已算好现金与剩余持仓）。"""
+    pf = ctx.portfolio
+    for code in list(pf.positions.keys()):
+        if code not in state["positions"]:
+            pf.positions.pop(code, None)
+    for code, sp in state["positions"].items():
+        pos = pf.positions.get(code)
+        if pos is None:
+            pos = Position()
+            pf.positions[code] = pos
+        pos.amount = sp["amount"]
+        pos.avg_cost = sp.get("avg_cost", pos.avg_cost)
+        pos.price = sp.get("price", pos.price)
+        pos.today_amount = sp.get("today_amount", 0.0)
+    pf.cash = float(state["cash"])
+
+
+def _parse_hhmm(s):
+    try:
+        h, m = str(s).split(":")[:2]
+        return datetime.time(int(h), int(m))
+    except (ValueError, TypeError):
+        return None
+
+
+def _daily_due(task_time: str, bar_dt) -> bool:
+    """run_daily 任务是否到点。open→首个 bar；close→14:59 起；HH:MM→对应时刻起。"""
+    t = bar_dt.time()
+    if task_time == "open":
+        return t >= datetime.time(9, 30)
+    if task_time == "close":
+        return t >= datetime.time(14, 59)
+    hhmm = _parse_hhmm(task_time)
+    return t >= hhmm if hhmm else False
+
+
+def _safe_call(account_id: str, func, ctx, tag: str) -> None:
+    """策略回调保护性调用：异常落 sim_logs，不中断主循环。"""
+    try:
+        func(ctx)
+    except Exception as e:  # noqa: BLE001
+        name = getattr(func, "__name__", "?")
+        _emit_log(account_id, "error", f"策略回调 {name}({tag}) 异常: {e}")
+
+
+def _fire_session(account_id: str, bundle, ctx, bar_dt, fired: set, jq_api,
+                  force_all: bool = False) -> None:
+    """盘中触发：到期 run_daily（每日一次）+ run_minute + handle_data（每 bar）。
+
+    force_all（日频账户）：忽略任务设定时刻，全部 run_daily 任务在本次唯一
+    tick 各触发一次。
+    """
+    calls = []
+    for func, t in bundle.daily:
+        ts = str(t)
+        if ts in ("before_open", "after_close"):
+            continue  # 盘前/盘后钩子触发
+        if ts == "every_bar" and not force_all:
+            calls.append((func, ts))
+            continue
+        key = (id(func), ts)
+        if key not in fired and (force_all or _daily_due(ts, bar_dt)):
+            fired.add(key)
+            calls.append((func, ts))
+    for func, _m in bundle.minute:
+        calls.append((func, "run_minute"))
+    if bundle.handle_data is not None:
+        calls.append((bundle.handle_data, "handle_data"))
+    for func, tag in calls:
+        _safe_call(account_id, func, ctx, tag)
+
+
+def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now) -> None:
+    """盘前（每交易日一次）：调度器重置 + T+1 清零 + before_open/before_trading_start。"""
+    fired.clear()
+    jq_api.on_new_day()
+    try:
+        days = jq_api.get_trade_days(end_date=str(now.date()), count=5)
+        prev = [d for d in days if pd.Timestamp(d).date() < now.date()]
+        if prev:
+            ctx.previous_date = pd.Timestamp(prev[-1]).date()
+    except Exception:  # noqa: BLE001
+        pass
+    for func, t in bundle.daily:
+        if str(t) == "before_open":
+            fired.add((id(func), "before_open"))
+            _safe_call(account_id, func, ctx, "before_open")
+    if bundle.before_trading_start is not None:
+        _safe_call(account_id, bundle.before_trading_start, ctx, "before_trading_start")
+
+
+def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
+    """成交增量 / 状态 / 净值快照落库（每轮一次）。"""
+    trades = jq_api._state.get("trades") or []
+    drained = aux.get("trades_drained", 0)
+    for t in trades[drained:]:
+        amount = abs(t["amount"])
+        if t["amount"] < 0 and t.get("avg_cost"):
+            pnl = (t["price"] - t["avg_cost"]) * amount
+            pnl_pct = t["price"] / t["avg_cost"] - 1
+        else:
+            pnl, pnl_pct = 0.0, 0.0
+        db.insert_sim_trade(account_id, str(t["dt"]),
+                            t["code"], "BUY" if t["amount"] > 0 else "SELL",
+                            t["price"], amount, round(pnl, 4), round(pnl_pct, 4),
+                            t.get("fee", 0.0))
+    aux["trades_drained"] = len(trades)
+    pf = ctx.portfolio
+    positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
+    net = round(pf.cash + positions_value, 4)
+    start_cash = aux["start_cash"]
+    _state_from_portfolio(ctx, state)
+    state["net_value"] = net
+    state["pnl"] = round(net - start_cash, 4)
+    state["dt"] = str(bar_dt)
+    save_state(account_id, state)
+    db.insert_sim_snapshot(account_id, str(bar_dt), net, round(pf.cash, 4),
+                           positions_value, round(net - start_cash, 4),
+                           round(net / start_cash - 1, 6) if start_cash else 0.0)
+
+
+def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
+    """收盘（每交易日一次）：after_close/after_trading_end + 真实分钟落盘 + 最终快照。"""
+    for func, t in bundle.daily:
+        if str(t) == "after_close":
+            _safe_call(account_id, func, ctx, "after_close")
+    if bundle.after_trading_end is not None:
+        _safe_call(account_id, bundle.after_trading_end, ctx, "after_trading_end")
+    live_feed.persist_real(dm, aux["fresh_frames"])
+    _persist(account_id, ctx, state, now, aux["jq_api"], aux)
+    _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘")
+
+
+# ---------------------------------------------------------------------------
+# 历史补跑（start_date 早于今天：先按历史分钟追上今天，再进实时循环）
+# ---------------------------------------------------------------------------
+
+def _trade_days_between(dm, start, end) -> list:
+    """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。"""
+    df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+    if df is None or df.empty:
+        return []
+    idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
+    if idx is None:
+        dcol = next((c for c in ("date", "datetime", "time", "dt") if c in df.columns), None)
+        if dcol is None:
+            return []
+        idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
+    lo, hi = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    return [d.date() for d in idx.normalize() if lo <= d <= hi]
+
+
+def _session_minutes(day) -> list:
+    """某交易日的 240 根 1m bar 时刻（09:31–11:30, 13:01–15:00，按收 bar 标记）。"""
+    out = []
+    for start_t, end_t in ((datetime.time(9, 31), datetime.time(11, 30)),
+                           (datetime.time(13, 1), datetime.time(15, 0))):
+        t = datetime.datetime.combine(day, start_t)
+        end = datetime.datetime.combine(day, end_t)
+        while t <= end:
+            out.append(t)
+            t += datetime.timedelta(minutes=1)
+    return out
+
+
+def _hist_feed(dm, codes, now, _acc):
+    """补跑馈送：取各标的截至 now（历史时刻）的最后一分钟收盘价。
+
+    走 ``dm.get_minute_price_at`` 滑窗加载（C1 近 3 月真实 1m / 更早 baostock 5m
+    插值，均在内存，不落盘）；无数据标的缺席，全部无数据则 bar_dt=None（该 bar
+    跳过，如停牌/数据空洞）。
+    """
+    prices = {}
+    for code in dict.fromkeys(codes):
+        p = dm.get_minute_price_at(code, now)
+        if p is not None:
+            prices[code] = float(p)
+    return prices, (now if prices else None)
+
+
+def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
+                    state: dict, aux: dict, start_date: str) -> None:
+    """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
+    yesterday = datetime.date.today() - datetime.timedelta(days=1)
+    days = _trade_days_between(dm, start_date, yesterday)
+    _emit_log(account_id, "info",
+              f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日")
+    for day in days:
+        if is_paused(account_id):
+            break
+        _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
+                    datetime.datetime.combine(day, datetime.time(9, 25)))
+        for bar in _session_minutes(day):
+            # 日频账户补跑同样每日只走首个 bar（09:31），与实时口径一致
+            if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
+                continue
+            _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+        _eod(account_id, bundle, ctx, dm, state, aux,
+             datetime.datetime.combine(day, datetime.time(15, 5)))
+        _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
+    _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
+
+
+def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
+                   state: dict, aux: dict, now=None):
+    """单轮分钟驱动：喂数 → 策略回调 → 止损巡检 → 落库。返回本轮 bar 时刻。
+
+    同一 bar 不重复触发；非当日 bar / 无数据时跳过并返回 None。
+    """
+    jq_api = aux["jq_api"]
+    now = now or datetime.datetime.now()
+    watch = list(dict.fromkeys(
+        list(getattr(ctx, "universe", None) or [])
+        + list(ctx.portfolio.positions.keys())))
+    prices, bar_dt = feed(dm, watch, now, aux["fresh_frames"])
+    if bar_dt is None:
+        _emit_log(account_id, "warn", "实时行情为空，本轮跳过")
+        return None
+    bar_ts = pd.Timestamp(bar_dt)
+    if bar_ts.date() != now.date():
+        return None  # 盘前/数据源滞后只拿到昨日 bar，不触发
+    last_bar = aux.get("last_bar")
+    if last_bar is not None and bar_ts <= last_bar:
+        return None  # 同一 bar 已处理
+    aux["last_bar"] = bar_ts
+    ctx.current_dt = bar_ts
+    jq_api._state["minute_prices"] = prices
+    jq_api._state["minute_mode"] = True
+    # 涨跌停禁买卖（昨收缺失的标的不判定）
+    today = str(bar_ts.date())
+    no_sell, no_buy = set(), set()
+    for code, px in prices.items():
+        prev = _prev_close_dm(dm, code, today)
+        if not prev:
+            continue
+        if px <= prev * (1 + LIMIT_DOWN_PCT):
+            no_sell.add(code)
+        elif px >= prev * (1 + LIMIT_UP_PCT):
+            no_buy.add(code)
+    jq_api._state["no_sell"] = no_sell
+    jq_api._state["no_buy"] = no_buy
+    _fire_session(account_id, bundle, ctx, bar_ts, aux["fired"], jq_api,
+                  force_all=aux.get("frequency") == "daily")
+    # 止损巡检（matcher 在 state 口径上工作，结果回写 portfolio）
+    _state_from_portfolio(ctx, state)
+    state["dt"] = str(bar_ts)
+    matcher.step(state, prices, no_sell=no_sell)
+    _apply_matcher_result(ctx, state)
+    for code, pos in ctx.portfolio.positions.items():
+        if code in prices:
+            pos.price = prices[code]
+    _persist(account_id, ctx, state, bar_ts, jq_api, aux)
+    return bar_ts
+
+
+def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
+                       feed=None, idle_interval: float = IDLE_INTERVAL) -> None:
+    """策略驱动主循环：交易时段每分钟驱动聚宽式策略并本地撮合。"""
+    sid = (acct.get("strategy_id") or "").strip()
+    strat = get_strategy(sid)
+    code = (strat or {}).get("code", "")
+    if not code:
+        db.update_sim_account(account_id, status="failed")
+        _emit_log(account_id, "error", f"策略不存在或代码为空: {sid}")
+        return
+    jq_api, jq_loader = _load_engine()
+    dm = dm if dm is not None else _make_dm()
+    feed = feed or live_feed.refresh
+    st = read_state(account_id)
+    has_saved = bool(st.get("start_cash"))
+    start_cash = float(st.get("start_cash") or acct.get("capital", 0.0) or 0.0)
+    cash = float(st["cash"]) if has_saved else start_cash
+    try:
+        bundle = jq_loader.load_strategy(code, dm, CONFIG.fee_rate, CONFIG.slippage, cash)
+    except Exception as e:  # noqa: BLE001
+        db.update_sim_account(account_id, status="failed")
+        _emit_log(account_id, "error", f"策略编译失败: {e}")
+        return
+    ctx = bundle.ctx
+    if has_saved:
+        _restore_portfolio(ctx, st)
+    jq_api._state["log_sink"] = lambda level, msg: _emit_log(account_id, level, msg)
+    try:
+        bundle.init_fn(ctx)
+    except Exception as e:  # noqa: BLE001
+        db.update_sim_account(account_id, status="failed")
+        _emit_log(account_id, "error", f"策略 init 异常: {e}")
+        return
+    state: dict = {
+        "cash": cash, "start_cash": start_cash, "net_value": cash, "pnl": 0.0,
+        "positions": {}, "stop_loss_log": st.get("stop_loss_log") or [],
+        "dt": st.get("dt"),
+    }
+    aux = {"jq_api": jq_api, "start_cash": start_cash, "fired": set(),
+           "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
+           "frequency": (acct.get("frequency") or "minute"), "daily_done": None}
+    start_date = (acct.get("start_date") or "").strip()
+    _emit_log(account_id, "info",
+              f"策略模拟盘启动: {sid} 资金 {start_cash}{'（恢复续跑）' if has_saved else ''}"
+              f"{(' 起始日期 ' + start_date) if start_date else ''}")
+    # 开始模拟日期早于今天且无存档 → 先按历史分钟补跑到昨天（补跑后 state 即最新，
+    # aux['last_bar'] 停在昨日 15:00，实时循环从今日 bar 无缝接上）
+    if start_date and not has_saved and start_date < str(datetime.date.today()):
+        _replay_history(account_id, bundle, ctx, dm, matcher, state, aux, start_date)
+    hooks_done: dict[str, str | None] = {"pre": None, "eod": None}
+    trading_day: tuple[str, bool] | None = None  # (today_str, bool) 每日缓存一次
+    try:
+        while not is_paused(account_id):
+            now = datetime.datetime.now()
+            today = str(now.date())
+            if trading_day is None or trading_day[0] != today:
+                trading_day = (today, _is_trading_day(dm, today))
+            if not trading_day[1] or (start_date and today < start_date):
+                # 非交易日，或 start_date 在未来（到日前空转等待）
+                time.sleep(idle_interval)
+                continue
+            t = now.time()
+            if hooks_done["pre"] != today and t >= datetime.time(9, 25):
+                _pre_market(account_id, bundle, ctx, aux["fired"], jq_api, now)
+                hooks_done["pre"] = today
+            if in_trading(now) or (datetime.time(15, 0) < t <= SESSION_END_GRACE):
+                if aux["frequency"] == "daily" and aux["daily_done"] == today:
+                    # 日频账户：当日唯一 tick 已完成
+                    time.sleep(idle_interval)
+                    continue
+                bar = _strategy_tick(account_id, bundle, ctx, dm, feed, matcher,
+                                     state, aux, now)
+                if bar is not None and aux["frequency"] == "daily":
+                    aux["daily_done"] = today
+                # 对齐分钟边界 + 偏移，等刚收的 bar 可读
+                time.sleep(max(1, 60 - now.second + TICK_OFFSET))
+            elif t > SESSION_END_GRACE and hooks_done["eod"] != today:
+                _eod(account_id, bundle, ctx, dm, state, aux, now)
+                hooks_done["eod"] = today
+            else:
+                time.sleep(idle_interval)
+    except Exception:
+        # 崩溃兜底置 failed，避免账户状态停留 running 误导前端
+        db.update_sim_account(account_id, status="failed")
+        log.exception("[runner] 账户 %s 策略主循环异常退出", account_id)
+        raise
+    db.update_sim_account(account_id, status="paused")
+
+
+# ---------------------------------------------------------------------------
+# 入口分派
+# ---------------------------------------------------------------------------
+
+def run_loop(account_id: str, provider: QuantDataProvider | None = None,
+             matcher: Matcher | None = None, dm=None, feed=None,
+             poll_interval: float = POLL_INTERVAL, idle_interval: float = IDLE_INTERVAL):
+    acct = db.get_sim_account(account_id)
+    if not acct:
+        return
+    stop = acct.get("stop_loss") or 0.03
+    matcher = matcher or Matcher(stop, account_id=account_id)
+    if (acct.get("strategy_id") or "").strip():
+        _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
+                           idle_interval=idle_interval)
+        return
+    _run_watcher_loop(account_id, acct, provider, matcher, poll_interval, idle_interval)

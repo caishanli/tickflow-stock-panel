@@ -295,6 +295,41 @@ class MootdxSource(DataSource):
             out = out.drop(columns=["datetime"])
         return out
 
+    def get_minute_recent(self, code, pages=1):
+        """最近 N 页 1 分钟 K 线（每页约 800 根，含当日盘中实时 bar）。
+
+        与 :meth:`get_minute` 的全量分页回看不同，本方法只取最近 ``pages``
+        页（start=0 为最新一页），供模拟盘盘中高频刷新：每只标的每次仅
+        ``pages`` 次 socket 调用。
+        """
+        sym = _to_symbol(code)
+
+        def _fn(c):
+            frames = []
+            for i in range(max(1, int(pages))):
+                df = c.bars(symbol=sym, frequency=8, start=i * 800, offset=800)
+                if df is None or df.empty:
+                    break
+                frames.append(df)
+                if len(df) < 800:
+                    break
+            if not frames:
+                raise DataSourceError("mootdx 无分钟数据")
+            return pd.concat(frames)
+
+        out, err = self._with_server_retry(_fn)
+        if out is None:
+            raise DataSourceError(f"mootdx 实时分钟获取失败 ({err})")
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        if "vol" in out.columns and "volume" not in out.columns:
+            out["volume"] = out["vol"]
+        if "amount" in out.columns and "money" not in out.columns:
+            out["money"] = out["amount"]
+        out.index.name = "datetime"
+        if "datetime" in out.columns:
+            out = out.drop(columns=["datetime"])
+        return out
+
     def get_index_realtime(self, codes):
         raise DataSourceError("mootdx 暂不支持指数实时")
 

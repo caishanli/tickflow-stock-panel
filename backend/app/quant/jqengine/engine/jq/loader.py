@@ -18,9 +18,14 @@ sys.modules.setdefault("jqdata", _jqdata)
 class StrategyBundle:
     """一次策略编译的产物。"""
 
-    def __init__(self, init_fn, ctx):
+    def __init__(self, init_fn, ctx, ns=None):
         self.init_fn = init_fn      # 用户 init(context) 函数
         self.ctx = ctx
+        ns = ns or {}
+        # 聚宽式盘中/盘前/盘后钩子（策略未定义则为 None，由驱动方判空调用）
+        self.handle_data = ns.get("handle_data")
+        self.before_trading_start = ns.get("before_trading_start")
+        self.after_trading_end = ns.get("after_trading_end")
 
     @property
     def daily(self):
@@ -77,4 +82,5 @@ def load_strategy(code, manager, fee, slippage, cash):
     return StrategyBundle(
         init_fn,
         ctx,
+        ns,
     )

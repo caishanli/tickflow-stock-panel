@@ -8,12 +8,13 @@ class G(SimpleNamespace):
 
 
 class Position:
-    """持仓：数量 / 成本 / 现价。"""
+    """持仓：数量 / 成本 / 现价。``today_amount`` 为当日买入量（T+1 当日不可卖）。"""
 
-    def __init__(self, amount=0, avg_cost=0.0, price=0.0):
+    def __init__(self, amount=0, avg_cost=0.0, price=0.0, today_amount=0.0):
         self.amount = amount
         self.avg_cost = avg_cost
         self.price = price
+        self.today_amount = today_amount
 
     @property
     def total_amount(self):
@@ -21,7 +22,7 @@ class Position:
 
     @property
     def closeable_amount(self):
-        return self.amount
+        return max(0.0, self.amount - float(self.today_amount or 0.0))
 
     @property
     def value(self):
