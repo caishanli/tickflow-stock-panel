@@ -1276,23 +1276,19 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             },
             "quantbridge": {"enabled": True},
             "jqbarcache": {"enabled": True},
+            # quantlive：运行期把净值/成交/日志实时落 quant.db，供 SSE 增量推送
+            # （否则这些只在本函数末尾批量写，前端要等整段回测跑完才一次性看到）。
+            "quantlive": {"enabled": True},
         },
         "extra": {"log_level": params.get("log_level", "error")},
     }
 
-    # 实时日志落库：聚宽策略的 log.info 经 jqcompat._Log -> LIVE_SINK 写 quant.db，
-    # 否则前端日志标签始终为空。复用 rqalpha 路径的全局 run_id 与 sink 钩子。
+    # 实时落库由 quantlive mod 负责（start_up 里注入 LIVE_SINK + 注册
+    # _on_after_trading/_on_trade，写入净值/成交/日志），这里只需把全局
+    # run_id 设好，mod 的事件钩子据此落 quant.db，前端 SSE 即可增量推送。
     global _LIVE_RUN_ID
     run_id = params.get("run_id") or _re.sub(r"\W+", "", strategy_path).lower()[:16]
     _LIVE_RUN_ID = run_id
-    try:
-        import app.quant.jqcompat as _jqcompat_mod
-        _jqcompat_mod.LIVE_SINK = (
-            lambda level, msg: db.insert_log(run_id, _now(), level, msg)
-            if _LIVE_RUN_ID is not None else None
-        )
-    except Exception:  # noqa: BLE001
-        pass
 
     out_dir = params.get("out_dir") or os.path.join(CONFIG.runtime_dir, "jqwufu")
     os.makedirs(out_dir, exist_ok=True)
