@@ -66,18 +66,38 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
   const { data } = useQuery({ queryKey: ['quant', 'strategies', 'latest'], queryFn: () => api.listStrategiesWithLatest() })
   const list = (data ?? []) as any[]
   const [page, setPage] = useState(1)
-  const [delId, setDelId] = useState<string | null>(null)
+  const [delIds, setDelIds] = useState<string[] | null>(null)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   const PAGE_SIZE = 15
 
   const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE))
   const safePage = Math.min(page, totalPages)
   const pageItems = list.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+  const pageIds = pageItems.map(s => s.id)
+  const allPageSelected = pageIds.length > 0 && pageIds.every(id => selected.has(id))
+
+  const toggle = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+  const togglePage = () => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (allPageSelected) pageIds.forEach(id => next.delete(id))
+      else pageIds.forEach(id => next.add(id))
+      return next
+    })
+  }
 
   const delMut = useMutation({
-    mutationFn: () => api.deleteStrategy(delId as string),
+    mutationFn: () => Promise.all((delIds as string[]).map(id => api.deleteStrategy(id))),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] })
-      setDelId(null)
+      setDelIds(null)
+      setSelected(new Set())
     },
   })
 
@@ -87,10 +107,18 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
         title="量化回测"
         subtitle="策略 · RQAlpha · 聚宽式 · 实时 SSE"
         right={
-          <button onClick={onNew}
-            className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn bg-accent text-base text-xs font-medium hover:bg-accent/90 transition-colors">
-            <Plus className="h-4 w-4" />新建
-          </button>
+          <div className="flex items-center gap-2">
+            {selected.size > 0 && (
+              <button onClick={() => setDelIds([...selected])}
+                className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 transition-colors">
+                <Trash2 className="h-3.5 w-3.5" />删除选中({selected.size})
+              </button>
+            )}
+            <button onClick={onNew}
+              className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn bg-accent text-base text-xs font-medium hover:bg-accent/90 transition-colors">
+              <Plus className="h-4 w-4" />新建
+            </button>
+          </div>
         }
       />
       <div className="flex-1 p-4 overflow-auto">
@@ -99,6 +127,10 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             <thead className="text-muted bg-elevated/40">
               <tr className="text-left">
                 <th className="px-3 py-2 font-normal w-10 text-center">#</th>
+                <th className="px-3 py-2 w-8 text-center">
+                  <input type="checkbox" checked={allPageSelected} onChange={togglePage}
+                    className="accent-accent cursor-pointer align-middle" />
+                </th>
                 <th className="px-3 py-2 font-normal">策略名称</th>
                 <th className="px-3 py-2 font-normal">最新回测周期</th>
                 <th className="px-3 py-2 font-normal text-right">收益率</th>
@@ -110,16 +142,21 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </thead>
             <tbody className="text-foreground">
               {pageItems.length === 0 && (
-                <tr><td colSpan={8} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
+                <tr><td colSpan={9} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
               )}
               {pageItems.map((s, i) => {
                 const m = pickMetrics(s.latest?.metrics_json)
                 const period = s.latest ? `${s.latest.start ?? ''} ~ ${s.latest.end ?? ''}` : '—'
                 const idx = (safePage - 1) * PAGE_SIZE + i + 1
+                const checked = selected.has(s.id)
                 return (
                   <tr key={s.id} onClick={() => onOpen(s.id)}
-                    className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
+                    className={`border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors ${checked ? 'bg-accent/5' : ''}`}>
                     <td className="px-3 py-2 text-center text-muted num">{idx}</td>
+                    <td className="px-3 py-2 text-center" onClick={e => e.stopPropagation()}>
+                      <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
+                        className="accent-accent cursor-pointer align-middle" />
+                    </td>
                     <td className="px-3 py-2 font-medium">{s.name}</td>
                     <td className="px-3 py-2 text-muted num">{period}</td>
                     <td className={`px-3 py-2 text-right num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</td>
@@ -127,7 +164,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                     <td className={`px-3 py-2 text-right num ${tone(m.sharpe)}`}>{fmtNum(m.sharpe)}</td>
                     <td className={`px-3 py-2 text-right num ${tone(null)}`}>{s.run_count}</td>
                     <td className="px-3 py-2 text-right" onClick={e => e.stopPropagation()}>
-                      <button onClick={() => setDelId(s.id)}
+                      <button onClick={() => setDelIds([s.id])}
                         className="inline-flex items-center gap-1 text-bear hover:underline text-xs">
                         <Trash2 className="h-3.5 w-3.5" />删除
                       </button>
@@ -152,13 +189,13 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
         )}
       </div>
 
-      {delId && (
-        <Modal onClose={() => setDelId(null)} ariaLabel="确认删除策略">
+      {delIds && (
+        <Modal onClose={() => setDelIds(null)} ariaLabel="确认删除策略">
           <div className="p-5 space-y-4">
             <h3 className="text-sm font-medium text-foreground">删除策略</h3>
-            <p className="text-xs text-muted">确定删除该策略及其全部回测记录？此操作不可恢复。</p>
+            <p className="text-xs text-muted">确定删除选中的 {delIds.length} 个策略及其全部回测记录？此操作不可恢复。</p>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setDelId(null)} className="px-3 py-1.5 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">取消</button>
+              <button onClick={() => setDelIds(null)} className="px-3 py-1.5 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">取消</button>
               <button onClick={() => delMut.mutate()} disabled={delMut.isPending}
                 className="px-3 py-1.5 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 transition-colors disabled:opacity-50">删除</button>
             </div>
