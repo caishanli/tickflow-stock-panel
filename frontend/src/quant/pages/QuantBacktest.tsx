@@ -98,6 +98,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
           <table className="w-full text-xs">
             <thead className="text-muted bg-elevated/40">
               <tr className="text-left">
+                <th className="px-3 py-2 font-normal w-10 text-center">#</th>
                 <th className="px-3 py-2 font-normal">策略名称</th>
                 <th className="px-3 py-2 font-normal">最新回测周期</th>
                 <th className="px-3 py-2 font-normal text-right">收益率</th>
@@ -109,14 +110,16 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </thead>
             <tbody className="text-foreground">
               {pageItems.length === 0 && (
-                <tr><td colSpan={7} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
+                <tr><td colSpan={8} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
               )}
-              {pageItems.map((s) => {
+              {pageItems.map((s, i) => {
                 const m = pickMetrics(s.latest?.metrics_json)
                 const period = s.latest ? `${s.latest.start ?? ''} ~ ${s.latest.end ?? ''}` : '—'
+                const idx = (safePage - 1) * PAGE_SIZE + i + 1
                 return (
                   <tr key={s.id} onClick={() => onOpen(s.id)}
                     className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
+                    <td className="px-3 py-2 text-center text-muted num">{idx}</td>
                     <td className="px-3 py-2 font-medium">{s.name}</td>
                     <td className="px-3 py-2 text-muted num">{period}</td>
                     <td className={`px-3 py-2 text-right num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</td>
