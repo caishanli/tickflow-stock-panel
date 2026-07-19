@@ -490,24 +490,17 @@ class _Log:
 
     def info(self, *a, **k):
         self._sink("INFO", a)
-        logger.info(*a)
 
     def warn(self, *a, **k):
         self._sink("WARNING", a)
-        print("[策略WARN]", *a)
-        logger.warning(*a)
 
     warning = warn
 
     def error(self, *a, **k):
         self._sink("ERROR", a)
-        print("[策略ERROR]", *a)
-        logger.error(*a)
 
     def debug(self, *a, **k):
         self._sink("DEBUG", a)
-        print("[策略DEBUG]", *a)
-        logger.debug(*a)
 
     def set_level(self, *a, **k):
         pass

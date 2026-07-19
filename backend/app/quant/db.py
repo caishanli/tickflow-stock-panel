@@ -272,6 +272,42 @@ def get_logs(run_id):
     return [dict(r) for r in rows]
 
 
+def get_logs_tail(run_id, limit=200):
+    """取最近 limit 条日志（按 rowid 倒序取末段，再按时间正序返回）。
+
+    返回 (rows, min_rowid)：rows 为时间正序的 dict 列表（含 rowid），
+    min_rowid 为这批里最小的 rowid，供前端「向上滚动加载更早」时作为游标。
+    """
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, ts, level, message FROM backtest_logs "
+            "WHERE run_id=? ORDER BY rowid DESC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+        total = c.execute(
+            "SELECT COUNT(*) AS n FROM backtest_logs WHERE run_id=?", (run_id,)
+        ).fetchone()["n"]
+    rows = [dict(r) for r in reversed(rows)]
+    min_rid = rows[0]["rowid"] if rows else None
+    return rows, min_rid, total
+
+
+def get_logs_before(run_id, before_rowid, limit=200):
+    """取 before_rowid 之前最多 limit 条日志（时间正序）。
+
+    用于「向上滚动加载更早」：游标为已加载批次的最小 rowid。返回 (rows, min_rowid)。
+    """
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, ts, level, message FROM backtest_logs "
+            "WHERE run_id=? AND rowid < ? ORDER BY rowid DESC LIMIT ?",
+            (run_id, before_rowid, limit),
+        ).fetchall()
+    rows = [dict(r) for r in reversed(rows)]
+    min_rid = rows[0]["rowid"] if rows else None
+    return rows, min_rid
+
+
 def get_logs_after(run_id, offset=0):
     """返回 rowid > offset 的日志行（SSE 增量用）。"""
     with get_conn() as c:

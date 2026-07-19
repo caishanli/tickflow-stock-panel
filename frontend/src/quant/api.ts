@@ -27,10 +27,20 @@ export const runBacktest = (p: any) => j('/backtest/run', { method: 'POST', body
 export const getBacktestStatus = (id: string) => j(`/backtest/${id}/status`)
 export const getBacktestEquity = (id: string) => j(`/backtest/${id}/equity`)
 export const getBacktestTrades = (id: string) => j(`/backtest/${id}/trades`)
-export const getBacktestLogs = (id: string) => j(`/backtest/${id}/logs`)
+export const getBacktestLogs = (id: string, opts?: { before?: number | null; limit?: number }) => {
+  const q = new URLSearchParams()
+  if (opts?.before != null) q.set('before', String(opts.before))
+  if (opts?.limit != null) q.set('limit', String(opts.limit))
+  const qs = q.toString()
+  return fetch(`/api/quant/backtest/${id}/logs${qs ? `?${qs}` : ''}`, {
+    headers: { 'Content-Type': 'application/json' },
+  }).then((r) => (r.ok ? r.json() : { data: [], total: null, min_rowid: null, has_more: false }))
+}
 export const getBacktestCsvUrl = (id: string) => `${B}/backtest/${id}/trades.csv`
 export const terminateBacktest = (id: string) => j(`/backtest/${id}/terminate`, { method: 'POST' })
 export const deleteBacktest = (id: string) => j(`/backtest/${id}`, { method: 'DELETE' })
+export const batchDeleteBacktests = (ids: string[]) =>
+  j('/backtest', { method: 'DELETE', body: JSON.stringify({ ids }) })
 
 export const listAccounts = () => j('/sim/accounts')
 export const createAccount = (b: any) => j('/sim/accounts', { method: 'POST', body: JSON.stringify(b) })

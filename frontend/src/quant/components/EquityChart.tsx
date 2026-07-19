@@ -8,12 +8,14 @@ export function EquityChart({ equity }: { equity: any[] }) {
     const dates = equity.map((d) => String(d.dt ?? d.date ?? '').slice(0, 10))
     const strat = equity.map((d) => Number(d.value ?? 0))
     const bench = equity.map((d) => Number(d.benchmark ?? 0))
-    const norm = (arr: number[]) => {
+    // 累计收益率（%）：相对首日净值的涨跌，含基准。首日为 0%。
+    const toReturn = (arr: number[]) => {
       const f = arr[0]
-      return f ? arr.map((v) => v / f) : arr
+      if (!f) return arr.map(() => 0)
+      return arr.map((v) => (v / f - 1) * 100)
     }
-    const s = norm(strat)
-    const b = norm(bench)
+    const s = toReturn(strat)
+    const b = toReturn(bench)
     return {
       animation: false,
       grid: { left: 56, right: 16, top: 28, bottom: 32 },
@@ -23,6 +25,7 @@ export function EquityChart({ equity }: { equity: any[] }) {
         backgroundColor: ct.tooltipBg,
         borderColor: ct.tooltipBorder,
         textStyle: { color: ct.tooltipText, fontSize: 12 },
+        valueFormatter: (v: any) => (v == null ? '-' : `${(Number(v)).toFixed(2)}%`),
       },
       xAxis: {
         type: 'category', data: dates,
@@ -32,7 +35,7 @@ export function EquityChart({ equity }: { equity: any[] }) {
       },
       yAxis: {
         type: 'value', scale: true,
-        axisLabel: { color: ct.text, fontSize: 10 },
+        axisLabel: { color: ct.text, fontSize: 10, formatter: (v: number) => `${v.toFixed(0)}%` },
         splitLine: { lineStyle: { color: ct.grid } },
       },
       dataZoom: [
@@ -50,6 +53,12 @@ export function EquityChart({ equity }: { equity: any[] }) {
                 { offset: 1, color: 'rgba(59,130,246,0.01)' },
               ],
             } as any,
+          },
+          markLine: {
+            silent: true, symbol: 'none',
+            lineStyle: { color: ct.border, width: 1, type: 'solid' },
+            data: [{ yAxis: 0 }],
+            label: { show: false },
           },
         },
         {

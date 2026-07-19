@@ -711,6 +711,74 @@ class _BundleProvider:
 # ---------------------------------------------------------------------------
 # 结果回收
 # ---------------------------------------------------------------------------
+def _compute_trade_metrics(trades):
+    """从成交序列（含每笔已实现 pnl）计算胜率/盈亏比/交易次数。
+
+    trades 为 _extract_trades 输出：每笔 dict 含 side / pnl。以「平仓（SELL）
+    且 pnl 非空」的成交作为一轮完整交易样本；BUY 的 pnl 恒为 0 不参与统计。
+    """
+    wins, losses, gross_win, gross_loss = 0, 0, 0.0, 0.0
+    closed = 0
+    for t in trades or []:
+        _side = (t.get("side") if isinstance(t, dict) else getattr(t, "side", None)) \
+            or (t.get("action") if isinstance(t, dict) else getattr(t, "action", None))
+        side = str(_side or "")
+        try:
+            pnl = float(t.get("pnl", 0.0) if isinstance(t, dict) else getattr(t, "pnl", 0.0))
+        except Exception:
+            pnl = 0.0
+        if "SELL" not in side.upper():
+            continue
+        if pnl != pnl:  # NaN 跳过
+            continue
+        closed += 1
+        if pnl > 0:
+            wins += 1
+            gross_win += pnl
+        elif pnl < 0:
+            losses += 1
+            gross_loss += -pnl
+    win_rate = (wins / closed) if closed else None
+    avg_win = (gross_win / wins) if wins else 0.0
+    avg_loss = (gross_loss / losses) if losses else 0.0
+    if avg_loss > 0:
+        pl_ratio = avg_win / avg_loss
+    elif avg_win > 0:
+        pl_ratio = float("inf")  # 全胜：盈亏比无穷大，前端按 null/— 处理
+    else:
+        pl_ratio = None
+    return {
+        "win_rate": win_rate,
+        "profit_loss_ratio": (None if pl_ratio == float("inf") else pl_ratio),
+        "trade_count": closed,
+    }
+
+
+def _sharpe_from_equity(equity):
+    """rqalpha 未给出 sharpe（短窗口/年化异常）时，用净值日收益自算年化夏普。
+
+    年化系数按交易日 252；无风险利率取 0。样本不足 2 日返回 None。
+    """
+    try:
+        vals = [float(r[1]) for r in equity if r is not None]
+        if len(vals) < 2:
+            return None
+        rets = [vals[i] / vals[i - 1] - 1 for i in range(1, len(vals))]
+        import math
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        if var <= 0:
+            return None
+        std = math.sqrt(var)
+        daily = mean / std if std else 0.0
+        ann = daily * math.sqrt(252)
+        if ann != ann or ann in (float("inf"), float("-inf")):
+            return None
+        return ann
+    except Exception:
+        return None
+
+
 def _extract_metrics(result):
     try:
         summary = result["sys_analyser"]["summary"]
@@ -732,25 +800,93 @@ def _extract_metrics(result):
         return {}
 
 
-def _extract_equity(result):
+def _extract_equity(result, benchmark=None, dm=None, start=None, end=None):
     """回收每日净值。第 3 列语义为**基准净值**（与 live 钩子 insert_equity_row 一致）：
-    sys_analyser 含 benchmark_portfolio 时取其 unit_net_value（按日期对齐、前向填充）；
-    未配置基准或取数失败时统一占位 1.0。（此前兜底路径写的是组合 unit_net_value，
-    与 live 钩子的 1.0 占位语义不一致，且占用 benchmark 列名，已统一。）
+
+    优先直接用基准日线收盘价计算「沪深300 当日收盘 / 首个可用收盘」（与图表归一
+    口径一致、最可靠）；若取不到日线再退回 rqalpha 的 benchmark_portfolio
+    unit_net_value；两者都失败才占位 1.0。此前纯依赖 rqalpha 的 benchmark_portfolio，
+    部分 run（如窗口对齐后）会缺失导致基准恒为 1，曲线变成直线。
     """
+    # 1) 自助计算基准净值：用 dm 加载的日线收盘价，按日期对齐到组合净值序列
+    _bench_by_date = {}
+    _bench_base = None
+    if benchmark and dm is not None:
+        _df = None
+        try:
+            _df = dm.fetch("get_daily", benchmark, start, end)
+        except Exception:
+            _df = None
+        # 离线/缓存覆盖不足导致 fetch 失败时，直接从已加载的日线缓存里找基准标的
+        # （长窗口回测本地可能只有多段 parquet，fetch 在 offline 模式会抛错）。
+        # 合并所有含该基准标的的 parquet，覆盖完整窗口。
+        if _df is None and getattr(dm, "cache", None) is not None:
+            try:
+                _all = dm.cache.get_all("daily")
+                _frames = []
+                for _k, _v in _all.items():
+                    if f"_{benchmark}" in str(_k) and _v is not None and not (hasattr(_v, "empty") and _v.empty):
+                        _frames.append(_v)
+                if _frames:
+                    _df = pd.concat(_frames, ignore_index=True) if len(_frames) > 1 else _frames[0]
+            except Exception:
+                _df = None
+        if _df is not None and not (hasattr(_df, "empty") and _df.empty):
+            _dcol = "trade_date" if "trade_date" in _df.columns else (
+                "date" if "date" in _df.columns else None)
+            if _dcol and "close" in _df.columns:
+                for _d, _c in zip(pd.to_datetime(_df[_dcol]).dt.date, _df["close"]):
+                    _bench_by_date[_d] = float(_c)
+                # 首个可用收盘作基准（与图表"以首日为 1"归一一致）
+                for _dd in sorted(_bench_by_date):
+                    _bench_base = _bench_by_date[_dd]
+                    break
+
+    def _bench_nav(dt_str):
+        if _bench_by_date and _bench_base:
+            _d = None
+            try:
+                _d = pd.Timestamp(dt_str).date()
+            except Exception:
+                _d = None
+            if _d is not None and _d in _bench_by_date:
+                return _bench_by_date[_d] / _bench_base
+            # 当日缺数据则前向取最近一个可用收盘
+            if _d is not None:
+                _prev = None
+                for _dd in sorted(_bench_by_date):
+                    if _dd <= _d:
+                        _prev = _dd
+                    else:
+                        break
+                if _prev is not None:
+                    return _bench_by_date[_prev] / _bench_base
+        return None
+
+    # 2) 退回 rqalpha 自带 benchmark_portfolio（按日期对齐、前向填充）
+    _rq_bench = None
+    if not _bench_by_date:
+        try:
+            bpf = result["sys_analyser"].get("benchmark_portfolio")
+            if bpf is not None and "unit_net_value" in getattr(bpf, "columns", []):
+                _rq_bench = bpf["unit_net_value"]
+        except Exception:
+            _rq_bench = None
+
     try:
         pf = result["sys_analyser"]["portfolio"]
-        bench_nav = None
-        bpf = result["sys_analyser"].get("benchmark_portfolio")
-        if bpf is not None and "unit_net_value" in getattr(bpf, "columns", []):
-            bench_nav = bpf["unit_net_value"].reindex(pf.index).ffill()
         out = []
         for i, (d, row) in enumerate(pf.iterrows()):
             dt = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
             bv = 1.0
-            if bench_nav is not None:
-                _v = float(bench_nav.iloc[i])
-                bv = _v if _v == _v else 1.0  # 前段 NaN（基准数据未覆盖）占位 1.0
+            _v = _bench_nav(dt)
+            if _v is None and _rq_bench is not None:
+                try:
+                    _v = float(_rq_bench.iloc[i])
+                except Exception:
+                    _v = None
+            if _v is not None and _v == _v:
+                bv = _v
             out.append((
                 dt,
                 float(row.get("total_value", 0.0) or 0.0),
@@ -1185,6 +1321,76 @@ def run_jq_backtest(strategy_path: str, params: dict,
         _load_etf_universe(dm)
     except Exception:
         pass
+    # 离线回测前，先把「回测区间所需的日线」在线补齐到本地缓存：rqalpha 会对
+    # benchmark 做「数据区间必须覆盖回测区间」的校验，本地日线若差最后一天
+    # （如盘后管道尚未追到最新交易日）会直接 failed。这里在 offline 开关之前，
+    # 对 benchmark + 指数 + 策略固定池逐只 dm.fetch(get_daily, start, end)：
+    # 缓存覆盖不足时 cache.get 会自动回源补齐并落盘（见 manager.fetch 的
+    # _covers 逻辑），随后离线回测用的就是完整数据。仅刷关键标的，不刷全市场
+    # 1600+ ETF（其余在回测中按需取、缺失则策略侧容忍/跳过）。
+    try:
+        _refresh_codes = list(dict.fromkeys(
+            [benchmark, "511880.XSHG"] + list(_EXTRA_INDEX_CODES)
+            + list(_extract_fixed_pools(strategy_text))
+        ))
+        _refreshed = 0
+        for _c in _refresh_codes:
+            try:
+                dm.fetch("get_daily", _c, start, end)
+                _refreshed += 1
+            except Exception:
+                pass
+        if _refreshed:
+            _log_progress(params.get("run_id"),
+                          f"离线回测前补齐日线缓存: {_refreshed}/{len(_refresh_codes)} 只标的已覆盖 {start}~{end}")
+        # 刷新后重建内存日线缓存，确保 preload_daily 拿到补齐后的帧
+        try:
+            dm.preload_daily()
+        except Exception:
+            pass
+        # 把回测窗口对齐到「数据实际可用的交易日区间」：rqalpha 的 benchmark
+        # 校验要求基准日线必须完整覆盖回测区间，且需要回测首日之前至少一根 bar
+        # （用于计算首日收益率，trading_dates 会比需求多一天）。若窗口超出可用
+        # 数据，或 start 正好压在基准数据首日（没有前置 bar），校验会直接 failed。
+        # 这里取 benchmark/指数补齐后的全部交易日，将 end 收敛到末日、start 收敛
+        # 到「至少第 2 个可用交易日」（保证有前置 bar），交给 rqalpha 的区间必然
+        # 落在可用数据内、且基准覆盖完整。
+        import datetime as _dt
+        _avail = set()
+        for _c in [benchmark] + list(_EXTRA_INDEX_CODES):
+            try:
+                _df = dm.fetch("get_daily", _c, start, end)
+                if _df is None or (hasattr(_df, "empty") and _df.empty):
+                    continue
+                _col = "trade_date" if "trade_date" in _df.columns else (
+                    "date" if "date" in _df.columns else None)
+                if not _col:
+                    continue
+                for _d in pd.to_datetime(_df[_col]).dt.date:
+                    _avail.add(_d)
+            except Exception:
+                pass
+        if _avail:
+            _days = sorted(_avail)
+            _last_str = _days[-1].strftime("%Y-%m-%d")
+            # end 收敛到最新可用交易日（不超出数据）
+            _req_end = pd.Timestamp(end).date()
+            if _days[-1] < _req_end:
+                _log_progress(params.get("run_id"),
+                              f"回测结束日 {end} 超出可用数据（最新 {_last_str}），自动收敛到 {_last_str}")
+                end = _last_str
+            # start 收敛：至少取第 2 个可用交易日，保证基准有前置 bar
+            _req_start = pd.Timestamp(start).date()
+            _min_start = _days[1] if len(_days) >= 2 else _days[0]
+            if _req_start < _min_start:
+                _ms = _min_start.strftime("%Y-%m-%d")
+                _log_progress(params.get("run_id"),
+                              f"回测开始日 {start} 超出基准可用数据首日（需前置 bar），自动收敛到 {_ms}")
+                start = _ms
+            elif _req_start > _days[-1]:
+                start = _last_str
+    except Exception:
+        pass
     _prev_offline = getattr(dm, "_offline", False)
     dm._offline = True
     try:
@@ -1339,7 +1545,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
         _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
         result = rq_run(config, source_code=strategy_code)
 
-        equity = _extract_equity(result)
+        equity = _extract_equity(result, benchmark=benchmark, dm=dm, start=start, end=end)
         trades = _extract_trades(result)
 
         eq_path = os.path.join(out_dir, "equity.csv")
@@ -1367,6 +1573,18 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             }
         except Exception:
             metrics = {}
+
+        # 胜率/盈亏比/交易次数：从成交序列（含每笔 pnl）计算，rqalpha 不输出这些
+        tm = _compute_trade_metrics(trades)
+        metrics["win_rate"] = tm["win_rate"]
+        metrics["profit_loss_ratio"] = tm["profit_loss_ratio"]
+        metrics["trade_count"] = tm["trade_count"]
+        # sharpe 兜底：rqalpha 短窗口常返回 null，用净值日收益自算年化夏普
+        if metrics.get("sharpe") is None:
+            metrics["sharpe"] = _sharpe_from_equity(equity)
+        # 年化兜底：rqalpha 未给时用 total_return 近似（短窗口偏差可接受）
+        if metrics.get("annualized") is None and metrics.get("total_return") is not None:
+            metrics["annualized"] = metrics["total_return"]
 
         n_trades = len(trades)
         final_equity = equity[-1][1] if equity else float(params.get("capital", 100000.0))

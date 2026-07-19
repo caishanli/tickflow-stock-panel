@@ -3,7 +3,7 @@
 
 export interface BacktestStreamHandlers {
   onStatus?: (s: { status: string; metrics?: string | null }) => void
-  onLog?: (l: { ts: string; level: string; message: string }) => void
+  onLog?: (l: { rowid?: number; ts: string; level: string; message: string }) => void
   onEquity?: (e: { dt: string; value: number; benchmark: number; cash: number; positions_value: number }) => void
   onTrade?: (t: { ts: string; code: string; action: string; price: number; amount: number; pnl: number; pnl_pct: number; commission: number }) => void
 }

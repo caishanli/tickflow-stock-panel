@@ -12,6 +12,7 @@ import { openBacktestStream } from '../stream'
 import { CodeEditor } from '../components/CodeEditor'
 import { EquityChart } from '../components/EquityChart'
 import { pickMetrics, fmtPct, fmtNum, tone } from '../metrics'
+import { useBacktestLogs } from '../useBacktestLogs'
 
 const INPUT_CLS =
   'h-9 w-full rounded-btn bg-base border border-border px-2.5 text-xs text-foreground ' +
@@ -24,6 +25,16 @@ function statusTone(s: string | undefined) {
   if (s === 'failed') return 'text-bear'
   if (s === 'running' || s === 'queued') return 'text-accent'
   return 'text-muted'
+}
+
+// 回测运行时间（created_at）格式化为 MM-DD HH:mm
+function fmtDateTime(s?: string | null): string {
+  if (!s) return ''
+  const t = s.replace('T', ' ').slice(0, 16)
+  // 取 月-日 时:分
+  const m = t.match(/(\d{4})-(\d{2})-(\d{2})[ ](\d{2}):(\d{2})/)
+  if (m) return `${m[2]}-${m[3]} ${m[4]}:${m[5]}`
+  return t
 }
 
 interface FormState {
@@ -219,6 +230,9 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const [logTab, setLogTab] = useState<'log' | 'error' | 'trade'>('log')
   const [advOpen, setAdvOpen] = useState(false)
   const [histOpen, setHistOpen] = useState(false)
+  const [selMode, setSelMode] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [confirmBatchDel, setConfirmBatchDel] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
   const [leftPct, setLeftPct] = useState(50)
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -270,7 +284,9 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       // 对应的库内代码优先于 payload.strategy_code）：先落库再提交，避免跑到旧代码
       await saveStrategy()
       const end = form.end.trim()
-      const start = short && end ? shiftDays(end, -7) : form.start.trim()
+      // 用户显式填了开始日期就尊重它；只有「编译运行」且开始日期为空时，
+      // 才退化为 end-7 的快速区间（不再覆盖用户已设的 start，避免静默改期）。
+      const start = form.start.trim() || (short && end ? shiftDays(end, -7) : '')
       const payload: any = {
         name, strategy_id: strategyId, strategy_code: code,
         symbols: extractUniverse(code),
@@ -291,7 +307,9 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const { data: status } = useQuery({ queryKey: ['quant', 'bt', runId, 'status'], queryFn: () => api.getBacktestStatus(runId as string), enabled: !!runId })
   const { data: equity } = useQuery({ queryKey: ['quant', 'bt', runId, 'equity'], queryFn: () => api.getBacktestEquity(runId as string), enabled: !!runId })
   const { data: trades } = useQuery({ queryKey: ['quant', 'bt', runId, 'trades'], queryFn: () => api.getBacktestTrades(runId as string), enabled: !!runId })
-  const { data: logs } = useQuery({ queryKey: ['quant', 'bt', runId, 'logs'], queryFn: () => api.getBacktestLogs(runId as string), enabled: !!runId })
+  // 日志增量加载：先拉尾部，向上滚动加载更早，运行期 SSE 新日志从底部追加
+  const { logs, hasMore, total, loadingMore, loadEarlier, appendLog } =
+    useBacktestLogs(runId as string | null)
   // 运行列表不做定时轮询：发起回测时已 invalidate 刷新；运行结束（终态）时由
   // 下方 SSE onStatus 补刷一次，拿到最终状态。空闲时零请求。
   const { data: runs } = useQuery({
@@ -310,6 +328,8 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   }
 
   const lastStatus = status ? (status.state ?? status.status) : undefined
+  // 回测进行中（排队/运行中）禁用两个运行按钮，防止重复发起/并发覆盖
+  const isRunning = lastStatus === 'queued' || lastStatus === 'running'
 
   useEffect(() => {
     if (!runId || !liveOn) return
@@ -323,8 +343,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       onEquity: (e) => appendTo(['quant', 'bt', runId, 'equity'], e, (r) => String(r.dt)),
       onTrade: (t) => appendTo(['quant', 'bt', runId, 'trades'], t,
         (r) => `${r.ts}|${r.code}|${r.action}|${r.price}`),
-      onLog: (l) => appendTo(['quant', 'bt', runId, 'logs'], l,
-        (r) => `${r.ts}|${r.level}|${r.message}`),
+      onLog: (l) => appendLog(l),
       onStatus: (s) => {
         qc.setQueryData(['quant', 'bt', runId, 'status'], (prev: any) => ({
           ...(prev || {}), status: s.status, metrics_json: s.metrics ?? (prev || {}).metrics_json,
@@ -386,6 +405,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const shownReturn = metrics.total_return ?? liveTotalReturn
 
   const editorBoxRef = useRef<HTMLDivElement>(null)
+  const logScrollRef = useRef<HTMLDivElement>(null)
   const [editorH, setEditorH] = useState(320)
   useEffect(() => {
     const el = editorBoxRef.current
@@ -432,13 +452,13 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
             </div>
           )}
         </div>
-        <button onClick={() => runMut.mutate(true)} disabled={!code || runMut.isPending}
+        <button onClick={() => runMut.mutate(true)} disabled={!code || runMut.isPending || isRunning}
           className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
           <Play className="h-3.5 w-3.5" />编译运行
         </button>
-        <button onClick={() => runMut.mutate(false)} disabled={!code || !form.start || !form.end || runMut.isPending}
+        <button onClick={() => runMut.mutate(false)} disabled={!code || !form.start || !form.end || runMut.isPending || isRunning}
           className="inline-flex items-center gap-1.5 h-9 px-4 rounded-btn bg-accent text-base text-xs font-medium disabled:opacity-50 hover:bg-accent/90 transition-colors">
-          <Play className="h-4 w-4" />{runMut.isPending ? '提交中…' : '开始回测'}
+          <Play className="h-4 w-4" />{runMut.isPending ? '提交中…' : isRunning ? '运行中…' : '开始回测'}
         </button>
         {lastStatus && (
           <span className={`text-xs font-medium px-2 py-0.5 rounded-btn bg-base border border-border ${statusTone(lastStatus)}`}>{lastStatus}</span>
@@ -455,20 +475,70 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
           </button>
           {histOpen && (
             <div className="absolute z-20 right-0 top-11 w-72 rounded-card border border-border bg-surface p-2 shadow-xl max-h-80 overflow-auto">
+              <div className="flex items-center justify-between px-1 pb-2 mb-1 border-b border-border">
+                <span className="text-xs text-muted">
+                  {selMode ? `已选 ${selected.size} / ${runList.length}` : `共 ${runList.length} 条`}
+                </span>
+                <button onClick={() => { setSelMode(s => !s); setSelected(new Set()) }}
+                  className={`px-2 py-0.5 rounded-btn text-xs border border-border transition-colors ${selMode ? 'text-accent border-accent/50' : 'text-muted hover:text-foreground'}`}>
+                  {selMode ? '取消多选' : '多选'}
+                </button>
+              </div>
               {runList.length === 0 && <div className="px-2 py-4 text-xs text-muted text-center">暂无回测</div>}
               {runList.map((r) => {
                 const p = (() => { try { return JSON.parse(r.params_json || '{}') } catch { return {} } })()
                 const m = pickMetrics(r.metrics_json)
                 const active = (selRunId ?? liveRunId) === r.id
+                const checked = selected.has(r.id)
+                if (selMode) {
+                  return (
+                    <button key={r.id}
+                      onClick={() => setSelected(prev => {
+                        const n = new Set(prev); n.has(r.id) ? n.delete(r.id) : n.add(r.id); return n
+                      })}
+                      className={`w-full text-left px-2 py-1.5 rounded-btn text-xs flex items-center gap-2 ${checked ? 'bg-elevated/70 text-foreground' : 'text-secondary hover:bg-elevated/60'}`}>
+                      <span className={`inline-flex w-3.5 h-3.5 items-center justify-center rounded border ${checked ? 'bg-accent border-accent text-base' : 'border-border'}`}>
+                        {checked && '✓'}
+                      </span>
+                      <span className="num flex-1 flex flex-col leading-tight min-w-0">
+                        <span className="flex items-center gap-1.5">
+                          <span className="truncate">{`${p.start ?? ''} ~ ${p.end ?? ''}`}</span>
+                          {active && <span className="shrink-0 px-1 rounded bg-accent/20 text-accent text-[10px] font-medium">当前</span>}
+                        </span>
+                        <span className="text-[10px] text-muted">{fmtDateTime(r.created_at)}</span>
+                      </span>
+                      <span className={`num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</span>
+                    </button>
+                  )
+                }
                 return (
                   <button key={r.id} onClick={() => { setSelRunId(r.id); setHistOpen(false) }}
                     className={`w-full text-left px-2 py-1.5 rounded-btn text-xs flex items-center justify-between gap-2 ${active ? 'bg-elevated text-foreground' : 'text-secondary hover:text-foreground hover:bg-elevated/60'}`}>
-                    <span className="num">{`${p.start ?? ''} ~ ${p.end ?? ''}`}</span>
+                    <span className="flex flex-col leading-tight min-w-0">
+                      <span className="num flex items-center gap-1.5">
+                        {`${p.start ?? ''} ~ ${p.end ?? ''}`}
+                        {active && <span className="px-1 rounded bg-accent/20 text-accent text-[10px] font-medium">当前</span>}
+                      </span>
+                      <span className="num text-[10px] text-muted">{fmtDateTime(r.created_at)}</span>
+                    </span>
                     <span className={`num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</span>
                   </button>
                 )
               })}
-              {selRunId && (
+              {selMode && runList.length > 0 && (
+                <div className="flex items-center gap-2 mt-2 pt-2 border-t border-border">
+                  <button onClick={() => setSelected(new Set(runList.map(r => r.id)))}
+                    className="px-2 py-1 rounded-btn text-xs text-muted hover:text-foreground">全选</button>
+                  <button onClick={() => setSelected(new Set())}
+                    className="px-2 py-1 rounded-btn text-xs text-muted hover:text-foreground">清空</button>
+                  <button disabled={selected.size === 0}
+                    onClick={() => setConfirmBatchDel(true)}
+                    className="ml-auto inline-flex items-center gap-1 px-2.5 py-1 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 disabled:opacity-40 transition-colors">
+                    <Trash2 className="h-3.5 w-3.5" />删除选中({selected.size})
+                  </button>
+                </div>
+              )}
+              {!selMode && selRunId && (
                 <button onClick={() => { setSelRunId(null); setHistOpen(false) }} className="w-full mt-1 px-2 py-1.5 rounded-btn text-xs text-muted hover:text-foreground border-t border-border">回到当前回测</button>
               )}
             </div>
@@ -523,8 +593,22 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
                 {runId && <button onClick={() => setConfirmDel(true)} className="inline-flex items-center gap-1 text-xs text-bear hover:underline"><Trash2 className="h-3.5 w-3.5" />删除</button>}
               </div>
             </div>
-            <div className="flex-1 overflow-auto p-3">
-              {logTab === 'log' && <LogList logs={Array.isArray(logs) ? logs : []} />}
+            <div
+              ref={logScrollRef}
+              onScroll={(e) => {
+                if (e.currentTarget.scrollTop < 40 && hasMore && !loadingMore) loadEarlier()
+              }}
+              className="flex-1 overflow-auto p-3"
+            >
+              {logTab === 'log' && (
+                <LazyLogList
+                  logs={logs}
+                  loadingMore={loadingMore}
+                  hasMore={hasMore}
+                  loaded={logs.length}
+                  total={total}
+                />
+              )}
               {logTab === 'error' && <LogList logs={errLogs} />}
               {logTab === 'trade' && <TradeTable trades={Array.isArray(trades) ? trades : []} />}
             </div>
@@ -540,6 +624,31 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
             <div className="flex justify-end gap-2">
               <button onClick={() => setConfirmDel(false)} className="px-3 py-1.5 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">取消</button>
               <button onClick={() => { api.deleteBacktest(runId).then(() => { qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] }); qc.invalidateQueries({ queryKey: ['quant', 'bt', 'runs', strategyId] }); setConfirmDel(false); setLiveRunId(null); setSelRunId(null) }) }}
+                className="px-3 py-1.5 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 transition-colors">删除</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {confirmBatchDel && (
+        <Modal onClose={() => setConfirmBatchDel(false)} ariaLabel="确认批量删除回测">
+          <div className="p-5 space-y-4">
+            <h3 className="text-sm font-medium text-foreground">批量删除回测</h3>
+            <p className="text-xs text-muted">确定删除选中的 <span className="font-mono">{selected.size}</span> 条回测及其全部数据（日志/净值/成交）？此操作不可恢复。</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setConfirmBatchDel(false)} className="px-3 py-1.5 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">取消</button>
+              <button onClick={() => {
+                const ids = Array.from(selected)
+                api.batchDeleteBacktests(ids).then(() => {
+                  qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] })
+                  qc.invalidateQueries({ queryKey: ['quant', 'bt', 'runs', strategyId] })
+                  setConfirmBatchDel(false); setSelMode(false); setSelected(new Set())
+                  // 若当前正在查看的 run 被删，回到当前回测
+                  if ((selRunId ?? liveRunId) && ids.includes(selRunId ?? liveRunId as string)) {
+                    setSelRunId(null); setLiveRunId(null)
+                  }
+                })
+              }}
                 className="px-3 py-1.5 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 transition-colors">删除</button>
             </div>
           </div>
@@ -623,7 +732,7 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
 function LogList({ logs }: { logs: any[] }) {
   if (logs.length === 0) return <div className="text-xs text-muted">暂无日志</div>
   return (
-    <div className="max-h-64 overflow-auto space-y-0.5 text-[11px] text-muted font-mono">
+    <div className="space-y-0.5 text-[11px] text-muted font-mono">
       {logs.map((l, i) => (
         <div key={i}>{typeof l === 'string' ? l : `${l.level ?? ''} ${l.message ?? JSON.stringify(l)}`}</div>
       ))}
@@ -631,10 +740,24 @@ function LogList({ logs }: { logs: any[] }) {
   )
 }
 
+function LazyLogList({ logs, loadingMore, hasMore, loaded, total }: {
+  logs: any[]; loadingMore: boolean; hasMore: boolean; loaded: number; total: number | null
+}) {
+  return (
+    <div>
+      <div className="sticky top-[-12px] -mt-3 mb-1 flex items-center gap-2 text-[10px] text-muted">
+        {loadingMore ? '加载更早日志…' : hasMore ? '向上滚动加载更早日志' : '已加载全部日志'}
+        {total != null && <span className="ml-auto">已加载 {loaded} / {total}</span>}
+      </div>
+      <LogList logs={logs} />
+    </div>
+  )
+}
+
 function TradeTable({ trades }: { trades: any[] }) {
   if (trades.length === 0) return <div className="text-xs text-muted">暂无成交</div>
   return (
-    <div className="overflow-auto max-h-64">
+    <div className="overflow-auto">
       <table className="w-full text-xs">
         <thead className="text-muted sticky top-0 bg-surface">
           <tr className="text-left">

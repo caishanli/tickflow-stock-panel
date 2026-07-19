@@ -129,8 +129,19 @@ def backtest_trades(run_id: str):
 
 
 @router.get("/backtest/{run_id}/logs")
-def backtest_logs(run_id: str):
-    return {"data": db.get_logs(run_id)}
+def backtest_logs(run_id: str, before: int | None = None, limit: int = 200):
+    """回测日志（增量/分页）。
+
+    - 不带 before：返回最近 limit 条（最新在尾部），含 total / min_rowid。
+    - 带 before（已加载批次的最小 rowid）：返回该 rowid 之前最多 limit 条，
+      用于前端「向上滚动加载更早」。has_more 表示是否还有更早日志可加载。
+    """
+    if before is None:
+        rows, min_rid, total = db.get_logs_tail(run_id, limit)
+        return {"data": rows, "total": total, "min_rowid": min_rid,
+                "has_more": total > len(rows)}
+    rows, min_rid = db.get_logs_before(run_id, before, limit)
+    return {"data": rows, "min_rowid": min_rid, "has_more": len(rows) >= limit}
 
 
 @router.get("/backtest/runs")
@@ -180,7 +191,7 @@ async def backtest_stream(run_id: str, since_id: int | None = None,
                 yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
             for row in db.get_logs_after(run_id, off_log):
                 off_log = row["rowid"]
-                yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
+                yield f"event: log\ndata: {_json.dumps({'rowid': row['rowid'], 'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
             # 终态（含 run 行被删的 unknown）：推完剩余增量后正常关闭流
             if status in ("done", "failed", "unknown"):
                 return
@@ -219,6 +230,21 @@ def backtest_delete(run_id: str):
         raise HTTPException(404, "not found")
     db.delete_run(run_id)
     return {"data": None}
+
+
+class BatchDeleteIn(BaseModel):
+    ids: list[str]
+
+
+@router.delete("/backtest")
+def backtest_batch_delete(body: BatchDeleteIn):
+    """批量删除回测（含各自日志/净值/成交）。"""
+    removed = []
+    for rid in body.ids:
+        if db.get_run(rid):
+            db.delete_run(rid)
+            removed.append(rid)
+    return {"data": {"removed": removed, "count": len(removed)}}
 
 
 # ---- 模拟盘 ----
