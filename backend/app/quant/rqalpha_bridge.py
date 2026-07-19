@@ -127,6 +127,20 @@ def _now():
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _log_progress(run_id: str | None, msg: str) -> None:
+    """运行期阶段进度实时落库（SSE 即刻推送到前端日志页签）。
+
+    预加载/数据源构建阶段没有 quantlive 事件钩子，不写进度日志的话，前端在
+    这段可达数十秒的窗口里只能看到 running 徽章，看不到任何运行情况。
+    """
+    if not run_id:
+        return
+    try:
+        db.insert_log(run_id, _now(), "INFO", msg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 内部 store（duck-typed，仅需实现 BaseDataSource 注册时用到的方法）
 # ---------------------------------------------------------------------------
@@ -847,11 +861,25 @@ def run_backtest(strategy_code: str, params: dict, provider=None, db_path: str |
 
         if provider is None:
             provider = _BundleProvider(params["bundle_dir"])
+        _log_progress(run_id, f"加载标的数据（{len(params.get('symbols') or [])} 只）…")
         ds = QuantRQAlphaDataSource(provider, CONFIG, params)
         _set_pending_data_source(ds)
 
+        # UI「编译运行」可不选日期（params 无 start/end）：回退到数据源可用区间，
+        # 否则 _build_config 取 params["start"] 直接 KeyError。
+        if not params.get("start") or not params.get("end"):
+            _lo, _hi = ds.available_data_range("1d")
+            if _lo != _dt.date.min:
+                params = dict(params,
+                              start=params.get("start") or _lo.isoformat(),
+                              end=params.get("end") or _hi.isoformat())
+
         config = _build_config(params)
         config.setdefault("mod", {})["quantlive"] = {"enabled": True}
+        _log_progress(
+            run_id,
+            f"初始化完成，启动 rqalpha 引擎（{config['base']['start_date']} ~ {config['base']['end_date']}）…",
+        )
         result = rq_run(config, source_code=strategy_code)
 
         metrics = _extract_metrics(result)
@@ -1112,6 +1140,12 @@ def run_jq_backtest(strategy_path: str, params: dict,
     """
     if db_path:
         db.init_db(db_path)
+        # 与 run_backtest 同口径：进入执行即置 running（否则 UI 侧整段运行期
+        # 状态一直停在 queued，看不到"正在跑"）；独立脚本无 run 行时同时建行。
+        _rid = params.get("run_id")
+        if _rid:
+            db.upsert_run(_rid, params.get("strategy_id", ""), params.get("name", ""),
+                          json.dumps(params, ensure_ascii=False), "running")
 
     from app.quant.jqengine.datasource.manager import DataManager, get_data_manager
     from app.quant.jqengine.datasource.base import DataSourceError
@@ -1127,9 +1161,11 @@ def run_jq_backtest(strategy_path: str, params: dict,
     # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
     # 等开关不一致（策略侧单例默认 True 会仍走 mootdx 实时分钟线网络）。
     dm = get_data_manager()
-    # 确保 tushare token 生效（单例可能在 .env 加载前已创建，导致 token 为空）
+    # 确保 tushare token 生效（单例可能在 .env 加载前已创建，导致 token 为空）。
+    # 注意 CONFIG 是 QuantConfig dataclass（app.quant.config），不是 jqengine 的
+    # dict 配置——误用 CONFIG.get(...) 会 AttributeError，子进程秒崩、run 永远 queued。
     import os as _os
-    _tok = _os.environ.get("TUSHARE_TOKEN") or CONFIG.get("TUSHARE_TOKEN", "")
+    _tok = _os.environ.get("TUSHARE_TOKEN") or CONFIG.tushare_token
     if _tok and dm.sources.get("tushare") is not None:
         try:
             dm.sources["tushare"].token = _tok
@@ -1139,6 +1175,8 @@ def run_jq_backtest(strategy_path: str, params: dict,
             pass
     # 回测使用真实 1 分钟数据（real_ 基底），缺口由 baostock 5 分钟插值补齐。
     dm._use_real_minute = True
+    _log_progress(params.get("run_id"),
+                  f"加载行情缓存与 ETF 宇宙（{start} ~ {end}，此阶段耗时较长，进度会持续更新）…")
     # 名录快照必须在离线开关之前加载/刷新：dm._offline 只约束行情(bar)回源，
     # 而 _load_etf_universe 的快照刷新（tushare fund_basic + mootdx 名称，
     # ≤7 天一次的元数据调用）在离线模式下会被跳过、退化为"缓存派生宇宙+无
@@ -1171,6 +1209,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     """run_jq_backtest 主体（独立成函数，便于上层用 try/finally 恢复 dm._offline）。"""
     from .jqcompat import install_jqcompat, JqDataSource
 
+    _log_progress(params.get("run_id"), "预加载日线缓存…")
     dm.preload_daily()
     dm.set_minute_window(start, end)
 
@@ -1195,6 +1234,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     if max_universe and len(etf_universe) > max_universe:
         etf_universe = etf_universe[:max_universe]
     print("[universe] 全市场 ETF 池: {} 只".format(len(etf_universe)))
+    _log_progress(params.get("run_id"), f"全市场 ETF 池: {len(etf_universe)} 只，构建数据源…")
 
     fixed_pools = _extract_fixed_pools(strategy_text)
 
@@ -1296,6 +1336,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
 
     try:
         from rqalpha import run as rq_run
+        _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
         result = rq_run(config, source_code=strategy_code)
 
         equity = _extract_equity(result)
@@ -1332,13 +1373,22 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
 
         if db_path:
             run_id = params.get("run_id") or _re.sub(r"\W+", "", strategy_path).lower()[:16]
-            db.upsert_run(run_id, params.get("strategy_id", "wufu"), params.get("name", ""), json.dumps(params, ensure_ascii=False), "done")
-            db.bulk_insert_equity(run_id, equity)
-            for t in trades:
-                db.insert_trade(run_id, *t)
-            db.update_run(run_id, "done",
-                          metrics_json=json.dumps(metrics, ensure_ascii=False),
-                          finished_at=_now())
+            # 兜底补写仅限实时钩子（quantlive）未写入时：否则运行期已逐日落库的
+            # 净值/成交会被这里全量重复插一遍（与 run_backtest 的兜底逻辑同口径）。
+            if not db.get_equity(run_id):
+                db.bulk_insert_equity(run_id, equity)
+            if not db.get_trades(run_id):
+                for t in trades:
+                    db.insert_trade(run_id, *t)
+            # 用户 terminate 等外部操作可能已把 run 置为终态：不覆盖（与
+            # run_backtest 同口径，避免状态回跳）。
+            _cur = db.get_run(run_id) or {}
+            if _cur.get("status") in ("failed", "cancelled"):
+                logger.info("run %s 已是终态 %s，跳过 done 回写", run_id, _cur.get("status"))
+            else:
+                db.update_run(run_id, "done",
+                              metrics_json=json.dumps(metrics, ensure_ascii=False),
+                              finished_at=_now())
 
         return {
             "trades_csv": tr_path,
@@ -1350,4 +1400,14 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
         }
     except Exception as e:  # noqa: BLE001
         logger.exception("聚宽回测失败: %s", e)
+        # 失败必须落库（日志 + failed 状态）：否则 run 永远停在 queued/running，
+        # 前端看不到任何运行情况（子进程 stdout/stderr 被 DEVNULL，不写库即不可见）。
+        if db_path:
+            _rid = params.get("run_id")
+            if _rid:
+                try:
+                    db.insert_log(_rid, _now(), "ERROR", str(e))
+                    db.update_run(_rid, "failed", error=str(e)[:500], finished_at=_now())
+                except Exception:  # noqa: BLE001
+                    pass
         return {"error": str(e)}

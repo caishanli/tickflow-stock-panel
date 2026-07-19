@@ -4,11 +4,34 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
+
+from dotenv import load_dotenv
+
+# 与 scripts/run_jq_rqalpha.py 等独立脚本同口径：先把 .env 加载进环境变量，
+# 再导入 app.quant（其 config 在 import 时读 TUSHARE_TOKEN 等环境变量）。
+# UI 链路不经过 pydantic-settings，缺了这一步子进程拿不到 token。
+load_dotenv()
 
 from app.quant import db
 from app.quant.config import CONFIG
 from app.quant.datasource.manager import QuantDataProvider
 from app.quant.strategies.store import get_strategy
+
+
+def _now() -> str:
+    import datetime as _dt
+
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _progress(run_id: str, msg: str) -> None:
+    """运行期进度日志实时落库（SSE 即刻推送）：预加载阶段没有 quantlive 钩子，
+    不写的话前端长达数十秒只看到 running 徽章、看不到任何运行情况。"""
+    try:
+        db.insert_log(run_id, _now(), "INFO", msg)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _looks_like_jq(code: str) -> bool:
@@ -42,9 +65,11 @@ def main():
         code = s["code"] if s else ""
     if not code:
         code = params.get("strategy_code", "")
+    _progress(run_id, "回测子进程已启动，策略代码就绪，正在初始化数据与引擎…")
 
     if _looks_like_jq(code):
         # 聚宽(jq)策略走 jqcompat 引擎（正确的日志/成交捕获与 ETF 池解析）
+        _progress(run_id, "检测到聚宽式策略，路由到 jqcompat 引擎（1m 逐 bar）")
         from app.quant.rqalpha_bridge import run_jq_backtest
         # run_jq_backtest 需要 strategy 文本；通过临时文件传入（与 scripts/
         # run_jq_rqalpha.py 同口径），避免把整段代码塞进 params 造成歧义。
@@ -62,4 +87,22 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 兜底：任何未捕获异常落 quant.db 并把 run 置 failed。子进程 stdout/stderr
+    # 被父进程 DEVNULL，不写库则前端永远停在 queued、看不到任何失败原因。
+    _run_id = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        if _run_id:
+            try:
+                import datetime as _dt
+
+                _now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                db.insert_log(_run_id, _now, "ERROR", traceback.format_exc()[-2000:])
+                db.update_run(_run_id, "failed", error=str(e)[:500], finished_at=_now)
+            except Exception:  # noqa: BLE001
+                pass
+        sys.exit(1)

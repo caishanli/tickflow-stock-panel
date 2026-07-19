@@ -20,10 +20,13 @@
     <meta name="theme-color" content="#8B5CF6" />
     <title>TickFlow Stock Panel · Quant Terminal</title>
     <link rel="preconnect" href="https://rsms.me/" />
-    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <!-- 外网字体 CSS 改为异步加载（media=print → onload 后切 all）：
+         它们是渲染阻塞资源，fonts.googleapis.com 不可达时整页白屏卡死；
+         异步后网络不通仅字体回退系统默认，页面照常渲染。 -->
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" media="print" onload="this.media='all'" />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   </head>
   <body class="bg-base text-foreground">
     <div id="root"></div>

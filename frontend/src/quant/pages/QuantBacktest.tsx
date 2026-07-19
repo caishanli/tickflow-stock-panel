@@ -265,8 +265,10 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   }
 
   const runMut = useMutation({
-    mutationFn: (short: boolean) => {
-      saveStrategy()
+    mutationFn: async (short: boolean) => {
+      // 子进程优先读"已保存"的策略代码（run_quant_backtest.py 里 strategy_id
+      // 对应的库内代码优先于 payload.strategy_code）：先落库再提交，避免跑到旧代码
+      await saveStrategy()
       const end = form.end.trim()
       const start = short && end ? shiftDays(end, -7) : form.start.trim()
       const payload: any = {
@@ -280,6 +282,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       return api.runBacktest(payload)
     },
     onSuccess: (d: any) => { setLiveRunId(d.run_id); setSelRunId(d.run_id); qc.invalidateQueries({ queryKey: ['quant', 'strategies', 'latest'] }) },
+    onError: (e: any) => toast(e?.message ? `回测提交失败: ${e.message}` : '回测提交失败', 'error'),
   })
 
   const runId = selRunId ?? liveRunId
@@ -301,8 +304,16 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
     })
   }
 
+  const lastStatus = status ? (status.state ?? status.status) : undefined
+
   useEffect(() => {
     if (!runId || !liveOn) return
+    if (lastStatus === 'done' || lastStatus === 'failed') {
+      // 终态不开 SSE（服务端终态推完即关流，EventSource 会把正常关流当错误
+      // 无限自动重连）；改为整表收尾拉一次，同时补齐 SSE 建连间隙可能漏掉的行。
+      qc.invalidateQueries({ queryKey: ['quant', 'bt', runId] })
+      return
+    }
     const es = openBacktestStream(runId, {
       onEquity: (e) => appendTo(['quant', 'bt', runId, 'equity'], e, (r) => String(r.dt)),
       onTrade: (t) => appendTo(['quant', 'bt', runId, 'trades'], t,
@@ -314,15 +325,54 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
       })),
     })
     return () => { es.close() }
-  }, [runId, liveOn, qc])
+  }, [runId, liveOn, qc, lastStatus])
 
-  const lastStatus = status ? (status.state ?? status.status) : undefined
   const metrics = pickMetrics(status?.metrics_json)
   const equityData: any[] = Array.isArray(equity) ? equity : []
   const runList: any[] = Array.isArray(runs) ? runs : []
+
+  // 日期框初始化（只填一次，且不清空用户已输入值）：
+  // 1. 有回测记录 → 用最近一次回测的周期（与列表页"最新回测周期"同口径，
+  //    runList 按 created_at 倒序，[0] 即最新一次）；
+  // 2. 无回测记录（新建策略）→ 默认最近一个月。
+  const dateSeeded = useRef(false)
+  useEffect(() => {
+    if (dateSeeded.current || runs === undefined) return
+    dateSeeded.current = true
+    let start = '', end = ''
+    if (runList.length > 0) {
+      try {
+        const p = JSON.parse(runList[0].params_json || '{}')
+        start = p.start || ''
+        end = p.end || ''
+      } catch { /* params_json 损坏时静默跳过 */ }
+    }
+    if (!start && !end) {
+      end = new Date().toISOString().slice(0, 10)
+      start = shiftDays(end, -30)
+    }
+    setForm(f => ({ ...f, start: f.start || start, end: f.end || end }))
+  }, [runs, runList])
+
+  // 从列表进入编辑器时自动选中最近一次回测，直接展示收益/曲线/日志，
+  // 不用手动点"历史"。仅首次执行一次，不覆盖用户之后的手动选择/新提交的运行。
+  const runAutoSel = useRef(false)
+  useEffect(() => {
+    if (runAutoSel.current || runList.length === 0) return
+    runAutoSel.current = true
+    if (selRunId == null && liveRunId == null) setSelRunId(runList[0].id)
+  }, [runList, selRunId, liveRunId])
+
   const excess = computeExcess(equityData)
   const errLogs = filterErrorLogs(Array.isArray(logs) ? logs : [])
   const hasError = errLogs.length > 0
+  // 运行期 metrics 要结束时才产出：用最新净值行实时估算收益率（初值=初始资金），
+  // 让用户在回测过程中就能看到实时收益，而不是干等到 done。
+  const lastEq = equityData.length > 0 ? equityData[equityData.length - 1] : null
+  const liveTotalReturn = metrics.total_return == null && lastEq && +form.capital > 0
+    ? Number(lastEq.value) / +form.capital - 1
+    : null
+  const shownReturn = metrics.total_return ?? liveTotalReturn
 
   const editorBoxRef = useRef<HTMLDivElement>(null)
   const [editorH, setEditorH] = useState(320)
@@ -431,7 +481,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
 
         <div className="flex-1 min-w-0 border-l border-border flex flex-col overflow-hidden">
           <div className="p-3 grid grid-cols-4 gap-2 shrink-0">
-            <MetricCard label="收益率" value={fmtPct(metrics.total_return)} tone={tone(metrics.total_return)} />
+            <MetricCard label="收益率" value={fmtPct(shownReturn)} tone={tone(shownReturn)} />
             <MetricCard label="年化" value={fmtPct(metrics.annualized)} tone={tone(metrics.annualized)} />
             <MetricCard label="夏普" value={fmtNum(metrics.sharpe)} tone={tone(metrics.sharpe)} />
             <MetricCard label="最大回撤" value={metrics.max_drawdown == null ? '—' : fmtPct(-metrics.max_drawdown)} tone={tone(metrics.max_drawdown ? -metrics.max_drawdown : null)} />
