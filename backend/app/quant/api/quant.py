@@ -288,25 +288,37 @@ def sim_stream(aid: str, since_id: int | None = None):
         off_log = db.get_max_sim_log_id(aid) if start is None else start
         off_trade = db.get_max_sim_trade_id(aid) if start is None else start
         off_eq = db.get_max_sim_snapshot_id(aid) if start is None else start
+        last_status = None
         while True:
             acct = db.get_sim_account(aid)
             status = acct.get("status") if acct else "unknown"
-            yield f"event: status\ndata: {_json.dumps({'status': status, 'state': db.read_sim_state(aid)}, ensure_ascii=False)}\n\n"
-            for row in db.get_sim_snapshots_after(aid, off_eq):
-                off_eq = row["rowid"]
-                d = {k: row[k] for k in ("dt", "net_value", "cash", "positions_value", "pnl", "pnl_pct")}
-                yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
-            for row in db.get_sim_trades_after(aid, off_trade):
-                off_trade = row["rowid"]
-                d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
-                yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
-            for row in db.get_sim_logs_after(aid, off_log):
-                off_log = row["rowid"]
-                yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
             # 终态（停止/删除/未知）推完增量后关闭流
-            if status in ("stopped", "cancelled", "deleted", "unknown"):
+            terminal = status in ("stopped", "cancelled", "deleted", "unknown")
+            # 仅取轻量的 max(rowid) 判断是否有增量，避免每轮全量查库
+            max_log = db.get_max_sim_log_id(aid)
+            max_trade = db.get_max_sim_trade_id(aid)
+            max_eq = db.get_max_sim_snapshot_id(aid)
+            has_new = (max_log > off_log or max_trade > off_trade
+                       or max_eq > off_eq or status != last_status)
+            if has_new:
+                if status != last_status:
+                    yield f"event: status\ndata: {_json.dumps({'status': status, 'state': db.read_sim_state(aid)}, ensure_ascii=False)}\n\n"
+                    last_status = status
+                for row in db.get_sim_snapshots_after(aid, off_eq):
+                    off_eq = row["rowid"]
+                    d = {k: row[k] for k in ("dt", "net_value", "cash", "positions_value", "pnl", "pnl_pct")}
+                    yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
+                for row in db.get_sim_trades_after(aid, off_trade):
+                    off_trade = row["rowid"]
+                    d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
+                    yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
+                for row in db.get_sim_logs_after(aid, off_log):
+                    off_log = row["rowid"]
+                    yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
+            if terminal:
                 return
-            await asyncio.sleep(0.5)
+            # 空闲（无增量）时拉长间隔，避免非交易时段空转烧 CPU
+            await asyncio.sleep(0.5 if has_new else 3)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
