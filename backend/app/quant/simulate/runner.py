@@ -172,7 +172,8 @@ def _is_trading_day(dm, today) -> bool:
             raise RuntimeError("指数日线为空")
         idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
         if idx is None:
-            dcol = next((c for c in ("date", "datetime", "time", "dt") if c in df.columns), None)
+            dcol = next((c for c in ("date", "datetime", "time", "dt", "trade_date", "trade_dt", "day")
+                         if c in df.columns), None)
             if dcol is None:
                 raise RuntimeError("指数日线无日期列")
             idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
@@ -201,6 +202,38 @@ def _prev_close_dm(dm, code: str, today: str):
         hist = df[df[dcol].astype(str).str[:10] < str(today)]
         return float(hist[col].iloc[-1]) if not hist.empty else None
     return float(df[col].iloc[-2]) if len(df) >= 2 else None
+
+
+def _seed_universe(ctx) -> None:
+    """把策略 g.* 股票池注入 ctx.universe，供回放/实时行情馈送取价。
+
+    聚宽策略常把股票池挂在自定义 ``g`` 变量上（如 g.global_etf_pool /
+    g.fixed_etf_pool / g.merged_etf_pool），而不调用 set_universe()。runner 的
+    ``_strategy_tick`` 仅按 ctx.universe 取价，若 universe 为空则每根 bar 都
+    "实时行情为空" 跳过，run_daily 永远不触发 → 策略不执行 → 0 成交。这里在
+    initialize 后把 g 上的池子收集进 universe，打破该死锁。
+    """
+    g = getattr(ctx, "g", None)
+    if g is None:
+        return
+    pools = []
+    for attr in ("fixed_etf_pool", "global_etf_pool", "merged_etf_pool",
+                 "domestic_etf_pool", "overseas_etf_pool", "sector_etf_pool",
+                 "etf_pool", "universe", "pool"):
+        val = getattr(g, attr, None)
+        if isinstance(val, (list, tuple, set)):
+            pools.extend(val)
+        elif isinstance(val, dict):
+            pools.extend(val.keys())
+    # 走弱期判定用到的指数（check_a_share_weak_period 固定列表）
+    pools += ["000300.XSHG", "399101.XSHE", "399006.XSHE", "000510.XSHG"]
+    codes = []
+    for c in pools:
+        c = str(c).strip()
+        if c and c not in codes:
+            codes.append(c)
+    if codes:
+        ctx.universe = codes
 
 
 def _restore_portfolio(ctx, st: dict) -> None:
@@ -375,7 +408,8 @@ def _trade_days_between(dm, start, end) -> list:
         return []
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
     if idx is None:
-        dcol = next((c for c in ("date", "datetime", "time", "dt") if c in df.columns), None)
+        dcol = next((c for c in ("date", "datetime", "time", "dt", "trade_date", "trade_dt", "day")
+                     if c in df.columns), None)
         if dcol is None:
             return []
         idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
@@ -512,6 +546,8 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     ctx = bundle.ctx
     if has_saved:
         _restore_portfolio(ctx, st)
+    # initialize 后把策略 g.* 池子注入 universe（打破回放取价死锁）
+    _seed_universe(ctx)
     jq_api._state["log_sink"] = lambda level, msg: _emit_log(account_id, level, msg)
     try:
         bundle.init_fn(ctx)

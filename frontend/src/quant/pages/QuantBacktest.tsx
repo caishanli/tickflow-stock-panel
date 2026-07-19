@@ -292,7 +292,12 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const { data: equity } = useQuery({ queryKey: ['quant', 'bt', runId, 'equity'], queryFn: () => api.getBacktestEquity(runId as string), enabled: !!runId })
   const { data: trades } = useQuery({ queryKey: ['quant', 'bt', runId, 'trades'], queryFn: () => api.getBacktestTrades(runId as string), enabled: !!runId })
   const { data: logs } = useQuery({ queryKey: ['quant', 'bt', runId, 'logs'], queryFn: () => api.getBacktestLogs(runId as string), enabled: !!runId })
-  const { data: runs } = useQuery({ queryKey: ['quant', 'bt', 'runs', strategyId], queryFn: () => api.listBacktests(strategyId), refetchInterval: 5000 })
+  // 运行列表不做定时轮询：发起回测时已 invalidate 刷新；运行结束（终态）时由
+  // 下方 SSE onStatus 补刷一次，拿到最终状态。空闲时零请求。
+  const { data: runs } = useQuery({
+    queryKey: ['quant', 'bt', 'runs', strategyId],
+    queryFn: () => api.listBacktests(strategyId),
+  })
 
   // SSE 增量直接追加到缓存，避免每次事件都整表重新拉取（否则运行中日志
   // 洪流会触发数百次 /logs /equity 轮询）。首拉历史由上面的 useQuery 完成。
@@ -320,9 +325,15 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         (r) => `${r.ts}|${r.code}|${r.action}|${r.price}`),
       onLog: (l) => appendTo(['quant', 'bt', runId, 'logs'], l,
         (r) => `${r.ts}|${r.level}|${r.message}`),
-      onStatus: (s) => qc.setQueryData(['quant', 'bt', runId, 'status'], (prev: any) => ({
-        ...(prev || {}), status: s.status, metrics_json: s.metrics ?? (prev || {}).metrics_json,
-      })),
+      onStatus: (s) => {
+        qc.setQueryData(['quant', 'bt', runId, 'status'], (prev: any) => ({
+          ...(prev || {}), status: s.status, metrics_json: s.metrics ?? (prev || {}).metrics_json,
+        }))
+        // 终态（完成/失败/取消）时补刷一次运行列表，拿到最终状态与指标
+        if (s.status === 'done' || s.status === 'failed' || s.status === 'cancelled') {
+          qc.invalidateQueries({ queryKey: ['quant', 'bt', 'runs', strategyId] })
+        }
+      },
     })
     return () => { es.close() }
   }, [runId, liveOn, qc, lastStatus])

@@ -456,6 +456,55 @@ def get_sim_logs(account_id, limit=500):
     return [dict(r) for r in reversed(rows)]
 
 
+def get_sim_logs_after(account_id, offset=0):
+    """返回 rowid > offset 的模拟盘日志（SSE 增量用）。"""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, ts, level, message FROM sim_logs "
+            "WHERE account_id=? AND rowid > ? ORDER BY rowid",
+            (account_id, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_sim_trades_after(account_id, offset=0):
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, ts, code, action, price, amount, pnl, pnl_pct, commission "
+            "FROM sim_trades WHERE account_id=? AND rowid > ? ORDER BY rowid",
+            (account_id, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_sim_snapshots_after(account_id, offset=0):
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT rowid, dt, net_value, cash, positions_value, pnl, pnl_pct "
+            "FROM sim_equity_snapshots WHERE account_id=? AND rowid > ? ORDER BY rowid",
+            (account_id, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_max_sim_log_id(account_id):
+    with get_conn() as c:
+        row = c.execute("SELECT MAX(rowid) AS m FROM sim_logs WHERE account_id=?", (account_id,)).fetchone()
+    return row["m"] or 0
+
+
+def get_max_sim_trade_id(account_id):
+    with get_conn() as c:
+        row = c.execute("SELECT MAX(rowid) AS m FROM sim_trades WHERE account_id=?", (account_id,)).fetchone()
+    return row["m"] or 0
+
+
+def get_max_sim_snapshot_id(account_id):
+    with get_conn() as c:
+        row = c.execute("SELECT MAX(rowid) AS m FROM sim_equity_snapshots WHERE account_id=?", (account_id,)).fetchone()
+    return row["m"] or 0
+
+
 def delete_sim_account(account_id):
     with get_conn() as c:
         c.execute("DELETE FROM sim_accounts WHERE id=?", (account_id,))

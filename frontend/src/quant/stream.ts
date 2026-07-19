@@ -16,3 +16,19 @@ export function openBacktestStream(runId: string, handlers: BacktestStreamHandle
   if (handlers.onTrade) es.addEventListener('trade', (e) => handlers.onTrade!(JSON.parse((e as MessageEvent).data)))
   return es
 }
+
+export interface SimStreamHandlers {
+  onStatus?: (s: { status: string; state: any }) => void
+  onLog?: (l: { ts: string; level: string; message: string }) => void
+  onEquity?: (e: { dt: string; net_value: number; cash: number; positions_value: number; pnl: number; pnl_pct: number }) => void
+  onTrade?: (t: { ts: string; code: string; action: string; price: number; amount: number; pnl: number; pnl_pct: number; commission: number }) => void
+}
+
+export function openSimStream(aid: string, handlers: SimStreamHandlers): EventSource {
+  const es = new EventSource(`/api/quant/sim/accounts/${aid}/stream`)
+  if (handlers.onStatus) es.addEventListener('status', (e) => handlers.onStatus!(JSON.parse((e as MessageEvent).data)))
+  if (handlers.onLog) es.addEventListener('log', (e) => handlers.onLog!(JSON.parse((e as MessageEvent).data)))
+  if (handlers.onEquity) es.addEventListener('equity', (e) => handlers.onEquity!(JSON.parse((e as MessageEvent).data)))
+  if (handlers.onTrade) es.addEventListener('trade', (e) => handlers.onTrade!(JSON.parse((e as MessageEvent).data)))
+  return es
+}
