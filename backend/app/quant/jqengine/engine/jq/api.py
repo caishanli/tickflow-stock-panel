@@ -638,6 +638,11 @@ class LogProxy:
             print(f"[STRATEGY {dt}] [DEBUG] {msg}")
             _emit_sink("debug", msg)
 
+    def notify(self, msg):
+        """推送通知（钉钉等）。未开启时退化为 log.info（写日志不推送）。"""
+        self.info(msg)
+        _emit_sink("notify", msg)
+
     def info_format(self, fmt, *args):
         self.info(fmt % args if args else fmt)
 
