@@ -46,9 +46,12 @@ interface FormState {
   capital: number
 }
 
+// 默认值对齐独立脚本 scripts/run_jq_rqalpha.py（fee/slippage 均为 0.0001）。
+// 注意：rqalpha 的 slippage 是每笔比例，10× 的默认值(0.001)会让高频换仓策略
+// 的成交从 127→81 笔、收益由 +51% 翻转为负，故此处必须与离线回测口径一致。
 const DEFAULT_FORM: FormState = {
   start: '', end: '', frequency: 'daily',
-  fee: 0.0003, slippage: 0.001, capital: 100000,
+  fee: 0.0001, slippage: 0.0001, capital: 100000,
 }
 
 export function QuantBacktest() {
