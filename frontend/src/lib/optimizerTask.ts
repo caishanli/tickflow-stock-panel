@@ -9,6 +9,8 @@ export interface OptimizeProgress {
   done: number
   total: number
   best_score: number | null
+  shared_matrix_bytes?: number
+  elapsed_ms?: number
 }
 
 export interface OptimizeResultRow {
@@ -27,6 +29,16 @@ export interface OptimizeResult {
   best_params: Record<string, any> | null
   best_score: number | null
   results: OptimizeResultRow[]
+  requested_max_workers: number
+  effective_workers: number
+  shared_market_data: boolean
+  shared_market_data_bytes: number
+  prepare_ms: number
+  best_backtest?: Record<string, any> | null
+  matrix_compute_cache?: Record<string, any>
+  timing_ms?: Record<string, number>
+  performance?: Record<string, any>
+  worker?: Record<string, any>
   elapsed_ms: number
 }
 
@@ -44,6 +56,7 @@ export interface StartOptimizeParams {
   objective: string
   direction?: string
   max_workers?: number
+  matrix_cache_max_mb?: number
   params?: Record<string, any> | null       // 未扫描参数固定为用户当前值
   overrides?: Record<string, any> | null     // 策略当前的 basic_filter/信号/风控覆盖
   symbols?: string[] | null
@@ -174,6 +187,9 @@ function connectSSE(url: string): void {
       if (reconnectAttempts > MAX_RECONNECT) {
         es.close()
         eventSource = null
+        // 清 localStorage: 否则刷新页面 tryReconnect 会重连到这个已放弃的任务。
+        localStorage.removeItem(RECONNECT_KEY)
+        localStorage.removeItem(JOB_KEY_KEY)
         current = { ...current, isPending: false, error: '连接中断, 重连多次失败' }
         emit()
       }
@@ -209,6 +225,7 @@ export function startOptimize(params: StartOptimizeParams): void {
     objective: params.objective,
     direction: params.direction,
     max_workers: params.max_workers,
+    matrix_cache_max_mb: params.matrix_cache_max_mb,
     params: params.params ? JSON.stringify(params.params) : undefined,
     overrides: params.overrides ? JSON.stringify(params.overrides) : undefined,
     symbols: params.symbols?.join(','),
@@ -244,9 +261,16 @@ export function stopOptimize(): void {
     localStorage.removeItem(RECONNECT_KEY)
     localStorage.removeItem(JOB_KEY_KEY)
   } else if (eventSource) {
-    // 保持连接等 job 事件; 兜底: 5s 后仍没 key 就强关
+    // 保持连接等 job 事件; 兜底: 5s 后仍没 key 就强关并清 localStorage,
+    // 避免刷新重连到未取消任务。(若期间 job 到达, handler 已清并置 null, 下面条件不成立跳过)
     const es = eventSource
-    setTimeout(() => { if (es === eventSource) { es.close(); eventSource = null } }, 5000)
+    setTimeout(() => {
+      if (es === eventSource) {
+        es.close(); eventSource = null
+        localStorage.removeItem(RECONNECT_KEY)
+        localStorage.removeItem(JOB_KEY_KEY)
+      }
+    }, 5000)
   }
   if (current?.isPending) {
     current = { ...current, isPending: false, error: '已取消' }

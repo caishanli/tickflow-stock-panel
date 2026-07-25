@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.indicators.pipeline import compute_enriched, compute_enriched_single
+from app.market_time import cn_now, cn_today
+from app.price_limits import is_risk_warning_name, price_limit_pct
 from app.services import kline_sync
 
 logger = logging.getLogger(__name__)
@@ -22,10 +25,10 @@ def _minute_allowed(capset) -> bool:
         return True
     from app.services import preferences
     provider = preferences.get_minute_data_provider()
-    if provider == "tickflow":
-        return False
-    from app.data_providers import custom as custom_sources
-    return custom_sources.provider_has_dataset(provider, "minute")
+    _, fallback, error = kline_sync._resolve_minute_provider(provider)
+    if error is not None:
+        logger.warning("minute provider resolution failed while checking access: %s", error)
+    return not fallback
 
 
 @router.get("/instruments/search")
@@ -130,6 +133,67 @@ def _get_asset_info(repo, symbol: str, asset_type: str) -> dict:
         return {"name": hit["name"][0]}
     except Exception:
         return {}
+
+
+def _get_price_limit_info(
+    repo,
+    symbol: str,
+    trade_date: date,
+    asset_type: str,
+    instrument_name: str | None,
+) -> dict | None:
+    """Return the date-aware limit rule and today's authoritative prices."""
+    if asset_type == "index":
+        return None
+
+    info = {
+        "rate": price_limit_pct(
+            symbol,
+            trade_date,
+            is_risk_warning=(
+                asset_type == "stock" and is_risk_warning_name(instrument_name)
+            ),
+        ),
+        "limit_up": None,
+        "limit_down": None,
+        "source": "rule",
+    }
+    if trade_date != cn_today():
+        return info
+
+    try:
+        import polars as pl
+
+        instruments = repo.get_instruments_asset(asset_type)
+        available = [
+            column
+            for column in ("symbol", "limit_up", "limit_down")
+            if column in instruments.columns
+        ]
+        if "symbol" not in available or len(available) == 1:
+            return info
+        hit = instruments.filter(pl.col("symbol") == symbol).select(available).head(1)
+        row = hit.to_dicts()[0] if not hit.is_empty() else None
+    except Exception:
+        return info
+    if row is None:
+        return info
+
+    has_authoritative_price = False
+    for field in ("limit_up", "limit_down"):
+        value = row.get(field)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric) and 0 < numeric < 10_000:
+            info[field] = numeric
+            has_authoritative_price = True
+    if has_authoritative_price:
+        info["source"] = "instrument"
+    return info
 
 
 @router.get("/daily")
@@ -405,17 +469,30 @@ def get_minute_batch(request: Request, body: dict):
     if not capset.has(Cap.KLINE_MINUTE_BATCH):
         raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (kline.minute.batch)")
 
-    trade_date = date.fromisoformat(trade_date_str) if trade_date_str else date.today()
+    trade_date = date.fromisoformat(trade_date_str) if trade_date_str else cn_today()
 
-    # 非交易日(周末/节假日)回退到最近有数据的交易日, 否则前端显示空白。
-    # 优先用本地分钟K最近日期; 本地从未同步过分钟K时, 回退到日K最近交易日
-    # (enriched 最新日一定有, 作为兜底), 确保 TickFlow 能拉到有效数据。
-    if trade_date == date.today():
-        recent_date = repo.latest_minute_date_global()
-        if recent_date is None:
-            recent_date = repo.latest_daily_date()
-        if recent_date is not None:
-            trade_date = recent_date
+    # 非交易日(周末/节假日)才回退到最近有数据的交易日; 否则盘中会显示昨天而非今天。
+    # 注意: 不能用 latest_minute_date_global() 判断盘中是否为交易日 —— 批量实时补拉
+    # 不落库 (见下方 sync_minute_batch 无 on_segment), 盘中它恒返回上次全量同步日,
+    # 用它做判据会导致 trade_date 永久回退到昨天, 再因 expected=240 判定昨日"完整"
+    # 而不再补拉今天, 形成永远显示昨日的死循环。
+    # 判据改为: 周末必回退; 工作日收盘后(>=15:30)仍无今日日K → 节假日, 回退。
+    if not trade_date_str:
+        today = cn_today()
+        need_fallback = today.weekday() >= 5  # 周六/周日必非交易日
+        if not need_fallback:
+            now_cn = cn_now()
+            after_close = now_cn.hour > 15 or (now_cn.hour == 15 and now_cn.minute >= 30)
+            if after_close:
+                latest_daily = repo.latest_daily_date()
+                if latest_daily is None or latest_daily < today:
+                    need_fallback = True
+        if need_fallback:
+            recent_date = repo.latest_minute_date_global()
+            if recent_date is None:
+                recent_date = repo.latest_daily_date()
+            if recent_date is not None:
+                trade_date = recent_date
 
     # Step 1: 本地优先 — 一次 scan 读全部 symbol 当日分钟K (股票 / ETF 分钟数据分开存储)
     etf_set = repo.get_etf_symbol_set()
@@ -430,9 +507,9 @@ def get_minute_batch(request: Request, body: dict):
             df_local = pl.concat([df_local, df_etf], how="diagonal_relaxed")
 
     # 期望条数 (盘中按当前时刻估算, 盘后 240)
-    now = datetime.now()
+    now = cn_now()
     h, m = now.hour, now.minute
-    if trade_date != date.today():
+    if trade_date != cn_today():
         expected = 240
     elif h < 9 or (h == 9 and m < 30):
         expected = 0
@@ -463,14 +540,38 @@ def get_minute_batch(request: Request, body: dict):
         start_time = datetime(trade_date.year, trade_date.month, trade_date.day, 9, 25, 0)
         end_time = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 5, 0)
         lim = capset.limits(Cap.KLINE_MINUTE_BATCH)
-        live_df = kline_sync.sync_minute_batch(
-            incomplete,
-            start_time=start_time,
-            end_time=end_time,
-            batch_size=lim.batch if lim else None,
-            rpm=lim.rpm if lim else None,
-        )
-        if not live_df.is_empty():
+        # etf_set 已在上方获取, 直接复用 — 按 asset_type 拆分调用 sync_minute_batch
+        # (自定义源 / TickFlow 路由均依赖 asset_type 正确传递)
+        # 契约: 本端点只接受 stock/ETF (指数分钟K走 /api/index/minute 独立路径),
+        # 故两分支已覆盖全部 incomplete。若未来放开指数支持, 需额外加 index 分支
+        # 以避免被误路由为 stock。
+        stock_incomplete = [s for s in incomplete if s not in etf_set]
+        etf_incomplete = [s for s in incomplete if s in etf_set]
+        live_parts: list[pl.DataFrame] = []
+        if stock_incomplete:
+            df_s = kline_sync.sync_minute_batch(
+                stock_incomplete,
+                start_time=start_time,
+                end_time=end_time,
+                batch_size=lim.batch if lim else None,
+                rpm=lim.rpm if lim else None,
+                asset_type="stock",
+            )
+            if not df_s.is_empty():
+                live_parts.append(df_s)
+        if etf_incomplete:
+            df_e = kline_sync.sync_minute_batch(
+                etf_incomplete,
+                start_time=start_time,
+                end_time=end_time,
+                batch_size=lim.batch if lim else None,
+                rpm=lim.rpm if lim else None,
+                asset_type="etf",
+            )
+            if not df_e.is_empty():
+                live_parts.append(df_e)
+        if live_parts:
+            live_df = pl.concat(live_parts, how="diagonal_relaxed")
             for sym in incomplete:
                 sub = live_df.filter(pl.col("symbol") == sym).sort("datetime")
                 if not sub.is_empty():
@@ -496,24 +597,47 @@ def get_minute(
     stock_name = stock_info.get("name")
 
     if trade_date is None:
-        trade_date = repo.latest_minute_date(symbol, asset_type=asset_type)
+        # 默认看今天, 而不是本地落盘的最近日 (盘中后者是昨天)。
+        # 非交易日(周末/节假日)才回退到本地最近有数据的交易日。
+        today = cn_today()
+        need_fallback = today.weekday() >= 5  # 周六/周日必非交易日
+        if not need_fallback:
+            now_cn = cn_now()
+            after_close = now_cn.hour > 15 or (now_cn.hour == 15 and now_cn.minute >= 30)
+            if after_close:
+                latest_daily = repo.latest_daily_date()
+                if latest_daily is None or latest_daily < today:
+                    need_fallback = True
+        if need_fallback:
+            recent = repo.latest_minute_date(symbol, asset_type=asset_type)
+            if recent is None:
+                recent = repo.latest_daily_date()
+            trade_date = recent if recent is not None else today
+        else:
+            trade_date = today
     if trade_date is None:
         # 本地无任何分钟K，尝试从 TickFlow 拉取当天
-        trade_date = date.today()
-        df = kline_sync.fetch_minute_single(symbol, trade_date)
+        trade_date = cn_today()
+        df = kline_sync.fetch_minute_single(symbol, trade_date, asset_type=asset_type)
+        price_limit = _get_price_limit_info(
+            repo, symbol, trade_date, asset_type, stock_name,
+        )
         return {
             "symbol": symbol, "name": stock_name, "stock_info": stock_info,
             "date": str(trade_date), "rows": df.to_dicts(), "source": "live",
+            "price_limit": price_limit,
         }
 
+    price_limit = _get_price_limit_info(
+        repo, symbol, trade_date, asset_type, stock_name,
+    )
     df = repo.get_minute(symbol, trade_date, asset_type=asset_type)
 
     # 完整交易日应有 240 条分钟K；如果是今天(盘中)，期望条数按已交易分钟估算
     expected = 240
-    today = date.today()
+    today = cn_today()
     if trade_date == today:
-        from datetime import datetime as _dt
-        now = _dt.now()
+        now = cn_now()
         h, m = now.hour, now.minute
         if h < 9 or (h == 9 and m < 30):
             expected = 0  # 还没开盘
@@ -532,14 +656,16 @@ def get_minute(
         return {
             "symbol": symbol, "name": stock_name, "stock_info": stock_info,
             "date": str(trade_date), "rows": df.to_dicts(), "source": "local",
+            "price_limit": price_limit,
         }
 
     # 本地不完整或无数据 → 从 TickFlow 实时拉取
-    live_df = kline_sync.fetch_minute_single(symbol, trade_date)
+    live_df = kline_sync.fetch_minute_single(symbol, trade_date, asset_type=asset_type)
     return {
         "symbol": symbol, "name": stock_name, "stock_info": stock_info,
         "date": str(trade_date), "rows": live_df.to_dicts(),
         "source": "live" if not live_df.is_empty() else "none",
+        "price_limit": price_limit,
     }
 
 
@@ -983,4 +1109,3 @@ async def rebuild_enriched(request: Request):
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）
 import concurrent.futures as _cf
 _long_task_executor = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="long-task")
-
