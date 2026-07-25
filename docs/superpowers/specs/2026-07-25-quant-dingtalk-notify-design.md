@@ -102,9 +102,9 @@ CREATE TABLE IF NOT EXISTS quant_settings (
 - 状态从 `sim_accounts` 的 `dingtalk_enabled` 字段读取
 - 开启时按钮高亮（蓝色），关闭时灰色
 
-### 量化设置页
+### 钉钉配置弹窗（新建 `frontend/src/quant/pages/DingtalkConfigDialog.tsx`）
 
-加一个"钉钉推送配置"卡片：
+模拟盘列表页或详情页入口触发弹窗，配置全局钉钉 webhook：
 
 - Webhook URL 输入框
 - 加签密钥输入框（可选，标注"如机器人设置了加签则填写"）
@@ -173,6 +173,6 @@ runner._emit_log(account_id, "notify", msg)
 | 修改 | `backend/app/quant/simulate/runner.py` | log_sink 加钉钉分支 |
 | 修改 | `backend/app/quant/db.py` | 表结构 + 配置读写 |
 | 修改 | `backend/app/quant/api/quant.py` | 新增 4 个 API |
-| 修改 | `frontend/src/quant/pages/QuantSim.tsx` | 详情页加开关 |
+| 修改 | `frontend/src/quant/pages/QuantSim.tsx` | 详情页加开关 + 配置入口 |
 | 修改 | `frontend/src/quant/api.ts` | API 封装 |
-| 修改 | `frontend/src/quant/pages/QuantSettings.tsx` | 钉钉配置卡片 |
+| 新建 | `frontend/src/quant/pages/DingtalkConfigDialog.tsx` | 钉钉配置弹窗 |
