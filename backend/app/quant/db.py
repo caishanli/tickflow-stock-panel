@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS strategies (
 CREATE TABLE IF NOT EXISTS sim_accounts (
     id TEXT PRIMARY KEY, name TEXT, capital REAL, stop_loss REAL, status TEXT,
     strategy_id TEXT, start_date TEXT, frequency TEXT DEFAULT 'minute',
+    dingtalk_enabled INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')), started_at TEXT);
 CREATE TABLE IF NOT EXISTS sim_state (
     account_id TEXT PRIMARY KEY, cash REAL, positions_json TEXT, net_value REAL,
