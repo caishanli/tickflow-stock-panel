@@ -378,7 +378,12 @@ def sim_equity(aid: str):
                 df["_day"] = df[dcol].astype(str).str.replace("-", "").str[:8]
                 close_col = "close" if "close" in df.columns else df.columns[-1]
                 day_close = df.groupby("_day")[close_col].last().to_dict()
+                # 基准日 = 模拟盘启动日前一个交易日（用前日收盘做基准，首日即反映当天涨跌）
                 base_day = first_day.replace("-", "")
+                sorted_days = sorted(day_close.keys())
+                base_idx = sorted_days.index(base_day) if base_day in sorted_days else 0
+                if base_idx > 0:
+                    base_day = sorted_days[base_idx - 1]  # 前一个交易日
                 base = day_close.get(base_day) or (sorted(day_close.values())[0] if day_close else 0)
                 if base:
                     bench_ret = {d: (day_close[d] / base - 1) * 100 for d in day_close}

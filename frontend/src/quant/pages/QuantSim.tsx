@@ -229,8 +229,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
       if (day) dayMap.set(day, d)
     }
     const data = Array.from(dayMap.values())
-    // 策略收益率(%)：以首日净值为基准
-    const baseNV = data.length > 0 ? Number(data[0].net_value ?? 0) : 0
+    // 策略收益率(%)：以初始资金为基准（首日即反映当天盈亏）
+    const baseNV = Number(st?.state?.start_cash ?? st?.start_cash ?? (data.length > 0 ? data[0].net_value : 0)) || 1
     const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / baseNV) - 1) * 100).toFixed(2)))
     const benchPct = data.map((d) => Number(d.benchmark_pct ?? 0))
     // 当日涨跌幅(%)：从累计收益率反推，(1+r_n)/(1+r_{n-1})-1
@@ -314,7 +314,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
         },
       ],
     } as any
-  }, [eq])
+  }, [eq, st])
 
   const tradeList: any[] = Array.isArray(tr) ? tr : []
   const stopLossList: any[] = Array.isArray(st?.stop_loss) ? st.stop_loss : []
