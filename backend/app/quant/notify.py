@@ -8,11 +8,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import time
 import urllib.parse
 from typing import Any
 
 import requests
+
+log = logging.getLogger(__name__)
 
 _TIMEOUT = 5
 
@@ -45,6 +48,10 @@ def send_dingtalk(webhook_url: str, secret: str, title: str, text: str) -> bool:
     try:
         resp = requests.post(url, json=payload, timeout=_TIMEOUT)
         data = resp.json()
-    except Exception:
+        if isinstance(data, dict) and data.get("errcode") == 0:
+            return True
+        log.warning("钉钉推送失败: %s", data)
         return False
-    return data.get("errcode") == 0
+    except Exception as e:  # noqa: BLE001
+        log.warning("钉钉推送异常: %s", e)
+        return False
