@@ -431,3 +431,36 @@ def datasource_verify():
         return {"data": {"ok": True}}
     except Exception as e:  # noqa: BLE001
         return {"data": {"ok": False, "error": str(e)}}
+
+
+# ---- 钉钉推送 ----
+@router.get("/settings/dingtalk")
+def get_dingtalk_config():
+    return {"data": {
+        "webhook_url": db.get_quant_setting("dingtalk_webhook_url") or "",
+        "secret": db.get_quant_setting("dingtalk_secret") or "",
+    }}
+
+
+@router.put("/settings/dingtalk")
+def save_dingtalk_config(body: dict):
+    db.set_quant_setting("dingtalk_webhook_url", body.get("webhook_url", ""))
+    db.set_quant_setting("dingtalk_secret", body.get("secret", ""))
+    return {"data": "ok"}
+
+
+@router.put("/sim/accounts/{aid}/dingtalk")
+def toggle_dingtalk(aid: str, body: dict):
+    db.update_sim_account(aid, dingtalk_enabled=1 if body.get("enabled") else 0)
+    return {"data": "ok"}
+
+
+@router.post("/settings/dingtalk/test")
+def test_dingtalk():
+    from ..notify import send_dingtalk
+    url = db.get_quant_setting("dingtalk_webhook_url") or ""
+    secret = db.get_quant_setting("dingtalk_secret") or ""
+    if not url:
+        return {"data": {"success": False, "message": "未配置 webhook URL"}}
+    ok = send_dingtalk(url, secret, "测试通知", "## 测试通知\n\n这是一条来自量化模拟盘的测试消息")
+    return {"data": {"success": ok, "message": "发送成功" if ok else "发送失败"}}

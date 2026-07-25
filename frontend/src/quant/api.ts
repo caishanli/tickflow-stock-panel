@@ -58,3 +58,10 @@ export const saveDatasourcePriority = (priority: string[]) =>
 export const saveDatasourceToken = (token: string) =>
   j('/datasource/token', { method: 'POST', body: JSON.stringify({ token }) })
 export const verifyDatasource = () => j('/datasource/verify', { method: 'POST' })
+
+export const toggleDingtalk = (aid: string, enabled: boolean) =>
+  j(`/sim/accounts/${aid}/dingtalk`, { method: 'PUT', body: JSON.stringify({ enabled }) })
+export const getDingtalkConfig = () => j('/settings/dingtalk')
+export const saveDingtalkConfig = (webhookUrl: string, secret: string) =>
+  j('/settings/dingtalk', { method: 'PUT', body: JSON.stringify({ webhook_url: webhookUrl, secret }) })
+export const testDingtalk = () => j('/settings/dingtalk/test', { method: 'POST' })
