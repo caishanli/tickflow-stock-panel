@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
@@ -127,11 +128,43 @@ def _run_watcher_loop(account_id: str, acct: dict, provider, matcher: Matcher,
 # ---------------------------------------------------------------------------
 
 def _emit_log(account_id: str, level: str, message: str) -> None:
-    """模拟盘日志落 sim_logs（供 /sim/accounts/{aid}/logs 读取），失败仅告警。"""
+    """模拟盘日志落 sim_logs（供 /sim/accounts/{aid}/logs 读取），失败仅告警。
+
+    level=="notify" 且账户开启钉钉推送且非补跑时，异步发送到钉钉。
+    """
     try:
         db.insert_sim_log(account_id, str(datetime.datetime.now()), level, message)
     except Exception:  # noqa: BLE001
         log.warning("[runner] 日志落库失败(%s): %s", level, message)
+    if level == "notify" and not _replay_active:
+        try:
+            acct = db.get_sim_account(account_id) or {}
+            if acct.get("dingtalk_enabled"):
+                _DINGTALK_EXECUTOR.submit(_send_dingtalk_async, account_id, message)
+        except Exception:  # noqa: BLE001
+            log.warning("[runner] 钉钉推送调度失败: %s", message)
+
+
+_DINGTALK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk")
+_replay_active = False
+
+
+def _send_dingtalk_async(account_id: str, msg: str) -> None:
+    """异步发送钉钉消息（fire-and-forget）。"""
+    try:
+        webhook_url = db.get_quant_setting("dingtalk_webhook_url") or ""
+        if not webhook_url:
+            return
+        secret = db.get_quant_setting("dingtalk_secret") or ""
+        acct = db.get_sim_account(account_id) or {}
+        name = acct.get("name", account_id)
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        title = f"模拟盘通知 [{name}]"
+        text = f"### {title}\n\n{msg}\n\n> 时间: {now}  \n> 账户: {account_id}"
+        from ..notify import send_dingtalk
+        send_dingtalk(webhook_url, secret, title, text)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[runner] 钉钉推送异常: %s", e)
 
 
 def _load_engine():
@@ -448,24 +481,28 @@ def _hist_feed(dm, codes, now, _acc):
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
     """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
-    yesterday = datetime.date.today() - datetime.timedelta(days=1)
-    days = _trade_days_between(dm, start_date, yesterday)
-    _emit_log(account_id, "info",
-              f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日")
-    for day in days:
-        if is_paused(account_id):
-            break
-        _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
-                    datetime.datetime.combine(day, datetime.time(9, 25)))
-        for bar in _session_minutes(day):
-            # 日频账户补跑同样每日只走首个 bar（09:31），与实时口径一致
-            if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
-                continue
-            _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
-        _eod(account_id, bundle, ctx, dm, state, aux,
-             datetime.datetime.combine(day, datetime.time(15, 5)))
-        _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
-    _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
+    global _replay_active
+    _replay_active = True
+    try:
+        yesterday = datetime.date.today() - datetime.timedelta(days=1)
+        days = _trade_days_between(dm, start_date, yesterday)
+        _emit_log(account_id, "info",
+                  f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日")
+        for day in days:
+            if is_paused(account_id):
+                break
+            _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
+                        datetime.datetime.combine(day, datetime.time(9, 25)))
+            for bar in _session_minutes(day):
+                if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
+                    continue
+                _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+            _eod(account_id, bundle, ctx, dm, state, aux,
+                 datetime.datetime.combine(day, datetime.time(15, 5)))
+            _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
+        _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
+    finally:
+        _replay_active = False
 
 
 def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
