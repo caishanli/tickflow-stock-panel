@@ -481,14 +481,21 @@ def insert_sim_log(account_id, ts, level, message):
         )
 
 
-def get_sim_logs(account_id, limit=500):
-    """按时间正序返回最近 limit 条日志。"""
+def get_sim_logs(account_id, limit=0):
+    """按时间正序返回日志。limit=0 表示全部。"""
     with get_conn() as c:
-        rows = c.execute(
-            "SELECT ts,level,message FROM sim_logs WHERE account_id=? "
-            "ORDER BY rowid DESC LIMIT ?",
-            (account_id, limit),
-        ).fetchall()
+        if limit and limit > 0:
+            rows = c.execute(
+                "SELECT ts,level,message FROM sim_logs WHERE account_id=? "
+                "ORDER BY rowid DESC LIMIT ?",
+                (account_id, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT ts,level,message FROM sim_logs WHERE account_id=? "
+                "ORDER BY rowid DESC",
+                (account_id,),
+            ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 

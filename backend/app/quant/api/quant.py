@@ -356,7 +356,38 @@ def sim_stream(aid: str, since_id: int | None = None):
 
 @router.get("/sim/accounts/{aid}/equity")
 def sim_equity(aid: str):
-    return {"data": db.get_sim_snapshots(aid)}
+    snaps = db.get_sim_snapshots(aid)
+    if not snaps:
+        return {"data": []}
+    # 附带沪深300基准：按日聚合快照，取每日末净值对应的 000300 收益率
+    import datetime as _dt
+    import pandas as _pd
+    try:
+        from ..jqengine.datasource.manager import get_data_manager
+        dm = get_data_manager()
+        first_day = str(snaps[0].get("dt", ""))[:10]
+        last_day = str(snaps[-1].get("dt", ""))[:10]
+        if not first_day:
+            return {"data": snaps}
+        start_ts = _pd.Timestamp(first_day) - _pd.Timedelta(days=10)
+        df = dm.fetch("get_daily", "000300.XSHG", str(start_ts)[:10], last_day)
+        if df is not None and not df.empty:
+            dcol = next((c for c in ("trade_date", "date", "datetime") if c in df.columns), None)
+            if dcol:
+                df = df.copy()
+                df["_day"] = df[dcol].astype(str).str.replace("-", "").str[:8]
+                close_col = "close" if "close" in df.columns else df.columns[-1]
+                day_close = df.groupby("_day")[close_col].last().to_dict()
+                base_day = first_day.replace("-", "")
+                base = day_close.get(base_day) or (sorted(day_close.values())[0] if day_close else 0)
+                if base:
+                    bench_ret = {d: (day_close[d] / base - 1) * 100 for d in day_close}
+                    for s in snaps:
+                        day = str(s.get("dt", ""))[:10].replace("-", "")
+                        s["benchmark_pct"] = round(bench_ret.get(day, 0), 2)
+    except Exception:
+        pass
+    return {"data": snaps}
 
 
 @router.get("/sim/accounts/{aid}/trades")
@@ -365,7 +396,7 @@ def sim_trades(aid: str):
 
 
 @router.get("/sim/accounts/{aid}/logs")
-def sim_logs(aid: str, limit: int = 500):
+def sim_logs(aid: str, limit: int = 0):
     return {"data": db.get_sim_logs(aid, limit)}
 
 

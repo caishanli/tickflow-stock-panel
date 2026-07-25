@@ -117,6 +117,7 @@ function SimList({ accounts, strategyName, onNew, onOpen }: {
             <thead className="text-muted border-b border-border">
               <tr className="text-left">
                 <th className="px-3 py-2.5 font-normal w-10">#</th>
+                <th className="px-3 py-2.5 font-normal">编号</th>
                 <th className="px-3 py-2.5 font-normal">名称</th>
                 <th className="px-3 py-2.5 font-normal">策略</th>
                 <th className="px-3 py-2.5 font-normal">开始日期</th>
@@ -134,6 +135,7 @@ function SimList({ accounts, strategyName, onNew, onOpen }: {
                   <tr key={a.id} onClick={() => onOpen(a.id)}
                     className="border-t border-border/60 hover:bg-elevated/60 cursor-pointer">
                     <td className="px-3 py-2.5 text-muted">{i + 1}</td>
+                    <td className="px-3 py-2.5 text-muted font-mono">{a.id}</td>
                     <td className="px-3 py-2.5">{a.name}</td>
                     <td className="px-3 py-2.5 text-muted">{strategyName(a.strategy_id)}</td>
                     <td className="px-3 py-2.5 text-muted">{a.start_date || '—'}</td>
@@ -217,20 +219,64 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
     ? state.net_value / state.start_cash - 1 : null
 
   const curve = useMemo(() => {
-    const accent = cssVar('--accent', '#3b82f6')
-    const data: any[] = Array.isArray(eq) ? eq : []
+    const accent = '#3b82f6'
+    const benchColor = '#f59e0b'
+    const raw: any[] = Array.isArray(eq) ? eq : []
+    // 按天聚合：每天取最后一个点的净值，日线级别展示
+    const dayMap = new Map<string, any>()
+    for (const d of raw) {
+      const day = String(d.dt ?? '').slice(0, 10)
+      if (day) dayMap.set(day, d)
+    }
+    const data = Array.from(dayMap.values())
+    // 策略收益率(%)：以首日净值为基准
+    const baseNV = data.length > 0 ? Number(data[0].net_value ?? 0) : 0
+    const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / baseNV) - 1) * 100).toFixed(2)))
+    const benchPct = data.map((d) => Number(d.benchmark_pct ?? 0))
+    // 当日涨跌幅(%)：从累计收益率反推，(1+r_n)/(1+r_{n-1})-1
+    const stratDaily = stratPct.map((v, i) =>
+      i === 0 ? 0 : Number((((1 + v / 100) / (1 + stratPct[i - 1] / 100) - 1) * 100).toFixed(2)))
+    const benchDaily = benchPct.map((v, i) =>
+      i === 0 ? 0 : Number((((1 + v / 100) / (1 + benchPct[i - 1] / 100) - 1) * 100).toFixed(2)))
+    const xLabels = data.map((d) => String(d.dt ?? '').slice(0, 10))
     return {
       animation: false,
-      grid: { left: 64, right: 16, top: 16, bottom: 32 },
+      grid: { left: 64, right: 16, top: 30, bottom: 32 },
+      legend: {
+        data: ['策略收益(累计)', '沪深300(累计)'],
+        textStyle: { color: cssVar('--muted', '#94a3b8'), fontSize: 11 },
+        top: 4, right: 8,
+      },
       tooltip: {
         trigger: 'axis',
         backgroundColor: cssVar('--surface', '#1e293b'),
         borderColor: cssVar('--border', '#334155'),
         textStyle: { color: cssVar('--foreground', '#e2e8f0'), fontSize: 12 },
+        formatter: (params: any[]) => {
+          if (!params || params.length === 0) return ''
+          const idx = params[0].dataIndex
+          const day = xLabels[idx] ?? ''
+          const sCum = stratPct[idx] ?? 0
+          const bCum = benchPct[idx] ?? 0
+          const sDay = stratDaily[idx] ?? 0
+          const bDay = benchDaily[idx] ?? 0
+          const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
+          const color = (v: number) => v >= 0 ? '#ef4444' : '#22c55e'
+          return `<div style="font-size:11px;margin-bottom:4px;opacity:0.7">${day}</div>` +
+            `<div style="display:grid;grid-template-columns:auto auto auto;gap:2px 12px;font-size:12px">` +
+            `<span style="color:${accent}">策略</span>` +
+            `<span style="color:${color(sCum)}">${fmt(sCum)}</span>` +
+            `<span style="color:${color(sDay)};opacity:0.6">${fmt(sDay)}</span>` +
+            `<span style="color:${benchColor}">沪深300</span>` +
+            `<span style="color:${color(bCum)}">${fmt(bCum)}</span>` +
+            `<span style="color:${color(bDay)};opacity:0.6">${fmt(bDay)}</span>` +
+            `</div>` +
+            `<div style="font-size:10px;margin-top:4px;opacity:0.4">累计 / 当日</div>`
+        },
       },
       xAxis: {
         type: 'category',
-        data: data.map((d) => String(d.dt ?? '')),
+        data: xLabels,
         axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10, hideOverlap: true },
         axisLine: { lineStyle: { color: cssVar('--border', '#334155') } },
         axisTick: { show: false },
@@ -238,26 +284,35 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
       yAxis: {
         type: 'value',
         scale: true,
-        axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10 },
+        axisLabel: { color: cssVar('--muted', '#94a3b8'), fontSize: 10, formatter: '{value}%' },
         splitLine: { lineStyle: { color: cssVar('--border', '#334155') } },
       },
       dataZoom: [
         { type: 'inside' },
         { type: 'slider', height: 14, bottom: 6, borderColor: cssVar('--border', '#334155'), textStyle: { color: cssVar('--muted', '#94a3b8'), fontSize: 10 } },
       ],
-      series: [{
-        name: '净值',
-        type: 'line',
-        data: data.map((d) => Number(d.net_value ?? 0)),
-        symbol: 'none',
-        lineStyle: { color: accent, width: 2 },
-        areaStyle: {
-          color: {
-            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: accent + '26' }, { offset: 1, color: accent + '03' }],
+      series: [
+        {
+          name: '策略收益(累计)',
+          type: 'line',
+          data: stratPct,
+          symbol: 'none',
+          lineStyle: { color: accent, width: 2 },
+          areaStyle: {
+            color: {
+              type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+              colorStops: [{ offset: 0, color: accent + '26' }, { offset: 1, color: accent + '03' }],
+            },
           },
         },
-      }],
+        {
+          name: '沪深300(累计)',
+          type: 'line',
+          data: benchPct,
+          symbol: 'none',
+          lineStyle: { color: benchColor, width: 1.5, type: 'dashed' },
+        },
+      ],
     } as any
   }, [eq])
 
@@ -274,6 +329,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
           <ArrowLeft size={14} />返回列表
         </button>
         <span className="text-sm font-medium text-foreground">{acct.name ?? '—'}</span>
+        <span className="text-xs text-muted font-mono">{aid}</span>
         <span className={`text-xs ${statusTone(acct.status)}`}>
           {STATUS_LABEL[acct.status] ?? acct.status ?? '—'}
         </span>

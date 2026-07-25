@@ -9,7 +9,10 @@ _LOCK = threading.Lock()
 
 
 class DataCache:
-    def __init__(self, root: str = "data/quant_cache"):
+    def __init__(self, root: str = ""):
+        if not root:
+            from ..config import CONFIG
+            root = os.path.join(os.path.dirname(CONFIG.db_path), "quant_cache")
         self.root = root
         os.makedirs(root, exist_ok=True)
 
