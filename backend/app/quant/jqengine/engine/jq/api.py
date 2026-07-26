@@ -525,7 +525,18 @@ def order(security, amount):
     fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
     fill = round(fill, 3)
     turnover = abs(amount) * fill
-    fee_amount = round(turnover * fee, 2)
+    # Use separate buy/sell commission rates with minimum
+    fee_cfg = _state.get("fee_config")
+    if fee_cfg:
+        if amount > 0:
+            comm_rate = fee_cfg["open_commission"]
+        else:
+            comm_rate = fee_cfg["close_commission"]
+        min_comm = fee_cfg["min_commission"]
+    else:
+        comm_rate = fee
+        min_comm = 0.0
+    fee_amount = round(max(turnover * comm_rate, min_comm), 2)
     tax_amount = 0.0
     if amount > 0:
         cost = turnover + fee_amount
@@ -660,7 +671,7 @@ def _reset(manager, fee, slippage, cash):
     ctx = Context()
     ctx.portfolio = Portfolio(cash)
     _state.update(ctx=ctx, manager=manager, fee=fee, slippage=slippage,
-                  daily=[], minute=[], records=[], trades=[],
+                  fee_config=None, daily=[], minute=[], records=[], trades=[],
                   minute_prices={}, minute_mode=False,
                   no_buy=set(), no_sell=set(), log_sink=None)
     return ctx
@@ -717,8 +728,24 @@ def set_order_cost(obj, _type="fund", type=None):
     _type = type or _type
     if isinstance(obj, OrderCost):
         _state["fee"] = float(obj.open_commission)
+        _state["fee_config"] = {
+            "open_commission": float(obj.open_commission),
+            "close_commission": float(obj.close_commission),
+            "close_today_commission": float(obj.close_today_commission),
+            "min_commission": float(obj.min_commission),
+            "open_tax": float(obj.open_tax),
+            "close_tax": float(obj.close_tax),
+        }
     elif isinstance(obj, dict):
         _state["fee"] = float(obj.get("open_commission", _state["fee"]))
+        _state["fee_config"] = {
+            "open_commission": float(obj.get("open_commission", 0.0001)),
+            "close_commission": float(obj.get("close_commission", 0.0001)),
+            "close_today_commission": float(obj.get("close_today_commission", 0.0001)),
+            "min_commission": float(obj.get("min_commission", 5)),
+            "open_tax": float(obj.get("open_tax", 0)),
+            "close_tax": float(obj.get("close_tax", 0)),
+        }
 
 
 def set_benchmark(code):
