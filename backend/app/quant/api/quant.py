@@ -456,7 +456,7 @@ def toggle_dingtalk(aid: str, body: dict):
 
 
 @router.post("/settings/dingtalk/test")
-def test_dingtalk(body: dict = None):
+def test_dingtalk(body: dict):
     from ..notify import send_dingtalk
     body = body or {}
     url = body.get("webhook_url") or db.get_quant_setting("dingtalk_webhook_url") or ""
