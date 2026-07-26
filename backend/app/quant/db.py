@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS strategies (
 CREATE TABLE IF NOT EXISTS sim_accounts (
     id TEXT PRIMARY KEY, name TEXT, capital REAL, stop_loss REAL, status TEXT,
     strategy_id TEXT, start_date TEXT, frequency TEXT DEFAULT 'minute',
+    dingtalk_enabled INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')), started_at TEXT);
 CREATE TABLE IF NOT EXISTS sim_state (
     account_id TEXT PRIMARY KEY, cash REAL, positions_json TEXT, net_value REAL,
@@ -45,6 +46,8 @@ CREATE TABLE IF NOT EXISTS sim_stop_loss (
     account_id TEXT, ts TEXT, code TEXT, action TEXT, price REAL, pnl_pct REAL);
 CREATE TABLE IF NOT EXISTS sim_logs (
     account_id TEXT, ts TEXT, level TEXT, message TEXT);
+CREATE TABLE IF NOT EXISTS quant_settings (
+    key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -74,6 +77,10 @@ def init_db(path: str | None = None) -> None:
         if "frequency" not in cols:
             conn.execute(
                 "ALTER TABLE sim_accounts ADD COLUMN frequency TEXT DEFAULT 'minute'")
+        # 兼容旧库：sim_accounts 补 dingtalk_enabled 列（钉钉推送开关，0 关 1 开）
+        if "dingtalk_enabled" not in cols:
+            conn.execute(
+                "ALTER TABLE sim_accounts ADD COLUMN dingtalk_enabled INTEGER DEFAULT 0")
         conn.commit()
     finally:
         conn.close()
@@ -377,6 +384,23 @@ def list_sim_accounts():
             "ORDER BY a.created_at"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_quant_setting(key: str) -> str | None:
+    """读取量化模块配置项（如钉钉 webhook/secret），不存在返回 None。"""
+    with get_conn() as c:
+        row = c.execute("SELECT value FROM quant_settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_quant_setting(key: str, value: str) -> None:
+    """写入/更新量化模块配置项（key 存在则覆盖）。"""
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO quant_settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
 
 def upsert_sim_state(account_id, cash, positions_json, net_value, pnl, start_cash,

@@ -270,6 +270,9 @@ class DataManager:
             src_name, raw_code = key.split("_", 1)
             if df is None or (hasattr(df, "empty") and df.empty):
                 continue
+            # 跳过过期日线：preload 不把过期数据读入内存，迫使 fetch 回源刷新
+            if self.cache._is_stale(df):
+                continue
             jq_code = self._to_jq_code(raw_code)
             pri = priority.index(src_name) if src_name in priority else len(priority)
             cands.setdefault(jq_code, []).append((pri, src_name, key, df))
@@ -319,7 +322,8 @@ class DataManager:
                 # 下方 cache.get 回源补齐。
                 req_start = args[1] if len(args) > 1 else None
                 req_end = args[2] if len(args) > 2 else None
-                if DataCache._covers(mem, req_start, req_end):
+                if (DataCache._covers(mem, req_start, req_end)
+                        and not self.cache._is_stale(mem)):
                     return mem
             del self._daily_mem[cache_key]
             self._daily_ver += 1  # 日线内存有删除，money memo 旧版本键失效
@@ -850,6 +854,10 @@ class DataManager:
             try:
                 # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘。
                 ddf = self._daily_mem.get("get_daily_" + code)
+                # 覆盖检查：_daily_mem 可能来自 preload_daily() 加载的旧缓存
+                if (ddf is not None and not (hasattr(ddf, "empty") and ddf.empty)
+                        and self.cache._is_stale(ddf)):
+                    ddf = None
                 if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
                     # peek 兜底顺序与 preload/fetch 一致复用 _priority()：
                     # 原硬编码 ("mootdx","astock","tushare") 与 preload 的

@@ -3,10 +3,11 @@ import ReactECharts from 'echarts-for-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Plus, Play, Square, RotateCcw } from 'lucide-react'
+import { ArrowLeft, Plus, Play, Square, RotateCcw, Bell } from 'lucide-react'
 import * as api from '../api'
 import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
+import { DingtalkConfigDialog } from './DingtalkConfigDialog'
 
 /** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
 function cssVar(name: string, fallback: string) {
@@ -172,6 +173,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
 }) {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs'>('trades')
+  const [showDingtalkCfg, setShowDingtalkCfg] = useState(false)
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
   const { data: st } = useQuery({
     queryKey: ['quant', 'sim', aid, 'status'], queryFn: () => api.getSimStatus(aid),
@@ -229,8 +231,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
       if (day) dayMap.set(day, d)
     }
     const data = Array.from(dayMap.values())
-    // 策略收益率(%)：以首日净值为基准
-    const baseNV = data.length > 0 ? Number(data[0].net_value ?? 0) : 0
+    // 策略收益率(%)：以初始资金为基准（首日即反映当天盈亏）
+    const baseNV = Number(st?.state?.start_cash ?? st?.start_cash ?? (data.length > 0 ? data[0].net_value : 0)) || 1
     const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / baseNV) - 1) * 100).toFixed(2)))
     const benchPct = data.map((d) => Number(d.benchmark_pct ?? 0))
     // 当日涨跌幅(%)：从累计收益率反推，(1+r_n)/(1+r_{n-1})-1
@@ -314,7 +316,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
         },
       ],
     } as any
-  }, [eq])
+  }, [eq, st])
 
   const tradeList: any[] = Array.isArray(tr) ? tr : []
   const stopLossList: any[] = Array.isArray(st?.stop_loss) ? st.stop_loss : []
@@ -338,6 +340,14 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
           {acct.start_date ? ` · 自 ${acct.start_date}` : ''}
         </span>
         <div className="ml-auto flex gap-2">
+          <button onClick={() => setShowDingtalkCfg(true)}
+            className={`inline-flex items-center gap-1 px-3 h-9 rounded-lg text-xs ${acct?.dingtalk_enabled ? 'bg-accent text-white' : 'bg-elevated text-foreground'}`}>
+            <Bell size={13} />钉钉{acct?.dingtalk_enabled ? '已开启' : '推送'}
+          </button>
+          <button onClick={() => api.toggleDingtalk(aid, !acct?.dingtalk_enabled).then(() => qc.invalidateQueries({ queryKey: ['quant', 'sim'] }))}
+            className="inline-flex items-center gap-1 px-2 h-9 rounded-lg bg-elevated text-foreground text-xs">
+            {acct?.dingtalk_enabled ? '关闭' : '开启'}
+          </button>
           <button onClick={() => startMut.mutate()} disabled={startMut.isPending || acct.status === 'running'}
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-accent text-white text-xs disabled:opacity-50">
             <Play size={13} />启动
@@ -499,6 +509,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
           </div>
         )}
       </div>
+      {showDingtalkCfg && <DingtalkConfigDialog onClose={() => setShowDingtalkCfg(false)} />}
     </div>
   )
 }

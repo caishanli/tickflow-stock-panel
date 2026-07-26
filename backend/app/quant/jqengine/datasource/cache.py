@@ -101,29 +101,53 @@ class DataCache:
                     return False
             except Exception:
                 return True
-        if start:
-            try:
-                # 仅当数据起始晚于请求结束（数据完全在请求区间之后）才视为失效；
-                # 请求起始早于数据起始（如回看窗口早于数据上市日）不失效——数据
-                # 从 first 起已覆盖回测区间，回源会因 offline 失败导致基准缺失。
-                if end and pd.Timestamp(first).date() > pd.Timestamp(end).date():
-                    return False
-            except Exception:
-                return True
         return True
+
+    def _is_stale(self, df, stale_days=1):
+        """Check if DataFrame's latest date is older than stale_days from today."""
+        if hasattr(df, "empty") and df.empty:
+            return False
+        try:
+            for col in ("trade_date", "date"):
+                if col in df.columns:
+                    last_date = pd.Timestamp(df[col].max()).date()
+                    return (
+                        pd.Timestamp.now().normalize().date() - last_date
+                    ).days > stale_days
+            if isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+                last_date = df.index.max().date()
+                return (
+                    pd.Timestamp.now().normalize().date() - last_date
+                ).days > stale_days
+        except Exception:
+            pass
+        return False
 
     def get(self, freq, code, loader, start=None, end=None):
         """命中缓存返回 DataFrame；未命中或覆盖不足时调用 loader 取数并写盘。
 
-        关键修复：不再对“本地有但不完整”的缓存睁一只眼，覆盖不足即视为失效、
+        关键修复：不再对“本地有但不完整”的缓存瞪一只眼，覆盖不足即视为失效、
         回源补齐，避免回测使用被冻结的过期数据。
+
+        当 freq=daily 时，额外检查数据末端距今是否超过 STALE_DAYS
+        天（默认1，确保日线始终为最新交易日），超过则视为过期并回源。
         """
+        stale_days = 1
         df = self.peek(freq, code)
-        if df is not None and self._covers(df, start, end):
+        if (df is not None and self._covers(df, start, end)
+                and not (freq == "daily"
+                         and self._is_stale(df, stale_days))):
             return df
-        df = loader()
-        if df is not None and not df.empty:
-            self.put(freq, code, df)
+        need_refetch = (
+            df is None
+            or (hasattr(df, "empty") and df.empty)
+            or (freq == "daily" and self._is_stale(df, stale_days))
+        )
+        if need_refetch:
+            fresh = loader()
+            if fresh is not None and not fresh.empty:
+                df = fresh
+                self.put(freq, code, df)
         return df
 
     def peek(self, freq, code):

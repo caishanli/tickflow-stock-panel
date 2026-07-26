@@ -24,6 +24,9 @@ def _is_index(code):
 # 规避 0.11.x BESTIP.HQ 空串 bug；海外网络通常全部超时，此时回退
 # 到 mootdx 自带 bestip 测速 / 裸 factory。
 _TDX_SERVERS = [
+    ('115.238.90.165', 7709), ('115.238.56.198', 7709),
+    ('218.75.126.9', 7709), ('124.160.88.183', 7709),
+    ('60.191.117.167', 7709), ('60.12.136.250', 7709),
     ('119.97.185.59', 7709), ('124.70.133.119', 7709), ('116.205.183.150', 7709),
     ('123.60.73.44', 7709), ('116.205.163.254', 7709), ('121.36.225.169', 7709),
     ('123.60.70.228', 7709), ('124.71.9.153', 7709), ('110.41.147.114', 7709),
@@ -82,28 +85,66 @@ class MootdxSource(DataSource):
 
     def _api(self):
         if self._client is None:
-            try:
-                from mootdx.quotes import Quotes
-                # 裸 factory（自动选速）实测对全市场标的都能取到数据且快，
-                # 作为默认客户端；显式 _TDX_SERVERS 仅作失败时的轮换兜底。
-                self._client = Quotes.factory(market="std")
-            except Exception as e:
-                raise DataSourceError(f"mootdx 初始化失败: {e}")
+            self._client = self._make_client()
         return self._client
+
+    def _make_client(self, server=None):
+        """创建 mootdx 客户端并用 pytdx 替换底层 tdxpy（tdxpy 0.2.7 协议不兼容）。
+
+        顺序：1) 显式 _TDX_SERVERS 探测 → 2) 裸 factory 兜底。
+        返回 StdQuotes 实例（client.client 已替换为 pytdx.TdxHq_API）。
+        """
+        from mootdx.quotes import Quotes
+        import pytdx.hq as _pytdx_hq
+
+        def _patch(quotes_client, ip, port):
+            """用 pytdx 替换 mootdx 内部的 tdxpy client，修复 bars/quotes 返回空。"""
+            try:
+                px = _pytdx_hq.TdxHq_API()
+                px.connect(ip, int(port), time_out=10)
+                quotes_client.client = px
+            except Exception:
+                pass
+            return quotes_client
+
+        # 1) 显式列表探测
+        servers = [server] if server else _TDX_SERVERS
+        for ip, port in servers:
+            if not _probe(ip, port):
+                continue
+            try:
+                c = Quotes.factory(market="std", server=(ip, port))
+                return _patch(c, ip, port)
+            except Exception:
+                continue
+        # 2) 裸 factory 兜底
+        try:
+            c = Quotes.factory(market="std")
+            # 裸 factory 可能选了未知服务器，尝试用已知可用服务器替换
+            for ip, port in _TDX_SERVERS:
+                if _probe(ip, port):
+                    return _patch(c, ip, port)
+            return c
+        except Exception as e:
+            raise DataSourceError(f"mootdx 初始化失败: {e}")
 
     def _rotate_server(self, to_bestip=False):
         """换服务器重建客户端（运行时取数超时/失败兜底）。
 
-        统一使用裸 ``Quotes.factory(market="std")``：实测对所有标的可用且快，
-        且**不会触发 mootdx 的 bestip 测速选服（会卡死）**。bestip 兜底已禁用。
+        按 _TDX_SERVERS 顺序轮换，每次都用 pytdx 替换底层 tdxpy。
         返回新客户端；全部失败返回 None。
         """
-        from mootdx.quotes import Quotes
+        self._server_idx += 1
+        if self._server_idx >= len(_TDX_SERVERS):
+            return None
+        ip, port = _TDX_SERVERS[self._server_idx]
+        if not _probe(ip, port):
+            return self._rotate_server(to_bestip)
         try:
-            self._client = Quotes.factory(market="std")
+            self._client = self._make_client(server=(ip, port))
             return self._client
         except Exception:
-            return None
+            return self._rotate_server(to_bestip)
 
     def _with_server_retry(self, fn, empty_ok=False):
         """执行取数 ``fn``，超时/返回空时按 _TDX_SERVERS 轮询换服务器重试。

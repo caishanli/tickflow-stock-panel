@@ -378,7 +378,12 @@ def sim_equity(aid: str):
                 df["_day"] = df[dcol].astype(str).str.replace("-", "").str[:8]
                 close_col = "close" if "close" in df.columns else df.columns[-1]
                 day_close = df.groupby("_day")[close_col].last().to_dict()
+                # 基准日 = 模拟盘启动日前一个交易日（用前日收盘做基准，首日即反映当天涨跌）
                 base_day = first_day.replace("-", "")
+                sorted_days = sorted(day_close.keys())
+                base_idx = sorted_days.index(base_day) if base_day in sorted_days else 0
+                if base_idx > 0:
+                    base_day = sorted_days[base_idx - 1]  # 前一个交易日
                 base = day_close.get(base_day) or (sorted(day_close.values())[0] if day_close else 0)
                 if base:
                     bench_ret = {d: (day_close[d] / base - 1) * 100 for d in day_close}
@@ -426,3 +431,37 @@ def datasource_verify():
         return {"data": {"ok": True}}
     except Exception as e:  # noqa: BLE001
         return {"data": {"ok": False, "error": str(e)}}
+
+
+# ---- 钉钉推送 ----
+@router.get("/settings/dingtalk")
+def get_dingtalk_config():
+    return {"data": {
+        "webhook_url": db.get_quant_setting("dingtalk_webhook_url") or "",
+        "secret": db.get_quant_setting("dingtalk_secret") or "",
+    }}
+
+
+@router.put("/settings/dingtalk")
+def save_dingtalk_config(body: dict):
+    db.set_quant_setting("dingtalk_webhook_url", body.get("webhook_url", ""))
+    db.set_quant_setting("dingtalk_secret", body.get("secret", ""))
+    return {"data": "ok"}
+
+
+@router.put("/sim/accounts/{aid}/dingtalk")
+def toggle_dingtalk(aid: str, body: dict):
+    db.update_sim_account(aid, dingtalk_enabled=1 if body.get("enabled") else 0)
+    return {"data": "ok"}
+
+
+@router.post("/settings/dingtalk/test")
+def test_dingtalk(body: dict):
+    from ..notify import send_dingtalk
+    body = body or {}
+    url = body.get("webhook_url") or db.get_quant_setting("dingtalk_webhook_url") or ""
+    secret = body.get("secret") or db.get_quant_setting("dingtalk_secret") or ""
+    if not url:
+        return {"data": {"success": False, "message": "未配置 webhook URL"}}
+    ok = send_dingtalk(url, secret, "测试通知", "## 测试通知\n\n这是一条来自量化模拟盘的测试消息")
+    return {"data": {"success": ok, "message": "发送成功" if ok else "发送失败"}}

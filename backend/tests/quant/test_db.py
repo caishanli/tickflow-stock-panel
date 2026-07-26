@@ -41,3 +41,22 @@ def test_sim_account_and_state():
     db.delete_sim_account("a1")
     assert db.get_sim_account("a1") is None
     os.unlink(p)
+
+def test_quant_settings_kv():
+    p = _fresh()
+    db.set_quant_setting("dingtalk_webhook_url", "https://oapi.dingtalk.com/robot/send?access_token=xxx")
+    db.set_quant_setting("dingtalk_secret", "SECxxx")
+    assert db.get_quant_setting("dingtalk_webhook_url") == "https://oapi.dingtalk.com/robot/send?access_token=xxx"
+    assert db.get_quant_setting("dingtalk_secret") == "SECxxx"
+    assert db.get_quant_setting("nonexistent") is None
+    os.unlink(p)
+
+def test_sim_account_dingtalk_enabled():
+    p = _fresh()
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "created")
+    acct = db.get_sim_account("a1")
+    assert acct["dingtalk_enabled"] == 0
+    db.update_sim_account("a1", dingtalk_enabled=1)
+    acct = db.get_sim_account("a1")
+    assert acct["dingtalk_enabled"] == 1
+    os.unlink(p)
