@@ -877,6 +877,22 @@ def get_all_securities(types=None, date=None):
 
 
 def is_temporarily_suspended(code, context=None):
+    """Check if a security is temporarily suspended at the current bar.
+
+    Returns True if minute volume is 0 (no trades at current time),
+    indicating the security is likely halted/suspended.
+    """
+    if not _state.get("minute_mode"):
+        return False
+    snap = _state.get("minute_prices") or {}
+    if code in snap:
+        return False
+    mgr = _state.get("manager")
+    ctx = _state.get("ctx")
+    if mgr and ctx and ctx.current_dt is not None:
+        p = mgr.get_minute_price_at(code, ctx.current_dt)
+        if p is None:
+            return True
     return False
 
 
