@@ -136,7 +136,7 @@ def _emit_log(account_id: str, level: str, message: str) -> None:
         db.insert_sim_log(account_id, str(datetime.datetime.now()), level, message)
     except Exception:  # noqa: BLE001
         log.warning("[runner] 日志落库失败(%s): %s", level, message)
-    if level == "notify" and not _replay_active:
+    if level == "notify" and account_id not in _replay_active_ids:
         try:
             acct = db.get_sim_account(account_id) or {}
             if acct.get("dingtalk_enabled"):
@@ -146,7 +146,7 @@ def _emit_log(account_id: str, level: str, message: str) -> None:
 
 
 _DINGTALK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk")
-_replay_active = False
+_replay_active_ids: set[str] = set()
 
 
 def _send_dingtalk_async(account_id: str, msg: str) -> None:
@@ -481,8 +481,7 @@ def _hist_feed(dm, codes, now, _acc):
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
     """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
-    global _replay_active
-    _replay_active = True
+    _replay_active_ids.add(account_id)
     try:
         yesterday = datetime.date.today() - datetime.timedelta(days=1)
         days = _trade_days_between(dm, start_date, yesterday)
@@ -502,7 +501,7 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
             _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
         _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
     finally:
-        _replay_active = False
+        _replay_active_ids.discard(account_id)
 
 
 def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
