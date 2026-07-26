@@ -64,4 +64,4 @@ export const toggleDingtalk = (aid: string, enabled: boolean) =>
 export const getDingtalkConfig = () => j('/settings/dingtalk')
 export const saveDingtalkConfig = (webhookUrl: string, secret: string) =>
   j('/settings/dingtalk', { method: 'PUT', body: JSON.stringify({ webhook_url: webhookUrl, secret }) })
-export const testDingtalk = () => j('/settings/dingtalk/test', { method: 'POST' })
+export const testDingtalk = (webhookUrl: string, secret: string) => j('/settings/dingtalk/test', { method: 'POST', body: JSON.stringify({ webhook_url: webhookUrl, secret }) })

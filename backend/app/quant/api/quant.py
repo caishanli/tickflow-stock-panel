@@ -456,10 +456,11 @@ def toggle_dingtalk(aid: str, body: dict):
 
 
 @router.post("/settings/dingtalk/test")
-def test_dingtalk():
+def test_dingtalk(body: dict = None):
     from ..notify import send_dingtalk
-    url = db.get_quant_setting("dingtalk_webhook_url") or ""
-    secret = db.get_quant_setting("dingtalk_secret") or ""
+    body = body or {}
+    url = body.get("webhook_url") or db.get_quant_setting("dingtalk_webhook_url") or ""
+    secret = body.get("secret") or db.get_quant_setting("dingtalk_secret") or ""
     if not url:
         return {"data": {"success": False, "message": "未配置 webhook URL"}}
     ok = send_dingtalk(url, secret, "测试通知", "## 测试通知\n\n这是一条来自量化模拟盘的测试消息")

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import * as api from '../api'
 
@@ -12,13 +12,24 @@ export function DingtalkConfigDialog({ onClose }: { onClose: () => void }) {
   const [secret, setSecret] = useState(cfg?.secret ?? '')
   const [testResult, setTestResult] = useState<string>('')
 
+  useEffect(() => {
+    if (cfg) {
+      setWebhookUrl(cfg.webhook_url ?? '')
+      setSecret(cfg.secret ?? '')
+    }
+  }, [cfg])
+
   const saveMut = useMutation({
     mutationFn: () => api.saveDingtalkConfig(webhookUrl, secret),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['quant', 'dingtalk'] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['quant', 'dingtalk'] })
+      onClose()
+    },
   })
   const testMut = useMutation({
-    mutationFn: () => api.testDingtalk(),
+    mutationFn: () => api.testDingtalk(webhookUrl, secret),
     onSuccess: (r: any) => setTestResult(r?.success ? '发送成功' : `失败: ${r?.message ?? ''}`),
+    onError: (e: any) => setTestResult(`请求失败: ${e?.message ?? ''}`),
   })
 
   return (
@@ -43,7 +54,7 @@ export function DingtalkConfigDialog({ onClose }: { onClose: () => void }) {
         <div className="flex justify-end gap-2">
           <button onClick={() => testMut.mutate()} disabled={testMut.isPending}
             className="px-3 h-9 rounded-lg bg-elevated text-foreground text-xs">测试发送</button>
-          <button onClick={() => { saveMut.mutate(); onClose() }} disabled={saveMut.isPending}
+          <button onClick={() => saveMut.mutate()} disabled={saveMut.isPending}
             className="px-3 h-9 rounded-lg bg-accent text-white text-xs">保存</button>
         </div>
       </div>
