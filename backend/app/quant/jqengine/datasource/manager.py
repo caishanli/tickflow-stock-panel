@@ -569,13 +569,11 @@ class DataManager:
 
     def _load_minute_merged(self, code, all_min=None, all_5min=None,
                             as_of=None, full=False, lo_hi=None):
-        """三源合并（缺口感知）：本地基底 + mootdx 补后续缺口 + baostock 补前序缺口。
+        """仅使用真实 mootdx 分钟数据（无合成/插值兜底）。
 
         - 本地分钟缓存（``minute/real_<code>.parquet``）里的真实 1 分钟：查到多少用多少（基底）；
         - 本地数据**之后**的缺口 → 回源 mootdx 获取（见 ``_load_real_minute``）；
-        - 本地数据**之前**的缺口 → baostock 5 分钟插值成 1 分钟补齐；
-        - 5 分钟线与 1 分钟线在缺口边界重叠的时间点：以 5 分钟线为准；
-        - 三源皆无 → 日线合成兜底（仅兜底，确定性）。
+        - 无真实数据时返回 None（不使用 baostock 插值或日线合成兜底）。
 
         ``all_min`` / ``all_5min`` 可选，传入 ``cache.get_all`` 的结果以跳过逐键查询。
         ``lo_hi`` 显式指定加载窗口 [lo, hi]（feed 整段区间用），优先级最高；
@@ -591,7 +589,6 @@ class DataManager:
         use_real = getattr(self, "_use_real_minute", True)
 
         layers = []
-        real_start = None
         if use_real:
             real = self._load_real_minute(code, lo_ts, hi_ts, all_min)
             if real is not None and not real.empty:
@@ -600,37 +597,13 @@ class DataManager:
                 real = real.loc[(real.index >= lo_ts) & (real.index <= hi_eff)]
             if real is not None and not real.empty:
                 layers.append(real)
-                real_start = real.index.min()
-
-        # 本地/真实数据“之前”的缺口：baostock 5 分钟插值补齐（只补缺口，
-        # 不覆盖真实段，避免无谓联网也避免用插值覆盖真实 1 分钟）。
-        if real_start is None or lo_ts < real_start:
-            try:
-                bs_hi = real_start if real_start is not None else hi_ts
-                baostock = self._load_baostock_minute(code, lo_ts, bs_hi, all_5min)
-                if baostock is not None and not baostock.empty:
-                    layers.append(baostock)
-            except Exception as e:
-                import logging
-                logging.warning("[DataManager] baostock分钟数据获取失败 %s: %s", code, e)
 
         if not layers:
-            # 三源皆无（mootdx/baostock 均失败）→ 最后兜底：日线合成分钟。
-            # 仅内存使用、绝不落盘（C2：非真实源数据不写库）。确定性、可复现。
-            try:
-                synth = self.minute_source.get_minute(code, hi_ts, lo_ts)
-                if synth is not None and not synth.empty:
-                    # H6b：合成兜底同样不得越出请求窗口
-                    return synth.loc[(synth.index >= lo_ts) & (synth.index <= hi_eff)]
-            except Exception as e:
-                import logging
-                logging.warning("[DataManager] 日线合成兜底失败 %s: %s", code, e)
-            # 三源皆缺：返回 None（不 raise），让上层 feed 跳过该标的而非中止回测。
+            # 无真实 mootdx 数据 → 返回 None（不使用 baostock 插值或日线合成兜底）。
             return None
 
         numeric_cols = ["open", "high", "low", "close", "volume", "money", "amount"]
-        # 以所有层的索引并集为基底；后加入的层（baostock 5 分钟）覆盖先前的层，
-        # 即缺口边界的重叠点以 5 分钟线为准。
+        # 以所有层的索引并集为基底；后加入的层覆盖先前的层。
         union_idx = layers[0].index
         for layer in layers[1:]:
             union_idx = union_idx.union(layer.index)

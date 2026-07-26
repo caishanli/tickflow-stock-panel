@@ -115,19 +115,19 @@ def test_money_memo_full_frame_and_version(tmp_path):
 
 # ---------------- H6b：baostock / merged 结果裁剪到请求窗口 [lo, hi] ----------------
 
-def test_merged_clipped_to_window_and_real_preserved(tmp_path):
-    """merged 不得越出请求窗口；real_ 真实段不得被 baostock 插值覆盖。"""
+def test_merged_clipped_to_window_and_real_only(tmp_path):
+    """merged 只含真实 mootdx 数据（无 baostock/synthetic 兜底）；越出窗口裁剪。"""
     dm = _make_dm(tmp_path)
     _seed_minute_caches(dm)
     merged = dm._load_minute_merged(CODE, full=True)
     assert not merged.empty
-    # 上界不越出回测末端（real_ 缓存延伸到 04-10、5min 到 04-15，均应被裁掉）
+    # 上界不越出回测末端（real_ 缓存延伸到 04-10，应被裁掉）
     assert merged.index.max() == pd.Timestamp("2026-03-31 15:00")
-    assert merged.index.min() >= pd.Timestamp(WIN_START)
-    # real_ 真实段保留真实值（旧实现被 baostock 离线兜底整段覆盖成插值）
+    assert merged.index.min() >= pd.Timestamp("2026-03-16 09:30")
+    # real_ 真实段保留真实值
     assert merged.loc[pd.Timestamp("2026-03-17 10:00"), "close"] == REAL_CLOSE
-    # real_ 之前的缺口由 baostock 插值补齐
-    assert merged.loc[pd.Timestamp("2026-03-03 10:00"), "close"] == BS_CLOSE
+    # 不再包含 baostock 插值数据（real 之前的缺口不补齐）
+    assert pd.Timestamp("2026-03-03 10:00") not in merged.index
 
 
 def test_baostock_offline_fallback_clipped(tmp_path):
@@ -151,18 +151,16 @@ def test_baostock_offline_fallback_clipped(tmp_path):
 # ---------------- H6a：get_minute_feed 走 merged（real_ 基底） ----------------
 
 def test_minute_feed_uses_real_base(tmp_path):
-    """feed 路径必须包含 real_ 真实 1m 段，而非整段 5min 插值。"""
+    """feed 路径只含真实 mootdx 数据，不再有 baostock 插值。"""
     dm = _make_dm(tmp_path)
     _seed_minute_caches(dm)
     feed = dm.get_minute_feed(CODE, WIN_START, WIN_END)
     assert not feed.empty
-    # 旧实现只走 _load_baostock_minute：此处会拿到 333 插值而非 777 真实值
+    # 只含真实 mootdx 数据
     assert feed.loc[pd.Timestamp("2026-03-17 10:00"), "close"] == REAL_CLOSE
-    assert feed.loc[pd.Timestamp("2026-03-03 10:00"), "close"] == BS_CLOSE
+    # real 之前的缺口不再由 baostock 补齐
+    assert pd.Timestamp("2026-03-03 10:00") not in feed.index
     assert feed.index.max() <= pd.Timestamp("2026-03-31 15:00")
-    # 覆盖元数据记录整段请求区间（上界归一到当日 15:00）
-    assert dm._minute_cov[CODE] == (pd.Timestamp(WIN_START),
-                                    pd.Timestamp("2026-03-31 15:00"))
 
 
 # ---------------- H6c：命中校验覆盖区间，结果与访问顺序无关 ----------------
@@ -174,12 +172,11 @@ def test_feed_reloads_when_cached_window_insufficient(tmp_path):
     # 先走策略滑窗：覆盖 [03-10, 03-25 15:00]
     dm._ensure_minute_windowed(CODE, "2026-03-25")
     assert dm._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
-    # 再请求整段 feed [03-02, 03-31]：旧实现命中滑窗帧，早期数据丢失
+    # 再请求整段 feed [03-02, 03-31]：只含真实 mootdx 数据
     feed = dm.get_minute_feed(CODE, WIN_START, WIN_END)
-    assert feed.loc[pd.Timestamp("2026-03-03 10:00"), "close"] == BS_CLOSE
+    # real 之前的缺口不再由 baostock 补齐
+    assert pd.Timestamp("2026-03-03 10:00") not in feed.index
     assert feed.loc[pd.Timestamp("2026-03-17 10:00"), "close"] == REAL_CLOSE
-    assert dm._minute_cov[CODE] == (pd.Timestamp(WIN_START),
-                                    pd.Timestamp("2026-03-31 15:00"))
 
 
 def test_feed_result_independent_of_access_order(tmp_path):
