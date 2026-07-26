@@ -560,10 +560,10 @@ class DataManager:
         if df is None or (hasattr(df, "empty") and df.empty):
             return None
         try:
-            sub = df[df.index <= dt_ts]
-            if sub.empty:
+            pos = df.index.searchsorted(dt_ts, side="right") - 1
+            if pos < 0:
                 return None
-            return float(sub["close"].iloc[-1])
+            return float(df["close"].iloc[pos])
         except Exception:
             return None
 
