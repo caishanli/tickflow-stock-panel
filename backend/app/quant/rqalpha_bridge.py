@@ -835,8 +835,10 @@ def _extract_equity(result, benchmark=None, dm=None, start=None, end=None):
             _dcol = "trade_date" if "trade_date" in _df.columns else (
                 "date" if "date" in _df.columns else None)
             if _dcol and "close" in _df.columns:
-                for _d, _c in zip(pd.to_datetime(_df[_dcol]).dt.date, _df["close"]):
-                    _bench_by_date[_d] = float(_c)
+                _dates = pd.to_datetime(_df[_dcol])
+                for _d, _c in zip(_dates.dt.date, _df["close"]):
+                    if pd.notna(_d):
+                        _bench_by_date[_d] = float(_c)
                 # 首个可用收盘作基准（与图表"以首日为 1"归一一致）
                 for _dd in sorted(_bench_by_date):
                     _bench_base = _bench_by_date[_dd]
@@ -1102,19 +1104,28 @@ _INDEX_MAKERS = ['中证', '上证', '深证', '国证', '沪深', '中华', '�
 
 
 def _clean_etf_name(name: str) -> str:
-    """把 tushare ETF 全称清洗成近似聚宽 display_name 的简称。
+    """把 tushare ETF 全称清洗成近似聚宽 display_name 的格式。
 
-    仅去除基金公司前缀与指数编制机构词（不动行业/主题/数字），使策略的
+    聚宽 display_name 格式为「主题/行业ETF + 基金公司」（如
+    "创业板人工智能ETF华宝"），基金公司名在末尾。此函数将 tushare
+    全称中的基金公司前缀移到末尾，并去除指数编制机构词，使策略的
     exclude / 行业分组逻辑能像在聚宽 display_name 上一样工作。
     """
     if not name:
         return name
     s = name
-    for c in _FUND_COMPANIES:
-        s = s.replace(c, "")
+    company = ""
+    for c in sorted(_FUND_COMPANIES, key=len, reverse=True):
+        if s.startswith(c):
+            company = c
+            s = s[len(c):]
+            break
     for m in _INDEX_MAKERS:
         s = s.replace(m, "")
-    return s.strip()
+    s = s.strip()
+    if company:
+        s = s + company
+    return s
 
 
 # ETF 名录快照：同一策略回测结果可复现（避免每次启动实时拉取 tushare/mootdx
@@ -1214,7 +1225,8 @@ def _fetch_etf_universe_online(dm):
             continue
         codes.append(jq)
         short = tdx_names.get(jq.split(".", 1)[0])
-        names[jq] = short or _clean_etf_name(r.get("name", jq)) or jq
+        ts_name = _clean_etf_name(r.get("name", jq)) or jq
+        names[jq] = ts_name
         ld = _fmt_date(r.get("list_date"))
         dd = _fmt_date(r.get("delist_date"))
         if ld or dd:

@@ -28,6 +28,7 @@
 # - S-5: 防御ETF增加备选池(华宝添益/建信添益/理财金H)，主ETF不可用时自动切换
 # v1.7 改造 (2026-07-09):
 # - P-5: 日内择时从3个复检点(13:40/14:10/14:40)扩展到5个(增加14:00/14:30)，分散执行时间降低拥挤
+import json
 import numpy as np
 import math
 import pandas as pd
