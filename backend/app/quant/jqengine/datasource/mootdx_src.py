@@ -375,7 +375,32 @@ class MootdxSource(DataSource):
         raise DataSourceError("mootdx 暂不支持指数实时")
 
     def get_etf_list(self):
-        raise DataSourceError("mootdx 未配置ETF池，请优先使用Tushare")
+        """用 TickFlow exchanges.get_instruments 拉取全市场 ETF 名录（免费，无需 token）。
+
+        返回与 tushare fund_basic 兼容的 dict 列表:
+        [{"ts_code": "510300.SH", "name": "沪深300ETF", "list_date": "20120528", "delist_date": ""}, ...]
+        """
+        try:
+            from app.services.index_sync import _fetch_instruments_by_type
+
+            df = _fetch_instruments_by_type("etf", "etf")
+            if df is None or df.is_empty():
+                raise DataSourceError("TickFlow get_instruments 返回空 ETF 列表")
+            records = []
+            for row in df.to_dicts():
+                symbol = str(row.get("symbol", ""))
+                name = str(row.get("name", ""))
+                records.append({
+                    "ts_code": symbol,
+                    "name": name,
+                    "list_date": "",
+                    "delist_date": "",
+                })
+            return records
+        except DataSourceError:
+            raise
+        except Exception as e:
+            raise DataSourceError(f"TickFlow ETF名录获取失败: {e}")
 
     def get_stock_names(self):
         """返回 {code: name} 字典，名称来自通达信行情（与聚宽 display_name 一致）。
