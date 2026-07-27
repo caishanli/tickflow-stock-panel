@@ -265,10 +265,15 @@ class DataManager:
             src_name, key, df = picked[1], picked[2], picked[3]
             # 预计算 trade_dt 列（date 对象），避免 get_daily_money_cached
             # 每天对每只重复 pd.to_datetime（全市场 1600+ 只 × 130 天极慢）。
-            if "trade_dt" not in df.columns and "trade_date" in df.columns:
-                df = df.copy()
-                df["trade_dt"] = pd.to_datetime(
-                    df["trade_date"].astype(str)).dt.date
+            if "trade_dt" not in df.columns:
+                if "trade_date" in df.columns:
+                    df = df.copy()
+                    df["trade_dt"] = pd.to_datetime(
+                        df["trade_date"].astype(str)).dt.date
+                elif "datetime" in df.columns:
+                    df = df.copy()
+                    df["trade_dt"] = pd.to_datetime(
+                        df["datetime"]).dt.date
             # 成交额单位归一（amount → money，单位：元），下游
             # get_daily_money_cached / total_turnover 统一用 money(元)
             df = _ensure_money_yuan(df, src_name)
@@ -796,8 +801,14 @@ class DataManager:
                 # daily_mem/preload 已预存 trade_dt 列（date 对象），直接复用。
                 if "trade_dt" not in ddf.columns:
                     ddf = ddf.copy()
-                    ddf["trade_dt"] = pd.to_datetime(
-                        ddf["trade_date"].astype(str)).dt.date
+                    if "trade_date" in ddf.columns:
+                        ddf["trade_dt"] = pd.to_datetime(
+                            ddf["trade_date"].astype(str)).dt.date
+                    elif "datetime" in ddf.columns:
+                        ddf["trade_dt"] = pd.to_datetime(
+                            ddf["datetime"]).dt.date
+                    else:
+                        continue
                 money_col = ddf["money"] if "money" in ddf.columns else None
                 amt_col = ddf["amount"] if "amount" in ddf.columns else None
                 if money_col is None:
