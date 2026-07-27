@@ -936,7 +936,9 @@ def get_security_info(code):
                     if isinstance(item, str):
                         names[item] = item.split(".")[0]
                     elif isinstance(item, dict):
-                        names[item.get("code", "")] = item.get("name", item.get("code", ""))
+                        ts_c = item.get("ts_code", item.get("code", ""))
+                        jq_c = _ts_code_to_jq_code(ts_c)
+                        names[jq_c] = item.get("name", jq_c)
                 _state["sec_names"] = names
         except Exception:
             pass
