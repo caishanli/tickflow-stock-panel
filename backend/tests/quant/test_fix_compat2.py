@@ -285,11 +285,10 @@ class _FakeMootdxSrc:
 class _UniverseDM:
     """_load_etf_universe 需要的最小 DataManager 鸭子类型。"""
 
-    def __init__(self, tushare=None, mootdx=None, offline=False, cache_codes=()):
+    def __init__(self, mootdx=None, offline=False, cache_codes=()):
         self._offline = offline
         self._daily_mem = {"get_daily_" + c: object() for c in cache_codes}
         self.sources = {
-            "tushare": tushare or _FakeTushareSrc(fail=True),
             "mootdx": mootdx or _FakeMootdxSrc(),
         }
 
@@ -309,73 +308,49 @@ def test_snapshot_fresh_used_without_network(tmp_path, monkeypatch):
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
-    dm = _UniverseDM(tushare=_FakeTushareSrc(fail=True), offline=False)
+    dm = _UniverseDM(offline=False)
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]
     assert names["510300.XSHG"] == "ETF-510300"
     assert list_dates["510300.XSHG"] == ("2020-01-01", "2999-12-31")
-    assert dm.sources["tushare"].calls == 0  # 未联网
 
 
-def test_snapshot_stale_offline_no_network(tmp_path, monkeypatch):
-    """快照过期 + dm._offline=True：绝不联网，旧快照照用。"""
+def test_snapshot_stale_falls_back_to_cache(tmp_path, monkeypatch):
+    """快照过期：从 _daily_mem 缓存推导 ETF 代码。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap, days_ago=30)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
-    dm = _UniverseDM(tushare=_FakeTushareSrc(fail=True), offline=True)
+    dm = _UniverseDM(cache_codes=["510300.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]
-    assert dm.sources["tushare"].calls == 0
 
 
-def test_snapshot_missing_offline_fallback(tmp_path, monkeypatch):
-    """离线且无快照：回退 ([], {}, {})，由调用方走缓存派生。"""
+def test_snapshot_missing_falls_back_to_cache(tmp_path, monkeypatch):
+    """无快照：从 _daily_mem 缓存推导 ETF 代码。"""
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT",
                         str(tmp_path / "nonexistent.json"))
-    dm = _UniverseDM(offline=True, cache_codes=["589720.XSHG"])
-    assert bridge._load_etf_universe(dm) == ([], {}, {})
-    assert dm.sources["tushare"].calls == 0
+    dm = _UniverseDM(cache_codes=["589720.XSHG"])
+    codes, names, list_dates = bridge._load_etf_universe(dm)
+    assert codes == ["589720.XSHG"]
 
 
-def test_snapshot_stale_online_refresh_writes_back(tmp_path, monkeypatch):
-    """快照过期 + 在线：网络刷新成功并原子写回（无 .tmp 残留）。"""
+def test_snapshot_stale_cache_derivation_with_names(tmp_path, monkeypatch):
+    """快照过期 + 缓存有代码 + mootdx 有名称：从缓存推导并合并名称。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap, codes=("OLD000.XSHG",), days_ago=30)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
-    rows = [{"ts_code": "510300.SH", "name": "华泰柏瑞沪深300ETF",
-             "list_date": "20120504", "delist_date": None}]
-    dm = _UniverseDM(tushare=_FakeTushareSrc(rows),
-                     mootdx=_FakeMootdxSrc({"510300": "300ETF"}, fail=False))
+    dm = _UniverseDM(mootdx=_FakeMootdxSrc({"510300": "300ETF"}, fail=False),
+                     cache_codes=["510300.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]
-    assert names["510300.XSHG"] == "300ETF"  # tushare 清洗后名称（去除公司名）
-    assert list_dates["510300.XSHG"] == ("2012-05-04", "2999-12-31")
-    # 原子写回：快照内容已刷新且可读，无临时文件残留
-    snap2 = bridge._read_etf_snapshot(str(snap))
-    assert snap2[1] == ["510300.XSHG"]
-    assert (_dt.datetime.now() - snap2[0]) <= _dt.timedelta(days=7)
-    assert not (tmp_path / "etf_universe_snapshot.json.tmp").exists()
-
-
-def test_snapshot_stale_online_network_fail_uses_stale(tmp_path, monkeypatch, caplog):
-    """快照过期 + 在线但网络失败：回退旧快照并 warning。"""
-    snap = tmp_path / "etf_universe_snapshot.json"
-    _write_snapshot(snap, days_ago=30)
-    monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
-    dm = _UniverseDM(tushare=_FakeTushareSrc(fail=True), offline=False)
-    with caplog.at_level(logging.WARNING, logger="app.quant.rqalpha_bridge"):
-        codes, names, list_dates = bridge._load_etf_universe(dm)
-    assert codes == ["510300.XSHG"]
-    assert [r for r in caplog.records if "快照" in r.message]
 
 
 def test_snapshot_cache_union_merge(tmp_path, monkeypatch):
-    """缓存并集保留：fund_basic 名录不全，本地日线缓存代码并入宇宙。"""
+    """缓存并集保留：本地日线缓存代码并入宇宙。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
-    dm = _UniverseDM(tushare=_FakeTushareSrc(fail=True),
-                     cache_codes=["589720.XSHG"])
+    dm = _UniverseDM(cache_codes=["589720.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert set(codes) == {"510300.XSHG", "589720.XSHG"}
     # 缓存并入的代码无 tdx 名称时兜底为代码本身，list_dates 不造数据
