@@ -32,9 +32,8 @@ def _data_path(sub: str) -> str:
 @dataclass
 class QuantConfig:
     data_priority: list[str] = field(
-        default_factory=lambda: ["tickflow", "tushare", "mootdx", "astock"]
+        default_factory=lambda: ["tickflow", "mootdx", "astock"]
     )
-    tushare_token: str = ""
     fee_rate: float = 0.0003
     slippage: float = 0.001
     default_stop_loss: float = 0.03
@@ -48,9 +47,8 @@ def load_config() -> QuantConfig:
     return QuantConfig(
         data_priority=_csv_list(
             _env("QUANT_DATA_PRIORITY"),
-            ["tickflow", "tushare", "mootdx", "astock"],
+            ["tickflow", "mootdx", "astock"],
         ),
-        tushare_token=_env("QUANT_TUSHARE_TOKEN"),
         fee_rate=float(_env("QUANT_FEE_RATE", "0.0003") or "0.0003"),
         slippage=float(_env("QUANT_SLIPPAGE", "0.001") or "0.001"),
         default_stop_loss=float(_env("QUANT_DEFAULT_STOP_LOSS", "0.03") or "0.03"),

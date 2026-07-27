@@ -181,14 +181,6 @@ def _make_dm():
     dm = get_data_manager()
     dm._use_real_minute = True
     dm._offline = False
-    tok = CONFIG.tushare_token
-    if tok and dm.sources.get("tushare") is not None:
-        try:
-            dm.sources["tushare"].token = tok
-            import tushare as ts
-            ts.set_token(tok)
-        except Exception:  # noqa: BLE001
-            log.warning("[runner] tushare token 注入失败", exc_info=True)
     try:
         dm.preload_daily()
     except Exception as e:  # noqa: BLE001

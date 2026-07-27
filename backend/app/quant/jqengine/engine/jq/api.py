@@ -830,7 +830,7 @@ def get_security_name(code):
                     names = {}
                 for item in etfs:
                     if isinstance(item, dict):
-                        jq_code = _tushare_to_jq_code(item.get("ts_code", ""))
+                        jq_code = _ts_code_to_jq_code(item.get("ts_code", ""))
                         names[jq_code] = item.get("name", jq_code)
                 _state["sec_names"] = names
         except Exception:
@@ -838,8 +838,8 @@ def get_security_name(code):
     return names.get(code, code) if names else code
 
 
-def _tushare_to_jq_code(ts_code):
-    """tushare 代码 -> 聚宽代码 (159069.SZ -> 159069.XSHE)。"""
+def _ts_code_to_jq_code(ts_code):
+    """ts_code 格式 -> 聚宽代码 (159069.SZ -> 159069.XSHE)。"""
     if "." not in ts_code:
         return ts_code
     pure, suffix = ts_code.split(".")
@@ -873,7 +873,7 @@ def get_all_securities(types=None, date=None):
                 continue
             for item in items or []:
                 if isinstance(item, str):
-                    code = _tushare_to_jq_code(item)
+                    code = _ts_code_to_jq_code(item)
                     pure = code.split(".")[0]
                     name = mootdx_names.get(pure, code)
                     records.append({"code": code, "display_name": name,
@@ -881,7 +881,7 @@ def get_all_securities(types=None, date=None):
                                     "end_date": "2200-01-01", "type": t})
                 else:
                     ts_code = item.get("ts_code", "")
-                    code = _tushare_to_jq_code(ts_code)
+                    code = _ts_code_to_jq_code(ts_code)
                     pure = code.split(".")[0]
                     name = mootdx_names.get(pure, item.get("name", code))
                     list_date = item.get("list_date", "")

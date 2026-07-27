@@ -408,7 +408,7 @@ def sim_logs(aid: str, limit: int = 0):
 # ---- 数据源 ----
 @router.get("/datasource")
 def datasource_get():
-    return {"data": {"priority": CONFIG.data_priority, "tushare_set": bool(CONFIG.tushare_token)}}
+    return {"data": {"priority": CONFIG.data_priority}}
 
 
 @router.post("/datasource/priority")
@@ -418,17 +418,13 @@ def datasource_priority(body: dict):
     return {"data": None}
 
 
-@router.post("/datasource/token")
-def datasource_token(body: dict):
-    CONFIG.tushare_token = body.get("token", "")
-    return {"data": None}
-
-
 @router.post("/datasource/verify")
 def datasource_verify():
     try:
-        QuantDataProvider().get_stock_list()
-        return {"data": {"ok": True}}
+        from ..jqengine.datasource.mootdx_src import MootdxSource
+        src = MootdxSource()
+        ok, msg = src.test_connection()
+        return {"data": {"ok": ok, "error": msg if not ok else None}}
     except Exception as e:  # noqa: BLE001
         return {"data": {"ok": False, "error": str(e)}}
 

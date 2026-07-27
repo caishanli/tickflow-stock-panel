@@ -5,11 +5,8 @@ import pandas as pd
 
 from .base import DataSourceError
 from .cache import DataCache
-from .tushare_src import TushareSource
 from .mootdx_src import MootdxSource
 from .astock_src import AStockSource
-from .baostock_src import BaostockSource, interpolate_5min_to_1min
-from .minute_synth import SyntheticMinuteSource
 
 from ..config import CONFIG
 
@@ -25,7 +22,6 @@ def _lazy_tickflow():
 
 SOURCES = {
     "tickflow": None,
-    "tushare": TushareSource,
     "mootdx": MootdxSource,
     "astock": AStockSource,
 }
@@ -36,7 +32,6 @@ class QuantDataProvider:
 
     def __init__(self, priority=None, token=None, cache=None):
         self.cache = cache or DataCache()
-        tok = token if token is not None else CONFIG.tushare_token
         self.sources = {}
         for k, v in SOURCES.items():
             if v is None:
@@ -45,15 +40,11 @@ class QuantDataProvider:
                     continue
                 v = real
             try:
-                self.sources[k] = v(token=tok) if k == "tushare" else v()
+                self.sources[k] = v()
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning("数据源 %s 初始化失败，跳过: %s", k, e)
                 continue
-        self.minute_source = SyntheticMinuteSource(
-            lambda code, start, end: self.fetch("get_daily", code, start, end)
-        )
-        self.sources["baostock"] = BaostockSource()
         self.priority = priority or CONFIG.data_priority
 
     def fetch(self, method, code, *args):
@@ -79,26 +70,18 @@ class QuantDataProvider:
         return df
 
     def get_minute(self, code, date):
-        # 尝试真实分钟数据源（mootdx/baostock），失败则报错
         import logging
-        for src_name in ("mootdx", "baostock"):
-            src = self.sources.get(src_name)
-            if src is None:
-                continue
+        src = self.sources.get("mootdx")
+        if src is not None:
             try:
-                if src_name == "mootdx":
-                    df = src.get_minute(code)
-                    if df is not None and not df.empty:
-                        return df
-                elif src_name == "baostock":
-                    df = src.get_5min(code, date, date)
-                    if df is not None and not df.empty:
-                        return interpolate_5min_to_1min(df)
+                df = src.get_minute(code)
+                if df is not None and not df.empty:
+                    return df
             except Exception as e:
-                logging.warning("[QuantDataProvider] %s获取分钟数据失败 %s: %s", src_name, code, e)
+                logging.warning("[QuantDataProvider] mootdx获取分钟数据失败 %s: %s", code, e)
         raise RuntimeError(
             f"[QuantDataProvider] 持仓 {code} 分钟数据获取失败: "
-            f"所有真实数据源（mootdx/baostock）均返回空或异常"
+            f"mootdx 返回空或异常"
         )
 
     def get_stock_list(self):

@@ -26,10 +26,9 @@ def _default_data_dir():
 
 def load_config():
     return {
-        "TUSHARE_TOKEN": os.getenv("TUSHARE_TOKEN", ""),
         "DATASOURCE_PRIORITY": [
             s.strip()
-            for s in os.getenv("DATASOURCE_PRIORITY", "tushare,mootdx,astock").split(",")
+            for s in os.getenv("DATASOURCE_PRIORITY", "mootdx,astock").split(",")
             if s.strip()
         ],
         "FEE_RATE": float(os.getenv("FEE_RATE", "0.0003")),
