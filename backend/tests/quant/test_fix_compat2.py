@@ -348,7 +348,7 @@ def test_snapshot_stale_online_refresh_writes_back(tmp_path, monkeypatch):
                      mootdx=_FakeMootdxSrc({"510300": "300ETF"}, fail=False))
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]
-    assert names["510300.XSHG"] == "300ETF华泰柏瑞"  # tushare 清洗后名称（含基金公司后缀）
+    assert names["510300.XSHG"] == "300ETF"  # tushare 清洗后名称（去除公司名）
     assert list_dates["510300.XSHG"] == ("2012-05-04", "2999-12-31")
     # 原子写回：快照内容已刷新且可读，无临时文件残留
     snap2 = bridge._read_etf_snapshot(str(snap))
