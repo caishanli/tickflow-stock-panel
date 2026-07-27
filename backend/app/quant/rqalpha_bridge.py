@@ -212,7 +212,7 @@ class QuantRQAlphaDataSource:
             for _k, _df in _all_daily.items():
                 if _df is None or getattr(_df, "empty", True):
                     continue
-                # 各源日线 schema 先归一（tushare trade_date/vol、mootdx datetime 索引），
+                # 各源日线 schema 先归一（mootdx datetime 索引等），
                 # 否则非 date 列命名的缓存帧被跳过、交易日历覆盖不足
                 _df = self._normalize_daily_df(_df)
                 if "date" not in _df.columns:
@@ -229,8 +229,7 @@ class QuantRQAlphaDataSource:
                 df = None
             if df is None or len(df) == 0:
                 continue
-            # 列名归一：tushare pro.daily 返回 trade_date/vol，mootdx 返回 datetime
-            # 索引 + vol，与下方 date/volume 契约不一致会 KeyError 致整个 run failed
+            # 列名归一：mootdx 返回 datetime 索引 + vol，与下方 date/volume 契约不一致会 KeyError 致整个 run failed
             df = self._normalize_daily_df(df)
             self._bars[code] = self._df_to_recarray(df, code=code)
             self._instruments[code] = self._make_instrument(code)
@@ -261,8 +260,6 @@ class QuantRQAlphaDataSource:
     def _normalize_daily_df(df: pd.DataFrame) -> pd.DataFrame:
         """各数据源日线 schema 归一到桥接契约（date/volume 列）。
 
-        - tushare pro.daily：trade_date → date；vol → volume（tushare vol 单位为手，
-          ×100 转股，与 mootdx 源内 vol×100 的口径一致）；
         - mootdx：datetime 索引 → date 列（其源已自行补 volume，不再重复换算）；
         - 已有 date/volume 列（如 bundle CSV）：原样返回，不改变既有行为。
         """
@@ -1081,12 +1078,12 @@ def _extract_fixed_pools(strategy_text: str):
 
 
 def _ts_to_jq(ts_code: str) -> str:
-    """tushare ts_code -> 聚宽 order_book_id（159059.SZ -> 159059.XSHE）。"""
+    """ts_code -> 聚宽 order_book_id（159059.SZ -> 159059.XSHE）。"""
     code, _, mkt = ts_code.partition(".")
     return "{}.{}".format(code, "XSHG" if mkt == "SH" else "XSHE")
 
 
-# 基金公司前缀（与策略 FUND_COMPANIES 对齐，用于把 tushare 全称清洗成近似聚宽简称）
+# 基金公司前缀（与策略 FUND_COMPANIES 对齐，用于把 ETF 全称清洗成近似聚宽简称）
 _FUND_COMPANIES = sorted(set([
     '易方达', '广发', '华夏', '华安', '嘉实', '富国', '招商', '鹏华', '南方', '汇添富', '国泰', '平安',
     '银华', '天弘', '建信', '工银', '华泰柏瑞', '博时', '景顺长城', '景顺', '华宝', '申万菱信', '万家', '中欧',
@@ -1104,7 +1101,7 @@ _INDEX_MAKERS = ['中证', '上证', '深证', '国证', '沪深', '中华', '�
 
 
 def _clean_etf_name(name: str) -> str:
-    """把 tushare ETF 全称清洗成近似聚宽 display_name 的简称。
+    """把 ETF 全称清洗成近似聚宽 display_name 的简称。
 
     仅去除基金公司前缀与指数编制机构词（不动行业/主题/数字），使策略的
     exclude / 行业分组逻辑能像在聚宽 display_name 上一样工作。
@@ -1119,8 +1116,8 @@ def _clean_etf_name(name: str) -> str:
     return s.strip()
 
 
-# ETF 名录快照：同一策略回测结果可复现（避免每次启动实时拉取 tushare/mootdx
-# 导致宇宙随时间漂移）。快照内容不含缓存并集（缓存并集在加载时并入）。
+# ETF 名录快照：同一策略回测结果可复现（避免每次启动实时拉取导致宇宙随时间漂移）。
+# 快照内容不含缓存并集（缓存并集在加载时并入）。
 # 与行情缓存同目录（jqengine DATA_DIR，默认仓库根 data/quant_kline）。
 _ETF_UNIVERSE_SNAPSHOT = os.path.join(
     _JQ_ENGINE_CONFIG["DATA_DIR"], "etf_universe_snapshot.json")
@@ -1160,11 +1157,9 @@ def _write_etf_snapshot(path, codes, names, list_dates):
 
 
 def _merge_cache_daily_codes(dm, codes, names, tdx_names=None):
-    """缓存并集：tushare fund_basic 名录不全（实测 589720.XSHG 等有日线数据
-    却查不到 fund_basic 记录），若只按 fund_basic 建池，聚宽池里有、本地池
-    缺失的标的会漏出候选（对账实测聚宽 04-09 首选 589720 本地缺席）。
-    本地日线缓存中有数据的代码一并纳入宇宙；名称取 tdx_names 兜底为代码本身，
-    list_date 无数据时退化为全程可交易（get_all_securities 的 _LIST_DATES 兜底）。
+    """缓存并集：本地日线缓存中有数据的代码一并纳入宇宙；名称取 tdx_names
+    兜底为代码本身，list_date 无数据时退化为全程可交易（get_all_securities 的
+    _LIST_DATES 兜底）。
     """
     tdx_names = tdx_names or {}
     cache_codes = [k.split("get_daily_", 1)[1]
@@ -1178,65 +1173,15 @@ def _merge_cache_daily_codes(dm, codes, names, tdx_names=None):
     return codes, names
 
 
-def _fetch_etf_universe_online(dm):
-    """实时拉取全市场 ETF 名录：tushare get_etf_list + mootdx 证券简称。
-
-    返回 (codes, names, list_dates, tdx_names)；tushare 失败返回 None（mootdx
-    失败容忍，回退 tushare 全称清洗）。名称口径：优先 mootdx（通达信）证券简称，
-    与聚宽 get_security_name/display_name 一致（如 513350 -> "油气ETF"）。
-    tushare fund_basic 只给全称（"标普石油天然气..."），其 name[:2] 分组键与
-    聚宽不同，会导致行业去重选出不同代表 ETF。缺失时回退清洗全称。
-    """
-    try:
-        src = dm.sources.get("tushare")
-        rows = src.get_etf_list()
-    except Exception as e:  # noqa: BLE001
-        print("[universe] tushare get_etf_list 失败:", e)
-        return None
-    tdx_names = {}
-    try:
-        tdx_names = dm.sources["mootdx"].get_stock_names() or {}
-    except Exception as e:  # noqa: BLE001
-        print("[universe] mootdx get_stock_names 失败，回退 tushare 全称清洗:", e)
-
-    def _fmt_date(v):
-        """tushare YYYYMMDD -> 'YYYY-MM-DD'；非法/缺失返回 None。"""
-        s = str(v or "").strip()
-        if len(s) == 8 and s.isdigit():
-            return "{}-{}-{}".format(s[:4], s[4:6], s[6:8])
-        return None
-
-    codes = []
-    names = {}
-    list_dates = {}
-    for r in rows:
-        try:
-            jq = _ts_to_jq(r["ts_code"])
-        except Exception:
-            continue
-        codes.append(jq)
-        short = tdx_names.get(jq.split(".", 1)[0])
-        ts_name = _clean_etf_name(r.get("name", jq)) or jq
-        names[jq] = ts_name
-        ld = _fmt_date(r.get("list_date"))
-        dd = _fmt_date(r.get("delist_date"))
-        if ld or dd:
-            list_dates[jq] = (ld or "2000-01-01", dd or "2999-12-31")
-    return codes, names, list_dates, tdx_names
-
-
 def _load_etf_universe(dm):
     """加载全市场 ETF 名录（代码 + 清洗后名称 + 上市/退市日期），对齐聚宽
     get_all_securities(['etf'])。返回 (codes, name_map, list_dates)，其中
-    list_dates 为 {code: (list_date, delist_date)}（'YYYY-MM-DD'）。快照与
-    网络都不可用时返回 ([], {}, {})，由调用方回退缓存派生宇宙。
+    list_dates 为 {code: (list_date, delist_date)}（'YYYY-MM-DD'）。
 
     快照机制（保证同一策略结果可复现，不随每次启动的实时拉取漂移）：
     - 快照存在且 fetched_at 距今 ≤7 天：直接使用（离线/在线都优先）；
-    - 快照缺失或过期且非离线模式：尝试网络刷新并原子写回快照；
-    - 网络失败但快照存在：用旧快照并 warning；
-    - dm._offline=True：只用快照或缓存派生，绝不联网（过期快照离线照用——
-      无法刷新时旧名录仍优于无名录）。
+    - 快照缺失或过期：从本地缓存推导 ETF 代码列表；
+    - 名称通过 mootdx get_stock_names() 获取（不依赖外部网络）。
     """
     snap = _read_etf_snapshot(_ETF_UNIVERSE_SNAPSHOT)
     fresh = (snap is not None
@@ -1244,30 +1189,18 @@ def _load_etf_universe(dm):
     if fresh:
         codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
         return codes, names, snap[3]
-
-    if not getattr(dm, "_offline", False):
-        fetched = _fetch_etf_universe_online(dm)
-        if fetched is not None:
-            codes, names, list_dates, tdx_names = fetched
-            try:
-                _write_etf_snapshot(_ETF_UNIVERSE_SNAPSHOT, codes, names, list_dates)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[universe] ETF 名录快照写回失败（不影响本次回测）: %s", e)
-            codes, names = _merge_cache_daily_codes(dm, codes, names, tdx_names)
-            return codes, names, list_dates
-        if snap is not None:
-            logger.warning(
-                "[universe] 网络刷新失败，回退旧 ETF 名录快照（fetched_at=%s）", snap[0])
-            codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
-            return codes, names, snap[3]
-        print("[universe] tushare get_etf_list 失败且无快照，回退缓存派生")
-        return [], {}, {}
-
-    # 离线模式：绝不联网；快照（含过期）照用，无快照则回退缓存派生
-    if snap is not None:
-        codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
-        return codes, names, snap[3]
-    return [], {}, {}
+    # 快照过期或不存在 → 从本地缓存推导
+    all_codes = [k.split("get_daily_", 1)[1]
+                 for k in (getattr(dm, "_daily_mem", None) or {})
+                 if k.startswith("get_daily_")]
+    is_idx = lambda p: p.startswith("000") or p.startswith("399")
+    etf_codes = [c for c in all_codes if not is_idx(c.split(".")[0])]
+    names = {}
+    try:
+        names = dm.sources["mootdx"].get_stock_names() or {}
+    except Exception:
+        pass
+    return etf_codes, names, {}
 
 
 def run_jq_backtest(strategy_path: str, params: dict,
@@ -1300,26 +1233,14 @@ def run_jq_backtest(strategy_path: str, params: dict,
     # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
     # 等开关不一致（策略侧单例默认 True 会仍走 mootdx 实时分钟线网络）。
     dm = get_data_manager()
-    # 确保 tushare token 生效（单例可能在 .env 加载前已创建，导致 token 为空）。
-    # 注意 CONFIG 是 QuantConfig dataclass（app.quant.config），不是 jqengine 的
-    # dict 配置——误用 CONFIG.get(...) 会 AttributeError，子进程秒崩、run 永远 queued。
-    import os as _os
-    _tok = _os.environ.get("TUSHARE_TOKEN") or CONFIG.tushare_token
-    if _tok and dm.sources.get("tushare") is not None:
-        try:
-            dm.sources["tushare"].token = _tok
-            import tushare as ts
-            ts.set_token(_tok)
-        except Exception:
-            pass
-    # 回测使用真实 1 分钟数据（real_ 基底），缺口由 baostock 5 分钟插值补齐。
+    # 回测使用真实 1 分钟数据（real_ 基底），缺口由 mootdx 5 分钟插值补齐。
     dm._use_real_minute = True
     _log_progress(params.get("run_id"),
                   f"加载行情缓存与 ETF 宇宙（{start} ~ {end}，此阶段耗时较长，进度会持续更新）…")
     # 名录快照必须在离线开关之前加载/刷新：dm._offline 只约束行情(bar)回源，
-    # 而 _load_etf_universe 的快照刷新（tushare fund_basic + mootdx 名称，
-    # ≤7 天一次的元数据调用）在离线模式下会被跳过、退化为"缓存派生宇宙+无
-    # 名称"（实测池构建失真、结果不可复现）。先在线拿到快照，离线回测照用。
+    # 而 _load_etf_universe 的快照刷新（≤7 天一次的元数据调用）在离线模式下
+    # 会被跳过、退化为"缓存派生宇宙+无名称"（实测池构建失真、结果不可复现）。
+    # 先加载快照，离线回测照用。
     try:
         _load_etf_universe(dm)
     except Exception:
@@ -1423,11 +1344,8 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     dm.set_minute_window(start, end)
 
     # 全量 ETF 宇宙（与聚宽 get_all_securities(['etf']) 对齐）：
-    # 优先读 ETF 名录快照（≤7 天，离线/在线都优先，保证结果可复现）；快照缺失/
-    # 过期且非离线时实时拉取 tushare+mootdx 并原子写回快照（按需回源：JqDataSource
-    # 构造时对每只调 dm.fetch("get_daily")，本地缓存缺失即回源并落盘，无需独立
-    # 预下载步骤）。快照与网络都不可用时回退到日线缓存键派生（离线可复现，此时
-    # 无上市日期数据，get_all_securities(date=...) 退化为不过滤）。
+    # 优先读 ETF 名录快照（≤7 天，保证结果可复现）；快照过期或缺失时
+    # 从本地日线缓存键派生（离线可复现，此时无上市日期数据）。
     def _is_index(p):
         return p.startswith("000") or p.startswith("399")
 
@@ -1448,7 +1366,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     fixed_pools = _extract_fixed_pools(strategy_text)
 
     # 数据源宇宙需覆盖：全市场动态池(etf_universe) + 策略源码固定池(fixed_pools，
-    # 含 LOF 如 501018 等不在 tushare ETF 列表中的标的) + 指数/基准/防御 ETF。
+    # 含 LOF 等不在 ETF 名录中的标的) + 指数/基准/防御 ETF。
     # 固定池标的会被策略直接下单，必须建 instrument，否则 RQInvalidArgument。
     ds_universe = list(dict.fromkeys(
         list(etf_universe) + list(fixed_pools) + _EXTRA_INDEX_CODES
