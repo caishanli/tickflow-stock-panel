@@ -452,6 +452,41 @@ def insert_sim_snapshot(account_id, dt, net_value, cash, positions_value, pnl, p
         )
 
 
+def batch_insert_snapshots(rows):
+    """批量写入快照。rows: list of (account_id, dt, net_value, cash, positions_value, pnl, pnl_pct)"""
+    if not rows:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "INSERT INTO sim_equity_snapshots(account_id,dt,net_value,cash,positions_value,pnl,pnl_pct) "
+            "VALUES(?,?,?,?,?,?,?)",
+            rows,
+        )
+
+
+def batch_insert_trades(rows):
+    """批量写入成交。rows: list of (account_id, ts, code, action, price, amount, pnl, pnl_pct, commission)"""
+    if not rows:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "INSERT INTO sim_trades(account_id,ts,code,action,price,amount,pnl,pnl_pct,commission) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+
+
+def batch_insert_logs(rows):
+    """批量写入日志。rows: list of (account_id, ts, level, message)"""
+    if not rows:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "INSERT INTO sim_logs(account_id,ts,level,message) VALUES(?,?,?,?)",
+            rows,
+        )
+
+
 def get_sim_snapshots(account_id):
     with get_conn() as c:
         rows = c.execute(
