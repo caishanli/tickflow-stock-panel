@@ -110,7 +110,7 @@ def _count_bars(start_dt, end_dt, freq):
 def _warn_fq_once(code, fq):
     """fq 口径不支持显式化：每标的每次回测只 warning 一次，不刷屏。
 
-    现状：本地日线统一为前复权口径（上游 tushare qfq，各源 adj 元数据由
+    现状：本地日线统一为前复权口径（各源 adj 元数据由
     jqengine 侧维护），fq="pre"/"qfq"/None 已直接满足；fq="none"/"raw"（不
     复权）与 "post"/"hfq"（后复权）本地无对应口径数据，实际仍返回前复权价，
     与请求口径不一致（不复权口径在除息/除权日附近收益有偏差）。
@@ -316,8 +316,7 @@ def get_all_securities(types=None, date=None):
 
     types 过滤：指数代码只在 types 含 'index' 时返回（对齐聚宽
     get_all_securities(['etf']) 只含真实 ETF）；types 为 None 时返回全部。
-    起止日期来自 install_jqcompat 注入的 _LIST_DATES（tushare fund_basic 的
-    list_date/delist_date）；数据不可得的标的退化为全程可交易
+    起止日期来自 install_jqcompat 注入的 _LIST_DATES（list_date/delist_date）；数据不可得的标的退化为全程可交易
     （2000-01-01 ~ 2999-12-31），保持修复前行为，避免误杀。
     """
     cutoff = str(pd.Timestamp(date).date()) if date is not None else None
@@ -727,25 +726,64 @@ class _DayBarStore:
         """一次性把内存缓存中的日线铺进 _bars，避免回测中逐标的 fetch（SQLite）。
 
         all_daily: cache.get_all("daily") 返回的 {key: DataFrame}（已全在内存）。
-        codes: 标的 order_book_id 列表（形如 512670.XSHG）。缓存 key 为
-        'astock_<code>'，回退到 '<code>'；命中即转 recarray 直接写入 _bars。
+        codes: 标的 order_book_id 列表（形如 512670.XSHG）。
+        缓存数据不足时自动走 dm.fetch 网络回源补齐。
         """
         ds = data_start if data_start is not None else self._data_start
         de = data_end if data_end is not None else self._data_end
+        ds_str = ds.strftime("%Y%m%d") if hasattr(ds, "strftime") else str(ds)
+        de_str = de.strftime("%Y%m%d") if hasattr(de, "strftime") else str(de)
+        # 收集所有已知源前缀（从 cache key 推断）
+        src_prefixes = set()
+        for k in all_daily:
+            if "_" in k:
+                src_prefixes.add(k.split("_", 1)[0])
         for code in codes:
             if code in self._bars:
                 continue
-            df = all_daily.get("astock_" + code)
-            if df is None:
-                df = all_daily.get("tushare_" + code)
-            if df is None:
-                df = all_daily.get("baostock_" + code)
-            if df is None:
+            # 收集该代码的所有候选帧，选日期覆盖最广的
+            candidates = []
+            for pfx in src_prefixes:
+                key = f"{pfx}_{code}"
+                df = all_daily.get(key)
+                if df is not None and not (hasattr(df, "empty") and df.empty):
+                    candidates.append(df)
+            # 回退：bare code key
+            if not candidates:
                 df = all_daily.get(code)
-            if df is None or getattr(df, "empty", True):
+                if df is not None and not (hasattr(df, "empty") and df.empty):
+                    candidates.append(df)
+            # 选日期范围最广的帧
+            best_df = None
+            best_span = 0
+            for df in candidates:
+                try:
+                    tmp = _normalize_daily(df)
+                    tmp = tmp[(tmp["date"] >= ds) & (tmp["date"] <= de)]
+                    span = len(tmp)
+                except Exception:
+                    span = 0
+                if span > best_span:
+                    best_span = span
+                    best_df = df
+            # 缓存数据覆盖不足 → 走 dm.fetch 网络回源补齐
+            if best_df is None or best_span == 0:
+                try:
+                    fetched = self._dm.fetch("get_daily", code, ds_str, de_str)
+                    if fetched is not None and not (hasattr(fetched, "empty") and fetched.empty):
+                        best_df = fetched
+                        try:
+                            tmp = _normalize_daily(fetched)
+                            tmp = tmp[(tmp["date"] >= ds) & (tmp["date"] <= de)]
+                            best_span = len(tmp)
+                        except Exception:
+                            best_span = 0
+                except Exception:
+                    pass
+            if best_df is None or best_span == 0:
                 self._bars[code] = np.empty(0, dtype=_BAR_DTYPE)
                 continue
-            ddf = _normalize_daily(df)
+            ddf = _normalize_daily(best_df)
             ddf = ddf[(ddf["date"] >= ds) & (ddf["date"] <= de)]
             if ddf.empty:
                 arr = np.empty(0, dtype=_BAR_DTYPE)
@@ -786,8 +824,7 @@ def _normalize_daily(df):
     else:
         vol = c * 0.0
     if "money" in df.columns:
-        # 优先 money：DataManager 侧已按源归一到元（tushare amount 为千元，
-        # 见 manager._ensure_money_yuan）；amount 仅作无 money 时的兜底
+        # 优先 money：DataManager 侧已归一到元；amount 仅作无 money 时的兜底
         turn = df["money"].astype(float)
     elif "amount" in df.columns:
         turn = df["amount"].astype(float)
@@ -896,7 +933,7 @@ def _minute_to_recarray(minute_df, prev_close_map=None, code=None):
     arr["high"] = df["high"].to_numpy(dtype=np.float64)
     arr["low"] = df["low"].to_numpy(dtype=np.float64)
     arr["volume"] = df["volume"].to_numpy(dtype=np.float64)
-    # 成交额优先使用真实 money/amount（real 1m / baostock 插值均带 money），否则用 close*volume
+    # 成交额优先使用 money/amount，否则用 close*volume
     if "money" in df.columns and df["money"].notna().any():
         turn = df["money"].astype(float).to_numpy(dtype=np.float64)
     elif "amount" in df.columns and df["amount"].notna().any():
@@ -928,7 +965,7 @@ class _MinuteBarStore:
 
 
 def _fund_instrument_type(code):
-    """按代码段判定基金/证券类型（与 tushare get_etf_list 的 LOF 前缀口径一致）。
+    """按代码段判定基金/证券类型。
 
     上交所(XSHG)：51/56/58 → ETF，50 → LOF；深交所(XSHE)：15 → ETF，16 → LOF；
     其余 → CS。rqalpha 股票账户支持 ETF/LOF 交易（INST_TYPE_IN_STOCK_ACCOUNT），
@@ -966,8 +1003,7 @@ def _daily_slice_side(dt, include_now):
 
 
 class JqDataSource:
-    """基于 DataManager（原始缓存数据：real 1m + baostock 5min 插值 + 日线合成兜底）
-    的 rqalpha 数据源。
+    """基于 DataManager（原始缓存数据：real 1m + 日线）的 rqalpha 数据源。
 
     日线在构造时一次性展开（覆盖全 ETF 宇宙，内存占用小）；分钟线**惰性**加载并按
     LRU 上限回收，避免为 1600+ 标的预生成全段 1m 历史导致 OOM。兼容 1m 频率回测。

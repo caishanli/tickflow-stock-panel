@@ -5,7 +5,6 @@
 - H7  get_daily_money_cached 先按 end_date 过滤、再 per-code tail(count)
       （原实现顺序颠倒，缓存延伸到"今天"时回测期内任何过去 end_date 返回空）
 - H6a get_minute_feed 改走 _load_minute_merged（real_ 真实 1m 基底生效）
-- H6b baostock 离线兜底 / merged 结果裁剪到请求窗口 [lo, hi] 闭区间
 - H6c _minute_mem 命中校验覆盖区间（同参数结果与访问顺序无关）
 - 重复定义 preload_minute_for_pool 合并为一个
 - M11 _minute_mem 有界 LRU（容量上限 + 驱逐释放 + 覆盖元数据联动清理）
@@ -22,11 +21,9 @@ from app.quant.jqengine.datasource.manager import DataManager
 CODE = "510300.XSHG"
 WIN_START = "2026-03-02"
 WIN_END = "2026-03-31"
-# real_ 真实 1m 段（含窗口外延伸，验证裁剪）；5min 缓存延伸到回测末端之后
+# real_ 真实 1m 段（含窗口外延伸，验证裁剪）
 REAL_START, REAL_END = "2026-03-16 09:30", "2026-04-10 15:00"
-FIVE_START, FIVE_END = "2026-03-02 09:35", "2026-04-15 15:00"
 REAL_CLOSE = 777.0    # real_ 真实段标记价
-BS_CLOSE = 333.0      # baostock 5min 插值段标记价（open=close，插值后恒等）
 
 
 def _make_dm(tmp_path, set_window=True, **kw):
@@ -39,13 +36,7 @@ def _make_dm(tmp_path, set_window=True, **kw):
 
 
 def _seed_minute_caches(dm, code=CODE):
-    """写入合成 real_ 1m 与 baostock 5min 缓存（5min 延伸到窗口末端之后）。"""
-    idx5 = pd.date_range(FIVE_START, FIVE_END, freq="5min")
-    df5 = pd.DataFrame(
-        {"open": BS_CLOSE, "high": BS_CLOSE, "low": BS_CLOSE,
-         "close": BS_CLOSE, "volume": 5.0, "amount": 5.0},
-        index=idx5)
-    dm.cache.put("5min", f"baostock_5min_{code}", df5)
+    """写入合成 real_ 1m 缓存。"""
     idx1 = pd.date_range(REAL_START, REAL_END, freq="1min")
     real = pd.DataFrame(
         {"open": REAL_CLOSE, "high": REAL_CLOSE, "low": REAL_CLOSE,
@@ -113,10 +104,10 @@ def test_money_memo_full_frame_and_version(tmp_path):
     assert (res3["money"] >= 9e8).all()
 
 
-# ---------------- H6b：baostock / merged 结果裁剪到请求窗口 [lo, hi] ----------------
+# ---------------- H6b：merged 结果裁剪到请求窗口 [lo, hi] ----------------
 
 def test_merged_clipped_to_window_and_real_only(tmp_path):
-    """merged 只含真实 mootdx 数据（无 baostock/synthetic 兜底）；越出窗口裁剪。"""
+    """merged 只含真实 mootdx 数据；越出窗口裁剪。"""
     dm = _make_dm(tmp_path)
     _seed_minute_caches(dm)
     merged = dm._load_minute_merged(CODE, full=True)
@@ -128,24 +119,6 @@ def test_merged_clipped_to_window_and_real_only(tmp_path):
     assert merged.loc[pd.Timestamp("2026-03-17 10:00"), "close"] == REAL_CLOSE
     # 不再包含 baostock 插值数据（real 之前的缺口不补齐）
     assert pd.Timestamp("2026-03-03 10:00") not in merged.index
-
-
-def test_baostock_offline_fallback_clipped(tmp_path):
-    """离线兜底路径：未完整覆盖时退化为已缓存段插值，但仍裁到 [lo, hi]。"""
-    dm = _make_dm(tmp_path)
-    # 5min 缓存从 03-10 才开始（未覆盖 lo=03-02），且延伸到窗口末端之后
-    idx5 = pd.date_range("2026-03-10 09:35", "2026-04-15 15:00", freq="5min")
-    df5 = pd.DataFrame(
-        {"open": BS_CLOSE, "high": BS_CLOSE, "low": BS_CLOSE,
-         "close": BS_CLOSE, "volume": 5.0, "amount": 5.0},
-        index=idx5)
-    dm.cache.put("5min", f"baostock_5min_{CODE}", df5)
-    out = dm._load_baostock_minute(
-        CODE, pd.Timestamp(WIN_START), pd.Timestamp(WIN_END), None)
-    assert not out.empty
-    # 旧实现只卡下界：结果会一直延伸到 04-15（回测末端之后，未来泄漏）
-    assert out.index.max() <= pd.Timestamp("2026-03-31 15:00")
-    assert out.index.min() >= pd.Timestamp(WIN_START)
 
 
 # ---------------- H6a：get_minute_feed 走 merged（real_ 基底） ----------------

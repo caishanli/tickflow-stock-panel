@@ -4,21 +4,19 @@ import logging
 import os
 from collections import OrderedDict
 
+import numpy as np
 import pandas as pd
 from dotenv import set_key
 
 logger = logging.getLogger("jqengine.dm")
 
 from .cache import DataCache
-from .tushare_src import TushareSource
 from .mootdx_src import MootdxSource
 from .astock_src import AStockSource
-from .baostock_src import BaostockSource, interpolate_5min_to_1min
-from .minute_synth import SyntheticMinuteSource
 from .base import DataSourceError
 from ..config import CONFIG, REPO_ROOT
 
-SOURCES = {"tushare": TushareSource, "mootdx": MootdxSource, "astock": AStockSource}
+SOURCES = {"mootdx": MootdxSource, "astock": AStockSource}
 
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
@@ -74,12 +72,9 @@ class _MinuteLRU(OrderedDict):
 def _ensure_money_yuan(df, src_name):
     """保证日线帧带 ``money`` 列（单位：元）。
 
-    各数据源 amount 单位不一：tushare pro.daily/fund_daily 的 ``amount`` 是
-    **千元**（实测 510300 amount=4,039,507 ≈ close×vol(手)×100/1000，与聚宽
-    全市场成交额口径一致），mootdx/baostock/astock 为元；mootdx 源已自带
+    各数据源 amount 单位不一：mootdx/astock 为元；mootdx 源已自带
     money(元)（见 mootdx_src.get_daily 的 amount→money 映射）。未归一时直接
-    把 amount 当元用会让全市场成交额聚合小 1000 倍（实测本地 41.7 亿 vs 聚宽
-    4967 亿），流动性门槛/池过滤全面失真。
+    把 amount 当元用会让全市场成交额聚合失真，流动性门槛/池过滤全面失真。
     """
     if df is None or getattr(df, "empty", True):
         return df
@@ -87,20 +82,17 @@ def _ensure_money_yuan(df, src_name):
         return df
     if "amount" not in df.columns:
         return df
-    factor = 1000.0 if src_name == "tushare" else 1.0
     df = df.copy()
-    df["money"] = pd.to_numeric(df["amount"], errors="coerce") * factor
+    df["money"] = pd.to_numeric(df["amount"], errors="coerce")
     return df
 
 
 def _ensure_volume_shares(df, src_name):
     """保证日线帧带 ``volume`` 列（单位：股）。
 
-    与 :func:`_ensure_money_yuan` 同模式：tushare pro.daily/fund_daily 的
-    ``vol`` 单位是**手**（1 手=100 股），归一为 ``volume``(股)（保留原
-    ``vol`` 列）；mootdx 源内已 vol×100→volume(股)（见
-    mootdx_src.get_daily），baostock/astock 的 volume 单位即为股（astock
-    实测小 ETF 约 5e7 量级），已有 ``volume`` 列的帧不动。
+    mootdx 源内已 vol×100→volume(股)（见 mootdx_src.get_daily），astock
+    的 volume 单位即为股（astock 实测小 ETF 约 5e7 量级），已有 ``volume``
+    列的帧不动。
     """
     if df is None or getattr(df, "empty", True):
         return df
@@ -108,34 +100,31 @@ def _ensure_volume_shares(df, src_name):
         return df
     if "vol" not in df.columns:
         return df
-    factor = 100.0 if src_name == "tushare" else 1.0
     df = df.copy()
-    df["volume"] = pd.to_numeric(df["vol"], errors="coerce") * factor
+    df["volume"] = pd.to_numeric(df["vol"], errors="coerce")
     return df
 
 
 def _infer_adj(df, src_name):
     """推断日线帧的复权口径：优先读 ``df.attrs["adj"]``（各源 get_daily
     已标注）；旧缓存帧（pickle/parquet）没有 attrs，按源名回退推断——
-    tushare 请求 adj="qfq" 按 "qfq"、mootdx 通达信原始价按 "raw"、
-    baostock 日线 adjustflag="1" 按 "qfq"、其余（如 astock）按 "unknown"。
+    mootdx 通达信原始价按 "raw"、其余（如 astock）按 "unknown"。
     """
     adj = getattr(df, "attrs", None)
     adj = adj.get("adj") if adj else None
     if adj:
         return adj
-    return {"tushare": "qfq", "mootdx": "raw",
-            "baostock": "qfq"}.get(src_name, "unknown")
+    return {"mootdx": "raw"}.get(src_name, "unknown")
 
 
 def _pick_daily_frame(candidates):
     """同一代码多源缓存并存时的选帧：按优先级取第一个非 raw 帧，全 raw 才用 raw。
 
-    背景：mootdx 为通达信原始不复权价（raw），tushare/baostock 为前复权
-    （qfq）；若只按源优先级选帧，同一回测内价格帧可能来自 qfq 源而 money
-    帧来自 raw 源，复权口径混乱。``candidates`` 为 ``(pri, src_name, key,
-    df)`` 元组、已按优先级升序；"非 raw" 含 qfq/unknown（unknown 可能是
-    前复权，raw 一定不是）。返回选中的元组；无候选返回 None。
+    背景：mootdx 为通达信原始不复权价（raw）；若只按源优先级选帧，
+    同一回测内价格帧可能来自不同复权口径。``candidates`` 为
+    ``(pri, src_name, key, df)`` 元组、已按优先级升序；"非 raw" 含
+    qfq/unknown（unknown 可能是前复权，raw 一定不是）。返回选中的元组；
+    无候选返回 None。
     """
     first_raw = None
     for cand in candidates:
@@ -156,17 +145,9 @@ class DataManager:
 
     def __init__(self, token=None, cache=None, minute_mem_cap=None):
         self.cache = cache or DataCache()
-        tok = token if token is not None else CONFIG["TUSHARE_TOKEN"]
-        self.sources = {
-            k: (v(token=tok) if k == "tushare" else v())
-            for k, v in SOURCES.items()
-        }
-        # 历史分钟线：优先走真实源（mootdx 分页回看），回退到日线合成的确定性分钟源
-        self.minute_source = SyntheticMinuteSource(
-            lambda code, start, end: self.fetch("get_daily", code, start, end)
-        )
-        # baostock 仅作分钟中间层（5分钟插值），不进入日线优先级链
-        self.sources["baostock"] = BaostockSource()
+        self.sources = {k: v() for k, v in SOURCES.items()}
+        # 历史分钟线：优先走真实源（mootdx 分页回看）
+        self._minute_win = None  # (start, end) 回测窗口
         self._minute_cov = {}  # code -> (lo_ts, hi_ts) 缓存帧已覆盖区间
         # M11 修复：分钟帧内存缓存改为有界 LRU（原无界 dict 永久持有帧，
         # 数百只 ETF × 全窗口 1m 帧可达 GB 级）。容量取 minute_mem_cap 参数
@@ -190,7 +171,7 @@ class DataManager:
         self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
         self._offline = False       # 回测离线模式：本地优先，缺失不联网回源
         # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
-        # 避免 tushare 对 ETF 永远返回空却每次都先试（慢且无意义）。
+        # 避免低效源反复先试。
         self._src_fail = {}
         self._demote_threshold = 3
         self._demoted = set()
@@ -206,14 +187,14 @@ class DataManager:
         H6c 修复：旧实现的 _minute_cov 不随缓存重置而清空，新窗口下会拿
         旧窗口的覆盖区间误判命中；现随帧一并清空。
         """
-        self.minute_source.window = (pd.Timestamp(start), pd.Timestamp(end))
+        self._minute_win = (pd.Timestamp(start), pd.Timestamp(end))
         # clear() 而非重新赋值：保持 _minute_mem 对象身份（LRU 实例）不变
         self._minute_mem.clear()
         self._minute_cov.clear()
 
     @staticmethod
     def _to_jq_code(code):
-        """tushare代码(.SZ/.SH) -> JQ代码(.XSHE/.XSHG)。"""
+        """代码(.SZ/.SH) -> JQ代码(.XSHE/.XSHG)。"""
         if "." not in code:
             return code
         pure, suffix = code.split(".", 1)
@@ -232,12 +213,11 @@ class DataManager:
         其余标的由策略按需走滑窗加载。
         """
         all_min = self.cache.get_all("minute")
-        all_5min = self.cache.get_all("5min")
-        win = self.minute_source.window
+        win = self._minute_win
         count = 0
         for code in codes:
             try:
-                df = self._load_minute_merged(code, all_min, all_5min, full=True)
+                df = self._load_minute_merged(code, all_min, full=True)
                 if df is not None and not df.empty:
                     self._minute_mem[code] = df
                     if win:
@@ -289,10 +269,10 @@ class DataManager:
                 df = df.copy()
                 df["trade_dt"] = pd.to_datetime(
                     df["trade_date"].astype(str)).dt.date
-            # 成交额单位归一（tushare amount 为千元 → 元），下游
+            # 成交额单位归一（amount → money，单位：元），下游
             # get_daily_money_cached / total_turnover 统一用 money(元)
             df = _ensure_money_yuan(df, src_name)
-            # 成交量单位归一（tushare vol 为手 ×100 → 股），与 money 同模式
+            # 成交量单位归一（vol → volume，单位：股），与 money 同模式
             df = _ensure_volume_shares(df, src_name)
             self._daily_mem[f"get_daily_{jq_code}"] = df
             count += 1
@@ -311,7 +291,7 @@ class DataManager:
             return self.get_minute(code, end_date, start_date)
         cache_key = f"{method}_{args[0] if args else ''}"
         # C3：daily 本地优先。_daily_mem 命中即返回；未命中或覆盖不足时，
-        # cache.get 会调 loader 回源（mootdx/tushare）并落盘。回测中
+        # cache.get 会调 loader 回源（mootdx）并落盘。回测中
         # preload_daily 已预加载全量日线，此处一般命中内存。
         if cache_key in self._daily_mem:
             mem = self._daily_mem[cache_key]
@@ -337,10 +317,11 @@ class DataManager:
             try:
                 if method in ("get_daily",):
                     code = args[0]
+                    fetch_args = list(args)
                     df = self.cache.get(
                         "daily", f"{name}_{code}",
-                        lambda s=src: getattr(s, method)(*args, **kwargs),
-                        *(args[1:3] if len(args) > 1 else []),
+                        lambda s=src, a=fetch_args: getattr(s, method)(*a, **kwargs),
+                        *(fetch_args[1:3] if len(fetch_args) > 1 else []),
                     )
                     if df is None or (hasattr(df, "empty") and df.empty):
                         raise DataSourceError(f"{name} 空数据")
@@ -371,7 +352,7 @@ class DataManager:
     def _maybe_demote(self, name):
         """某数据源连续取数失败达阈值 -> 降到优先级末位并持久化到 .env。
 
-        典型场景：tushare 对 ETF 日线始终返回空，前几次逐标的联网试探既慢又无意义；
+        典型场景：某数据源对 ETF 日线始终返回空，前几次逐标的联网试探既慢又无意义；
         累计失败达阈值后自动把该源挪到最后，后续取数直接走 mootdx/astock，并把新
         顺序写回 .env，使后续运行也受益。已降级或本就在末位则跳过。
         """
@@ -419,13 +400,9 @@ class DataManager:
         """桥接器时钟 feed 专用：加载并缓存**整段回测区间**的分钟线。
 
         与 :meth:`get_minute` 的滑窗不同，feed 需覆盖全部回测区间以驱动回放，
-        因此按完整窗口加载（仅 1~2 只标的）。窗口上界用回测 end（而非 today），
-        避免超出本地 5min 缓存覆盖而被迫回源 baostock 网络。
+        因此按完整窗口加载（仅 1~2 只标的）。窗口上界用回测 end（而非 today）。
 
-        H6a 修复：feed 改走 :meth:`_load_minute_merged` 三源合并（real_ 真实
-        1 分钟基底 + baostock 5 分钟插值补缺口），兑现 rqalpha_bridge "回测
-        使用真实 1 分钟数据" 的承诺；原实现只走 _load_baostock_minute，整段
-        区间都是 5 分钟插值，``_use_real_minute`` 开关在 feed 路径完全失效。
+        H6a 修复：feed 改走 :meth:`_load_minute_merged` 真实 mootdx 分钟数据。
         H6c 修复：命中缓存前校验覆盖区间包含 [start, end]，覆盖不足重新合并，
         不再"先到先得"。
         """
@@ -461,9 +438,9 @@ class DataManager:
         """
         if lo_hi is not None:
             return pd.Timestamp(lo_hi[0]), pd.Timestamp(lo_hi[1])
-        if self.minute_source.window:
-            win_start0 = self.minute_source.window[0]
-            win_end0 = self.minute_source.window[1]
+        if self._minute_win:
+            win_start0 = self._minute_win[0]
+            win_end0 = self._minute_win[1]
         else:
             win_start0 = pd.Timestamp.today() - pd.Timedelta(days=400)
             win_end0 = pd.Timestamp.today()
@@ -504,7 +481,7 @@ class DataManager:
         if as_of is not None:
             as_of_ts = pd.Timestamp(as_of).normalize()
         else:
-            win = self.minute_source.window
+            win = self._minute_win
             as_of_ts = win[1] if win else pd.Timestamp.now().normalize()
         lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=False)
         hi_eff = self._hi_eff(hi_ts)
@@ -534,7 +511,7 @@ class DataManager:
         for code in codes:
             try:
                 # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
-                # 超出本地 5min 缓存覆盖范围而被迫回源 baostock 网络。
+                # 超出 mootdx 实际覆盖范围。
                 df = self._ensure_minute_windowed(code, as_of_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     loaded += 1
@@ -567,21 +544,61 @@ class DataManager:
         except Exception:
             return None
 
-    def _load_minute_merged(self, code, all_min=None, all_5min=None,
+    @staticmethod
+    def _adjust_for_splits(df):
+        """检测分钟数据中的拆股/合股跳变并向前复权。
+
+        隔夜缺口 >30% 视为拆股信号，计算分割比率，将跳变点之前的所有价格
+        除以该比率（向前复权），确保跨拆股日的价格可比。
+        """
+        if df is None or df.empty or len(df) < 2:
+            return df
+        price_cols = ["open", "high", "low", "close"]
+        has_price = any(c in df.columns for c in price_cols)
+        if not has_price:
+            return df
+        ref = df["close"] if "close" in df.columns else df.get("open")
+        if ref is None or ref.isna().all():
+            return df
+        dates = ref.index.normalize()
+        unique_dates = dates.unique()
+        if len(unique_dates) < 2:
+            return df
+        daily_last = ref.groupby(dates).last()
+        daily_first = ref.groupby(dates).first()
+        ratios = daily_first.values[1:] / daily_last.values[:-1]
+        split_mask = np.isfinite(ratios) & (
+            (ratios < 0.5) | (ratios > 2.0)
+        )
+        if not split_mask.any():
+            return df
+        split_dates = unique_dates[1:][split_mask]
+        split_ratios = ratios[split_mask]
+        result = df.copy()
+        for split_date, ratio in zip(split_dates, split_ratios):
+            if not np.isfinite(ratio) or ratio <= 0:
+                continue
+            mask = result.index < split_date
+            for col in price_cols:
+                if col in result.columns:
+                    result.loc[mask, col] = result.loc[mask, col] / ratio
+        return result
+
+    def _load_minute_merged(self, code, all_min=None,
                             as_of=None, full=False, lo_hi=None):
         """仅使用真实 mootdx 分钟数据（无合成/插值兜底）。
 
         - 本地分钟缓存（``minute/real_<code>.parquet``）里的真实 1 分钟：查到多少用多少（基底）；
         - 本地数据**之后**的缺口 → 回源 mootdx 获取（见 ``_load_real_minute``）；
-        - 无真实数据时返回 None（不使用 baostock 插值或日线合成兜底）。
+        - 无真实数据时返回 None。
 
-        ``all_min`` / ``all_5min`` 可选，传入 ``cache.get_all`` 的结果以跳过逐键查询。
+        ``all_min`` 可选，传入 ``cache.get_all`` 的结果以跳过逐键查询。
         ``lo_hi`` 显式指定加载窗口 [lo, hi]（feed 整段区间用），优先级最高；
         否则 ``full`` 展开整段回测区间（feed 用），``full=False`` 只展开截至
         ``as_of`` 最近 ``minute_lookback`` 天（滑窗，默认）。
 
         H6b 修复：各层及合并结果统一裁剪到请求窗口 [lo, hi] 闭区间——原实现
-        real_ 本地帧与 baostock 插值帧都可延伸到窗口上界之外（回测末端之后），
+        real_ 本地帧可延伸到窗口上界之外（回测末端之后），
         造成未来数据泄漏。
         """
         lo_ts, hi_ts = self._minute_window(as_of=as_of, full=full, lo_hi=lo_hi)
@@ -599,7 +616,7 @@ class DataManager:
                 layers.append(real)
 
         if not layers:
-            # 无真实 mootdx 数据 → 返回 None（不使用 baostock 插值或日线合成兜底）。
+            # 无真实 mootdx 数据 → 返回 None。
             return None
 
         numeric_cols = ["open", "high", "low", "close", "volume", "money", "amount"]
@@ -616,89 +633,19 @@ class DataManager:
                 if col in layer.columns:
                     merged.loc[layer.index, col] = layer[col]
         merged = merged.sort_index()
+        # 拆股/合股调整：检测隔夜价格跳变（阈值30%），向前复权
+        merged = self._adjust_for_splits(merged)
         # H6b：合并结果裁剪到请求窗口 [lo, hi] 闭区间（防越界/未来泄漏）。
         return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
-
-    def _load_baostock_minute(self, code, lo_ts, hi_ts, all_5min):
-        """baostock 5 分钟线的本地优先获取 + 运行时插值。
-
-        本地 5min 缓存命中且覆盖请求区间 → 直接用；否则从 baostock 回源
-        （仅拉取缺失区间），与已缓存区间合并后落盘本地 5min 缓存；插值出的 1 分钟
-        只在本进程内使用、**不落盘**（避免数据库膨胀）。
-
-        注意: 缓存按 code 单键存储，若只缓存过局部区间(如某次只取了 4 月)，
-        后续请求早期区间时必须重新回源并合并，否则会拿错区间的数据，导致
-        早期 1 分钟缺口无法被 baostock 补齐。
-
-        H6b 修复：所有返回路径在插值前统一把 5 分钟帧裁到请求窗口 [lo, hi]
-        闭区间。原离线兜底只卡下界（``cached.index >= lo_ts``），导致：
-        1) merged 路径中 baostock 层延伸进 real_ 真实段，把重叠区间覆盖成
-        插值（实测预热帧中 real 段只剩最后 6 个交易日）；
-        2) 帧可延伸到请求上界之外（回测末端之后），泄漏未来数据。
-        """
-        key5 = f"baostock_5min_{code}"
-        if all_5min is not None:
-            cached = all_5min.get(key5)
-        else:
-            cached = self.cache.peek("5min", key5)
-        lo_ts = pd.Timestamp(lo_ts)
-        hi_ts = pd.Timestamp(hi_ts)
-        hi_clip = self._hi_eff(hi_ts)
-
-        def _clip(df5):
-            # H6b：裁到请求窗口 [lo, hi] 闭区间（hi 为纯日期时含当日 15:00）
-            return df5.loc[(df5.index >= lo_ts) & (df5.index <= hi_clip)]
-
-        covers = (cached is not None and not cached.empty
-                  and cached.index.max() >= hi_ts
-                  and cached.index.min() <= lo_ts)
-        if covers:
-            # 本地 5min 缓存连续覆盖整个请求区间 → 直接插值返回（不落盘，C2）。
-            return interpolate_5min_to_1min(_clip(cached))
-        if self._offline:
-            # 离线：5min 未完整覆盖且不联网，退化为已缓存段的插值（缺失段留空）
-            if cached is not None and not cached.empty:
-                return interpolate_5min_to_1min(_clip(cached))
-            return None
-        # C1 绝对约束：本地 5min 未覆盖请求区间时，回源 baostock 补齐缺失段
-        # （之前为躲"每只卡 2.7s"而跳过回源，导致早期/缺口数据缺失，违反约束）。
-        # 回源结果合并写回本地 5min 缓存（真实数据可落盘，C1）；插值出的 1m 仍不落盘（C2）。
-        try:
-            bs = self.sources.get("baostock")
-            if bs is None:
-                raise DataSourceError("baostock 源不可用")
-            # 回源整个请求区间（baostock 单次查询代价固定，合并写库后下次命中本地）
-            fresh = bs.get_5min(code, lo_ts.strftime("%Y-%m-%d"),
-                                 hi_ts.strftime("%Y-%m-%d"))
-            if fresh is not None and not fresh.empty:
-                if cached is not None and not cached.empty:
-                    merged = pd.concat([cached, fresh]).sort_index()
-                    merged = merged[~merged.index.duplicated(keep="last")]
-                else:
-                    merged = fresh
-                try:
-                    self.cache.put("5min", key5, merged)
-                except Exception as e:
-                    import logging
-                    logging.warning("[DataManager] baostock 5min 落盘失败 %s: %s", code, e)
-                return interpolate_5min_to_1min(_clip(merged))
-        except Exception as e:
-            import logging
-            logging.warning("[DataManager] baostock 回源 5min 失败 %s: %s", code, e)
-        # 回源失败且本地有截断段 → 退化为截断插值（仍尽量给数据，而非返回 None）
-        if cached is not None and not cached.empty:
-            return interpolate_5min_to_1min(_clip(cached))
-        return None
 
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
         """缺口感知的真实分钟线获取（本地基底 + mootdx 仅补后续缺口）。
 
-        本地命中 → 作为基底返回；仅当请求超出本地末端时才对“本地之后的缺口”
+        本地命中 → 作为基底返回；仅当请求超出本地末端时才对"本地之后的缺口"
         回源 mootdx 并合并写回。这样不会用 mootdx 全量窗口覆盖掉本地较早的真实
-        1 分钟——否则缓存会随“今天”推移不断缩水，早期数据被迫退化为插值。
+        1 分钟——否则缓存会随"今天"推移不断缩水。
 
-        请求整体早于本地最早日期（且本地无数据）→ mootdx 也取不到 → 返回 None，
-        交 baostock 5 分钟插值兜底。
+        请求整体早于本地最早日期（且本地无数据）→ mootdx 也取不到 → 返回 None。
         """
         real_key = f"real_{code}"
         if all_min is not None:
@@ -727,8 +674,7 @@ class DataManager:
                         combined = pd.concat([local, fresh]).sort_index()
                         combined = combined[~combined.index.duplicated(keep="last")]
                         # C1 绝对约束：本地缺失段由 mootdx 真实获取后必须落盘，
-                        # 下次回测直接命中本地，避免反复联网。仅真实 1m 落盘，
-                        # 插值(5m)数据绝不写库（见 _load_baostock_minute / C2）。
+                        # 下次回测直接命中本地，避免反复联网。仅真实 1m 落盘。
                         try:
                             self.cache.put("minute", real_key, combined)
                         except Exception as e:
@@ -833,14 +779,9 @@ class DataManager:
                     ddf = None
                 if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
                     # peek 兜底顺序与 preload/fetch 一致复用 _priority()：
-                    # 原硬编码 ("mootdx","astock","tushare") 与 preload 的
-                    # (tushare,mootdx,astock) 矛盾——同一代码价格帧来自
-                    # tushare(前复权) 而 money 帧可能来自 mootdx(不复权)
                     for src in self._priority():
                         cached = self.cache.peek("daily", f"{src}_{code}")
                         if cached is not None and not (hasattr(cached, "empty") and cached.empty):
-                            # 与 preload 同口径：tushare amount(千元)/vol(手)
-                            # 归一为 money(元)/volume(股)
                             ddf = _ensure_money_yuan(cached, src)
                             ddf = _ensure_volume_shares(ddf, src)
                             break
@@ -896,7 +837,7 @@ class DataManager:
                 ",".join(CONFIG["DATASOURCE_PRIORITY"]))
 
     def verify_token(self, token):
-        return TushareSource(token=token).test_connection()
+        return MootdxSource().test_connection()
 
     def list_sources(self):
         return [{"name": n, "priority": i, "available": True}

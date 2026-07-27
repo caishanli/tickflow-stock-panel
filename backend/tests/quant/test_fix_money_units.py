@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """成交额单位归一与 get_all_securities types 过滤的修复回归测试。
 
-背景（对账实测）：tushare pro.daily/fund_daily 的 amount 单位是**千元**，
-被 _build_money_full 当元直接使用，全市场 ETF 成交额聚合小 ~1000 倍
-（本地 41.7 亿 vs 聚宽 4967 亿）；同时 get_all_securities(['etf']) 未按
-types 过滤，4 只指数（其 amount 为成分股全市场成交额、万亿级）混入 ETF
-聚合。修复后 ETF 合计 5304 亿 vs 聚宽 4967 亿（+6.8%，宇宙差异）。
+背景：各数据源 amount 单位已统一为元，_ensure_money_yuan 直接将 amount
+赋给 money，无需因子转换。get_all_securities(['etf']) 按 types 过滤，
+指数不混入 ETF。
 """
 
 import pandas as pd
@@ -14,11 +12,11 @@ from app.quant import jqcompat
 from app.quant.jqengine.datasource.cache import DataCache
 from app.quant.jqengine.datasource.manager import DataManager, _ensure_money_yuan
 
-DATES = pd.date_range("2026-07-08", periods=3)
+DATES = pd.date_range("2026-07-25", periods=3)
 
 
-def _tushare_df():
-    # tushare schema：vol 单位手、amount 单位千元
+def _astock_df():
+    # astock schema：amount 单位元
     return pd.DataFrame({
         "trade_date": [d.strftime("%Y%m%d") for d in DATES],
         "open": [4.8, 4.85, 4.83],
@@ -47,16 +45,16 @@ def _make_dm(tmp_path):
     return dm
 
 
-def test_ensure_money_yuan_tushare_amount_is_qianyuan():
-    df = _ensure_money_yuan(_tushare_df(), "tushare")
-    # amount(千元) ×1000 → money(元)
-    assert df["money"].iloc[-1] == 4039507.185 * 1000
+def test_ensure_money_yuan_astock_amount_is_yuan():
+    df = _ensure_money_yuan(_astock_df(), "astock")
+    # amount(元) 直接 → money(元)，无因子转换
+    assert df["money"].iloc[-1] == 4039507.185
     assert "amount" in df.columns  # 原列保留
 
 
-def test_ensure_money_yuan_non_tushare_factor_1():
+def test_ensure_money_yuan_non_astock_factor_1():
     df = _ensure_money_yuan(
-        pd.DataFrame({"close": [1.0], "vol": [100], "amount": [123.0]}), "baostock")
+        pd.DataFrame({"close": [1.0], "vol": [100], "amount": [123.0]}), "mootdx")
     assert df["money"].iloc[0] == 123.0
 
 
@@ -68,23 +66,22 @@ def test_ensure_money_yuan_keeps_existing_money():
 
 def test_preload_daily_normalizes_money_units(tmp_path):
     dm = _make_dm(tmp_path)
-    dm.cache.put("daily", "tushare_510300.XSHG", _tushare_df())
+    dm.cache.put("daily", "astock_510300.XSHG", _astock_df())
     dm.cache.put("daily", "mootdx_512800.XSHG", _mootdx_df())
     dm.preload_daily()
     ts = dm._daily_mem["get_daily_510300.XSHG"]
-    assert ts["money"].iloc[-1] == 4039507.185 * 1000
+    assert ts["money"].iloc[-1] == 4039507.185
     mt = dm._daily_mem["get_daily_512800.XSHG"]
     assert mt["money"].iloc[0] == 1.01e8
 
 
 def test_money_aggregate_excludes_unit_error(tmp_path):
-    """策略口径全市场合计：tushare 千元修正后与元单位帧同量级相加。"""
+    """策略口径全市场合计：amount 单位统一为元，直接可用。"""
     dm = _make_dm(tmp_path)
-    dm.cache.put("daily", "tushare_510300.XSHG", _tushare_df())
+    dm.cache.put("daily", "astock_510300.XSHG", _astock_df())
     dm.preload_daily()
     m = dm.get_daily_money_cached(["510300.XSHG"], DATES[-1], count=1)
-    # 修正前 4,039,507（元），修正后 4,039,507,185（元）
-    assert m["money"].iloc[0] == 4039507.185 * 1000
+    assert m["money"].iloc[0] == 4039507.185
 
 
 # ---------------------------------------------------------------------------
