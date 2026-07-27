@@ -386,6 +386,8 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
     """成交增量 / 状态 / 净值快照落库（每轮一次）。"""
     trades = jq_api._state.get("trades") or []
     drained = aux.get("trades_drained", 0)
+    is_replay = aux.get("replay_mode", False)
+    batch_trades = aux.get("batch_trades") if is_replay else None
     for t in trades[drained:]:
         amount = abs(t["amount"])
         if t["amount"] < 0 and t.get("avg_cost"):
@@ -393,10 +395,14 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
             pnl_pct = t["price"] / t["avg_cost"] - 1
         else:
             pnl, pnl_pct = 0.0, 0.0
-        db.insert_sim_trade(account_id, str(t["dt"]),
-                            t["code"], "BUY" if t["amount"] > 0 else "SELL",
-                            t["price"], amount, round(pnl, 4), round(pnl_pct, 4),
-                            t.get("fee", 0.0))
+        trade_row = (account_id, str(t["dt"]),
+                     t["code"], "BUY" if t["amount"] > 0 else "SELL",
+                     t["price"], amount, round(pnl, 4), round(pnl_pct, 4),
+                     t.get("fee", 0.0))
+        if batch_trades is not None:
+            batch_trades.append(trade_row)
+        else:
+            db.insert_sim_trade(*trade_row)
     aux["trades_drained"] = len(trades)
     pf = ctx.portfolio
     positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
@@ -407,13 +413,21 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
     state["pnl"] = round(net - start_cash, 4)
     state["dt"] = str(bar_dt)
     save_state(account_id, state)
-    db.insert_sim_snapshot(account_id, str(bar_dt), net, round(pf.cash, 4),
-                           positions_value, round(net - start_cash, 4),
-                           round(net / start_cash - 1, 6) if start_cash else 0.0)
+    snapshot_row = (account_id, str(bar_dt), net, round(pf.cash, 4),
+                    positions_value, round(net - start_cash, 4),
+                    round(net / start_cash - 1, 6) if start_cash else 0.0)
+    if is_replay:
+        aux.setdefault("batch_snapshots", []).append(snapshot_row)
+        if len(aux["batch_snapshots"]) % 60 == 0:
+            _flush_replay_batch(account_id, aux)
+    else:
+        db.insert_sim_snapshot(*snapshot_row)
 
 
 def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
     """收盘（每交易日一次）：after_close/after_trading_end + 真实分钟落盘 + 最终快照。"""
+    if aux.get("replay_mode"):
+        _flush_replay_batch(account_id, aux)
     for func, t in bundle.daily:
         if str(t) == "after_close":
             _safe_call(account_id, func, ctx, "after_close")
@@ -472,11 +486,29 @@ def _hist_feed(dm, codes, now, _acc):
     return prices, (now if prices else None)
 
 
+def _flush_replay_batch(account_id: str, aux: dict) -> None:
+    """将补跑期间攒批的 snapshot/trade/log 一次性写入 DB。"""
+    from .. import db as _db
+    snapshots = aux.pop("batch_snapshots", [])
+    trades = aux.pop("batch_trades", [])
+    logs = aux.pop("batch_logs", [])
+    if snapshots:
+        _db.batch_insert_snapshots(snapshots)
+    if trades:
+        _db.batch_insert_trades(trades)
+    if logs:
+        _db.batch_insert_logs(logs)
+
+
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
     """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
     _replay_active_ids.add(account_id)
     try:
+        aux["replay_mode"] = True
+        aux["batch_snapshots"] = []
+        aux["batch_trades"] = []
+        aux["batch_logs"] = []
         yesterday = datetime.date.today() - datetime.timedelta(days=1)
         days = _trade_days_between(dm, start_date, yesterday)
         _emit_log(account_id, "info",
@@ -495,6 +527,8 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
             _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
         _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
     finally:
+        _flush_replay_batch(account_id, aux)
+        aux.pop("replay_mode", None)
         _replay_active_ids.discard(account_id)
 
 
@@ -584,7 +618,13 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
         _restore_portfolio(ctx, st)
     # initialize 后把策略 g.* 池子注入 universe（打破回放取价死锁）
     _seed_universe(ctx)
-    jq_api._state["log_sink"] = lambda level, msg: _emit_log(account_id, level, msg)
+    def _replay_log_sink(level, msg):
+        if aux.get("replay_mode"):
+            aux.setdefault("batch_logs", []).append(
+                (account_id, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, msg))
+        else:
+            _emit_log(account_id, level, msg)
+    jq_api._state["log_sink"] = _replay_log_sink
     try:
         bundle.init_fn(ctx)
     except Exception as e:  # noqa: BLE001
