@@ -361,9 +361,11 @@ def _fire_session(account_id: str, bundle, ctx, bar_dt, fired: set, jq_api,
         _safe_call(account_id, func, ctx, tag)
 
 
-def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now) -> None:
+def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict | None = None) -> None:
     """盘前（每交易日一次）：调度器重置 + T+1 清零 + before_open/before_trading_start。"""
     fired.clear()
+    if aux is not None:
+        aux["prev_close_cache"] = {}
     jq_api.on_new_day()
     try:
         days = jq_api.get_trade_days(end_date=str(now.date()), count=5)
@@ -483,7 +485,7 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
             if is_paused(account_id):
                 break
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
-                        datetime.datetime.combine(day, datetime.time(9, 25)))
+                        datetime.datetime.combine(day, datetime.time(9, 25)), aux)
             for bar in _session_minutes(day):
                 if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
                     continue
@@ -524,8 +526,14 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     # 涨跌停禁买卖（昨收缺失的标的不判定）
     today = str(bar_ts.date())
     no_sell, no_buy = set(), set()
+    pc_cache = aux.setdefault("prev_close_cache", {})
     for code, px in prices.items():
-        prev = _prev_close_dm(dm, code, today)
+        cache_key = (code, today)
+        prev = pc_cache.get(cache_key)
+        if prev is None:
+            prev = _prev_close_dm(dm, code, today)
+            if prev:
+                pc_cache[cache_key] = prev
         if not prev:
             continue
         if px <= prev * (1 + LIMIT_DOWN_PCT):
@@ -613,7 +621,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                 continue
             t = now.time()
             if hooks_done["pre"] != today and t >= datetime.time(9, 25):
-                _pre_market(account_id, bundle, ctx, aux["fired"], jq_api, now)
+                _pre_market(account_id, bundle, ctx, aux["fired"], jq_api, now, aux)
                 hooks_done["pre"] = today
             if in_trading(now) or (datetime.time(15, 0) < t <= SESSION_END_GRACE):
                 if aux["frequency"] == "daily" and aux["daily_done"] == today:
