@@ -240,6 +240,21 @@ async def lifespan(app: FastAPI):
         logger.warning("monitor engine load failed: %s", e)
     app.state.monitor_engine = monitor_engine
 
+    # 模拟盘恢复: 启动时检测 status=running 但进程已死的账户，标记为 paused
+    try:
+        from app.quant import db as quant_db
+        import os as _os
+        for acct in quant_db.list_sim_accounts():
+            if acct.get("status") == "running":
+                pid = acct.get("pid")
+                alive = pid and _os.path.exists(f"/proc/{pid}")
+                if not alive:
+                    quant_db.update_sim_account(acct["id"], status="paused", pid=None)
+                    logger.warning("sim account %s (%s) pid=%s dead, set to paused",
+                                   acct["id"][:8], acct.get("name"), pid)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("sim account recovery failed: %s", e)
+
     yield
 
     if app.state.scheduler:
