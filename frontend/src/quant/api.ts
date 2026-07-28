@@ -47,6 +47,7 @@ export const createAccount = (b: any) => j('/sim/accounts', { method: 'POST', bo
 export const startAccount = (id: string) => j(`/sim/accounts/${id}/start`, { method: 'POST' })
 export const pauseAccount = (id: string) => j(`/sim/accounts/${id}/pause`, { method: 'POST' })
 export const resetAccount = (id: string) => j(`/sim/accounts/${id}/reset`, { method: 'POST' })
+export const deleteAccount = (id: string) => j(`/sim/accounts/${id}`, { method: 'DELETE' })
 export const getSimStatus = (id: string) => j(`/sim/accounts/${id}/status`)
 export const getSimEquity = (id: string) => j(`/sim/accounts/${id}/equity`)
 export const getSimTrades = (id: string) => j(`/sim/accounts/${id}/trades`)

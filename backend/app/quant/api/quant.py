@@ -11,7 +11,7 @@ from .. import db
 from ..config import CONFIG
 from ..service import (
     submit_backtest, terminate_backtest, account_create, account_start, account_pause,
-    account_reset,
+    account_reset, account_delete,
 )
 from ..strategies.store import (
     list_strategies, get_strategy, save_strategy, delete_strategy,
@@ -285,6 +285,12 @@ def sim_pause(aid: str):
 @router.post("/sim/accounts/{aid}/reset")
 def sim_reset(aid: str):
     account_reset(aid)
+    return {"data": None}
+
+
+@router.delete("/sim/accounts/{aid}")
+def sim_delete(aid: str):
+    account_delete(aid)
     return {"data": None}
 
 

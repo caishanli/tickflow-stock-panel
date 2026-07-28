@@ -3,7 +3,7 @@ import ReactECharts from 'echarts-for-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Plus, Play, Square, RotateCcw, Bell } from 'lucide-react'
+import { ArrowLeft, Plus, Play, Square, RotateCcw, Bell, Trash2 } from 'lucide-react'
 import * as api from '../api'
 import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
@@ -59,6 +59,10 @@ export function QuantSim() {
   const startMut = useMutation({ mutationFn: () => api.startAccount(sel!), onSuccess: invalidate })
   const pauseMut = useMutation({ mutationFn: () => api.pauseAccount(sel!), onSuccess: invalidate })
   const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: invalidate })
+  const deleteMut = useMutation({
+    mutationFn: () => api.deleteAccount(sel!),
+    onSuccess: () => { setView('list'); setSel(null); invalidate() },
+  })
   const createMut = useMutation({
     mutationFn: (b: AccountForm) => api.createAccount(b),
     onSuccess: () => { setDialog(false); invalidate() },
@@ -84,6 +88,7 @@ export function QuantSim() {
           startMut={startMut}
           pauseMut={pauseMut}
           resetMut={resetMut}
+          deleteMut={deleteMut}
         />
       )}
       <AccountDialog open={dialog} onClose={() => setDialog(false)}
@@ -163,13 +168,14 @@ function SimList({ accounts, strategyName, onNew, onOpen }: {
 // 详情视图
 // ---------------------------------------------------------------------------
 
-function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: {
+function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, deleteMut }: {
   aid: string
   strategyName: (id: string) => string
   onBack: () => void
   startMut: any
   pauseMut: any
   resetMut: any
+  deleteMut: any
 }) {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs'>('trades')
@@ -359,6 +365,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut }: 
           <button onClick={() => resetMut.mutate()} disabled={resetMut.isPending}
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
             <RotateCcw size={13} />重置
+          </button>
+          <button onClick={() => { if (window.confirm('确定删除该模拟账户？此操作不可恢复。')) deleteMut.mutate() }}
+            disabled={deleteMut.isPending}
+            className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-bear/10 text-bear text-xs disabled:opacity-50 hover:bg-bear/20">
+            <Trash2 size={13} />删除
           </button>
         </div>
       </div>

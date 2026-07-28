@@ -131,6 +131,15 @@ def account_reset(aid: str) -> None:
             c.execute(f"DELETE FROM {t} WHERE account_id=?", (aid,))
 
 
+def account_delete(aid: str) -> None:
+    acct = db.get_sim_account(aid) or {}
+    if not kill_process_group(acct.get("pid")) and acct.get("status") == "running":
+        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+        with open(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"), "w"):
+            pass
+    db.delete_sim_account(aid)
+
+
 # ---- 读库封装（供 API 调用）----
 def get_run(run_id: str):
     return db.get_run(run_id)
