@@ -428,6 +428,37 @@ def history(security, bar_count, unit="1d", field=None, skip_paused=True, df=Tru
     return df_out.set_index("time")[list(fields)]
 
 
+def get_extras(field, securities, start_date=None, end_date=None, count=None,
+               frequency="1d", fields=None, skip_paused=True, fq="pre", df=True,
+               **kwargs):
+    """聚宽 get_extras 兼容 shim。
+
+    当前仅支持 field='unit_net_value'（ETF 净值），其余字段返回空 DataFrame 并 warn。
+    ETF 净值无独立数据源时以 close 近似。
+    """
+    import logging as _log
+    if field != "unit_net_value":
+        _log.warning("[jqcompat] get_extras field=%s not implemented, returning empty", field)
+        return pd.DataFrame()
+    codes = [securities] if isinstance(securities, str) else list(securities)
+    env = Environment.get_instance()
+    end_dt = pd.Timestamp(end_date) if end_date is not None else env.trading_dt
+    start_dt = pd.Timestamp(start_date) if start_date is not None else end_dt
+    out = {}
+    for code in codes:
+        bars = get_price(code, start_date=str(start_dt.date()),
+                         end_date=str(end_dt.date()),
+                         frequency="1d", fields=["close"], panel=False, fq=fq)
+        if bars is not None and not bars.empty:
+            out[code] = bars.set_index("time")["close"]
+    if not out:
+        return pd.DataFrame()
+    result = pd.DataFrame(out)
+    if isinstance(securities, str) and code in result.columns:
+        return result[[code]]
+    return result
+
+
 def set_benchmark(code):
     global _BENCHMARK
     _BENCHMARK = code
@@ -1628,6 +1659,7 @@ def _register_jq_apis():
         ("set_order_cost", set_order_cost),
         ("set_option", set_option),
         ("history", history),
+        ("get_extras", get_extras),
         ("record", record),
         ("run_daily", run_daily),
         ("run_minute", run_minute),
