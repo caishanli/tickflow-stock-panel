@@ -643,10 +643,19 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     _emit_log(account_id, "info",
               f"策略模拟盘启动: {sid} 资金 {start_cash}{'（恢复续跑）' if has_saved else ''}"
               f"{(' 起始日期 ' + start_date) if start_date else ''}")
-    # 开始模拟日期早于今天且无存档 → 先按历史分钟补跑到昨天（补跑后 state 即最新，
-    # aux['last_bar'] 停在昨日 15:00，实时循环从今日 bar 无缝接上）
-    if start_date and not has_saved and start_date < str(datetime.date.today()):
-        _replay_history(account_id, bundle, ctx, dm, matcher, state, aux, start_date)
+    # 补跑逻辑：无存档从 start_date 补跑；有存档但 dt 早于今天也要补跑缺失天数
+    today_str = str(datetime.date.today())
+    replay_from = None
+    if has_saved:
+        saved_dt = state.get("dt")
+        if saved_dt:
+            saved_day = str(saved_dt)[:10]
+            if saved_day < today_str:
+                replay_from = saved_day
+    elif start_date and start_date < today_str:
+        replay_from = start_date
+    if replay_from:
+        _replay_history(account_id, bundle, ctx, dm, matcher, state, aux, replay_from)
     hooks_done: dict[str, str | None] = {"pre": None, "eod": None}
     trading_day: tuple[str, bool] | None = None  # (today_str, bool) 每日缓存一次
     try:
