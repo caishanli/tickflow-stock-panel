@@ -60,7 +60,7 @@ export function QuantSim() {
   const pauseMut = useMutation({ mutationFn: () => api.pauseAccount(sel!), onSuccess: invalidate })
   const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: invalidate })
   const deleteMut = useMutation({
-    mutationFn: () => api.deleteAccount(sel!),
+    mutationFn: (id: string) => api.deleteAccount(id),
     onSuccess: () => { setView('list'); setSel(null); invalidate() },
   })
   const createMut = useMutation({
@@ -79,6 +79,7 @@ export function QuantSim() {
           strategyName={strategyName}
           onNew={() => setDialog(true)}
           onOpen={openDetail}
+          onDelete={(id) => { if (window.confirm('确定删除该模拟账户？此操作不可恢复。')) deleteMut.mutate(id) }}
         />
       ) : (
         <SimDetail
@@ -101,11 +102,12 @@ export function QuantSim() {
 // 列表视图
 // ---------------------------------------------------------------------------
 
-function SimList({ accounts, strategyName, onNew, onOpen }: {
+function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
   accounts: any[]
   strategyName: (id: string) => string
   onNew: () => void
   onOpen: (id: string) => void
+  onDelete: (id: string) => void
 }) {
   return (
     <div className="flex-1 overflow-auto p-4 space-y-3">
@@ -131,6 +133,7 @@ function SimList({ accounts, strategyName, onNew, onOpen }: {
                 <th className="px-3 py-2.5 font-normal">状态</th>
                 <th className="px-3 py-2.5 font-normal text-right">净值</th>
                 <th className="px-3 py-2.5 font-normal text-right">收益率</th>
+                <th className="px-3 py-2.5 font-normal text-right w-16"></th>
               </tr>
             </thead>
             <tbody className="text-foreground">
@@ -138,20 +141,27 @@ function SimList({ accounts, strategyName, onNew, onOpen }: {
                 const ret = typeof a.net_value === 'number' && a.capital
                   ? a.net_value / a.capital - 1 : null
                 return (
-                  <tr key={a.id} onClick={() => onOpen(a.id)}
-                    className="border-t border-border/60 hover:bg-elevated/60 cursor-pointer">
+                  <tr key={a.id}
+                    className="border-t border-border/60 hover:bg-elevated/60">
                     <td className="px-3 py-2.5 text-muted">{i + 1}</td>
-                    <td className="px-3 py-2.5 text-muted font-mono">{a.id}</td>
-                    <td className="px-3 py-2.5">{a.name}</td>
-                    <td className="px-3 py-2.5 text-muted">{strategyName(a.strategy_id)}</td>
-                    <td className="px-3 py-2.5 text-muted">{a.start_date || '—'}</td>
-                    <td className="px-3 py-2.5 text-muted">{FREQ_LABEL[a.frequency] ?? a.frequency ?? '分钟级'}</td>
-                    <td className={`px-3 py-2.5 ${statusTone(a.status)}`}>
+                    <td className="px-3 py-2.5 text-muted font-mono cursor-pointer" onClick={() => onOpen(a.id)}>{a.id}</td>
+                    <td className="px-3 py-2.5 cursor-pointer" onClick={() => onOpen(a.id)}>{a.name}</td>
+                    <td className="px-3 py-2.5 text-muted cursor-pointer" onClick={() => onOpen(a.id)}>{strategyName(a.strategy_id)}</td>
+                    <td className="px-3 py-2.5 text-muted cursor-pointer" onClick={() => onOpen(a.id)}>{a.start_date || '—'}</td>
+                    <td className="px-3 py-2.5 text-muted cursor-pointer" onClick={() => onOpen(a.id)}>{FREQ_LABEL[a.frequency] ?? a.frequency ?? '分钟级'}</td>
+                    <td className={`px-3 py-2.5 cursor-pointer ${statusTone(a.status)}`} onClick={() => onOpen(a.id)}>
                       {STATUS_LABEL[a.status] ?? a.status}
                     </td>
-                    <td className="px-3 py-2.5 text-right num">{fmtNum(a.net_value)}</td>
-                    <td className={`px-3 py-2.5 text-right num ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>
+                    <td className="px-3 py-2.5 text-right num cursor-pointer" onClick={() => onOpen(a.id)}>{fmtNum(a.net_value)}</td>
+                    <td className={`px-3 py-2.5 text-right num cursor-pointer ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
                       {fmtPct(ret)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right">
+                      <button onClick={(e) => { e.stopPropagation(); if (window.confirm(`确定删除「${a.name}」？`)) onDelete(a.id) }}
+                        className="p-1 rounded hover:bg-bear/10 text-muted hover:text-bear transition-colors"
+                        title="删除">
+                        <Trash2 size={13} />
+                      </button>
                     </td>
                   </tr>
                 )
@@ -366,7 +376,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
             <RotateCcw size={13} />重置
           </button>
-          <button onClick={() => { if (window.confirm('确定删除该模拟账户？此操作不可恢复。')) deleteMut.mutate() }}
+          <button onClick={() => { if (window.confirm('确定删除该模拟账户？此操作不可恢复。')) deleteMut.mutate(aid) }}
             disabled={deleteMut.isPending}
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-bear/10 text-bear text-xs disabled:opacity-50 hover:bg-bear/20">
             <Trash2 size={13} />删除
