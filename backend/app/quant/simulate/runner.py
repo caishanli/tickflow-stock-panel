@@ -500,6 +500,37 @@ def _flush_replay_batch(account_id: str, aux: dict) -> None:
         _db.batch_insert_logs(logs)
 
 
+def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
+                        state: dict, aux: dict, from_ts: datetime.datetime) -> None:
+    """补跑同一天内从 from_ts 到当前时间的分钟 bar（盘中重启场景）。"""
+    _replay_active_ids.add(account_id)
+    try:
+        aux["replay_mode"] = True
+        aux["batch_snapshots"] = []
+        aux["batch_trades"] = []
+        aux["batch_logs"] = []
+        today = datetime.date.today()
+        _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
+                    datetime.datetime.combine(today, datetime.time(9, 25)), aux)
+        now = datetime.datetime.now()
+        _emit_log(account_id, "info",
+                  f"补跑今日 {from_ts.strftime('%H:%M')} ~ {now.strftime('%H:%M')}")
+        for bar in _session_minutes(today):
+            if bar <= from_ts:
+                continue
+            if bar > now:
+                break
+            if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
+                continue
+            _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+        _emit_log(account_id, "info",
+                  f"日内补跑完成，净值 {state.get('net_value', 0):.2f}")
+    finally:
+        _flush_replay_batch(account_id, aux)
+        aux.pop("replay_mode", None)
+        _replay_active_ids.discard(account_id)
+
+
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
     """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
@@ -643,19 +674,31 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     _emit_log(account_id, "info",
               f"策略模拟盘启动: {sid} 资金 {start_cash}{'（恢复续跑）' if has_saved else ''}"
               f"{(' 起始日期 ' + start_date) if start_date else ''}")
-    # 补跑逻辑：无存档从 start_date 补跑；有存档但 dt 早于今天也要补跑缺失天数
-    today_str = str(datetime.date.today())
+    # 补跑逻辑：无存档从 start_date 补跑；有存档但 dt 早于当前时间也要补跑缺失数据
+    now = datetime.datetime.now()
+    today_str = str(now.date())
     replay_from = None
+    replay_partial = False  # True = 需要补跑今天内缺失的分钟
     if has_saved:
         saved_dt = state.get("dt")
         if saved_dt:
-            saved_day = str(saved_dt)[:10]
-            if saved_day < today_str:
-                replay_from = saved_day
+            try:
+                saved_ts = datetime.datetime.fromisoformat(str(saved_dt))
+            except (ValueError, TypeError):
+                saved_ts = None
+            if saved_ts and saved_ts < now:
+                if saved_ts.date() == now.date():
+                    # 同一天但时间更早：需要补跑今天内缺失的分钟
+                    replay_partial = True
+                else:
+                    # 不同天：补跑完整天
+                    replay_from = str(saved_ts)[:10]
     elif start_date and start_date < today_str:
         replay_from = start_date
     if replay_from:
         _replay_history(account_id, bundle, ctx, dm, matcher, state, aux, replay_from)
+    elif replay_partial:
+        _replay_partial_day(account_id, bundle, ctx, dm, matcher, state, aux, saved_ts)
     hooks_done: dict[str, str | None] = {"pre": None, "eod": None}
     trading_day: tuple[str, bool] | None = None  # (today_str, bool) 每日缓存一次
     try:
