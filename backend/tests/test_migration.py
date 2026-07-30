@@ -75,3 +75,10 @@ class TestMigration:
         result = conn.execute("SELECT count(*) FROM instruments").fetchone()
         assert result[0] == 2
         conn.close()
+
+    def test_migrate_empty_dir(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = tmp_path / "stock.duckdb"
+        migrate_parquet_to_duckdb(data_dir, db_path)
+        assert db_path.exists()
