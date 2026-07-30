@@ -68,197 +68,50 @@ class QuantDataProvider:
         if cached is not None:
             return cached
 
-        # 1) DuckDB 有就直接读
-        tf = self.sources.get("tickflow")
-        if tf is not None:
+        # 按优先级遍历: tickflow(DuckDB) → mootdx → astock
+        for name in self.priority:
+            src = self.sources.get(name)
+            if src is None:
+                continue
             try:
-                df = tf.get_daily(code, start, end)
+                df = src.get_daily(code, start, end)
                 if df is not None and not df.empty:
                     self.cache.put(key, df)
                     return df
             except Exception as e:
-                log.warning("[QuantDataProvider] tickflow 日线失败 %s: %s", code, e)
-
-        # 2) DuckDB 没有, mootdx 回源并落盘
-        mx = self.sources.get("mootdx")
-        if mx is not None:
-            try:
-                df = mx.get_daily(code, start, end)
-                if df is not None and not df.empty:
-                    self._persist_daily_to_duckdb(code, df)
-                    self.cache.put(key, df)
-                    return df
-            except Exception as e:
-                log.warning("[QuantDataProvider] mootdx 日线失败 %s: %s", code, e)
-
-        # 3) 都没有, 尝试 astock
-        ast = self.sources.get("astock")
-        if ast is not None:
-            try:
-                df = ast.get_daily(code, start, end)
-                if df is not None and not df.empty:
-                    self.cache.put(key, df)
-                    return df
-            except Exception as e:
-                log.warning("[QuantDataProvider] astock 日线失败 %s: %s", code, e)
+                log.warning("[QuantDataProvider] %s 日线失败 %s: %s", name, code, e)
 
         raise RuntimeError(
             f"[QuantDataProvider] 日线数据获取失败 {code}: "
             f"所有数据源均无数据"
         )
 
-    def _persist_daily_to_duckdb(self, code: str, df) -> None:
-        """mootdx 回源日线数据落盘 DuckDB。"""
-        import logging
-        try:
-            import polars as pl
-            pldf = pl.from_pandas(df)
-            sym = code.split(".")[0]
-            if "symbol" not in pldf.columns:
-                pldf = pldf.with_columns(pl.lit(sym).alias("symbol"))
-            if "date" in pldf.columns:
-                pldf = pldf.with_columns(pl.col("date").cast(pl.Date))
-            keep = [c for c in ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-                    if c in pldf.columns]
-            pldf = pldf.select(keep)
-            tf = self.sources.get("tickflow")
-            if tf is not None and hasattr(tf, "_repo"):
-                tf._repo._upsert_daily(pldf, "kline_daily")
-        except Exception as e:
-            logging.getLogger(__name__).warning("[QuantDataProvider] 日线落盘失败 %s: %s", code, e)
-
     def get_minute(self, code, date):
         import logging
         log = logging.getLogger(__name__)
 
-        # 1) DuckDB 有就直接读
-        tf = self.sources.get("tickflow")
-        if tf is not None:
+        # 按优先级遍历: tickflow(DuckDB) → mootdx
+        for name in self.priority:
+            src = self.sources.get(name)
+            if src is None:
+                continue
             try:
-                df = tf.get_minute(code, date)
+                df = src.get_minute(code, date)
                 if df is not None and not df.empty:
                     return df
             except Exception as e:
-                log.warning("[QuantDataProvider] tickflow 分钟数据失败 %s: %s", code, e)
+                log.warning("[QuantDataProvider] %s 分钟数据失败 %s: %s", name, code, e)
 
-        # 2) DuckDB 没有, mootdx 回源并落盘
-        mx = self.sources.get("mootdx")
-        if mx is not None:
-            try:
-                df = mx.get_minute(code, date)
-                if df is not None and not df.empty:
-                    self._persist_minute_to_duckdb(code, date, df)
-                    return df
-            except Exception as e:
-                log.warning("[QuantDataProvider] mootdx 分钟数据失败 %s: %s", code, e)
-
-        # 3) 都没有, 返回错误
         raise RuntimeError(
             f"[QuantDataProvider] 持仓 {code} 分钟数据获取失败: "
-            f"DuckDB 和 mootdx 均无数据"
+            f"所有数据源均无数据"
         )
 
-    def _persist_minute_to_duckdb(self, code: str, date, df) -> None:
-        """mootdx 回源数据落盘 DuckDB, 供后续读取。"""
-        import logging
-        try:
-            import polars as pl
-            pldf = pl.from_pandas(df)
-            sym = code.split(".")[0]
-            if "symbol" not in pldf.columns:
-                pldf = pldf.with_columns(pl.lit(sym).alias("symbol"))
-            keep = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-                    if c in pldf.columns]
-            pldf = pldf.select(keep)
-            tf = self.sources.get("tickflow")
-            if tf is not None and hasattr(tf, "_repo"):
-                tf._repo._upsert_daily(pldf, "kline_minute")
-        except Exception as e:
-            logging.getLogger(__name__).warning("[QuantDataProvider] 分钟数据落盘失败 %s: %s", code, e)
-
     def get_stock_list(self):
-        import logging
-        log = logging.getLogger(__name__)
-
-        # 1) DuckDB 有就直接读
-        tf = self.sources.get("tickflow")
-        if tf is not None:
-            try:
-                df = tf.get_stock_list()
-                if df is not None and len(df) > 0:
-                    return df
-            except Exception as e:
-                log.warning("[QuantDataProvider] tickflow 股票列表失败: %s", e)
-
-        # 2) DuckDB 没有, TickFlow API 回源并落盘
-        if tf is not None and hasattr(tf, "_repo"):
-            try:
-                from app.tickflow.client import get_client
-                client = get_client()
-                if client is not None:
-                    symbols = []
-                    for ex in ["SZ", "SH"]:
-                        try:
-                            items = client.exchanges.get_instruments(ex, instrument_type="stock")
-                            for it in items or []:
-                                sym = (it if isinstance(it, dict) else {}).get("symbol")
-                                if sym:
-                                    symbols.append(str(sym))
-                        except Exception:
-                            continue
-                    if symbols:
-                        import polars as pl
-                        df = pl.DataFrame({"symbol": symbols})
-                        tf._repo.save_instruments(df)
-                        log.info("[QuantDataProvider] 股票列表从TickFlow API回源: %d 只", len(symbols))
-                        return symbols
-            except Exception as e:
-                log.warning("[QuantDataProvider] TickFlow API 股票列表失败: %s", e)
-
-        # 3) 都没有
-        raise RuntimeError("[QuantDataProvider] 股票列表获取失败: 所有数据源均无数据")
+        return self._fetch_noarg("get_stock_list")
 
     def get_etf_list(self):
-        import logging
-        log = logging.getLogger(__name__)
-
-        # 1) DuckDB 有就直接读
-        tf = self.sources.get("tickflow")
-        if tf is not None:
-            try:
-                df = tf.get_etf_list()
-                if df is not None and len(df) > 0:
-                    return df
-            except Exception as e:
-                log.warning("[QuantDataProvider] tickflow ETF列表失败: %s", e)
-
-        # 2) DuckDB 没有, TickFlow API 回源并落盘
-        if tf is not None and hasattr(tf, "_repo"):
-            try:
-                from app.tickflow.client import get_client
-                client = get_client()
-                if client is not None:
-                    symbols = []
-                    for ex in ["SZ", "SH"]:
-                        try:
-                            items = client.exchanges.get_instruments(ex, instrument_type="etf")
-                            for it in items or []:
-                                sym = (it if isinstance(it, dict) else {}).get("symbol")
-                                if sym:
-                                    symbols.append(str(sym))
-                        except Exception:
-                            continue
-                    if symbols:
-                        import polars as pl
-                        df = pl.DataFrame({"symbol": symbols})
-                        tf._repo.save_etf_instruments(df)
-                        log.info("[QuantDataProvider] ETF列表从TickFlow API回源: %d 只", len(symbols))
-                        return symbols
-            except Exception as e:
-                log.warning("[QuantDataProvider] TickFlow API ETF列表失败: %s", e)
-
-        # 3) 都没有
-        raise RuntimeError("[QuantDataProvider] ETF列表获取失败: 所有数据源均无数据")
+        return self._fetch_noarg("get_etf_list")
 
     def _fetch_noarg(self, method):
         last = None
@@ -272,6 +125,5 @@ class QuantDataProvider:
                 last = e
                 continue
             except TypeError:
-                # 部分源的方法签名不带 code 参数，直接无参调用即可
                 continue
         raise last or DataSourceError(f"所有数据源均不可用: {method}")
