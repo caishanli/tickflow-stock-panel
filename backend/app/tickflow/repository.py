@@ -1819,9 +1819,7 @@ class KlineRepository:
 
             sql = f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})"
             data = [tuple(row) for row in df.iter_rows()]
-
-            with self._lock:
-                self.db.executemany(sql, data)
+            self.db.executemany(sql, data)
 
     def _update_enriched_cache(self, asset_type: str, df: pl.DataFrame) -> None:
         """Update in-memory enriched cache after write."""
@@ -2020,7 +2018,7 @@ class KlineRepository:
 
     def merge_live_daily_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """Merge live daily data for specific asset type."""
-        if df.is_empty():
+        if df.is_empty() or "date" not in df.columns:
             return
         table = {
             "stock": "kline_daily",
@@ -2050,7 +2048,7 @@ class KlineRepository:
 
     def merge_live_enriched_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """Merge live enriched data for specific asset type."""
-        if df.is_empty():
+        if df.is_empty() or "date" not in df.columns:
             return
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         df_storage = df.select([c for c in ENRICHED_STORAGE_COLS if c in df.columns])
@@ -2066,7 +2064,7 @@ class KlineRepository:
 
     def flush_live_daily(self, df: pl.DataFrame) -> None:
         """Flush today's daily K data (full overwrite for today)."""
-        if df.is_empty():
+        if df.is_empty() or "date" not in df.columns:
             return
         self._upsert_daily(df, "kline_daily")
         self._bump_matrix_data_generation("stock")
