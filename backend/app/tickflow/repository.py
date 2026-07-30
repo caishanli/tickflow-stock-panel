@@ -632,13 +632,7 @@ class KlineRepository:
         self._etf_symbol_set_cache = None
 
     def _refresh_enriched(self) -> None:
-        """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。
-
-        enriched parquet 仅存 14 列基础数据。启动时读入历史数据并即时计算完整指标，
-        将结果缓存在内存中供各服务使用。
-
-        优化: 扩大历史读取范围, 同时缓存完整历史 (含指标), 供 filter_history 策略直接复用。
-        """
+        """从 DuckDB 加载 enriched 最新日到内存 + 构建聚合表。"""
         try:
             started = time.perf_counter()
             logger.info("enriched refresh start")
@@ -648,31 +642,20 @@ class KlineRepository:
             latest = self._latest_enriched_date_duckdb()
             logger.info("enriched refresh step done: latest date=%s (%.2fs)", latest, time.perf_counter() - step)
             if not latest:
-                # 磁盘已无数据: 必须清空内存缓存, 否则旧数据会残留
-                # (清数据后看板仍显示旧数据的根因)
                 self.clear_cache()
                 logger.info("enriched refresh skipped: no latest date (%.2fs)", time.perf_counter() - started)
                 return
 
-            # Step 1: 直接读最新日期的分区文件 (仅 14 列)
-            enriched_dir = self.store.data_dir / "kline_daily_enriched"
-            ds = latest.isoformat() if hasattr(latest, "isoformat") else str(latest)
-            target_parquet = enriched_dir / f"date={ds}" / "part.parquet"
-
-            if not target_parquet.exists():
-                logger.info("enriched refresh skipped: %s not found (%.2fs)", target_parquet, time.perf_counter() - started)
-                return
-
             step = time.perf_counter()
-            logger.info("enriched refresh step start: read latest parquet %s", target_parquet)
-            df_latest = pl.read_parquet(target_parquet)
-            logger.info("enriched refresh step done: read latest parquet rows=%d (%.2fs)", len(df_latest), time.perf_counter() - step)
+            logger.info("enriched refresh step start: read latest from DuckDB")
+            df_latest = self.db.execute(
+                "SELECT * FROM kline_daily_enriched WHERE date = ?", [latest]
+            ).pl()
+            logger.info("enriched refresh step done: read latest rows=%d (%.2fs)", len(df_latest), time.perf_counter() - step)
             if df_latest.is_empty():
-                logger.info("enriched refresh skipped: latest parquet empty (%.2fs)", time.perf_counter() - started)
+                logger.info("enriched refresh skipped: latest DuckDB empty (%.2fs)", time.perf_counter() - started)
                 return
 
-            # Step 2: 读近 300 天 14 列数据 → compute → filter(latest) → 缓存
-            # 300 日历天 ≈ 210 交易日, 覆盖 filter_history 最大 lookback(90) + warmup(60)
             try:
                 from datetime import timedelta
                 from app.indicators.pipeline import compute_indicators, compute_signals, compute_limit_signals
@@ -680,15 +663,13 @@ class KlineRepository:
                 read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
                                          "volume", "amount", "raw_close", "raw_high", "raw_low"]
                              if c in df_latest.columns]
-                lf = (
-                    scan_enriched_parquet(self._enriched_glob)
-                    .filter(pl.col("date") >= start_full)
-                    .sort(["symbol", "date"])
-                )
-
+                select_cols = ", ".join(read_cols)
                 step = time.perf_counter()
                 logger.info("enriched refresh step start: collect history from %s", start_full)
-                df_hist = lf.select(read_cols).collect()
+                df_hist = self.db.execute(
+                    f"SELECT {select_cols} FROM kline_daily_enriched WHERE date >= ? ORDER BY symbol, date",
+                    [start_full],
+                ).pl()
                 logger.info("enriched refresh step done: collect history rows=%d (%.2fs)", len(df_hist), time.perf_counter() - step)
                 if not df_hist.is_empty():
                     instruments = self._instruments_cache if self._instruments_cache is not None else pl.DataFrame()
@@ -807,7 +788,7 @@ class KlineRepository:
                 df_hist = pl.DataFrame()
                 agg_a = pl.DataFrame()
         else:
-            # 降级: 读 parquet + compute_indicators
+            # 降级: 从 DuckDB 读取 + compute_indicators
             df_hist, agg_a = self._build_live_agg_from_parquet(latest, start_60d)
 
         if df_hist.is_empty():
@@ -885,21 +866,25 @@ class KlineRepository:
         agg_a = agg_a.join(df_vol, on="symbol", how="left")
         logger.info("live agg step done: annual vol state (%.2fs)", time.perf_counter() - step)
 
-        # 昨日连板数: 从 enriched parquet 取 (用于增量计算同向 +1)
+        # 昨日连板数: 从 DuckDB enriched 表取 (用于增量计算同向 +1)
         step = time.perf_counter()
         logger.info("live agg step start: consecutive state")
-        lf = scan_enriched_parquet(self._enriched_glob).filter(pl.col("date") == latest)
-        consec_cols = [c for c in ["symbol", "consecutive_limit_ups", "consecutive_limit_downs"]
-                       if c in lf.collect_schema().names()]
-        if len(consec_cols) == 3:
-            consec_df = lf.select(consec_cols).collect()
-            if not consec_df.is_empty():
+        try:
+            consec_df = self.db.execute(
+                "SELECT symbol, consecutive_limit_ups, consecutive_limit_downs "
+                "FROM kline_daily_enriched WHERE date = ?", [latest]
+            ).pl()
+            consec_cols = [c for c in ["symbol", "consecutive_limit_ups", "consecutive_limit_downs"]
+                           if c in consec_df.columns]
+            if len(consec_cols) == 3:
                 consec = consec_df.select(
                     "symbol",
                     pl.col("consecutive_limit_ups").alias("_prev_consec_up"),
                     pl.col("consecutive_limit_downs").alias("_prev_consec_down"),
                 )
                 agg_a = agg_a.join(consec, on="symbol", how="left")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("consecutive state read skipped: %s", e)
         logger.info("live agg step done: consecutive state (%.2fs)", time.perf_counter() - step)
 
         # B类: 按 symbol 分组聚合 — 窗口统计
@@ -961,20 +946,14 @@ class KlineRepository:
         return latest
 
     def _build_live_agg_from_parquet(self, latest: date, start_60d: date) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """降级路径: 从 parquet 读取数据并计算指标 (当 _enriched_history_cache 不可用时)。"""
+        """降级路径: 从 DuckDB 读取数据并计算指标 (当 _enriched_history_cache 不可用时)。"""
         from app.indicators.pipeline import compute_indicators
 
-        lf = (
-            scan_enriched_parquet(self._enriched_glob)
-            .filter(pl.col("date") >= start_60d)
-            .filter(pl.col("date") <= latest)
-            .sort(["symbol", "date"])
-        )
-
-        read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close", "volume",
-                                 "raw_close", "raw_high", "raw_low"]
-                     if c in lf.collect_schema().names()]
-        df_hist = lf.select(read_cols).collect()
+        read_cols = "symbol, date, open, high, low, close, volume, raw_close, raw_high, raw_low"
+        df_hist = self.db.execute(
+            f"SELECT {read_cols} FROM kline_daily_enriched WHERE date >= ? AND date <= ? ORDER BY symbol, date",
+            [start_60d, latest],
+        ).pl()
 
         if df_hist.is_empty():
             return df_hist, pl.DataFrame()
@@ -996,20 +975,18 @@ class KlineRepository:
         return df_hist, agg_a
 
     def _refresh_etf_enriched(self) -> None:
-        """从 ETF enriched parquet 加载最新日到内存缓存。"""
+        """从 DuckDB ETF enriched 表加载最新日到内存缓存。"""
         try:
-            enriched_dir = self.store.data_dir / "kline_etf_enriched"
-            dates = sorted(
-                p.name[5:] for p in enriched_dir.glob("date=*")
-                if p.is_dir() and p.name.startswith("date=")
-            ) if enriched_dir.exists() else []
-            if not dates:
+            result = self.db.execute("SELECT max(date) FROM kline_etf_enriched").fetchone()
+            if not result or not result[0]:
                 self._etf_enriched_cache = None
                 self._etf_enriched_cache_date = None
                 return
-            latest = date.fromisoformat(dates[-1])
-            target_parquet = enriched_dir / f"date={dates[-1]}" / "part.parquet"
-            df_latest = pl.read_parquet(target_parquet)
+            latest = result[0]
+
+            df_latest = self.db.execute(
+                "SELECT * FROM kline_etf_enriched WHERE date = ?", [latest]
+            ).pl()
             if df_latest.is_empty():
                 return
 
@@ -1019,14 +996,11 @@ class KlineRepository:
             read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
                                      "volume", "amount", "raw_close", "raw_high", "raw_low"]
                          if c in df_latest.columns]
-            df_hist = (
-                scan_enriched_parquet(self._etf_enriched_glob,
-                                cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
-                .filter(pl.col("date") >= start_full)
-                .select(read_cols)
-                .sort(["symbol", "date"])
-                .collect()
-            )
+            select_cols = ", ".join(read_cols)
+            df_hist = self.db.execute(
+                f"SELECT {select_cols} FROM kline_etf_enriched WHERE date >= ? ORDER BY symbol, date",
+                [start_full],
+            ).pl()
             if df_hist.is_empty():
                 self._etf_enriched_cache = df_latest.sort(["symbol"])
             else:
