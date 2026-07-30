@@ -1123,18 +1123,20 @@ def run_pipeline(data_dir: Path | None = None,
                 historical_shares=historical_shares,
             )
 
-            # 只保留新日期的行
-            new_date_set = set()
-            for nd in new_date_dirs:
-                ds = nd.stem.split("=")[1]
-                new_date_set.add(ds)
-            enriched_new = enriched_new.filter(
-                pl.col("date").map_elements(lambda x: x.isoformat(), return_dtype=pl.Utf8).is_in(list(new_date_set))
-            )
+            # Parquet path: only keep rows for new dates (DuckDB path already filtered raw_new)
+            if repo is None:
+                new_date_set = set()
+                for nd in new_date_dirs:
+                    ds = nd.stem.split("=")[1]
+                    new_date_set.add(ds)
+                enriched_new = enriched_new.filter(
+                    pl.col("date").map_elements(lambda x: x.isoformat(), return_dtype=pl.Utf8).is_in(list(new_date_set))
+                )
 
             t_new = _t.perf_counter()
+            n_new = len(new_date_dirs) if repo is None else enriched_new["date"].n_unique()
             logger.info("增量计算: %d 个新日期, %d 行, 耗时 %.2fs",
-                        len(new_date_dirs), enriched_new.height, t_new - t0)
+                        n_new, enriched_new.height, t_new - t0)
 
             if not enriched_new.is_empty():
                 for date_df in enriched_new.partition_by("date"):
