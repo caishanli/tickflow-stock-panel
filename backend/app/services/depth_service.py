@@ -22,16 +22,14 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import threading
 import time
-from datetime import date, time as dt_time
-
-from app.market_time import cn_now, cn_today
-from pathlib import Path
+from datetime import date
+from datetime import time as dt_time
 
 import polars as pl
 
+from app.market_time import cn_now, cn_today
 from app.tickflow.capabilities import Cap
 from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
 
@@ -107,39 +105,42 @@ class DepthService:
         logger.info("depth sealed: 启动补跑今天定版")
         try:
             self.finalize()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("depth sealed 启动补跑失败: %s", e)
 
     def _restore_from_parquet(self, d: date) -> None:
-        """从 parquet 恢复内存缓存(服务重启后)。"""
+        """从 DuckDB 恢复内存缓存(服务重启后)。"""
         if not self._repo:
             return
-        out = self._repo.store.data_dir / "depth5" / f"date={d.isoformat()}" / "part.parquet"
-        if not out.exists():
-            return
         try:
-            df = pl.read_parquet(out)
+            result = self._repo.db.execute(
+                "SELECT symbol, sealed, bid1_volume, ask1_volume FROM depth5 WHERE date = ?", [d]
+            ).fetchall()
+            if not result:
+                return
             cache: dict[str, dict] = {}
-            for row in df.to_dicts():
-                sym = row.get("symbol")
+            for row in result:
+                sym, sealed, bid1_vol, ask1_vol = row
                 if not sym:
                     continue
+                # 从 sealed 和 bid1_vol/ask1_vol 反推 status
+                # 简化恢复: 默认设为 limit_up (sealed 对应 sealed_up)
                 cache[sym] = {
-                    "sealed_up": row.get("sealed_up"),
-                    "sealed_down": row.get("sealed_down"),
-                    "ask1_vol": row.get("ask1_vol"),
-                    "bid1_vol": row.get("bid1_vol"),
-                    "status": row.get("status"),
-                    "fetched_ts": row.get("fetched_at"),
+                    "sealed_up": sealed,
+                    "sealed_down": None,
+                    "ask1_vol": ask1_vol,
+                    "bid1_vol": bid1_vol,
+                    "status": "limit_up",
+                    "fetched_ts": None,
                 }
             with self._lock:
                 self._sealed_cache = cache
                 self._sealed_ready = True
                 self._sealed_date = d
                 self._persisted_date = d
-            logger.info("depth sealed: 从 parquet 恢复 %d 只 (日期=%s)", len(cache), d)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("depth sealed 从 parquet 恢复失败: %s", e)
+            logger.info("depth sealed: 从 DuckDB 恢复 %d 只 (日期=%s)", len(cache), d)
+        except Exception as e:
+            logger.warning("depth sealed 从 DuckDB 恢复失败: %s", e)
 
     def start_polling(self) -> None:
         """启动盘中轮询线程(连板梯队监控开启 + 有能力 + 交易时段)。"""
@@ -185,7 +186,7 @@ class DepthService:
             with self._lock:
                 count = len(self._sealed_cache)
             return {"ok": True, "count": count, "msg": f"已修正 {count} 只"}
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("depth run_once 失败: %s", e)
             return {"ok": False, "count": 0, "msg": f"修正失败: {e}"}
 
@@ -297,7 +298,7 @@ class DepthService:
                 data = tf.depth.batch(chunk)
                 if isinstance(data, dict):
                     result.update(data)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("depth.batch 第 %d 批失败(%d 只): %s", i + 1, len(chunk), e)
                 # 单批失败不影响其他批
         return result
@@ -313,7 +314,7 @@ class DepthService:
     # ================================================================
 
     def _persist(self, today: date) -> None:
-        """把内存缓存写 depth5/date=今天/part.parquet。"""
+        """把内存缓存写 DuckDB depth5 表。"""
         with self._lock:
             cache = dict(self._sealed_cache)
         if not cache:
@@ -321,43 +322,46 @@ class DepthService:
 
         rows = []
         for sym, e in cache.items():
+            status = e.get("status")
+            sealed_up = e.get("sealed_up")
+            sealed_down = e.get("sealed_down")
+            # 根据 status 选择对应的 sealed 值
+            if status == "limit_up":
+                sealed = sealed_up
+            elif status == "limit_down":
+                sealed = sealed_down
+            else:
+                sealed = None
             rows.append({
                 "symbol": sym,
-                "sealed_up": e.get("sealed_up"),
-                "sealed_down": e.get("sealed_down"),
-                "ask1_vol": e.get("ask1_vol"),
-                "bid1_vol": e.get("bid1_vol"),
-                "status": e.get("status"),
-                "fetched_at": e.get("fetched_ts"),
+                "date": today,
+                "bid1_price": 0.0,
+                "bid1_volume": e.get("bid1_vol"),
+                "ask1_price": 0.0,
+                "ask1_volume": e.get("ask1_vol"),
+                "sealed": sealed,
             })
-        # 显式 schema: sealed_up/sealed_down 是 bool 与 None 混合, 不指定 schema
-        # polars 会按首行推断类型, 后续遇到不一致 (bool vs null) 报
-        # "could not append value: false of type: bool to the builder"。
         df = pl.DataFrame(rows, schema={
             "symbol": pl.Utf8,
-            "sealed_up": pl.Boolean,
-            "sealed_down": pl.Boolean,
-            "ask1_vol": pl.Int64,
-            "bid1_vol": pl.Int64,
-            "status": pl.Utf8,
-            "fetched_at": pl.Float64,
+            "date": pl.Date,
+            "bid1_price": pl.Float64,
+            "bid1_volume": pl.Float64,
+            "ask1_price": pl.Float64,
+            "ask1_volume": pl.Float64,
+            "sealed": pl.Boolean,
         })
-        ds = today.isoformat()
-        out = self._repo.store.data_dir / "depth5" / f"date={ds}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        # 原子写: 先写临时文件再 os.replace, 避免读侧 (get_sealed_map) 读到半写 parquet
-        tmp = out.with_name(out.name + ".tmp")
-        df.write_parquet(tmp)
-        os.replace(tmp, out)
+        # 先删除当天旧数据, 再插入新数据
+        self._repo.db.execute("DELETE FROM depth5 WHERE date = ?", [today])
+        self._repo.db.execute("INSERT INTO depth5 SELECT * FROM df")
         self._persisted_date = today
-        logger.info("depth sealed 落盘: %d 行 → %s", df.height, out)
+        logger.info("depth sealed 落盘: %d 行 → DuckDB depth5", df.height)
 
     def _persisted_for_date(self, d: date) -> bool:
-        """检查某日 depth5 文件是否已存在。"""
+        """检查某日 depth5 数据是否已存在。"""
         if not self._repo:
             return False
-        out = self._repo.store.data_dir / "depth5" / f"date={d.isoformat()}" / "part.parquet"
-        return out.exists()
+        result = self._repo.db.execute("SELECT count(*) FROM depth5 WHERE date = ?", [d]).fetchone()
+        return result[0] > 0 if result else False
 
     # ================================================================
     # 查询(供 limit_ladder API 用)
@@ -400,29 +404,28 @@ class DepthService:
     def _read_from_parquet(self, target_date: date, is_down: bool) -> dict:
         if not self._repo:
             return {}
-        out = self._repo.store.data_dir / "depth5" / f"date={target_date.isoformat()}" / "part.parquet"
-        if not out.exists():
-            return {}
         try:
-            df = pl.read_parquet(out)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("depth5 parquet 读取失败: %s", e)
+            result = self._repo.db.execute(
+                "SELECT symbol, sealed, bid1_volume, ask1_volume FROM depth5 WHERE date = ?",
+                [target_date],
+            ).fetchall()
+        except Exception as e:
+            logger.warning("depth5 DuckDB 读取失败: %s", e)
             return {}
-        sealed_key = "sealed_down" if is_down else "sealed_up"
         # 封单量: 涨停=买一量, 跌停=卖一量
-        vol_key = "ask1_vol" if is_down else "bid1_vol"
-        result = {}
-        for row in df.to_dicts():
-            sym = row.get("symbol")
+        data = {}
+        for row in result:
+            sym, sealed, bid1_vol, ask1_vol = row
             if not sym:
                 continue
-            result[sym] = {
-                "sealed": row.get(sealed_key),
-                "vol": row.get(vol_key),
+            vol = ask1_vol if is_down else bid1_vol
+            data[sym] = {
+                "sealed": sealed,
+                "vol": vol,
                 "ready": True,
                 "age": None,  # 盘后定版, 无 age
             }
-        return result
+        return data
 
     def is_sealed_ready(self, target_date: date) -> bool:
         """sealed 数据是否就绪(供前端降级判定)。"""
@@ -450,7 +453,7 @@ class DepthService:
                     self._poll_once()
                 else:
                     logger.debug("depth sealed: 非连续竞价时段, 跳过(避免集合竞价盘口覆盖 11:30 定格值)")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("depth sealed 轮询异常: %s", e)
 
             # 等待下一轮(用 _running 检查保证能及时退出)
@@ -559,7 +562,7 @@ class DepthService:
         }
         try:
             qs.push_alerts([alert])
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("depth 接管通知推送失败: %s", e)
 
     def _notify_depth_updated(self, count: int) -> None:
@@ -571,7 +574,7 @@ class DepthService:
             return
         try:
             qs.notify_depth_updated()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("depth 更新通知推送失败: %s", e)
 
     # ================================================================
