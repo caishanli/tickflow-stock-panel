@@ -9,6 +9,7 @@ import pytest
 
 from app.tickflow.repository import DataStore, KlineRepository
 from app.quant.datasource.tickflow_src import TickflowSource
+from app.quant.datasource.base import DataSourceError
 
 
 @pytest.fixture
@@ -57,9 +58,6 @@ class TestQuantTickFlowSourceDuckDB:
 
     def test_reads_minute_from_duckdb(self, setup_duckdb: Path) -> None:
         src = TickflowSource(db_path=setup_duckdb)
-        # get_minute may return empty if no minute data, but should not raise
-        try:
-            df = src.get_minute("000001.XSHE", "2026-01-15")
-            assert df is not None
-        except Exception:
-            pass  # No minute data is acceptable
+        # get_minute should raise DataSourceError when no minute data is available
+        with pytest.raises(DataSourceError):
+            src.get_minute("000001.XSHE", "2026-01-15")

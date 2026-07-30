@@ -1045,8 +1045,8 @@ class KlineRepository:
                 self._instruments_cache = df
                 logger.info("instruments 缓存已加载 (DuckDB): %d 只", len(df))
                 return
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("DuckDB instruments read failed, falling back to Parquet: %s", e)
         try:
             # 回退到 Parquet
             df = pl.scan_parquet(self._inst_glob).collect()
@@ -1615,8 +1615,8 @@ class KlineRepository:
             df = lf.collect()
             if not df.is_empty():
                 return df
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Parquet daily read failed for %s, falling back to DuckDB: %s", symbol, e)
         # 回退到 DuckDB 读取
         try:
             sql = "SELECT * FROM kline_daily WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date"
