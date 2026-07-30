@@ -88,7 +88,7 @@ def run_instruments_sync(repo: KlineRepository) -> dict:
     维表含当日涨跌停价 (limit_up/down), 同步完成后刷新 enriched 内存缓存,
     确保跨天后连板梯队/选股等读到的是基于最新维表的数据 (而非前一交易日残留)。
     """
-    rows = instrument_sync.sync_instruments(repo.store.data_dir)
+    rows = instrument_sync.sync_instruments(repo)
     _refresh_instruments_view(repo)
     _invalidate("instruments")
     # 维表更新后重建 enriched 缓存 (clear + refresh, 与设置页「清理并刷新」同等效果)
@@ -120,7 +120,7 @@ def run_now(
 
     # Step 0: 先同步个股维表, 再解析标的池 — 确保标的池基于最新 instruments
     emit("sync_instruments", 2, "同步个股维表…")
-    inst_rows = instrument_sync.sync_instruments(repo.store.data_dir)
+    inst_rows = instrument_sync.sync_instruments(repo)
     if inst_rows > 0:
         _refresh_instruments_view(repo)
     emit("sync_instruments", 8, f"个股维表同步完成,{inst_rows} 只标的")

@@ -1,19 +1,19 @@
 """标的维表同步服务。
 
 盘前 9:10 调用 tf.exchanges.get_instruments("SH"/"SZ"/"BJ", type="stock")
-获取全量标的元数据，flatten ext 字段，写入 instruments.parquet。
+获取全量标的元数据，flatten ext 字段，写入 DuckDB instruments 表。
 
 Starter+ 盘后可用 quotes.get(universes) 顺便补充 name。
 """
 from __future__ import annotations
 
 import logging
-from datetime import date
 from pathlib import Path
 
 import polars as pl
 
 from app.tickflow.client import get_client
+from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +71,8 @@ def _fetch_instruments_via_provider() -> list[dict] | None:
     return rows
 
 
-def sync_instruments(data_dir: Path) -> int:
-    """全量同步标的维表 → data/instruments/instruments.parquet。
+def sync_instruments(repo: KlineRepository) -> int:
+    """全量同步标的维表 → DuckDB instruments 表。
 
     返回写入的行数。
     """
@@ -94,13 +94,28 @@ def sync_instruments(data_dir: Path) -> int:
         return 0
 
     df = pl.DataFrame(all_rows)
-    df = df.with_columns(pl.lit(date.today()).alias("as_of"))
 
-    out = data_dir / "instruments" / "instruments.parquet"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(out)
+    # Map flattened columns to DuckDB table schema
+    # _flatten_instruments produces: type, listing_date
+    # DuckDB table expects: asset_type, list_date
+    rename_map = {}
+    if "type" in df.columns and "asset_type" not in df.columns:
+        rename_map["type"] = "asset_type"
+    if "listing_date" in df.columns and "list_date" not in df.columns:
+        rename_map["listing_date"] = "list_date"
+    if rename_map:
+        df = df.rename(rename_map)
 
-    logger.info("instruments synced: %d rows → %s", df.height, out)
+    # Select only columns that exist in the DuckDB table
+    target_cols = ["symbol", "name", "exchange", "asset_type", "list_date",
+                   "total_shares", "float_shares"]
+    existing = [c for c in target_cols if c in df.columns]
+    df = df.select(existing)
+
+    repo.db.execute("DELETE FROM instruments")
+    repo.db.execute("INSERT INTO instruments SELECT * FROM df")
+
+    logger.info("instruments synced: %d rows → DuckDB", df.height)
     return df.height
 
 
