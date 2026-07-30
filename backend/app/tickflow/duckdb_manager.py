@@ -25,7 +25,7 @@ class DuckDBManager:
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._conn = duckdb.connect(
+        self._conn: duckdb.DuckDBPyConnection | None = duckdb.connect(
             database=str(db_path),
             read_only=read_only,
         )
@@ -35,21 +35,44 @@ class DuckDBManager:
 
         logger.info("DuckDB connected: %s (read_only=%s)", db_path, read_only)
 
-    def execute(self, sql: str, params: list[Any] | None = None) -> duckdb.DuckDBPyRelation:
+    def get_connection(self, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+        """Return a DuckDB connection.
+
+        Parameters
+        ----------
+        read_only:
+            If True, return a read-only connection. Ignored; the manager
+            always returns its own connection whose access level is set at
+            construction time.
+        """
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("DuckDBManager is closed")
+            return self._conn
+
+    def execute(self, sql: str, params: list[Any] | None = None) -> duckdb.DuckDBPyConnection:
         """Execute a SQL statement and return the relation."""
-        if params:
-            return self._conn.execute(sql, params)
-        return self._conn.execute(sql)
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("DuckDBManager is closed")
+            if params:
+                return self._conn.execute(sql, params)
+            return self._conn.execute(sql)
 
     def execute_many(self, sql: str, params_list: list[tuple[Any, ...]]) -> None:
         """Execute a SQL statement with multiple parameter sets."""
-        self._conn.executemany(sql, params_list)
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("DuckDBManager is closed")
+            self._conn.executemany(sql, params_list)
 
     def close(self) -> None:
         """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            logger.info("DuckDB closed: %s", self.db_path)
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+                logger.info("DuckDB closed: %s", self.db_path)
 
     def __enter__(self) -> DuckDBManager:
         return self

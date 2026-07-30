@@ -1,8 +1,6 @@
 """Tests for DuckDB connection manager."""
 from __future__ import annotations
 
-import os
-import tempfile
 from pathlib import Path
 
 import duckdb
@@ -52,7 +50,7 @@ class TestDuckDBManager:
         result = read_mgr.execute("SELECT * FROM test").fetchall()
         assert result == [(1,)]
 
-        with pytest.raises(Exception):
+        with pytest.raises(duckdb.InvalidInputException):
             read_mgr.execute("INSERT INTO test VALUES (2)")
 
         read_mgr.close()
