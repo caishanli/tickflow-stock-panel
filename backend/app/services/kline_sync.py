@@ -25,20 +25,6 @@ from app.tickflow.repository import KlineRepository
 logger = logging.getLogger(__name__)
 
 
-def _atomic_write_parquet(df: pl.DataFrame, out) -> None:
-    """先写临时文件再原子替换, 避免进程中断留下损坏的 parquet。
-
-    与 repository._atomic_write_parquet 同语义。adj_factor 的 all.parquet 是全市场
-    单文件、每次「读→concat→原地写」, 直接 write_parquet(out) 在进程被 kill
-    (dev.sh 清端口用 kill -9)、reap 超时或断电时会留下半截文件, 之后复权视图
-    scan_parquet 整条链路报错、enriched 全市场重算不出。临时文件后缀 .tmp 不匹配
-    *.parquet glob, 不会被扫描误读。
-    """
-    tmp = out.with_name(out.name + ".tmp")
-    df.write_parquet(tmp)
-    tmp.replace(out)  # 同目录 rename, POSIX/NTFS 均为原子操作
-
-
 # 标准列(无论 SDK 返回什么形状,我们把它规范成这套)
 CANONICAL_DAILY_COLS = [
     "symbol", "date", "open", "high", "low", "close", "volume", "amount",
@@ -493,7 +479,9 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
         else:
             day_df = day_df.drop("_trade_date")
         day_df = day_df.sort("symbol", "datetime")
-        _atomic_write_parquet(day_df, out)
+        tmp = out.with_name(out.name + ".tmp")
+        day_df.write_parquet(tmp)
+        tmp.replace(out)
         written += day_df.height
     return written
 
@@ -944,7 +932,9 @@ def _migrate_symbol_to_date_partition(repo: KlineRepository) -> None:
         out = minute_dir / f"date={trade_date}" / "part.parquet"
         out.parent.mkdir(parents=True, exist_ok=True)
         day_df = day_df.drop("_trade_date").sort("symbol", "datetime")
-        _atomic_write_parquet(day_df, out)
+        tmp = out.with_name(out.name + ".tmp")
+        day_df.write_parquet(tmp)
+        tmp.replace(out)
 
     # 删旧目录
     for d in old_dirs:

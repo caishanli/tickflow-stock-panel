@@ -1057,13 +1057,22 @@ class KlineRepository:
             logger.warning("instruments 缓存刷新失败: %s", e)
 
     def _refresh_index_instruments(self) -> None:
-        """加载指数 instruments 到内存。"""
+        """加载指数 instruments 到内存。优先从 DuckDB 读取，回退到 Parquet。"""
+        try:
+            df = self.db.execute("SELECT * FROM instruments_index").pl()
+            if not df.is_empty():
+                self._index_instruments_cache = df
+                self._index_symbol_set_cache = None
+                logger.info("index instruments 缓存已加载 (DuckDB): %d 只", len(df))
+                return
+        except Exception as e:  # noqa: BLE001
+            logger.debug("DuckDB instruments_index read failed, falling back to Parquet: %s", e)
         try:
             df = pl.scan_parquet(self._index_inst_glob).collect()
             if not df.is_empty():
                 self._index_instruments_cache = df
                 self._index_symbol_set_cache = None
-                logger.info("index instruments 缓存已加载: %d 只", len(df))
+                logger.info("index instruments 缓存已加载 (Parquet): %d 只", len(df))
         except Exception as e:  # noqa: BLE001
             logger.debug("index instruments 缓存刷新跳过: %s", e)
 
@@ -1071,11 +1080,17 @@ class KlineRepository:
         """加载 ETF instruments 到内存；兼容旧版 instruments_index 中的 ETF。"""
         parts: list[pl.DataFrame] = []
         try:
-            df = pl.scan_parquet(self._etf_inst_glob).collect()
+            df = self.db.execute("SELECT * FROM instruments_etf").pl()
             if not df.is_empty():
                 parts.append(df)
         except Exception as e:  # noqa: BLE001
-            logger.debug("etf instruments 缓存刷新跳过(new): %s", e)
+            logger.debug("DuckDB instruments_etf read failed, falling back to Parquet: %s", e)
+            try:
+                df = pl.scan_parquet(self._etf_inst_glob).collect()
+                if not df.is_empty():
+                    parts.append(df)
+            except Exception as e2:  # noqa: BLE001
+                logger.debug("etf instruments 缓存刷新跳过(new): %s", e2)
         try:
             legacy = self.get_index_instruments()
             if not legacy.is_empty() and "asset_type" in legacy.columns:
@@ -1912,7 +1927,7 @@ class KlineRepository:
         """按日分区写入指数日K数据 (merge-upsert)。"""
         if df.is_empty():
             return
-        self._write_daily_partition(df, "kline_index_daily")
+        self._upsert_daily(df, "kline_index_daily")
 
     def append_index_enriched(self, df: pl.DataFrame) -> None:
         """按日分区写入指数 enriched 数据。磁盘仅写入通用基础行情窄表。"""
@@ -1921,13 +1936,13 @@ class KlineRepository:
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
         df_storage = df.select(storage_cols)
-        self._write_daily_partition(df_storage, "kline_index_enriched")
+        self._upsert_daily(df_storage, "kline_index_enriched")
 
     def append_etf_daily(self, df: pl.DataFrame) -> None:
         """按日分区写入 ETF 日K数据 (merge-upsert)。"""
         if df.is_empty():
             return
-        self._write_daily_partition(df, "kline_etf_daily")
+        self._upsert_daily(df, "kline_etf_daily")
 
     def append_etf_enriched(self, df: pl.DataFrame) -> None:
         """按日分区写入 ETF enriched 数据。磁盘仅写入基础行情窄表。"""
@@ -1936,7 +1951,7 @@ class KlineRepository:
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
         df_storage = df.select(storage_cols)
-        self._write_daily_partition(df_storage, "kline_etf_enriched")
+        self._upsert_daily(df_storage, "kline_etf_enriched")
 
     def append_daily_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """按资产类型写入日K；stock/index 保持旧目录兼容。"""
@@ -1969,9 +1984,14 @@ class KlineRepository:
         """保存指数标的维表。"""
         if df.is_empty() or "symbol" not in df.columns:
             return
-        out = self.store.data_dir / "instruments_index" / "instruments_index.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write_parquet(df.unique(subset=["symbol"], keep="last").sort("symbol"), out)
+        df = df.unique(subset=["symbol"], keep="last").sort("symbol")
+        cols = df.columns
+        placeholders = ", ".join(["?"] * len(cols))
+        col_names = ", ".join(cols)
+        sql = f"INSERT OR REPLACE INTO instruments_index ({col_names}) VALUES ({placeholders})"
+        data = [tuple(row) for row in df.iter_rows()]
+        with self._write_lock:
+            self.db.executemany(sql, data)
         self._index_instruments_cache = None
         self._etf_instruments_cache = None
         self._refresh_index_instruments()
@@ -1982,9 +2002,14 @@ class KlineRepository:
             return
         if "asset_type" not in df.columns:
             df = df.with_columns(pl.lit("etf").alias("asset_type"))
-        out = self.store.data_dir / "instruments_etf" / "instruments_etf.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write_parquet(df.unique(subset=["symbol"], keep="last").sort("symbol"), out)
+        df = df.unique(subset=["symbol"], keep="last").sort("symbol")
+        cols = df.columns
+        placeholders = ", ".join(["?"] * len(cols))
+        col_names = ", ".join(cols)
+        sql = f"INSERT OR REPLACE INTO instruments_etf ({col_names}) VALUES ({placeholders})"
+        data = [tuple(row) for row in df.iter_rows()]
+        with self._write_lock:
+            self.db.executemany(sql, data)
         self._etf_instruments_cache = None
         self._refresh_etf_instruments()
 
@@ -2049,40 +2074,7 @@ class KlineRepository:
         with self._lock:
             self.store._register_unified_views()
 
-    @staticmethod
-    def _atomic_write_parquet(df: pl.DataFrame, out: Path) -> None:
-        """先写临时文件再原子替换, 避免进程中断留下损坏的 parquet。
 
-        直接 write_parquet(out) 在进程被 kill (dev.sh 清端口用 kill -9)
-        或断电时会留下半截文件, 之后 scan_parquet glob 整条链路报错。
-        临时文件后缀 .tmp 不匹配 *.parquet glob, 不会被扫描误读。
-        """
-        tmp = out.with_name(out.name + ".tmp")
-        df.write_parquet(tmp)
-        tmp.replace(out)  # 同目录 rename, POSIX/NTFS 均为原子操作
-
-    def _write_daily_partition(self, df: pl.DataFrame, table: str) -> None:
-        """按 date 分区写入 parquet，每个日期一个文件，支持 merge-upsert。"""
-        base = self.store.data_dir / table
-        with self._write_lock:
-            for date_df in df.partition_by("date"):
-                dt = date_df["date"][0]
-                ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-                out = base / f"date={ds}" / "part.parquet"
-                out.parent.mkdir(parents=True, exist_ok=True)
-                if out.exists():
-                    existing = pl.read_parquet(out)
-                    date_df = pl.concat([existing, date_df], how="diagonal_relaxed").unique(
-                        subset=["symbol", "date"], keep="last"
-                    )
-                date_df = date_df.sort(["symbol", "date"])
-                self._atomic_write_parquet(date_df, out)
-        generation_asset = {
-            "kline_daily_enriched": "stock",
-            "kline_etf_enriched": "etf",
-        }.get(table)
-        if generation_asset is not None:
-            self._bump_matrix_data_generation(generation_asset)
 
     def merge_live_daily_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """Merge live daily data for specific asset type."""
@@ -2146,15 +2138,8 @@ class KlineRepository:
             "index": "kline_index_daily",
             "etf": "kline_etf_daily",
         }.get(asset_type)
-        if not table:
-            return
-        base = self.store.data_dir / table
-        dt = df["date"][0]
-        ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-        out = base / f"date={ds}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with self._write_lock:
-            self._atomic_write_parquet(df.sort(["symbol", "date"]), out)
+        if table:
+            self._upsert_daily(df, table)
 
     def flush_live_enriched(self, df: pl.DataFrame) -> None:
         """Flush today's enriched data (full overwrite for today)."""
@@ -2174,24 +2159,19 @@ class KlineRepository:
         if asset_type == "stock":
             self._enriched_cache = cache_df
             self._enriched_cache_date = dt
-            table = "kline_daily_enriched"
         elif asset_type == "etf":
             self._etf_enriched_cache = cache_df
             self._etf_enriched_cache_date = dt
-            table = "kline_etf_enriched"
-        elif asset_type == "index":
-            table = "kline_index_enriched"
-        else:
-            return
 
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
-        df_storage = df.select(storage_cols).sort(["symbol"])
-        base = self.store.data_dir / table
-        ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-        out = base / f"date={ds}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with self._write_lock:
-            self._atomic_write_parquet(df_storage, out)
+        df_storage = df.select(storage_cols)
+        table = {
+            "stock": "kline_daily_enriched",
+            "index": "kline_index_enriched",
+            "etf": "kline_etf_enriched",
+        }.get(asset_type)
+        if table:
+            self._upsert_daily(df_storage, table)
         if asset_type in {"stock", "etf"}:
             self._bump_matrix_data_generation(asset_type)
