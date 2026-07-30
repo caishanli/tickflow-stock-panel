@@ -104,21 +104,45 @@ fi
 
 # ===== 4. 启动 + 日志前缀 =====
 PIDS=()
+RUNNING=1
 
 cleanup() {
+  RUNNING=0
   echo
   info "关闭服务..."
+  # 先向子进程发 TERM
   for pid in "${PIDS[@]:-}"; do
-    if [ -n "$pid" ]; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
   done
-  # 等子进程退出,避免孤儿
-  wait 2>/dev/null || true
+  # 等子进程退出，最多等5秒
+  local waited=0
+  while [ $waited -lt 5 ]; do
+    local alive=0
+    for pid in "${PIDS[@]:-}"; do
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    [ $alive -eq 0 ] && break
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  # 还活着就强杀
+  for pid in "${PIDS[@]:-}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      warn "PID $pid 未响应 TERM，强制 KILL"
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
   ok "已退出"
   exit 0
 }
-trap cleanup INT TERM
+
+# 捕获 INT / TERM / HUP，统一走 cleanup
+trap cleanup INT TERM HUP
 
 # 用 awk 加前缀(macOS sed 没有 -u line-buffered,改用 awk + fflush 兼容)
 prefix_awk() {
@@ -150,11 +174,20 @@ PIDS+=("$!")
 ) &
 PIDS+=("$!")
 
-# 等任一退出(bash 4.3+)或全部退出(老 bash)
-if wait -n 2>/dev/null; then
-  warn "其中一个进程退出,正在关闭另一个..."
-  cleanup
-else
-  # 老 bash 没有 wait -n,退化为 wait 全部
-  wait
-fi
+# 用轮询代替 wait，避免 bash 兼容性问题导致卡死
+while [ "$RUNNING" -eq 1 ]; do
+  alive=0
+  for pid in "${PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive=$((alive + 1))
+    fi
+  done
+  if [ "$alive" -eq 0 ]; then
+    warn "所有子进程已退出"
+    cleanup
+  elif [ "$alive" -lt "${#PIDS[@]}" ]; then
+    warn "其中一个进程退出，正在关闭另一个..."
+    cleanup
+  fi
+  sleep 1
+done

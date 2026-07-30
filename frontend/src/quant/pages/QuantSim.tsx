@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
+import { toast } from '@/components/Toast'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Plus, Play, Square, RotateCcw, Bell, Trash2 } from 'lucide-react'
 import * as api from '../api'
@@ -144,7 +145,27 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
                   <tr key={a.id}
                     className="border-t border-border/60 hover:bg-elevated/60">
                     <td className="px-3 py-2.5 text-muted">{i + 1}</td>
-                    <td className="px-3 py-2.5 text-muted font-mono cursor-pointer" onClick={() => onOpen(a.id)}>{a.id}</td>
+                    <td className="px-3 py-2.5 text-muted font-mono" onClick={(e) => {
+                      const target = e.target as HTMLElement
+                      if (target.closest('.copy-id')) return
+                      onOpen(a.id)
+                    }}>
+                      <span className="copy-id inline-flex items-center gap-1 cursor-pointer hover:text-accent transition-colors"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          const ta = document.createElement('textarea')
+                          ta.value = a.id
+                          ta.style.position = 'fixed'
+                          ta.style.left = '-9999px'
+                          document.body.appendChild(ta)
+                          ta.select()
+                          try { document.execCommand('copy'); toast('已复制', 'success', 'top') }
+                          catch { toast('复制失败', 'error') }
+                          document.body.removeChild(ta)
+                        }}>
+                        {a.id}
+                      </span>
+                    </td>
                     <td className="px-3 py-2.5 cursor-pointer" onClick={() => onOpen(a.id)}>{a.name}</td>
                     <td className="px-3 py-2.5 text-muted cursor-pointer" onClick={() => onOpen(a.id)}>{strategyName(a.strategy_id)}</td>
                     <td className="px-3 py-2.5 text-muted cursor-pointer" onClick={() => onOpen(a.id)}>{a.start_date || '—'}</td>

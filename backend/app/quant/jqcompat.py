@@ -343,7 +343,10 @@ def get_all_securities(types=None, date=None):
             "type": "index" if is_idx else "etf",
         })
     df = pd.DataFrame(rows)
-    if not df.empty:
+    if df.empty:
+        df = pd.DataFrame(columns=["display_name", "name", "start_date", "end_date", "type"])
+        df.index.name = "order_book_id"
+    else:
         df = df.set_index("order_book_id")
     return df
 

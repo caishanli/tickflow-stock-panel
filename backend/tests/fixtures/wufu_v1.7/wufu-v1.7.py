@@ -310,7 +310,7 @@ def initialize(context):
     g.r2_dyn_switch_count = 0
 
     # ==================== H78a 走弱期 R² 过滤（方案B：保留 MA + R² 双过滤）====================
-    g.enable_weak_r2_filter = True
+    g.enable_weak_r2_filter = False  # v1.8: 走弱期禁用R²过滤，与v5.2对齐（走弱期动量得分更重要）
 
     set_benchmark("510300.XSHG")
     run_daily(morning_routine, time='09:00')
@@ -1483,6 +1483,24 @@ def compute_regime_p0_daily(context):
     )
 
 
+def _check_weak_condition_for_date(target_date):
+    """检查某一天是否满足走弱条件（3/4指数低于MA10），用于向前回溯预热。"""
+    indexes = ['000300.XSHG', '399101.XSHE', '399006.XSHE', '000510.XSHG']
+    below_count = 0
+    for code in indexes:
+        df = attribute_history(code, g.weak_period_ma_lookback + 5, '1d', ['close'], skip_paused=False)
+        if df is None or len(df) < g.weak_period_ma_lookback + 2:
+            continue
+        df = df[df.index.map(lambda x: x.date() if hasattr(x, 'date') else x) <= target_date]
+        if len(df) < g.weak_period_ma_lookback:
+            continue
+        current_price = df['close'].iloc[-1]
+        ma_val = df['close'].iloc[-g.weak_period_ma_lookback:].mean()
+        if current_price < ma_val:
+            below_count += 1
+    return below_count >= 3
+
+
 def check_a_share_weak_period(context):
     today = context.current_dt.date()
     indexes = {
@@ -1491,7 +1509,26 @@ def check_a_share_weak_period(context):
         '创业板': '399006.XSHE',
         '中证A500': '000510.XSHG'
     }
-    
+
+    # v1.7: 首次运行时向前回溯2天预热 streak，避免回测起始日影响走弱期判定
+    cd = int(getattr(g, 'weak_confirm_days', 2))
+    if not g.is_a_share_weak and getattr(g, 'weak_enter_streak', 0) == 0:
+        try:
+            trade_dates = get_trade_days(end_date=today, count=cd + 1)
+            _to_date = lambda x: x.date() if hasattr(x, 'date') else x
+            past_dates = [_to_date(d) for d in trade_dates if _to_date(d) < today][-cd:]
+            prefill = 0
+            for pd_date in past_dates:
+                if _check_weak_condition_for_date(pd_date):
+                    prefill += 1
+                else:
+                    break
+            if prefill > 0:
+                g.weak_enter_streak = prefill
+                log.info(f"📊 【走弱期预热】向前回溯{cd}天，其中连续{prefill}天满足走弱条件，streak预热为{prefill}/{cd}")
+        except Exception:
+            pass
+
     above_count = 0
     below_count = 0
     for name, code in indexes.items():
@@ -1521,7 +1558,6 @@ def check_a_share_weak_period(context):
     max_days_exceeded = (g.weak_days_count >= g.max_weak_days)
     
     # v1.2: 延迟确认机制 —— 连续N天满足条件才切换，避免单日噪声
-    cd = int(getattr(g, 'weak_confirm_days', 2))
     if weak_condition_met:
         g.weak_enter_streak = getattr(g, 'weak_enter_streak', 0) + 1
     else:

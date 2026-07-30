@@ -104,21 +104,37 @@ class DataCache:
         return True
 
     def _is_stale(self, df, stale_days=1):
-        """Check if DataFrame's latest date is older than stale_days from today."""
+        """Check if DataFrame is missing recent trading days.
+
+        Uses weekday counting to approximate trading day gaps (ignoring
+        holidays).  If the gap between ``last_date`` and today contains
+        zero weekdays (pure weekend), the data is never considered stale.
+        Otherwise it is stale when the weekday gap exceeds ``stale_days``.
+        """
         if hasattr(df, "empty") and df.empty:
             return False
         try:
+            today = pd.Timestamp.now().normalize().date()
+            last_date = None
             for col in ("trade_date", "date"):
                 if col in df.columns:
                     last_date = pd.Timestamp(df[col].max()).date()
-                    return (
-                        pd.Timestamp.now().normalize().date() - last_date
-                    ).days > stale_days
-            if isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+                    break
+            if last_date is None and isinstance(getattr(df, "index", None), pd.DatetimeIndex):
                 last_date = df.index.max().date()
-                return (
-                    pd.Timestamp.now().normalize().date() - last_date
-                ).days > stale_days
+            if last_date is None:
+                return False
+            gap = (today - last_date).days
+            if gap <= 1:
+                return False
+            from datetime import timedelta
+            weekday_count = sum(
+                1 for i in range(1, gap + 1)
+                if (last_date + timedelta(days=i)).weekday() < 5
+            )
+            if weekday_count == 0:
+                return False
+            return weekday_count > stale_days
         except Exception:
             pass
         return False
@@ -126,22 +142,33 @@ class DataCache:
     def get(self, freq, code, loader, start=None, end=None):
         """命中缓存返回 DataFrame；未命中或覆盖不足时调用 loader 取数并写盘。
 
-        关键修复：不再对“本地有但不完整”的缓存瞪一只眼，覆盖不足即视为失效、
-        回源补齐，避免回测使用被冻结的过期数据。
-
-        当 freq=daily 时，额外检查数据末端距今是否超过 STALE_DAYS
-        天（默认1，确保日线始终为最新交易日），超过则视为过期并回源。
+        逻辑：
+        - 先查本地缓存（peek），如果覆盖请求区间且不是"需要回源刷新"→直接返回。
+        - 回源刷新条件（need_refetch）：
+          a) 本地无缓存（df is None / empty）
+          b) 本地不覆盖请求区间（_covers returns False）
+          c) 实时/当日请求（end >= 今天）且数据过期（_is_stale）
+        - 历史回源请求（end < 今天）不做 _is_stale 检查，直接用本地缓存。
         """
-        stale_days = 1
+        today = pd.Timestamp.now().normalize().date()
         df = self.peek(freq, code)
-        if (df is not None and self._covers(df, start, end)
-                and not (freq == "daily"
-                         and self._is_stale(df, stale_days))):
+        covers = df is not None and not (hasattr(df, "empty") and df.empty) and self._covers(df, start, end)
+        # 实时请求：end 为今天或未来时才检查过期
+        is_live = False
+        if end is not None:
+            try:
+                end_date = pd.Timestamp(end).date() if not isinstance(end, (pd.Timestamp,)) else end.date()
+                is_live = end_date >= today
+            except Exception:
+                is_live = True
+        stale = freq == "daily" and is_live and df is not None and self._is_stale(df)
+        if covers and not stale:
             return df
         need_refetch = (
             df is None
             or (hasattr(df, "empty") and df.empty)
-            or (freq == "daily" and self._is_stale(df, stale_days))
+            or not covers
+            or stale
         )
         if need_refetch:
             fresh = loader()
