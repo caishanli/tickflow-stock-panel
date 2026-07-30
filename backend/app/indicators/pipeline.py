@@ -1297,6 +1297,62 @@ def run_pipeline(data_dir: Path | None = None,
     return written
 
 
+def run_enriched_pipeline(repo: 'KlineRepository', full: bool = False) -> None:
+    """Run enriched pipeline and write results to DuckDB.
+
+    Args:
+        repo: KlineRepository instance with DuckDB connection
+        full: If True, recompute all data; if False, only compute new dates
+    """
+    from app.tickflow.repository import KlineRepository
+
+    # Read daily data from DuckDB
+    daily_df = repo._scan_daily("kline_daily")
+    if daily_df.is_empty():
+        logger.info("No daily data found, skipping enriched pipeline")
+        return
+
+    # Load instruments for limit signals and turnover rate
+    instruments = pl.DataFrame()
+    try:
+        instruments = repo._scan_daily("instruments")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Failed to load instruments: %s", e)
+
+    # Load historical shares for turnover rate calculation
+    from app.share_capital import load_share_history
+    historical_shares = load_share_history(repo.store.data_dir)
+
+    # Load adjustment factors for forward adjustment
+    factor_path = repo.store.data_dir / "adj_factor" / "all.parquet"
+    factors = pl.DataFrame()
+    if factor_path.exists():
+        try:
+            factors = pl.read_parquet(factor_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to load adjustment factors: %s", e)
+
+    # Compute enriched data
+    enriched_df = compute_enriched(
+        daily_df,
+        factors=factors,
+        instruments=instruments,
+        historical_shares=historical_shares,
+    )
+
+    if enriched_df.is_empty():
+        logger.info("Enriched computation resulted in empty DataFrame")
+        return
+
+    # Strip to storage columns
+    df_storage = enriched_df.select([c for c in ENRICHED_STORAGE_COLS if c in enriched_df.columns])
+
+    # Write to DuckDB
+    repo._upsert_daily(df_storage, "kline_daily_enriched")
+
+    logger.info("Enriched pipeline completed: %d rows written to DuckDB", df_storage.height)
+
+
 def _load_factors(factor_path: Path) -> pl.DataFrame:
     """加载复权因子文件。"""
     if not factor_path.exists():
