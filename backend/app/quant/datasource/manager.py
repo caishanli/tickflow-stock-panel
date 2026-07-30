@@ -71,17 +71,19 @@ class QuantDataProvider:
 
     def get_minute(self, code, date):
         import logging
-        src = self.sources.get("mootdx")
-        if src is not None:
+        for name in self.priority:
+            src = self.sources.get(name)
+            if src is None:
+                continue
             try:
-                df = src.get_minute(code)
+                df = src.get_minute(code, date)
                 if df is not None and not df.empty:
                     return df
             except Exception as e:
-                logging.warning("[QuantDataProvider] mootdx获取分钟数据失败 %s: %s", code, e)
+                logging.warning("[QuantDataProvider] %s 分钟数据失败 %s: %s", name, code, e)
         raise RuntimeError(
             f"[QuantDataProvider] 持仓 {code} 分钟数据获取失败: "
-            f"mootdx 返回空或异常"
+            f"所有数据源均返回空或异常"
         )
 
     def get_stock_list(self):

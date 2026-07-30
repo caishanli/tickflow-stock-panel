@@ -73,9 +73,10 @@ def fetch_one_symbol(client, code: str) -> pl.DataFrame | None:
             df["volume"] = df["vol"]
         if "amount" in df.columns and "money" not in df.columns:
             df["money"] = df["amount"]
+        df.index.name = "datetime"
+        if "datetime" in df.columns:
+            df = df.drop(columns=["datetime"])
         pdf = df.reset_index()
-        if "datetime" in pdf.columns:
-            pdf = pdf.drop(columns=["datetime"])
         frames.append(pl.from_pandas(pdf))
         if len(df) < PAGE_SIZE:
             break
@@ -106,13 +107,9 @@ class BackfillWorker(threading.Thread):
 
     def run(self) -> None:
         try:
-            import pytdx.hq as _pytdx_hq
             from mootdx.quotes import Quotes
 
             c = Quotes.factory(market="std", server=self._server)
-            px = _pytdx_hq.TdxHq_API()
-            px.connect(self._server[0], self._server[1], time_out=10)
-            c.client = px
         except Exception as e:
             logger.warning("Worker 连接失败 %s: %s", self._server, e)
             return
@@ -134,6 +131,30 @@ class BackfillWorker(threading.Thread):
                     logger.info("进度: %d/%d", self._counter[0], self._total)
 
 
+def _fetch_symbols_from_tickflow(asset_type: str) -> list[str]:
+    """从 TickFlow API 获取标的列表 (instruments 表为空时的 fallback)。"""
+    try:
+        from app.tickflow.client import get_client
+        tf = get_client()
+        if tf is None:
+            return []
+        exchanges = ["SZ", "SH"]
+        symbols: list[str] = []
+        for ex in exchanges:
+            try:
+                items = tf.exchanges.get_instruments(ex, instrument_type=asset_type)
+                for it in items or []:
+                    sym = (it if isinstance(it, dict) else {}).get("symbol")
+                    if sym:
+                        symbols.append(str(sym))
+            except Exception:
+                continue
+        logger.info("TickFlow API 获取 %s 标的: %d 只", asset_type, len(symbols))
+        return symbols
+    except Exception:
+        return []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="历史分钟K补全 (mootdx)")
     parser.add_argument("--workers", type=int, default=8, help="并发线程数 (默认8)")
@@ -152,10 +173,14 @@ def main() -> None:
         etf = repo.get_etf_instruments()
         if not etf.is_empty() and "symbol" in etf.columns:
             symbols.extend(etf["symbol"].cast(pl.Utf8).to_list())
+        else:
+            symbols.extend(_fetch_symbols_from_tickflow("etf"))
     if args.asset in ("stock", "all"):
         inst = repo.get_instruments()
         if not inst.is_empty() and "symbol" in inst.columns:
             symbols.extend(inst["symbol"].cast(pl.Utf8).to_list())
+        else:
+            symbols.extend(_fetch_symbols_from_tickflow("stock"))
     symbols = sorted(set(symbols))
     if not symbols:
         logger.error("无标的可补全")
