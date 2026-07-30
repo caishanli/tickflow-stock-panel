@@ -50,6 +50,18 @@ class TestKlineSyncDuckDB:
         result = repo.db.execute("SELECT count(*) FROM adj_factor_etf").fetchone()
         assert result[0] == 1
 
+    def test_append_adj_factor_ex_factor_rename(self, repo: KlineRepository) -> None:
+        df = pl.DataFrame({
+            "symbol": ["000001", "000001"],
+            "trade_date": [date(2026, 1, 15), date(2026, 1, 16)],
+            "ex_factor": [1.0, 1.05],
+        })
+        repo.append_adj_factor(df, asset_type="stock")
+        result = repo.db.execute("SELECT count(*) FROM adj_factor").fetchone()
+        assert result[0] == 2
+        rows = repo.db.execute("SELECT adj_factor FROM adj_factor ORDER BY trade_date").fetchall()
+        assert [r[0] for r in rows] == [1.0, 1.05]
+
     def test_normalize_adj_factor(self) -> None:
         raw = {
             "000001": [

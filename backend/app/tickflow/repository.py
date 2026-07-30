@@ -1927,6 +1927,8 @@ class KlineRepository:
         """Append adj_factor data to DuckDB (merge-upsert by symbol+trade_date)."""
         if df.is_empty():
             return
+        if "ex_factor" in df.columns and "adj_factor" not in df.columns:
+            df = df.rename({"ex_factor": "adj_factor"})
         table = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
         self._upsert_daily(df, table)
 
