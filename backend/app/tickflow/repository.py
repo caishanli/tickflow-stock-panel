@@ -26,7 +26,7 @@ import duckdb
 import polars as pl
 
 from app.config import settings
-from app.parquet import scan_enriched_parquet
+
 
 logger = logging.getLogger(__name__)
 
@@ -1591,81 +1591,55 @@ class KlineRepository:
 
     def _scan_daily_symbol(self, symbol: str, start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
         try:
-            lf = scan_enriched_parquet(self._enriched_glob,
-                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol") == symbol)
-                & (pl.col("date") >= start)
-                & (pl.col("date") <= end)
-            ).sort("date")
-            if columns:
-                schema_names = lf.collect_schema().names()
-                existing = [c for c in columns if c in schema_names]
-                lf = lf.select(existing)
-            df = lf.collect()
-            if not df.is_empty():
-                return df
-        except Exception as e:  # noqa: BLE001
-            logger.debug("Parquet daily read failed for %s, falling back to DuckDB: %s", symbol, e)
-        # 回退到 DuckDB 读取
-        try:
-            sql = "SELECT * FROM kline_daily WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date"
+            sql = "SELECT * FROM kline_daily_enriched WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date"
             params = [symbol, start, end]
             df = self.db.execute(sql, params).pl()
             if columns and not df.is_empty():
                 existing = [c for c in columns if c in df.columns]
                 df = df.select(existing)
             return df
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("日K查询失败: %s", e)
             return pl.DataFrame()
 
     def _scan_daily_batch(self, symbols: list[str], start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
         try:
-            lf = scan_enriched_parquet(self._enriched_glob,
-                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol").is_in(symbols))
-                & (pl.col("date") >= start)
-                & (pl.col("date") <= end)
-            ).sort(["symbol", "date"])
-            if columns:
-                schema_names = lf.collect_schema().names()
-                existing = [c for c in columns if c in schema_names]
-                lf = lf.select(existing)
-            return lf.collect()
+            if not symbols:
+                return pl.DataFrame()
+            sym_placeholders = ", ".join(["?"] * len(symbols))
+            sql = f"SELECT * FROM kline_daily_enriched WHERE symbol IN ({sym_placeholders}) AND date >= ? AND date <= ? ORDER BY symbol, date"
+            params = [*symbols, start, end]
+            df = self.db.execute(sql, params).pl()
+            if columns and not df.is_empty():
+                existing = [c for c in columns if c in df.columns]
+                df = df.select(existing)
+            return df
         except Exception as e:  # noqa: BLE001
             logger.warning("日K批量查询失败: %s", e)
             return pl.DataFrame()
 
     def _scan_index_daily_symbol(self, symbol: str, start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
         try:
-            lf = scan_enriched_parquet(self._index_enriched_glob,
-                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol") == symbol)
-                & (pl.col("date") >= start)
-                & (pl.col("date") <= end)
-            ).sort("date")
-            if columns:
-                schema_names = lf.collect_schema().names()
-                existing = [c for c in columns if c in schema_names]
-                lf = lf.select(existing)
-            return lf.collect()
+            sql = "SELECT * FROM kline_index_enriched WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date"
+            params = [symbol, start, end]
+            df = self.db.execute(sql, params).pl()
+            if columns and not df.is_empty():
+                existing = [c for c in columns if c in df.columns]
+                df = df.select(existing)
+            return df
         except Exception as e:  # noqa: BLE001
             logger.warning("指数日K查询失败: %s", e)
             return pl.DataFrame()
 
     def _scan_etf_daily_symbol(self, symbol: str, start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
         try:
-            lf = scan_enriched_parquet(self._etf_enriched_glob,
-                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol") == symbol)
-                & (pl.col("date") >= start)
-                & (pl.col("date") <= end)
-            ).sort("date")
-            if columns:
-                schema_names = lf.collect_schema().names()
-                existing = [c for c in columns if c in schema_names]
-                lf = lf.select(existing)
-            return lf.collect()
+            sql = "SELECT * FROM kline_etf_enriched WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date"
+            params = [symbol, start, end]
+            df = self.db.execute(sql, params).pl()
+            if columns and not df.is_empty():
+                existing = [c for c in columns if c in df.columns]
+                df = df.select(existing)
+            return df
         except Exception as e:  # noqa: BLE001
             logger.debug("ETF 日K查询跳过: %s", e)
             return pl.DataFrame()

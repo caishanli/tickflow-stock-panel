@@ -17,14 +17,14 @@ def setup_duckdb(tmp_path: Path) -> Path:
     store = DataStore(data_dir=tmp_path / "data")
     repo = KlineRepository(store=store)
 
-    # Insert daily data
+    # Insert daily enriched data (what _scan_daily_symbol now queries)
     df = pl.DataFrame({
         "symbol": ["000001", "000001"],
         "date": [date(2026, 1, 15), date(2026, 1, 16)],
         "open": [10.0, 11.0], "high": [11.0, 12.0], "low": [9.0, 10.0], "close": [10.5, 11.5],
         "volume": [1000.0, 1200.0], "amount": [10000.0, 12000.0], "quote_ts": [1705305600, 1705305600],
     })
-    repo.append_daily(df)
+    repo.append_enriched(df)
 
     # Insert instruments directly into DuckDB
     inst_df = pl.DataFrame({
