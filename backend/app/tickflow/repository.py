@@ -470,6 +470,40 @@ class KlineRepository:
         with self._lock:
             return self.db.execute(sql, params or []).fetchone()
 
+    def _scan_daily(self, table: str, symbol: str | None = None,
+                    start_date: date | None = None, end_date: date | None = None) -> pl.DataFrame:
+        """Scan daily data from DuckDB with optional filters."""
+        sql = f"SELECT * FROM {table}"
+        params = []
+        conditions = []
+
+        if symbol:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if start_date:
+            conditions.append("date >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("date <= ?")
+            params.append(end_date)
+
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+
+        sql += " ORDER BY symbol, date"
+
+        return self.db.execute(sql, params).pl()
+
+    def get_latest_date(self, table: str = "kline_daily") -> date | None:
+        """Get the latest date in the table."""
+        result = self.db.execute(f"SELECT max(date) FROM {table}").fetchone()
+        return result[0] if result and result[0] else None
+
+    def get_date_range(self, table: str = "kline_daily") -> tuple[date | None, date | None]:
+        """Get the date range in the table."""
+        result = self.db.execute(f"SELECT min(date), max(date) FROM {table}").fetchone()
+        return (result[0], result[1]) if result else (None, None)
+
     # ================================================================
     # Polars 缓存管理
     # ================================================================
