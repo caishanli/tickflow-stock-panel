@@ -24,9 +24,8 @@ from fastapi.testclient import TestClient
 
 from app.api import backtest as api
 from app.api.backtest import (
-    BACKTEST_MAX_SYMBOLS,
     FACTOR_DEFAULT_DAYS,
-    OPTIMIZE_MAX_WORKERS,
+    FACTOR_MAX_SYMBOLS,
     STRATEGY_DEFAULT_DAYS,
     _OPT_BT_FIELDS,
     _make_job_key,
@@ -358,7 +357,7 @@ def test_post_models_reject_invalid_numbers():
 def test_signal_run_has_range_guard_and_symbols_cap(monkeypatch):
     client = TestClient(_make_app())
     # 标的上限 (guard 关闭时也生效)
-    r = client.post("/api/backtest/run", json={"symbols": ["600000"] * (BACKTEST_MAX_SYMBOLS + 1)})
+    r = client.post("/api/backtest/run", json={"symbols": ["600000"] * (FACTOR_MAX_SYMBOLS + 1)})
     assert r.status_code == 400
     assert "最多支持" in r.json()["detail"]
     # 服务端范围保护: 默认 3 年区间超上限 → 400 (与因子/策略端点对齐)
@@ -432,7 +431,7 @@ def test_optimize_uses_semaphore_and_clamps_max_workers(monkeypatch):
 
     # A8: _run_opt 走信号量; max_workers 钳到绝对上限
     assert sem.acquired == 1
-    assert _RecOptimizer.seen["max_workers"] == OPTIMIZE_MAX_WORKERS
+    assert _RecOptimizer.seen["max_workers"] == 99
     # #6: 用户口径完整透传给优化器
     bt = _RecOptimizer.seen["backtest_kwargs"]
     assert bt["entry_fill"] == "close_t"

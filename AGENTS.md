@@ -1,6 +1,6 @@
 # AGENTS.md — tickflow-stock-panel
 
-A 股「选股 + 监控 + 回测」量化工作台。后端 FastAPI + Polars/DuckDB/Parquet，前端 React 18 + Vite + TS。数据来自 TickFlow 数据源。
+A 股「选股 + 监控 + 回测」量化工作台。后端 FastAPI + Polars + DuckDB，前端 React 18 + Vite + TS。数据来自 TickFlow 数据源。
 
 ## 运行
 
@@ -31,7 +31,7 @@ uv run --extra dev mypy app               # 类型检查
 
 - 入口：`backend/app/main.py`（`app.main:app`，uvicorn `--reload`）。路由在 `backend/app/api/`，按功能拆分（screener/backtest/monitor 等）。
 - 数据层：`backend/app/tickflow/repository.py` 加载 instruments + 日 K，计算 **enriched** 表落 Parquet（路径 `data/kline_daily_enriched/date=YYYY-MM-DD/`）。`data/` 整体 **不入库**（见 `.gitignore`），更新代码不会覆盖本地数据。
-- 计算主力用 **Polars**；查询用 **DuckDB**；存储 **Parquet**。唯一 pandas 边界是回测（`vectorbt`，ADR-19），别在其它处引入 pandas。
+- 计算主力用 **Polars**；查询用 **DuckDB**；存储 **DuckDB**（`data/tickflow.duckdb`），Parquet 用于分区导出。唯一 pandas 边界是回测（`vectorbt`，ADR-19），别在其它处引入 pandas。
 - 回测依赖可选：`uv sync --extra backtest`（vectorbt 体积大、macOS/Intel 可能需现场编译）。
 - 策略系统：`backend/app/strategy/`，18 个内置策略在 `builtin/`。扩展方式见 `docs/strategy.md` 与 `backend/app/strategy/prompts/strategy-guide.md`（AI 生成与手写规范）。
 - 插件/数据源：`backend/app/plugins/`（内置 `stocksdk`）。第三方数据接入走 YAML，见 `docs/custom-data-source.md` 与 `docs/plugin-development.md`。

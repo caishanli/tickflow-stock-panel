@@ -123,7 +123,6 @@ def test_load_panel_warmup_keeps_indicators_valid_at_range_start(monkeypatch, tm
         "volume": [1000.0] * n,
         "amount": [10000.0] * n,
     })
-    monkeypatch.setattr("app.services.backtest.scan_enriched_parquet", lambda *a, **k: lf)
     repo = types.SimpleNamespace(store=types.SimpleNamespace(data_dir=tmp_path))
     svc = BacktestService(repo)
 
