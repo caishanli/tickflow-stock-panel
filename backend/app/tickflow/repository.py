@@ -78,9 +78,12 @@ class DataStore:
         for sub in ("metrics", "income", "balance_sheet", "cash_flow", "shares"):
             (self.data_dir / "financials" / sub).mkdir(parents=True, exist_ok=True)
 
-        # DuckDB 内存模式 — 不建 .db 文件(§7.1)
-        self.db = duckdb.connect(database=":memory:")
-        self._register_views()
+        # Persistent DuckDB — replaces in-memory + Parquet views
+        db_path = self.data_dir / "stock.duckdb"
+        self.db = duckdb.connect(database=str(db_path))
+
+        self._create_tables()
+        self._register_unified_views()
 
     def _migrate_legacy_data_dir(self) -> None:
         """把旧桌面版数据目录 (<安装目录>/../TickFlowStockPanel_Data/) 迁移到新位置 (<安装目录>/data/)。
@@ -139,6 +142,124 @@ class DataStore:
             logger.info("legacy data migration done")
         except Exception as e:  # noqa: BLE001
             logger.warning("legacy data migration failed (startup continues): %s", e)
+
+    def _create_tables(self) -> None:
+        """Create DuckDB tables if they don't exist."""
+        statements = [
+            """CREATE TABLE IF NOT EXISTS kline_daily (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_daily_enriched (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, raw_close DOUBLE, raw_high DOUBLE, raw_low DOUBLE,
+                turnover_rate DOUBLE, consecutive_limit_ups UINTEGER, consecutive_limit_downs UINTEGER,
+                quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_index_daily (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_index_enriched (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, raw_close DOUBLE, raw_high DOUBLE, raw_low DOUBLE,
+                turnover_rate DOUBLE, consecutive_limit_ups UINTEGER, consecutive_limit_downs UINTEGER,
+                quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_etf_daily (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_etf_enriched (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, raw_close DOUBLE, raw_high DOUBLE, raw_low DOUBLE,
+                turnover_rate DOUBLE, consecutive_limit_ups UINTEGER, consecutive_limit_downs UINTEGER,
+                quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_minute (
+                symbol VARCHAR, datetime TIMESTAMP, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE,
+                PRIMARY KEY (symbol, datetime)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_etf_minute (
+                symbol VARCHAR, datetime TIMESTAMP, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE,
+                PRIMARY KEY (symbol, datetime)
+            )""",
+            """CREATE TABLE IF NOT EXISTS instruments (
+                symbol VARCHAR PRIMARY KEY, name VARCHAR, exchange VARCHAR,
+                asset_type VARCHAR, list_date DATE, total_shares DOUBLE, float_shares DOUBLE
+            )""",
+            """CREATE TABLE IF NOT EXISTS instruments_index (
+                symbol VARCHAR PRIMARY KEY, name VARCHAR, exchange VARCHAR,
+                asset_type VARCHAR, list_date DATE, total_shares DOUBLE, float_shares DOUBLE
+            )""",
+            """CREATE TABLE IF NOT EXISTS instruments_etf (
+                symbol VARCHAR PRIMARY KEY, name VARCHAR, exchange VARCHAR,
+                asset_type VARCHAR, list_date DATE, total_shares DOUBLE, float_shares DOUBLE
+            )""",
+            """CREATE TABLE IF NOT EXISTS instruments_ext (
+                symbol VARCHAR PRIMARY KEY, name VARCHAR, exchange VARCHAR,
+                asset_type VARCHAR, list_date DATE, total_shares DOUBLE, float_shares DOUBLE
+            )""",
+            """CREATE TABLE IF NOT EXISTS adj_factor (
+                symbol VARCHAR, trade_date DATE, adj_factor DOUBLE,
+                PRIMARY KEY (symbol, trade_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS adj_factor_etf (
+                symbol VARCHAR, trade_date DATE, adj_factor DOUBLE,
+                PRIMARY KEY (symbol, trade_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS depth5 (
+                symbol VARCHAR, date DATE,
+                bid1_price DOUBLE, bid1_volume DOUBLE, ask1_price DOUBLE, ask1_volume DOUBLE,
+                sealed BOOLEAN,
+                PRIMARY KEY (symbol, date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS kline_ext (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, quote_ts BIGINT,
+                PRIMARY KEY (symbol, date)
+            )""",
+            # Financial tables
+            """CREATE TABLE IF NOT EXISTS financials_metrics (
+                symbol VARCHAR, report_date DATE,
+                PRIMARY KEY (symbol, report_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS financials_income (
+                symbol VARCHAR, report_date DATE,
+                PRIMARY KEY (symbol, report_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS financials_balance_sheet (
+                symbol VARCHAR, report_date DATE,
+                PRIMARY KEY (symbol, report_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS financials_cash_flow (
+                symbol VARCHAR, report_date DATE,
+                PRIMARY KEY (symbol, report_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS financials_shares (
+                symbol VARCHAR, report_date DATE,
+                PRIMARY KEY (symbol, report_date)
+            )""",
+            """CREATE TABLE IF NOT EXISTS pools (
+                pool_name VARCHAR, symbol VARCHAR,
+                PRIMARY KEY (pool_name, symbol)
+            )""",
+            # Convenience view: kline_enriched → kline_daily_enriched
+            "CREATE OR REPLACE VIEW kline_enriched AS SELECT * FROM kline_daily_enriched",
+        ]
+        for sql in statements:
+            try:
+                self.db.execute(sql)
+            except Exception as e:
+                logger.debug("Table creation skipped: %s", e)
 
     def _register_views(self) -> None:
         """把 Parquet 目录挂载为 DuckDB 视图(§7.3)。"""
