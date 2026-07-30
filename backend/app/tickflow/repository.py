@@ -1923,6 +1923,13 @@ class KlineRepository:
         elif asset_type == "etf":
             self.append_etf_daily(df)
 
+    def append_adj_factor(self, df: pl.DataFrame, asset_type: str = "stock") -> None:
+        """Append adj_factor data to DuckDB (merge-upsert by symbol+trade_date)."""
+        if df.is_empty():
+            return
+        table = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+        self._upsert_daily(df, table)
+
     def append_enriched_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """按资产类型写入 enriched；stock/index 保持旧目录兼容。"""
         if asset_type == "stock":

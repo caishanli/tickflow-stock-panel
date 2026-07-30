@@ -186,14 +186,6 @@ def sync_and_persist_daily_batch(
             if df.is_empty():
                 return 0
             repo.append_daily(df)
-            try:
-                d = repo.store.data_dir.as_posix()
-                repo.db.execute(
-                    f"""CREATE OR REPLACE VIEW kline_daily AS
-                        SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("refresh view failed: %s", e)
             return df.height
         # 自定义源未配置 daily → 回退 TickFlow
 
@@ -215,15 +207,6 @@ def sync_and_persist_daily_batch(
         return 0
 
     repo.append_daily(df)
-
-    try:
-        d = repo.store.data_dir.as_posix()
-        repo.db.execute(
-            f"""CREATE OR REPLACE VIEW kline_daily AS
-                SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("refresh view failed: %s", e)
 
     return df.height
 
@@ -349,19 +332,16 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
             if new_data.is_empty():
                 return 0, []
             affected = new_data["symbol"].unique().to_list()
-            factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
-            out = repo.store.data_dir / factor_dir / "all.parquet"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            if out.exists():
-                existing = pl.read_parquet(out)
-                before = existing.height
-                merged = pl.concat([existing, new_data]).unique(
-                    subset=["symbol", "trade_date"], keep="last",
-                ).sort(["symbol", "trade_date"])
-                _atomic_write_parquet(merged, out)
-                return merged.height - before, affected
-            _atomic_write_parquet(new_data.sort(["symbol", "trade_date"]), out)
-            return new_data.height, affected
+            before = repo.execute_one(
+                "SELECT count(*) FROM adj_factor" if asset_type != "etf"
+                else "SELECT count(*) FROM adj_factor_etf"
+            )[0]
+            repo.append_adj_factor(new_data, asset_type=asset_type)
+            after = repo.execute_one(
+                "SELECT count(*) FROM adj_factor" if asset_type != "etf"
+                else "SELECT count(*) FROM adj_factor_etf"
+            )[0]
+            return after - before, affected
         # 自定义源未配置 adj_factor → 回退 TickFlow
 
     if not capset.has(Cap.ADJ_FACTOR):
@@ -416,25 +396,14 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
     # 提取受影响的 symbol 列表(合并前)
     affected = new_data["symbol"].unique().to_list()
 
-    factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
-    out = repo.store.data_dir / factor_dir / "all.parquet"
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    if out.exists():
-        existing = pl.read_parquet(out)
-        before = existing.height
-        merged = pl.concat([existing, new_data]).unique(
-            subset=["symbol", "trade_date"], keep="last",
-        ).sort(["symbol", "trade_date"])
-        _atomic_write_parquet(merged, out)
-        added = merged.height - before
-        logger.info("adj_factor merged: %d total (+%d new), %d/%d symbols",
-                     merged.height, added, new_data.height, len(symbols))
-        return added, affected
-    else:
-        _atomic_write_parquet(new_data.sort(["symbol", "trade_date"]), out)
-        logger.info("adj_factor synced: %d rows (%d symbols)", new_data.height, len(symbols))
-        return new_data.height, affected
+    table = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+    before = repo.execute_one(f"SELECT count(*) FROM {table}")[0]
+    repo.append_adj_factor(new_data, asset_type=asset_type)
+    after = repo.execute_one(f"SELECT count(*) FROM {table}")[0]
+    added = after - before
+    logger.info("adj_factor merged: %d total (+%d new), %d/%d symbols",
+                 after, added, new_data.height, len(symbols))
+    return added, affected
 
 
 # ===== 分钟 K 同步 =====
