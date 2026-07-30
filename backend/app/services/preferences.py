@@ -119,6 +119,18 @@ def get_minute_intraday_refresh_interval() -> int:
                    int(load().get("minute_intraday_refresh_interval", 6))))
 
 
+def get_minute_k_enabled() -> bool:
+    return load().get("minute_k_enabled", False)
+
+
+def get_minute_k_interval() -> float:
+    return load().get("minute_k_interval", 30.0)
+
+
+def get_minute_k_worker_count() -> int:
+    return load().get("minute_k_worker_count", 8)
+
+
 # 监控中心个股通知 ext 字段默认配置 (与 ext_presets 内置预设对齐)
 _MONITOR_EXT_FIELDS_DEFAULT = {
     "concept": "ext_gn_ths.所属概念",

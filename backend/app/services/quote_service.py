@@ -893,27 +893,9 @@ class QuoteService:
 
     @staticmethod
     def _market_phase() -> str:
-        """A股行情轮询阶段(北京时间)。
-
-        final 阶段用于午休/收盘定版: 需要至少成功拉取一版边界后的行情, 才算进入休盘。
-        """
-        now = cn_now()
-        if now.weekday() >= 5:
-            return "closed"
-        t = now.time()
-        if dt_time(9, 15) <= t < dt_time(9, 30):
-            return "preopen"
-        if dt_time(9, 30) <= t < dt_time(11, 30):
-            return "morning"
-        if dt_time(11, 30) <= t < dt_time(12, 55):
-            return "morning_final"
-        if dt_time(12, 55) <= t < dt_time(13, 0):
-            return "pre_afternoon"
-        if dt_time(13, 0) <= t < dt_time(15, 0):
-            return "afternoon"
-        if t >= dt_time(15, 0):
-            return "close_final"
-        return "closed"
+        """A股行情轮询阶段(北京时间)。"""
+        from app.services.market_phase import market_phase
+        return market_phase()
 
     @staticmethod
     def _final_sync_key(phase: str) -> tuple[date, str] | None:
@@ -935,21 +917,14 @@ class QuoteService:
 
     def _is_trading_hours(self) -> bool:
         """行情轮询窗口(兼容旧调用): 包含盘前预热和未完成的午休/收盘定版。"""
-        return self._should_poll_for_phase(self._market_phase())
+        from app.services.market_phase import is_trading_hours
+        return is_trading_hours()
 
     @staticmethod
     def _is_continuous_trading() -> bool:
-        """A股连续竞价时段(北京时间): 9:30-11:30 / 13:00-15:00, 仅工作日。
-
-        比 _is_trading_hours 严格: 排除 9:15-9:30 集合竞价(指示价, 非成交价)、
-        午间与 15:00 后收盘缓冲。监控评估只在此窗口进行, 不对竞价/收盘后的陈旧价告警。
-        (节假日由 _evaluate_monitors 里的「快照日期=当日」新鲜度判据兜底, 无需交易日历。)
-        """
-        now = cn_now()
-        t = now.time()
-        morning = dt_time(9, 30) <= t <= dt_time(11, 30)
-        afternoon = dt_time(13, 0) <= t <= dt_time(15, 0)
-        return now.weekday() < 5 and (morning or afternoon)
+        """A股连续竞价时段(北京时间): 9:30-11:30 / 13:00-15:00, 仅工作日。"""
+        from app.services.market_phase import is_continuous_trading
+        return is_continuous_trading()
 
     @staticmethod
     def _save_enabled(enabled: bool) -> None:

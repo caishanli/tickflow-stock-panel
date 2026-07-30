@@ -621,17 +621,6 @@ class DepthService:
 
     @staticmethod
     def _is_continuous_trading() -> bool:
-        """A股连续竞价时段(北京时间): 9:30-11:30 / 13:00-15:00, 仅工作日。
-
-        比 _is_trading_hours 严格: 排除午间休市前后(11:30-13:00)。
-        depth sealed 轮询用此窗口而非宽窗口, 关键原因:
-        12:55-13:00 午后集合竞价准备期, ask1/bid1 盘口语义与连续竞价不同,
-        「涨停价上卖一==0」的真封判定在此期间失效, 会用竞价盘口覆盖 11:30
-        已定格的正确 sealed 值, 导致涨停股误判为 sealed=False(假涨停)被错误扣减。
-        与 quote_service._is_continuous_trading 窗口定义保持一致。
-        """
-        now = cn_now()
-        t = now.time()
-        morning = dt_time(9, 30) <= t <= dt_time(11, 30)
-        afternoon = dt_time(13, 0) <= t <= dt_time(15, 0)
-        return now.weekday() < 5 and (morning or afternoon)
+        """A股连续竞价时段(北京时间): 9:30-11:30 / 13:00-15:00, 仅工作日。"""
+        from app.services.market_phase import is_continuous_trading
+        return is_continuous_trading()

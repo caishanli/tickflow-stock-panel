@@ -79,6 +79,12 @@ async def lifespan(app: FastAPI):
     qs.set_repo(repo)
     qs.boot_check()
 
+    # 分钟K实时行情服务 (mootdx多线程)
+    from app.services.minute_k_service import MinuteKService
+    mks = MinuteKService(repo)
+    app.state.minute_k_service = mks
+    mks.boot_check()
+
     # QuoteService 需要访问 strategy_monitor 等单例
     # 先创建 strategy_monitor，再注入 app.state
     from app.strategy.monitor import StrategyMonitorService
@@ -268,6 +274,9 @@ async def lifespan(app: FastAPI):
     qs = getattr(app.state, "quote_service", None)
     if qs:
         qs.stop()
+    mks = getattr(app.state, "minute_k_service", None)
+    if mks:
+        mks.stop()
     dsvc = getattr(app.state, "depth_service", None)
     if dsvc:
         dsvc.stop_polling()
