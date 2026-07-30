@@ -456,32 +456,18 @@ def _datetime_to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
-    """按 _trade_date 分区落盘分钟 K (读旧→concat→unique→原子写)。返回写入行数。
-
-    抽自原 sync_and_persist_minute 末尾的循环, 供流式落盘 (每段一次) 与一次性迁移共用。
-    """
+def _write_minute_partition(df: pl.DataFrame, repo: KlineRepository) -> int:
+    """写入分钟 K 到 DuckDB。返回写入行数。"""
     if df.is_empty():
         return 0
     df = df.with_columns(pl.col("datetime").dt.date().alias("_trade_date"))
     written = 0
     for day_df in df.partition_by("_trade_date"):
-        trade_date = day_df["_trade_date"][0]
-        out = minute_dir / f"date={trade_date}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if out.exists():
-            existing = pl.read_parquet(out)
-            if "datetime" in existing.columns:
-                existing = existing.filter(pl.col("datetime").is_not_null())
-            day_df = pl.concat([existing, day_df.drop("_trade_date")]).unique(
-                subset=["symbol", "datetime"], keep="last",
-            )
-        else:
-            day_df = day_df.drop("_trade_date")
-        day_df = day_df.sort("symbol", "datetime")
-        tmp = out.with_name(out.name + ".tmp")
-        day_df.write_parquet(tmp)
-        tmp.replace(out)
+        day_df = day_df.drop("_trade_date")
+        table = "kline_etf_minute" if "_etf_minute" in str(repo._minute_glob) else "kline_minute"
+        cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in day_df.columns]
+        day_df = day_df.select(cols)
+        repo._upsert_daily(day_df, table)
         written += day_df.height
     return written
 
@@ -1018,11 +1004,10 @@ def sync_and_persist_minute(
 
     # 流式落盘: 每段拉完立即写盘, 内存峰值 = 单段 (而非全量)。
     # 全量攒内存曾导致 1 年全市场分钟 K OOM 卡死 (3 亿行 / 数十 GB)。
-    minute_dir = repo.store.data_dir / "kline_minute"
     written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
 
     def _persist(seg_df: pl.DataFrame) -> None:
-        written_box[0] += _write_minute_partition(seg_df, minute_dir)
+        written_box[0] += _write_minute_partition(seg_df, repo)
 
     segment_days = preferences.get_minute_sync_segment_days()
     sync_minute_batch(
