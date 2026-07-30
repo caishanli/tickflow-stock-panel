@@ -61,13 +61,71 @@ class QuantDataProvider:
         raise last or DataSourceError(f"所有数据源均不可用: {method} {code}")
 
     def get_daily(self, code, start, end):
+        import logging
+        log = logging.getLogger(__name__)
         key = f"daily_{code}_{start}_{end}"
         cached = self.cache.get(key)
         if cached is not None:
             return cached
-        df = self.fetch("get_daily", code, start, end)
-        self.cache.put(key, df)
-        return df
+
+        # 1) DuckDB 有就直接读
+        tf = self.sources.get("tickflow")
+        if tf is not None:
+            try:
+                df = tf.get_daily(code, start, end)
+                if df is not None and not df.empty:
+                    self.cache.put(key, df)
+                    return df
+            except Exception as e:
+                log.warning("[QuantDataProvider] tickflow 日线失败 %s: %s", code, e)
+
+        # 2) DuckDB 没有, mootdx 回源并落盘
+        mx = self.sources.get("mootdx")
+        if mx is not None:
+            try:
+                df = mx.get_daily(code, start, end)
+                if df is not None and not df.empty:
+                    self._persist_daily_to_duckdb(code, df)
+                    self.cache.put(key, df)
+                    return df
+            except Exception as e:
+                log.warning("[QuantDataProvider] mootdx 日线失败 %s: %s", code, e)
+
+        # 3) 都没有, 尝试 astock
+        ast = self.sources.get("astock")
+        if ast is not None:
+            try:
+                df = ast.get_daily(code, start, end)
+                if df is not None and not df.empty:
+                    self.cache.put(key, df)
+                    return df
+            except Exception as e:
+                log.warning("[QuantDataProvider] astock 日线失败 %s: %s", code, e)
+
+        raise RuntimeError(
+            f"[QuantDataProvider] 日线数据获取失败 {code}: "
+            f"所有数据源均无数据"
+        )
+
+    def _persist_daily_to_duckdb(self, code: str, df) -> None:
+        """mootdx 回源日线数据落盘 DuckDB。"""
+        import logging
+        try:
+            import polars as pl
+            pldf = pl.from_pandas(df)
+            sym = code.split(".")[0]
+            if "symbol" not in pldf.columns:
+                pldf = pldf.with_columns(pl.lit(sym).alias("symbol"))
+            if "date" in pldf.columns:
+                pldf = pldf.with_columns(pl.col("date").cast(pl.Date))
+            keep = [c for c in ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+                    if c in pldf.columns]
+            pldf = pldf.select(keep)
+            tf = self.sources.get("tickflow")
+            if tf is not None and hasattr(tf, "_repo"):
+                tf._repo._upsert_daily(pldf, "kline_daily")
+        except Exception as e:
+            logging.getLogger(__name__).warning("[QuantDataProvider] 日线落盘失败 %s: %s", code, e)
 
     def get_minute(self, code, date):
         import logging
