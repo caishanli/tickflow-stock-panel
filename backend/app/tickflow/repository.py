@@ -263,62 +263,7 @@ class DataStore:
                 logger.debug("Table creation skipped: %s", e)
 
     def _register_views(self) -> None:
-        """把 Parquet 目录挂载为 DuckDB 视图(§7.3)。"""
-        d = self.data_dir.as_posix()
-        statements = [
-            f"""CREATE OR REPLACE VIEW kline_daily AS
-                SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_enriched AS
-                SELECT * FROM read_parquet('{d}/kline_daily_enriched/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_index_daily AS
-                SELECT * FROM read_parquet('{d}/kline_index_daily/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_index_enriched AS
-                SELECT * FROM read_parquet('{d}/kline_index_enriched/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_etf_daily AS
-                SELECT * FROM read_parquet('{d}/kline_etf_daily/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_etf_enriched AS
-                SELECT * FROM read_parquet('{d}/kline_etf_enriched/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_etf_minute AS
-                SELECT * FROM read_parquet('{d}/kline_etf_minute/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_minute AS
-                SELECT * FROM read_parquet('{d}/kline_minute/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW adj_factor AS
-                SELECT * FROM read_parquet('{d}/adj_factor/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW adj_factor_etf AS
-                SELECT * FROM read_parquet('{d}/adj_factor_etf/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW instruments AS
-                SELECT * FROM read_parquet('{d}/instruments/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW instruments_index AS
-                SELECT * FROM read_parquet('{d}/instruments_index/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW instruments_etf AS
-                SELECT * FROM read_parquet('{d}/instruments_etf/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW instruments_ext AS
-                SELECT * FROM read_parquet('{d}/instruments_ext/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_ext AS
-                SELECT * FROM read_parquet('{d}/kline_ext/**/*.parquet', union_by_name=true)""",
-            # 财务数据视图
-            f"""CREATE OR REPLACE VIEW financials_metrics AS
-                SELECT * FROM read_parquet('{d}/financials/metrics/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW financials_income AS
-                SELECT * FROM read_parquet('{d}/financials/income/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW financials_balance_sheet AS
-                SELECT * FROM read_parquet('{d}/financials/balance_sheet/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW financials_cash_flow AS
-                SELECT * FROM read_parquet('{d}/financials/cash_flow/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW financials_shares AS
-                SELECT * FROM read_parquet('{d}/financials/shares/*.parquet', union_by_name=true)""",
-            # 五档盘口 sealed 真假涨停(独立旁路存储,不进 enriched)
-            f"""CREATE OR REPLACE VIEW depth5 AS
-                SELECT * FROM read_parquet('{d}/depth5/**/*.parquet', union_by_name=true)""",
-        ]
-        for sql in statements:
-            try:
-                self.db.execute(sql)
-            except Exception as e:  # noqa: BLE001
-                # 空数据目录(首次启动)或权限问题时 DuckDB 会抛 IOException;
-                # 跨版本/平台也可能抛 CatalogException 等。空目录缺视图不影响启动
-                # (后续同步写入数据后会重新刷新视图),这里一律降级为 debug 日志。
-                logger.debug("view registration skipped (no parquet yet): %s", sql[:60])
+        """No-op — all data lives in real DuckDB tables created by _create_tables()."""
         self._register_unified_views()
 
     def _has_parquet(self, subdir: str) -> bool:
@@ -1937,65 +1882,12 @@ class KlineRepository:
         self._refresh_etf_instruments()
 
     def refresh_index_views(self) -> None:
-        """刷新指数相关 DuckDB 视图。"""
-        d = self.store.data_dir.as_posix()
-        statements = [
-            f"""CREATE OR REPLACE VIEW kline_index_daily AS
-                SELECT * FROM read_parquet('{d}/kline_index_daily/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_index_enriched AS
-                SELECT * FROM read_parquet('{d}/kline_index_enriched/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_etf_daily AS
-                SELECT * FROM read_parquet('{d}/kline_etf_daily/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW kline_etf_enriched AS
-                SELECT * FROM read_parquet('{d}/kline_etf_enriched/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW instruments_index AS
-                SELECT * FROM read_parquet('{d}/instruments_index/**/*.parquet', union_by_name=true)""",
-            f"""CREATE OR REPLACE VIEW instruments_etf AS
-                SELECT * FROM read_parquet('{d}/instruments_etf/**/*.parquet', union_by_name=true)""",
-        ]
-        for sql in statements:
-            try:
-                with self._lock:
-                    self.db.execute(sql)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("index/etf view refresh skipped: %s", e)
-        with self._lock:
-            self.store._register_unified_views()
+        """No-op — all data lives in real DuckDB tables created by _create_tables()."""
+        pass
 
     def rebuild_views(self) -> None:
-        """重建全部 13 张 parquet 视图并重挂 unified 视图 —— 唯一权威实现。
-
-        原先 daily_pipeline._refresh_views(盘后管道) 与 /api/data/clear(清库) 各自
-        内联了同一份视图重建 SQL, 清库那份还漏了几张视图导致漂移。此处收敛为单一入口:
-        覆盖全部 13 张视图 (二者的超集), 空目录 (清库后) 也能安全重挂。
-        """
-        d = self.store.data_dir.as_posix()
-        views = {
-            "kline_daily": f"{d}/kline_daily/**/*.parquet",
-            "kline_enriched": f"{d}/kline_daily_enriched/**/*.parquet",
-            "kline_index_daily": f"{d}/kline_index_daily/**/*.parquet",
-            "kline_index_enriched": f"{d}/kline_index_enriched/**/*.parquet",
-            "kline_etf_daily": f"{d}/kline_etf_daily/**/*.parquet",
-            "kline_etf_enriched": f"{d}/kline_etf_enriched/**/*.parquet",
-            "kline_etf_minute": f"{d}/kline_etf_minute/**/*.parquet",
-            "kline_minute": f"{d}/kline_minute/**/*.parquet",
-            "adj_factor": f"{d}/adj_factor/**/*.parquet",
-            "adj_factor_etf": f"{d}/adj_factor_etf/**/*.parquet",
-            "instruments": f"{d}/instruments/**/*.parquet",
-            "instruments_index": f"{d}/instruments_index/**/*.parquet",
-            "instruments_etf": f"{d}/instruments_etf/**/*.parquet",
-        }
-        for name, path in views.items():
-            try:
-                with self._lock:
-                    self.db.execute(
-                        f"CREATE OR REPLACE VIEW {name} AS "
-                        f"SELECT * FROM read_parquet('{path}', union_by_name=true)"
-                    )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("rebuild view %s failed: %s", name, e)
-        with self._lock:
-            self.store._register_unified_views()
+        """No-op — all data lives in real DuckDB tables created by _create_tables()."""
+        pass
 
 
 
