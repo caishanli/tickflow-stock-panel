@@ -1217,13 +1217,19 @@ class KlineRepository:
         return self._instruments_cache
 
     def get_historical_shares(self) -> pl.DataFrame:
-        """读取财务股本历史，并在文件更新后自动刷新缓存。"""
-        path = self.store.data_dir / "financials" / "shares" / "part.parquet"
-        mtime_ns = path.stat().st_mtime_ns if path.exists() else None
-        if self._historical_shares_cache is None or mtime_ns != self._historical_shares_mtime_ns:
-            from app.share_capital import load_share_history
-            self._historical_shares_cache = load_share_history(self.store.data_dir)
-            self._historical_shares_mtime_ns = mtime_ns
+        """读取财务股本历史。优先 DuckDB，回退 Parquet。"""
+        # Try DuckDB first
+        try:
+            df = self.db.execute("SELECT * FROM financials_shares").pl()
+            if not df.is_empty():
+                self._historical_shares_cache = df
+                return df
+        except Exception as e:  # noqa: BLE001
+            logger.debug("DuckDB financials_shares read failed: %s", e)
+
+        # Fallback: read Parquet via share_capital module
+        from app.share_capital import load_share_history
+        self._historical_shares_cache = load_share_history(self.store.data_dir)
         return self._historical_shares_cache
 
     def get_index_instruments(self) -> pl.DataFrame:
