@@ -37,19 +37,19 @@ def test_first_share_sync_fetches_complete_history(tmp_path, monkeypatch):
 
     assert rows == 2
     assert calls == [(["600000.SH"], False)]
-    stored = pl.read_parquet(tmp_path / "financials" / "shares" / "part.parquet")
+    stored = financial_sync.get_financial_df(tmp_path, "shares")
     assert stored["period_end"].to_list() == ["2023-12-31", "2024-06-30"]
 
 
 def test_incremental_share_sync_updates_existing_and_backfills_new_symbols(tmp_path, monkeypatch):
     _write_instruments(tmp_path, ["600000.SH", "000001.SZ"])
-    path = tmp_path / "financials" / "shares" / "part.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame({
+    # Seed existing data into DuckDB
+    existing_df = pl.DataFrame({
         "symbol": ["600000.SH"],
         "period_end": ["2024-06-30"],
         "float_shares": [10.0],
-    }).write_parquet(path)
+    })
+    financial_sync._write_table("shares", existing_df, tmp_path)
     calls: list[tuple[list[str], bool]] = []
 
     def fake_fetch(table, symbols, capset, latest_only=True):
@@ -73,7 +73,7 @@ def test_incremental_share_sync_updates_existing_and_backfills_new_symbols(tmp_p
 
     assert rows == 3
     assert calls == [(["000001.SZ"], False), (["600000.SH"], True)]
-    stored = pl.read_parquet(path).sort(["symbol", "period_end"])
+    stored = financial_sync.get_financial_df(tmp_path, "shares").sort(["symbol", "period_end"])
     assert stored.filter(pl.col("symbol") == "600000.SH")["float_shares"].to_list() == [11.0]
     assert stored.filter(pl.col("symbol") == "000001.SZ")["float_shares"].to_list() == [20.0, 21.0]
 
@@ -164,12 +164,12 @@ def test_turnover_without_share_history_keeps_existing_behavior(monkeypatch):
 
 
 def test_data_status_includes_share_history(tmp_path):
-    path = tmp_path / "financials" / "shares" / "part.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame({
+    # Seed data into DuckDB
+    df = pl.DataFrame({
         "symbol": ["600000.SH", "600000.SH", "000001.SZ"],
         "period_end": ["2023-12-31", "2024-06-30", "2024-06-30"],
-    }).write_parquet(path)
+    })
+    financial_sync._write_table("shares", df, tmp_path)
 
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
     result = data_api._safe_aggregate_financials(repo)

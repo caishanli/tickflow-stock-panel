@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import polars as pl
 
 from app.tickflow.capabilities import Cap, CapabilitySet
@@ -129,13 +130,15 @@ def _write_table(table: str, df: pl.DataFrame, data_dir: Path) -> int:
     if df.is_empty() or "symbol" not in df.columns:
         return 0
 
-    # 写入 Parquet (全量覆盖)
-    out_dir = data_dir / "financials" / table
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "part.parquet"
-    df.write_parquet(out_file)
+    db_path = data_dir / "stock.duckdb"
+    conn = duckdb.connect(str(db_path))
+    try:
+        tbl_name = f"financials_{table}"
+        conn.execute(f"CREATE OR REPLACE TABLE {tbl_name} AS SELECT * FROM df")
+        logger.info("sync_%s done: %d records written to DuckDB", table, len(df))
+    finally:
+        conn.close()
 
-    logger.info("sync_%s done: %d records written", table, len(df))
     return len(df)
 
 
@@ -248,34 +251,23 @@ def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
 # DuckDB 视图
 # ================================================================
 
-def _refresh_financials_views(data_dir: Path) -> None:
-    """刷新财务表 DuckDB 视图 (在 DataStore.db 上注册)。"""
-    d = data_dir.as_posix()
-    views = {
-        "financials_metrics": f"{d}/financials/metrics/*.parquet",
-        "financials_income": f"{d}/financials/income/*.parquet",
-        "financials_balance_sheet": f"{d}/financials/balance_sheet/*.parquet",
-        "financials_cash_flow": f"{d}/financials/cash_flow/*.parquet",
-        "financials_shares": f"{d}/financials/shares/*.parquet",
-    }
-    for name, path in views.items():
-        out = data_dir / "financials" / name.replace("financials_", "") / "part.parquet"
-        if not out.exists():
-            continue
-        # 视图注册需要由 DataStore 完成,这里只做日志
-        logger.debug("financial parquet ready: %s (%d rows)", name, out.stat().st_size)
+def _refresh_financials_views(_data_dir: Path) -> None:
+    """No-op: 财务数据已直接存储在 DuckDB 表中, 无需额外视图注册。"""
 
 
 def get_financial_df(data_dir: Path, table: str) -> pl.DataFrame:
-    """读取本地财务 Parquet。"""
-    path = data_dir / "financials" / table / "part.parquet"
-    if not path.exists():
+    """读取本地财务 DuckDB 表。"""
+    db_path = data_dir / "stock.duckdb"
+    if not db_path.exists():
         return pl.DataFrame()
+    conn = duckdb.connect(str(db_path), read_only=True)
     try:
-        return pl.read_parquet(path)
+        return conn.execute(f"SELECT * FROM financials_{table}").pl()
     except Exception as e:
         logger.warning("读取 financials/%s 失败: %s", table, e)
         return pl.DataFrame()
+    finally:
+        conn.close()
 
 
 # ================================================================
@@ -315,17 +307,40 @@ class FinancialScheduler:
         try:
             from app.services import preferences
             restored = dict(preferences.get_financial_sync_times())
-            # 老用户迁移兜底: 若某表在 preferences 无记录但 parquet 已存在(升级前同步过),
-            # 用 parquet 文件的修改时间作为同步时间并补写持久化。
+            # 老用户迁移兜底: 若某表在 preferences 无记录但数据已存在(升级前同步过),
+            # 用数据存在性作为同步时间并补写持久化。
+            db_path = data_dir / "stock.duckdb"
             for table in FINANCIAL_TABLES:
                 if table in restored:
                     continue
+                # 先检查旧版 Parquet (向后兼容)
                 parquet = data_dir / "financials" / table / "part.parquet"
                 if parquet.exists():
                     mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=timezone.utc).isoformat()
                     restored[table] = mtime
                     preferences.set_financial_sync_time(table, mtime)
                     logger.info("FinancialScheduler backfilled last_sync for %s from parquet mtime", table)
+                    continue
+                # 再检查 DuckDB 表
+                if db_path.exists():
+                    try:
+                        conn = duckdb.connect(str(db_path), read_only=True)
+                        count = conn.execute(
+                            f"SELECT count(*) FROM financials_{table}"
+                        ).fetchone()[0]
+                        conn.close()
+                        if count and count > 0:
+                            mtime = datetime.fromtimestamp(
+                                db_path.stat().st_mtime, tz=timezone.utc
+                            ).isoformat()
+                            restored[table] = mtime
+                            preferences.set_financial_sync_time(table, mtime)
+                            logger.info(
+                                "FinancialScheduler backfilled last_sync for %s from DuckDB",
+                                table,
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
             self._last_sync = restored
             if self._last_sync:
                 logger.info("FinancialScheduler restored last_sync: %s", list(self._last_sync.keys()))

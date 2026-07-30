@@ -406,24 +406,28 @@ def _safe_aggregate_minute(repo) -> dict | None:
 
 
 def _safe_aggregate_financials(repo) -> dict | None:
-    """财务数据统计 — 检查各表文件是否存在及行数。"""
+    """财务数据统计 — 检查各表 DuckDB 表是否存在及行数。"""
     data_dir = repo.store.data_dir
     tables_info: dict[str, dict] = {}
     total_rows = 0
 
+    db_path = data_dir / "stock.duckdb"
     for table in ("metrics", "income", "balance_sheet", "cash_flow", "shares"):
-        path = data_dir / "financials" / table / "part.parquet"
-        if path.exists():
-            try:
-                import polars as pl
-                df = pl.read_parquet(path, columns=["symbol"])
-                rows = len(df)
-                symbols = df["symbol"].n_unique() if not df.is_empty() else 0
-                tables_info[table] = {"rows": rows, "symbols": symbols}
-                total_rows += rows
-            except Exception:
-                tables_info[table] = {"rows": 0, "symbols": 0}
-        else:
+        if not db_path.exists():
+            tables_info[table] = {"rows": 0, "symbols": 0}
+            continue
+        try:
+            import duckdb
+            conn = duckdb.connect(str(db_path), read_only=True)
+            result = conn.execute(
+                f"SELECT count(*), count(DISTINCT symbol) FROM financials_{table}"
+            ).fetchone()
+            conn.close()
+            rows = result[0] if result else 0
+            symbols = result[1] if result else 0
+            tables_info[table] = {"rows": rows, "symbols": symbols}
+            total_rows += rows
+        except Exception:
             tables_info[table] = {"rows": 0, "symbols": 0}
 
     if total_rows == 0:

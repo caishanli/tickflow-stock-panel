@@ -43,18 +43,22 @@ def financial_status(request: Request):
     data_dir = request.app.state.repo.store.data_dir
     tables = {}
 
+    db_path = data_dir / "stock.duckdb"
     for table in FINANCIAL_TABLES:
-        path = data_dir / "financials" / table / "part.parquet"
-        if path.exists():
-            try:
-                df = pl.read_parquet(path, columns=["symbol"])
-                tables[table] = {
-                    "rows": len(df),
-                    "symbols": df["symbol"].n_unique() if not df.is_empty() else 0,
-                }
-            except Exception:
-                tables[table] = {"rows": 0, "symbols": 0}
-        else:
+        if not db_path.exists():
+            tables[table] = {"rows": 0, "symbols": 0}
+            continue
+        try:
+            import duckdb
+            conn = duckdb.connect(str(db_path), read_only=True)
+            result = conn.execute(
+                f"SELECT count(*), count(DISTINCT symbol) FROM financials_{table}"
+            ).fetchone()
+            conn.close()
+            rows = result[0] if result else 0
+            symbols = result[1] if result else 0
+            tables[table] = {"rows": rows, "symbols": symbols}
+        except Exception:
             tables[table] = {"rows": 0, "symbols": 0}
 
     fs = getattr(request.app.state, "financial_scheduler", None)
