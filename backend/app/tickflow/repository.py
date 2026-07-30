@@ -1037,13 +1037,23 @@ class KlineRepository:
             logger.debug("ETF enriched 缓存刷新跳过: %s", e)
 
     def _refresh_instruments(self) -> None:
-        """加载 instruments 到内存。"""
+        """加载 instruments 到内存。优先从 DuckDB 读取，回退到 Parquet。"""
         try:
+            # 优先从 DuckDB 读取
+            df = self.db.execute("SELECT * FROM instruments").pl()
+            if not df.is_empty():
+                self._instruments_cache = df
+                logger.info("instruments 缓存已加载 (DuckDB): %d 只", len(df))
+                return
+        except Exception:
+            pass
+        try:
+            # 回退到 Parquet
             df = pl.scan_parquet(self._inst_glob).collect()
             if not df.is_empty():
                 self._instruments_cache = df
-                logger.info("instruments 缓存已加载: %d 只", len(df))
-        except Exception as e:  # noqa: BLE001
+                logger.info("instruments 缓存已加载 (Parquet): %d 只", len(df))
+        except Exception as e:
             logger.warning("instruments 缓存刷新失败: %s", e)
 
     def _refresh_index_instruments(self) -> None:
@@ -1602,8 +1612,21 @@ class KlineRepository:
                 schema_names = lf.collect_schema().names()
                 existing = [c for c in columns if c in schema_names]
                 lf = lf.select(existing)
-            return lf.collect()
-        except Exception as e:  # noqa: BLE001
+            df = lf.collect()
+            if not df.is_empty():
+                return df
+        except Exception:
+            pass
+        # 回退到 DuckDB 读取
+        try:
+            sql = "SELECT * FROM kline_daily WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date"
+            params = [symbol, start, end]
+            df = self.db.execute(sql, params).pl()
+            if columns and not df.is_empty():
+                existing = [c for c in columns if c in df.columns]
+                df = df.select(existing)
+            return df
+        except Exception as e:
             logger.warning("日K查询失败: %s", e)
             return pl.DataFrame()
 
