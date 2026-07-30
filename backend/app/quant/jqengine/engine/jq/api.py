@@ -224,8 +224,14 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
     frames = []
     for sec in security:
         df = mgr._daily_mem.get(f"get_daily_{sec}")
-        if df is None or df.empty:
-            continue
+        if df is None or (hasattr(df, "empty") and df.empty):
+            # 兜底：走原 fetch 路径（触发加载并缓存到 _daily_mem）
+            try:
+                df = mgr.fetch("get_daily", sec, start_date or "20000101", end_date or "20300101")
+            except Exception:
+                continue
+            if df is None or (hasattr(df, "empty") and df.empty):
+                continue
         idx = df.index
         if not isinstance(idx, pd.DatetimeIndex):
             continue
@@ -242,10 +248,6 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
             sub = sub.tail(count)
         if sub.empty:
             continue
-        if sec == "159363.XSHE":
-            import sys
-            # Don't print closes anymore, just verify count
-            pass
         sub = sub.copy()
         sub["code"] = sec
         sub["time"] = sub.index
@@ -895,7 +897,9 @@ def get_all_securities(types=None, date=None):
         except Exception:
             continue
     if not records:
-        return pd.DataFrame()
+        df = pd.DataFrame(columns=["display_name", "name", "start_date", "end_date", "type"])
+        df.index.name = "code"
+        return df
     df = pd.DataFrame(records).set_index("code")
     if date is not None:
         cutoff = str(date)[:10] if not isinstance(date, str) else date[:10]

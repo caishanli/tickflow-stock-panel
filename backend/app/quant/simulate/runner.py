@@ -63,7 +63,7 @@ def _prev_close(provider: QuantDataProvider, code: str, today: str):
         return None
     col = "close" if "close" in df.columns else df.columns[-1]
     # 有日期列时取日期 < today 的最后一根；无日期列退化为倒数第二根（末根通常是当日）
-    dcol = next((c for c in ("date", "datetime", "time", "dt", "day") if c in df.columns), None)
+    dcol = next((c for c in ("date", "datetime", "dt", "day") if c in df.columns), None)
     if dcol:
         hist = df[df[dcol].astype(str).str[:10] < str(today)]
         return float(hist[col].iloc[-1]) if not hist.empty else None
@@ -189,19 +189,39 @@ def _make_dm():
 
 
 def _is_trading_day(dm, today) -> bool:
-    """当日是否交易日：沪深300 指数日线末根日期 == 今日。取数失败降级 weekday 判定。"""
+    """当日是否交易日：用日线数据校验历史日期，近期日期用 weekday 判定。
+
+    盘中/刚收盘时近几日的日线数据可能尚未生成，用 idx[-1]==today 判定会误判，
+    因此对 today >= now-2天 直接走 weekday 降级路径。
+    """
+    now_date = pd.Timestamp.now().date()
+    td = pd.Timestamp(today).date()
+    if td >= now_date - datetime.timedelta(days=2):
+        # 近期日期：weekday 判定即可（日线可能尚未生成）
+        return td.weekday() < 5
     try:
         start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
-        df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
+        df = None
+        mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
+        if mootdx_src is not None:
+            try:
+                df = mootdx_src.get_daily("000300.XSHG", start, str(today))
+            except Exception:
+                df = None
+        if df is None:
+            df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
         if df is None or df.empty:
             raise RuntimeError("指数日线为空")
         idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
         if idx is None:
-            dcol = next((c for c in ("date", "datetime", "time", "dt", "trade_date", "trade_dt", "day")
+            dcol = next((c for c in ("date", "datetime", "dt", "trade_date", "trade_dt", "day")
                          if c in df.columns), None)
-            if dcol is None:
+            if dcol is not None:
+                idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
+            elif "timestamp" in df.columns:
+                idx = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], unit="s"))
+            else:
                 raise RuntimeError("指数日线无日期列")
-            idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
         return bool(len(idx)) and pd.Timestamp(idx[-1]).date() == pd.Timestamp(today).date()
     except Exception as e:  # noqa: BLE001
         log.warning("[runner] 交易日判定失败，降级 weekday: %s", e)
@@ -222,7 +242,7 @@ def _prev_close_dm(dm, code: str, today: str):
     if isinstance(df.index, pd.DatetimeIndex):
         hist = df[df.index.normalize() < today_ts]
         return float(hist[col].iloc[-1]) if not hist.empty else None
-    dcol = next((c for c in ("date", "datetime", "time", "dt", "day") if c in df.columns), None)
+    dcol = next((c for c in ("date", "datetime", "dt", "day") if c in df.columns), None)
     if dcol:
         hist = df[df[dcol].astype(str).str[:10] < str(today)]
         return float(hist[col].iloc[-1]) if not hist.empty else None
@@ -366,6 +386,10 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
     fired.clear()
     if aux is not None:
         aux["prev_close_cache"] = {}
+        # 每日清空无分钟数据缓存：新交易日可能有标的开始有数据（如新ETF上市）
+        dm = aux.get("dm")
+        if dm is not None and hasattr(dm, "_minute_empty"):
+            dm._minute_empty.clear()
     jq_api.on_new_day()
     try:
         days = jq_api.get_trade_days(end_date=str(now.date()), count=5)
@@ -374,12 +398,21 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
             ctx.previous_date = pd.Timestamp(prev[-1]).date()
     except Exception:  # noqa: BLE001
         pass
+    # 盘前刷新最新交易日的日线数据（策略 get_price('1d') 会用到）
+    dm = aux.get("dm") if aux is not None else None
+    if dm is not None:
+        try:
+            dm.preload_daily()
+        except Exception:  # noqa: BLE001
+            pass
     for func, t in bundle.daily:
         if str(t) == "before_open":
             fired.add((id(func), "before_open"))
             _safe_call(account_id, func, ctx, "before_open")
     if bundle.before_trading_start is not None:
         _safe_call(account_id, bundle.before_trading_start, ctx, "before_trading_start")
+    # 盘前回调可能更新 g.* 池子，重新注入 universe（每日刷新）
+    _seed_universe(ctx)
 
 
 def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
@@ -443,17 +476,34 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
 # ---------------------------------------------------------------------------
 
 def _trade_days_between(dm, start, end) -> list:
-    """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。"""
-    df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+    """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。
+
+    优先用 dm 已有的 mootdx 源（避免重复建连），回退到 dm.fetch。
+    """
+    df = None
+    mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
+    if mootdx_src is not None:
+        try:
+            df = mootdx_src.get_daily("000300.XSHG", str(start), str(end))
+        except Exception:
+            df = None
+    if df is None:
+        try:
+            df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+        except Exception:
+            pass
     if df is None or df.empty:
         return []
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
     if idx is None:
-        dcol = next((c for c in ("date", "datetime", "time", "dt", "trade_date", "trade_dt", "day")
+        dcol = next((c for c in ("date", "datetime", "dt", "trade_date", "trade_dt", "day")
                      if c in df.columns), None)
-        if dcol is None:
+        if dcol is not None:
+            idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
+        elif "timestamp" in df.columns:
+            idx = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], unit="s"))
+        else:
             return []
-        idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
     lo, hi = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
     return [d.date() for d in idx.normalize() if lo <= d <= hi]
 
@@ -565,7 +615,7 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
 
 def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
                    state: dict, aux: dict, now=None):
-    """单轮分钟驱动：喂数 → 策略回调 → 止损巡检 → 落库。返回本轮 bar 时刻。
+    """单轮分钟驱动：喂数 -> 策略回调 -> 止损巡检 -> 落库。返回本轮 bar 时刻。
 
     同一 bar 不重复触发；非当日 bar / 无数据时跳过并返回 None。
     """
@@ -576,7 +626,12 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         + list(ctx.portfolio.positions.keys())))
     prices, bar_dt = feed(dm, watch, now, aux["fresh_frames"])
     if bar_dt is None:
-        _emit_log(account_id, "warn", "实时行情为空，本轮跳过")
+        # 收盘宽限期内无实时数据属正常，不报警
+        t = pd.Timestamp(now).time()
+        if t <= SESSION_END_GRACE:
+            pass  # 静默跳过
+        else:
+            _emit_log(account_id, "warn", "实时行情为空，本轮跳过")
         return None
     bar_ts = pd.Timestamp(bar_dt)
     if bar_ts.date() != now.date():
@@ -647,8 +702,23 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     ctx = bundle.ctx
     if has_saved:
         _restore_portfolio(ctx, st)
-    # initialize 后把策略 g.* 池子注入 universe（打破回放取价死锁）
+    try:
+        bundle.init_fn(ctx)
+    except Exception as e:  # noqa: BLE001
+        db.update_sim_account(account_id, status="failed")
+        _emit_log(account_id, "error", f"策略 init 异常: {e}")
+        return
+    # initialize 后把策略 g.* 池子注入 universe（首次构建 + 打破回放取价死锁）
     _seed_universe(ctx)
+    aux = {"jq_api": jq_api, "start_cash": start_cash, "fired": set(),
+           "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
+           "frequency": (acct.get("frequency") or "minute"), "daily_done": None,
+           "dm": dm}
+    state: dict = {
+        "cash": cash, "start_cash": start_cash, "net_value": cash, "pnl": 0.0,
+        "positions": {}, "stop_loss_log": st.get("stop_loss_log") or [],
+        "dt": st.get("dt"),
+    }
     def _replay_log_sink(level, msg):
         if aux.get("replay_mode"):
             aux.setdefault("batch_logs", []).append(
@@ -656,20 +726,6 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
         else:
             _emit_log(account_id, level, msg)
     jq_api._state["log_sink"] = _replay_log_sink
-    try:
-        bundle.init_fn(ctx)
-    except Exception as e:  # noqa: BLE001
-        db.update_sim_account(account_id, status="failed")
-        _emit_log(account_id, "error", f"策略 init 异常: {e}")
-        return
-    state: dict = {
-        "cash": cash, "start_cash": start_cash, "net_value": cash, "pnl": 0.0,
-        "positions": {}, "stop_loss_log": st.get("stop_loss_log") or [],
-        "dt": st.get("dt"),
-    }
-    aux = {"jq_api": jq_api, "start_cash": start_cash, "fired": set(),
-           "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
-           "frequency": (acct.get("frequency") or "minute"), "daily_done": None}
     start_date = (acct.get("start_date") or "").strip()
     _emit_log(account_id, "info",
               f"策略模拟盘启动: {sid} 资金 {start_cash}{'（恢复续跑）' if has_saved else ''}"

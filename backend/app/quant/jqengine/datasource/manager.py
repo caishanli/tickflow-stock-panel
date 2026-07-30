@@ -161,6 +161,7 @@ class DataManager:
         self._minute_mem = _MinuteLRU(
             cap=minute_mem_cap,
             on_evict=lambda k, _v: self._minute_cov.pop(k, None))
+        self._minute_empty = set()  # 已知无分钟数据的标的，避免重复网络请求
         self._daily_mem = {}
         # _daily_mem 数据版本号：每次写入/删除递增，money memo 键含版本据此失效
         self._daily_ver = 0
@@ -250,9 +251,6 @@ class DataManager:
             src_name, raw_code = key.split("_", 1)
             if df is None or (hasattr(df, "empty") and df.empty):
                 continue
-            # 跳过过期日线：preload 不把过期数据读入内存，迫使 fetch 回源刷新
-            if self.cache._is_stale(df):
-                continue
             jq_code = self._to_jq_code(raw_code)
             pri = priority.index(src_name) if src_name in priority else len(priority)
             cands.setdefault(jq_code, []).append((pri, src_name, key, df))
@@ -279,6 +277,16 @@ class DataManager:
             df = _ensure_money_yuan(df, src_name)
             # 成交量单位归一（vol → volume，单位：股），与 money 同模式
             df = _ensure_volume_shares(df, src_name)
+            # 确保 index 是 DatetimeIndex：批量路径 _get_price_batch_daily
+            # 依赖 isinstance(idx, DatetimeIndex) 做日期切片，若为 RangeIndex
+            # 会被全部跳过导致 get_price 返回空。
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if "trade_date" in df.columns:
+                    df.index = pd.to_datetime(df["trade_date"].astype(str))
+                elif "datetime" in df.columns:
+                    df.index = pd.to_datetime(df["datetime"])
+                elif "timestamp" in df.columns:
+                    df.index = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
             self._daily_mem[f"get_daily_{jq_code}"] = df
             count += 1
         # 日线内存已整体刷新：递增数据版本号，使 money memo 按新版本键重建
@@ -307,8 +315,16 @@ class DataManager:
                 # 下方 cache.get 回源补齐。
                 req_start = args[1] if len(args) > 1 else None
                 req_end = args[2] if len(args) > 2 else None
+                # 只在实时请求（end >= 今天）时检查过期；历史请求直接用内存数据
+                _is_live_req = False
+                if req_end is not None:
+                    try:
+                        _end_date = pd.Timestamp(req_end).date()
+                        _is_live_req = _end_date >= pd.Timestamp.now().normalize().date()
+                    except Exception:
+                        _is_live_req = True
                 if (DataCache._covers(mem, req_start, req_end)
-                        and not self.cache._is_stale(mem)):
+                        and not (self.cache._is_stale(mem) and _is_live_req)):
                     return mem
             del self._daily_mem[cache_key]
             self._daily_ver += 1  # 日线内存有删除，money memo 旧版本键失效
@@ -334,6 +350,14 @@ class DataManager:
                     # 成交量单位归一为 volume(股)
                     df = _ensure_money_yuan(df, name)
                     df = _ensure_volume_shares(df, name)
+                    # 确保 index 是 DatetimeIndex（同 preload_daily 逻辑）
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        if "trade_date" in df.columns:
+                            df.index = pd.to_datetime(df["trade_date"].astype(str))
+                        elif "datetime" in df.columns:
+                            df.index = pd.to_datetime(df["datetime"])
+                        elif "timestamp" in df.columns:
+                            df.index = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
                     self._daily_mem[cache_key] = df
                     self._daily_ver += 1  # 日线内存有写入，money memo 旧版本键失效
                     self._src_fail[name] = 0  # 该源成功取数，重置连续失败计数
@@ -465,6 +489,9 @@ class DataManager:
         取决于访问顺序（先到先得）；加校验后同参数回测结果与访问顺序无关、
         可复现。
         """
+        # 已知无数据的标的（指数等），跳过重复加载
+        if code in self._minute_empty:
+            return None
         df = self._minute_mem.get(code)
         if df is None or (hasattr(df, "empty") and df.empty):
             return None
@@ -478,11 +505,14 @@ class DataManager:
 
         滑窗为 [as_of - minute_lookback, as_of]（下界不早于回测窗口起点）。
         H6c 修复：原实现"首次按需加载后永久复用"、命中不校验覆盖区间，同一
-        标的的数据口径取决于访问顺序；现按 _minute_cov 校验覆盖：覆盖才命中，
+        标的数据口径取决于访问顺序；现按 _minute_cov 校验覆盖：覆盖才命中，
         否则重新按滑窗合并加载（窗口随 as_of 前移而滑动）。
         as_of 归一到日（上界扩到当日 15:00），同一交易日内的重复调用直接
         命中，不会逐 bar 重载；日内分钟级切片由调用方按精确 dt 自行截取。
         """
+        # 已知无分钟数据的标的（指数等），直接跳过
+        if code in self._minute_empty:
+            return None
         if as_of is not None:
             as_of_ts = pd.Timestamp(as_of).normalize()
         else:
@@ -497,6 +527,8 @@ class DataManager:
         if df is not None and not df.empty:
             self._minute_mem[code] = df
             self._minute_cov[code] = (lo_ts, hi_eff)
+        else:
+            self._minute_empty.add(code)
         return df
 
     def preload_minute_for_pool(self, codes, as_of=None):
@@ -668,7 +700,10 @@ class DataManager:
                     pass  # 离线：不联网补缺口
                 else:
                     try:
-                        fresh = self.sources["mootdx"].get_minute(code)
+                        # 限制拉取量：缺口约 N 个交易日 × 240 bar/天，加 50% 余量
+                        gap_days = max((hi_ts - local_end).days, 1)
+                        max_bars = min(gap_days * 360, 30000)
+                        fresh = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
                     except Exception as e:
                         import logging
                         logging.warning("[DataManager] mootdx回源补充缺口失败 %s: %s", code, e)
@@ -697,7 +732,10 @@ class DataManager:
             # 离线：完全缺失的标的不再联网回源，直接返回 None 由上层跳过
             return None
         try:
-            df = self.sources["mootdx"].get_minute(code)
+            # 无本地缓存：按请求窗口估算拉取量，避免默认30000全量拉取
+            win_days = max((hi_ts - lo_ts).days, 1) if lo_ts and hi_ts else 15
+            max_bars = min(win_days * 360, 30000)
+            df = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
         except Exception as e:
             import logging
             logging.warning("[DataManager] mootdx首次获取分钟数据失败 %s: %s", code, e)
