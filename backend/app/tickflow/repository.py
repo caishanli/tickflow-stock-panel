@@ -30,6 +30,15 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+_store: DataStore | None = None
+
+
+def get_store() -> DataStore:
+    global _store
+    if _store is None:
+        _store = DataStore()
+    return _store
+
 
 def enriched_dirname(asset_type: str) -> str:
     """asset_type → enriched parquet 目录名。ETF 走独立目录, 其余(stock)用日K enriched。"""

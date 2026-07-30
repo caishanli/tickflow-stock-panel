@@ -8,7 +8,6 @@ Phase 1 实现:
 from __future__ import annotations
 
 import logging
-from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -57,15 +56,39 @@ def get_pool(pool_id: PoolId, refresh: bool = False) -> list[str]:
     if pool_id == "watchlist":
         return _load_watchlist()
 
-    cache = _pool_cache_path(pool_id)
-    if cache.exists() and not refresh:
-        df = pl.read_parquet(cache)
-        return df["symbol"].to_list()
+    from app.tickflow.repository import get_store
+    store = get_store()
+
+    if not refresh:
+        try:
+            result = store.db.execute(
+                "SELECT symbol FROM pools WHERE pool_name = ?", [pool_id]
+            ).fetchall()
+            if result:
+                return [r[0] for r in result]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("DuckDB pools read failed: %s", e)
+
+        cache = _pool_cache_path(pool_id)
+        if cache.exists():
+            try:
+                df = pl.read_parquet(cache)
+                if not df.is_empty():
+                    return df["symbol"].to_list()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Parquet pools read failed: %s", e)
 
     symbols = _fetch_pool(pool_id)
     if symbols:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        pl.DataFrame({"symbol": symbols, "as_of": [date.today()] * len(symbols)}).write_parquet(cache)
+        df = pl.DataFrame({
+            "pool_name": [pool_id] * len(symbols),
+            "symbol": symbols,
+        })
+        try:
+            store.db.execute("DELETE FROM pools WHERE pool_name = ?", [pool_id])
+            store.db.execute("INSERT INTO pools SELECT * FROM df")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("DuckDB pools write failed: %s", e)
     return symbols
 
 
