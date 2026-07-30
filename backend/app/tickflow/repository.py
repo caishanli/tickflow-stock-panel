@@ -492,16 +492,17 @@ class KlineRepository:
 
         sql += " ORDER BY symbol, date"
 
-        return self.db.execute(sql, params).pl()
+        with self._lock:
+            return self.db.execute(sql, params).pl()
 
     def get_latest_date(self, table: str = "kline_daily") -> date | None:
         """Get the latest date in the table."""
-        result = self.db.execute(f"SELECT max(date) FROM {table}").fetchone()
+        result = self.execute_one(f"SELECT max(date) FROM {table}")
         return result[0] if result and result[0] else None
 
     def get_date_range(self, table: str = "kline_daily") -> tuple[date | None, date | None]:
         """Get the date range in the table."""
-        result = self.db.execute(f"SELECT min(date), max(date) FROM {table}").fetchone()
+        result = self.execute_one(f"SELECT min(date), max(date) FROM {table}")
         return (result[0], result[1]) if result else (None, None)
 
     # ================================================================
