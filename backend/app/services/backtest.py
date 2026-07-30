@@ -16,7 +16,6 @@ import pandas as pd
 import polars as pl
 
 from app.config import settings
-from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
@@ -153,17 +152,14 @@ class BacktestService:
         warmup_start = start - timedelta(days=_INDICATOR_WARMUP_DAYS)
         try:
             from app.tickflow.repository import enriched_dirname
-            enriched_glob = str(self.repo.store.data_dir / enriched_dirname(asset_type) / "**" / "*.parquet")
-            df = (
-                scan_enriched_parquet(enriched_glob)
-                .filter(
-                    (pl.col("symbol").is_in(symbols))
-                    & (pl.col("date") >= warmup_start)
-                    & (pl.col("date") <= end)
-                )
-                .sort(["date", "symbol"])
-                .collect()
-            )
+            table = enriched_dirname(asset_type)
+            sym_placeholders = ", ".join(["?"] * len(symbols))
+            df = self.repo.db.execute(
+                f"SELECT * FROM {table} "
+                f"WHERE symbol IN ({sym_placeholders}) AND date >= ? AND date <= ? "
+                f"ORDER BY date, symbol",
+                [*symbols, warmup_start, end],
+            ).pl()
         except Exception as e:  # noqa: BLE001
             logger.warning("backtest load failed: %s", e)
             return pd.DataFrame()

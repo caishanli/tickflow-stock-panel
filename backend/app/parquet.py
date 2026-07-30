@@ -1,8 +1,5 @@
-"""Polars parquet helpers."""
+"""Polars parquet helpers — schema definitions only."""
 from __future__ import annotations
-
-import warnings
-from typing import Any
 
 import polars as pl
 
@@ -35,24 +32,3 @@ ENRICHED_STORAGE_SCHEMA: dict[str, pl.DataType] = {
     "consecutive_limit_downs": pl.UInt32,
     "quote_ts": pl.Int64,
 }
-
-
-def scan_parquet_compat(source: Any, **kwargs: Any) -> pl.LazyFrame:
-    """Scan partitioned parquet while tolerating additive schema changes."""
-    kwargs.setdefault("missing_columns", "insert")
-    kwargs.setdefault("extra_columns", "ignore")
-    return pl.scan_parquet(source, **kwargs)
-
-
-def scan_daily_parquet(source: Any, **kwargs: Any) -> pl.LazyFrame:
-    warnings.warn("scan_daily_parquet is deprecated, use DuckDB queries", DeprecationWarning, stacklevel=2)
-    kwargs.setdefault("schema", DAILY_STORAGE_SCHEMA)
-    kwargs.setdefault("cast_options", pl.ScanCastOptions(integer_cast="allow-float"))
-    return scan_parquet_compat(source, **kwargs)
-
-
-def scan_enriched_parquet(source: Any, **kwargs: Any) -> pl.LazyFrame:
-    warnings.warn("scan_enriched_parquet is deprecated, use DuckDB queries", DeprecationWarning, stacklevel=2)
-    kwargs.setdefault("schema", ENRICHED_STORAGE_SCHEMA)
-    kwargs.setdefault("cast_options", pl.ScanCastOptions(integer_cast="allow-float"))
-    return scan_parquet_compat(source, **kwargs)

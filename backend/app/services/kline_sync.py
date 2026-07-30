@@ -456,15 +456,16 @@ def _datetime_to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _write_minute_partition(df: pl.DataFrame, repo: KlineRepository) -> int:
+def _write_minute_partition(df: pl.DataFrame, repo: KlineRepository,
+                           asset_type: str = "stock") -> int:
     """写入分钟 K 到 DuckDB。返回写入行数。"""
     if df.is_empty():
         return 0
     df = df.with_columns(pl.col("datetime").dt.date().alias("_trade_date"))
+    table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
     written = 0
     for day_df in df.partition_by("_trade_date"):
         day_df = day_df.drop("_trade_date")
-        table = "kline_etf_minute" if "_etf_minute" in str(repo._minute_glob) else "kline_minute"
         cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in day_df.columns]
         day_df = day_df.select(cols)
         repo._upsert_daily(day_df, table)
@@ -1007,7 +1008,7 @@ def sync_and_persist_minute(
     written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
 
     def _persist(seg_df: pl.DataFrame) -> None:
-        written_box[0] += _write_minute_partition(seg_df, repo)
+        written_box[0] += _write_minute_partition(seg_df, repo, asset_type="stock")
 
     segment_days = preferences.get_minute_sync_segment_days()
     sync_minute_batch(

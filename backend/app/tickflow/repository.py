@@ -3,7 +3,6 @@
 数据分层:
   - DuckDB 视图: 冷查询(统计、元数据、用户自定义SQL)
   - Polars 缓存: 热路径(enriched 最新日 ~5500行 + instruments ~5500行)
-  - Polars scan_parquet: 分钟K/历史日K (predicate pushdown)
 
 缓存生命周期:
   - startup 时不加载(数据可能为空)
@@ -41,7 +40,7 @@ def get_store() -> DataStore:
 
 
 def enriched_dirname(asset_type: str) -> str:
-    """asset_type → enriched parquet 目录名。ETF 走独立目录, 其余(stock)用日K enriched。"""
+    """asset_type → enriched 表名。ETF 走独立表, 其余(stock)用 kline_daily_enriched。"""
     return "kline_etf_enriched" if asset_type == "etf" else "kline_daily_enriched"
 
 
@@ -275,73 +274,75 @@ class DataStore:
         """No-op — all data lives in real DuckDB tables created by _create_tables()."""
         self._register_unified_views()
 
-    def _has_parquet(self, subdir: str) -> bool:
-        return any((self.data_dir / subdir).rglob("*.parquet"))
+    def _table_exists(self, table: str) -> bool:
+        try:
+            result = self.db.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [table]
+            ).fetchone()
+            return result is not None
+        except Exception:  # noqa: BLE001
+            return False
 
     def _register_unified_views(self) -> None:
-        """Register optional all-asset views when their backing parquet exists.
-
-        Physical storage remains split for performance and compatibility. These
-        views are convenience read models for new APIs/features.
-        """
+        """Register optional all-asset views when their backing tables have data."""
         daily_parts: list[str] = []
         enriched_parts: list[str] = []
         minute_parts: list[str] = []
         inst_parts: list[str] = []
 
-        if self._has_parquet("kline_daily"):
+        if self._table_exists("kline_daily"):
             daily_parts.append("""
                 SELECT symbol, date, open, high, low, close, volume, amount,
                        'stock' AS asset_type, 'tickflow' AS source
                 FROM kline_daily
             """)
-        if self._has_parquet("kline_index_daily"):
+        if self._table_exists("kline_index_daily"):
             daily_parts.append("""
                 SELECT symbol, date, open, high, low, close, volume, amount,
                        'index' AS asset_type, 'tickflow' AS source
                 FROM kline_index_daily
             """)
-        if self._has_parquet("kline_etf_daily"):
+        if self._table_exists("kline_etf_daily"):
             daily_parts.append("""
                 SELECT symbol, date, open, high, low, close, volume, amount,
                        'etf' AS asset_type, 'tickflow' AS source
                 FROM kline_etf_daily
             """)
 
-        if self._has_parquet("kline_daily_enriched"):
+        if self._table_exists("kline_daily_enriched"):
             enriched_parts.append("SELECT *, 'stock' AS asset_type, 'tickflow' AS source FROM kline_enriched")
-        if self._has_parquet("kline_index_enriched"):
+        if self._table_exists("kline_index_enriched"):
             enriched_parts.append("SELECT *, 'index' AS asset_type, 'tickflow' AS source FROM kline_index_enriched")
-        if self._has_parquet("kline_etf_enriched"):
+        if self._table_exists("kline_etf_enriched"):
             enriched_parts.append("SELECT *, 'etf' AS asset_type, 'tickflow' AS source FROM kline_etf_enriched")
 
-        if self._has_parquet("kline_minute"):
+        if self._table_exists("kline_minute"):
             minute_parts.append("""
                 SELECT symbol, datetime, open, high, low, close, volume, amount,
                        'stock' AS asset_type, 'tickflow' AS source
                 FROM kline_minute
             """)
-        if self._has_parquet("kline_etf_minute"):
+        if self._table_exists("kline_etf_minute"):
             minute_parts.append("""
                 SELECT symbol, datetime, open, high, low, close, volume, amount,
                        'etf' AS asset_type, 'tickflow' AS source
                 FROM kline_etf_minute
             """)
 
-        if self._has_parquet("instruments"):
+        if self._table_exists("instruments"):
             inst_parts.append("""
-                SELECT symbol, name, code, exchange, 'stock' AS asset_type, 'tickflow' AS source
+                SELECT symbol, name, exchange, 'stock' AS asset_type, 'tickflow' AS source
                 FROM instruments
             """)
-        if self._has_parquet("instruments_index"):
+        if self._table_exists("instruments_index"):
             inst_parts.append("""
-                SELECT symbol, name, code, NULL AS exchange, 'index' AS asset_type, 'tickflow' AS source
+                SELECT symbol, name, NULL AS exchange, 'index' AS asset_type, 'tickflow' AS source
                 FROM instruments_index
                 WHERE coalesce(asset_type, 'index') != 'etf'
             """)
-        if self._has_parquet("instruments_etf"):
+        if self._table_exists("instruments_etf"):
             inst_parts.append("""
-                SELECT symbol, name, code, NULL AS exchange, 'etf' AS asset_type, 'tickflow' AS source
+                SELECT symbol, name, NULL AS exchange, 'etf' AS asset_type, 'tickflow' AS source
                 FROM instruments_etf
             """)
 
@@ -405,15 +406,7 @@ class KlineRepository:
         # parquet/instruments 同步刷新完成后的轻量回调；用于调度派生缓存预热。
         self._on_refresh_done: Callable[[], None] | None = None
 
-        # parquet glob 路径
-        self._enriched_glob = str(store.data_dir / "kline_daily_enriched" / "**" / "*.parquet")
-        self._index_enriched_glob = str(store.data_dir / "kline_index_enriched" / "**" / "*.parquet")
-        self._etf_enriched_glob = str(store.data_dir / "kline_etf_enriched" / "**" / "*.parquet")
-        self._minute_glob = str(store.data_dir / "kline_minute" / "**" / "*.parquet")
-        self._etf_minute_glob = str(store.data_dir / "kline_etf_minute" / "**" / "*.parquet")
-        self._inst_glob = str(store.data_dir / "instruments" / "**" / "*.parquet")
-        self._index_inst_glob = str(store.data_dir / "instruments_index" / "**" / "*.parquet")
-        self._etf_inst_glob = str(store.data_dir / "instruments_etf" / "**" / "*.parquet")
+
 
     def execute_all(self, sql: str, params: list | None = None) -> list[tuple]:
         """线程安全的 SELECT → fetchall。DuckDB 单 connection 非线程安全，所有读路径须走此方法。"""
@@ -965,42 +958,23 @@ class KlineRepository:
             logger.debug("ETF enriched 缓存刷新跳过: %s", e)
 
     def _refresh_instruments(self) -> None:
-        """加载 instruments 到内存。优先从 DuckDB 读取，回退到 Parquet。"""
+        """加载 instruments 到内存。"""
         try:
-            # 优先从 DuckDB 读取
             df = self.db.execute("SELECT * FROM instruments").pl()
             if not df.is_empty():
                 self._instruments_cache = df
-                logger.info("instruments 缓存已加载 (DuckDB): %d 只", len(df))
-                return
+                logger.info("instruments 缓存已加载: %d 只", len(df))
         except Exception as e:  # noqa: BLE001
-            logger.debug("DuckDB instruments read failed, falling back to Parquet: %s", e)
-        try:
-            # 回退到 Parquet
-            df = pl.scan_parquet(self._inst_glob).collect()
-            if not df.is_empty():
-                self._instruments_cache = df
-                logger.info("instruments 缓存已加载 (Parquet): %d 只", len(df))
-        except Exception as e:
             logger.warning("instruments 缓存刷新失败: %s", e)
 
     def _refresh_index_instruments(self) -> None:
-        """加载指数 instruments 到内存。优先从 DuckDB 读取，回退到 Parquet。"""
+        """加载指数 instruments 到内存。"""
         try:
             df = self.db.execute("SELECT * FROM instruments_index").pl()
             if not df.is_empty():
                 self._index_instruments_cache = df
                 self._index_symbol_set_cache = None
-                logger.info("index instruments 缓存已加载 (DuckDB): %d 只", len(df))
-                return
-        except Exception as e:  # noqa: BLE001
-            logger.debug("DuckDB instruments_index read failed, falling back to Parquet: %s", e)
-        try:
-            df = pl.scan_parquet(self._index_inst_glob).collect()
-            if not df.is_empty():
-                self._index_instruments_cache = df
-                self._index_symbol_set_cache = None
-                logger.info("index instruments 缓存已加载 (Parquet): %d 只", len(df))
+                logger.info("index instruments 缓存已加载: %d 只", len(df))
         except Exception as e:  # noqa: BLE001
             logger.debug("index instruments 缓存刷新跳过: %s", e)
 
@@ -1012,13 +986,7 @@ class KlineRepository:
             if not df.is_empty():
                 parts.append(df)
         except Exception as e:  # noqa: BLE001
-            logger.debug("DuckDB instruments_etf read failed, falling back to Parquet: %s", e)
-            try:
-                df = pl.scan_parquet(self._etf_inst_glob).collect()
-                if not df.is_empty():
-                    parts.append(df)
-            except Exception as e2:  # noqa: BLE001
-                logger.debug("etf instruments 缓存刷新跳过(new): %s", e2)
+            logger.debug("instruments_etf 读取跳过: %s", e)
         try:
             legacy = self.get_index_instruments()
             if not legacy.is_empty() and "asset_type" in legacy.columns:
@@ -1381,10 +1349,6 @@ class KlineRepository:
         if asset_type == "etf":
             return self.get_etf_daily(symbol, start, end, columns)
         return pl.DataFrame()
-
-    def _minute_glob_for(self, asset_type: str) -> str:
-        """按资产类型选择分钟K parquet glob。ETF 分钟数据独立存储于 kline_etf_minute。"""
-        return self._etf_minute_glob if asset_type == "etf" else self._minute_glob
 
     def get_minute(
         self,

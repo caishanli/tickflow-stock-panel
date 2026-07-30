@@ -24,7 +24,6 @@ import polars as pl
 
 from app.config import settings
 from app.market_time import cn_today
-from app.parquet import scan_daily_parquet, scan_enriched_parquet, scan_parquet_compat
 from app.price_limits import (
     polars_is_risk_warning_name,
     polars_limit_price,
@@ -1030,27 +1029,64 @@ def run_pipeline(data_dir: Path | None = None,
     daily_dir = d / "kline_daily"
     enriched_base = d / "kline_daily_enriched"
     factor_path = d / "adj_factor" / "all.parquet"
-    inst_glob = str(d / "instruments" / "**" / "*.parquet")
 
-    if repo is None and (not daily_dir.exists() or not any(daily_dir.rglob("*.parquet"))):
-        logger.info("无日K数据, 跳过管道")
-        return 0
+    # 创建 DuckDB 连接 (当 repo 未提供时)
+    _own_db = False
+    if repo is None:
+        import duckdb
+        db_path = d / "stock.duckdb"
+        db = duckdb.connect(database=str(db_path))
+        _own_db = True
+    else:
+        db = repo.db
 
-    daily_glob = (daily_dir / "**" / "*.parquet").as_posix()
-    _cast = pl.ScanCastOptions(integer_cast="allow-float")
-    written = 0
+    try:
+        return _run_pipeline_inner(
+            db=db, daily_dir=daily_dir, enriched_base=enriched_base,
+            factor_path=factor_path, symbols=symbols,
+            new_dates_only=new_dates_only, on_batch_done=on_batch_done, repo=repo,
+        )
+    finally:
+        if _own_db:
+            db.close()
+
+
+def _run_pipeline_inner(
+    db: Any,
+    daily_dir: Path,
+    enriched_base: Path,
+    factor_path: Path,
+    symbols: list[str] | None,
+    new_dates_only: bool,
+    on_batch_done: Callable[[int, int], None] | None,
+    repo: 'KlineRepository | None',
+) -> int:
+    """Inner implementation of run_pipeline using DuckDB."""
+    import time as _t
+    t0 = _t.perf_counter()
 
     daily_df: pl.DataFrame | None = None
     if repo is not None:
         daily_df = repo._scan_daily("kline_daily")
+    else:
+        try:
+            daily_df = db.execute("SELECT * FROM kline_daily").pl()
+        except Exception:  # noqa: BLE001
+            daily_df = None
+
+    if daily_df is None or daily_df.is_empty():
+        logger.info("无日K数据, 跳过管道")
+        return 0
+
+    written = 0
 
     # 加载 instruments (涨跌停+换手率需要)
     instruments = pl.DataFrame()
     try:
-        instruments = scan_parquet_compat(inst_glob, cast_options=_cast).collect()
+        instruments = db.execute("SELECT * FROM instruments").pl()
     except Exception as e:  # noqa: BLE001
         logger.warning("instruments 读取失败: %s", e)
-    historical_shares = load_share_history(d)
+    historical_shares = load_share_history(daily_dir.parent)
 
     if new_dates_only:
         # ── 向后增量模式 ──
@@ -1076,35 +1112,27 @@ def run_pipeline(data_dir: Path | None = None,
                 return 0
             raw_new: pl.DataFrame = daily_df.filter(pl.col("date").is_in(new_dates)).sort(["symbol", "date"]) if new_dates else pl.DataFrame()
         else:
-            # 1. 找出 daily 有但 enriched 还没有的日期
+            # DuckDB mode: find dates not yet in enriched
             enriched_dates = set()
-            if enriched_base.exists():
-                enriched_dates = {p.stem.split("=")[1] for p in enriched_base.glob("date=*")}
+            try:
+                rows = db.execute("SELECT DISTINCT date FROM kline_daily_enriched").fetchall()
+                enriched_dates = {str(r[0]) for r in rows}
+            except Exception:  # noqa: BLE001
+                pass
 
-            # 读新增日期的 daily 数据 (所有标的)
-            new_date_dirs = sorted(
-                p for p in daily_dir.glob("date=*")
-                if p.stem.split("=")[1] not in enriched_dates
-            )
-            if not new_date_dirs and not symbols:
+            all_dates = daily_df["date"].unique().to_list()
+            new_dates = [d for d in all_dates if str(d) not in enriched_dates]
+            if not new_dates and not symbols:
                 logger.info("增量模式: 无新日期, 无需重算")
                 return 0
-
-            # 2. 为新日期计算 enriched (所有标的)
-            if new_date_dirs:
-                raw_new_lf = scan_daily_parquet(new_date_dirs[0] / "*.parquet", cast_options=_cast)
-                for nd in new_date_dirs[1:]:
-                    raw_new_lf = pl.concat([raw_new_lf, scan_daily_parquet(nd / "*.parquet", cast_options=_cast)], how="diagonal_relaxed")
-                raw_new = raw_new_lf.sort(["symbol", "date"]).collect(streaming=True)
-            else:
-                raw_new = pl.DataFrame()
+            raw_new = daily_df.filter(pl.col("date").is_in(new_dates)).sort(["symbol", "date"]) if new_dates else pl.DataFrame()
 
         if not raw_new.is_empty():
 
             # 增量模式: 只算新日期, 但指标需要历史窗口
             # 读已有 enriched 最近 60 天作为历史前缀
             sym_list = raw_new["symbol"].unique().to_list()
-            hist_df = _load_recent_history(enriched_base, sym_list, days=60, repo=repo)
+            hist_df = _load_recent_history(enriched_base, sym_list, days=60, repo=repo, db=db)
 
             # 合并历史 + 新数据
             if not hist_df.is_empty():
@@ -1156,12 +1184,14 @@ def run_pipeline(data_dir: Path | None = None,
         # 3. 受除权因子影响的个股: 重算全部已有日期 (累积因子链变了)
         if symbols:
             sym_set = set(symbols)
-            if repo is not None and daily_df is not None:
+            if daily_df is not None:
                 raw_sym = daily_df.filter(pl.col("symbol").is_in(list(sym_set)))
             else:
-                raw_sym_lf = scan_daily_parquet(daily_glob, cast_options=_cast).sort(["symbol", "date"])
-                raw_sym_lf = raw_sym_lf.filter(pl.col("symbol").is_in(list(sym_set)))
-                raw_sym = raw_sym_lf.collect(streaming=True)
+                sym_placeholders = ", ".join(["?"] * len(sym_set))
+                raw_sym = db.execute(
+                    f"SELECT * FROM kline_daily WHERE symbol IN ({sym_placeholders}) ORDER BY symbol, date",
+                    list(sym_set),
+                ).pl()
             if not raw_sym.is_empty():
                 factors_sym = factors.filter(pl.col("symbol").is_in(list(sym_set))) if not factors.is_empty() else factors
                 inst_sym = instruments.filter(pl.col("symbol").is_in(list(sym_set))) if not instruments.is_empty() else instruments
@@ -1196,7 +1226,7 @@ def run_pipeline(data_dir: Path | None = None,
 
     # ── 全量 或 除权因子增量 模式 ──
     mode = f"incremental ({len(symbols)} symbols)" if symbols else "full"
-    base = d / "kline_daily_enriched"
+    base = enriched_base
 
     # 加载复权因子 (全量加载一次,每批复用)
     factors = _load_factors(factor_path)
@@ -1208,8 +1238,8 @@ def run_pipeline(data_dir: Path | None = None,
 
     # ── 按 symbol 分批处理: 每只股只有 ~244 行, 无冗余计算 ──
     # 先获取全部 symbol 列表
-    if repo is not None:
-        if daily_df is None or daily_df.is_empty():
+    if daily_df is not None:
+        if daily_df.is_empty():
             logger.info("无日K数据, 跳过管道")
             return 0
         if symbols:
@@ -1217,14 +1247,16 @@ def run_pipeline(data_dir: Path | None = None,
             daily_df = daily_df.filter(pl.col("symbol").is_in(list(sym_set)))
         all_symbols = daily_df.select("symbol").unique().sort("symbol")["symbol"].to_list()
     else:
-        lf_all = scan_daily_parquet(daily_glob, cast_options=_cast)
         if symbols:
-            sym_set = set(symbols)
-            lf_all = lf_all.filter(pl.col("symbol").is_in(list(sym_set)))
-        all_symbols = (
-            lf_all.select("symbol").unique().sort("symbol")
-            .collect(streaming=True)["symbol"].to_list()
-        )
+            sym_placeholders = ", ".join(["?"] * len(symbols))
+            all_symbols = db.execute(
+                f"SELECT DISTINCT symbol FROM kline_daily WHERE symbol IN ({sym_placeholders}) ORDER BY symbol",
+                symbols,
+            ).pl()["symbol"].to_list()
+        else:
+            all_symbols = db.execute(
+                "SELECT DISTINCT symbol FROM kline_daily ORDER BY symbol"
+            ).pl()["symbol"].to_list()
     if not all_symbols:
         logger.info("无日K数据, 跳过管道")
         return 0
@@ -1252,13 +1284,15 @@ def run_pipeline(data_dir: Path | None = None,
         batch_syms = all_symbols[batch_start:batch_end]
 
         # 只读取本批 symbol 的数据
-        if repo is not None and daily_df is not None:
+        if daily_df is not None:
             raw = daily_df.filter(pl.col("symbol").is_in(batch_syms))
             raw = raw.sort(["symbol", "date"])
         else:
-            lf_batch = scan_daily_parquet(daily_glob, cast_options=_cast)
-            lf_batch = lf_batch.filter(pl.col("symbol").is_in(batch_syms))
-            raw = lf_batch.sort(["symbol", "date"]).collect(streaming=True)
+            sym_placeholders = ", ".join(["?"] * len(batch_syms))
+            raw = db.execute(
+                f"SELECT * FROM kline_daily WHERE symbol IN ({sym_placeholders}) ORDER BY symbol, date",
+                batch_syms,
+            ).pl()
 
         if raw.is_empty():
             continue
@@ -1430,45 +1464,33 @@ def _load_factors(factor_path: Path) -> pl.DataFrame:
 
 
 def _load_recent_history(enriched_base: Path, symbols: list[str], days: int,
-                         repo: 'KlineRepository | None' = None) -> pl.DataFrame:
+                         repo: 'KlineRepository | None' = None,
+                         db: Any = None) -> pl.DataFrame:
     """从已有 enriched 加载最近 N 天的历史数据(用于增量模式的指标计算窗口)。
 
     只读基础行情列, 作为指标计算的历史前缀。
-    当 repo 提供时优先从 DuckDB 读取, 否则回退到 Parquet。
     """
     from datetime import date, timedelta
     cutoff = date.today() - timedelta(days=days + 30)  # 多读 30 天余量
 
-    if repo is not None:
-        try:
-            sym_placeholders = ", ".join(["?"] * len(symbols))
-            cols = "symbol, date, open, high, low, close, volume, amount, raw_close, raw_high, raw_low"
-            df = repo.db.execute(
-                f"SELECT {cols} FROM kline_daily_enriched "
-                f"WHERE symbol IN ({sym_placeholders}) AND date >= ? ORDER BY symbol, date",
-                [*symbols, cutoff],
-            ).pl()
-            if not df.is_empty():
-                return df
-        except Exception as e:  # noqa: BLE001
-            logger.warning("DuckDB history load failed, falling back to Parquet: %s", e)
+    conn = repo.db if repo is not None else db
+    if conn is None:
+        return pl.DataFrame()
 
     try:
-        lf = (
-            scan_enriched_parquet(str(enriched_base / "**" / "*.parquet"), cast_options=_cast)
-            .filter(
-                (pl.col("symbol").is_in(symbols))
-                & (pl.col("date") >= cutoff)
-            )
-            .sort(["symbol", "date"])
-        )
-        hist_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
-                                 "volume", "amount", "raw_close", "raw_high", "raw_low"]
-                    if c in lf.schema]
-        return lf.select(hist_cols).collect()
+        sym_placeholders = ", ".join(["?"] * len(symbols))
+        cols = "symbol, date, open, high, low, close, volume, amount, raw_close, raw_high, raw_low"
+        df = conn.execute(
+            f"SELECT {cols} FROM kline_daily_enriched "
+            f"WHERE symbol IN ({sym_placeholders}) AND date >= ? ORDER BY symbol, date",
+            [*symbols, cutoff],
+        ).pl()
+        if not df.is_empty():
+            return df
     except Exception as e:  # noqa: BLE001
-        logger.warning("历史数据加载失败: %s", e)
-        return pl.DataFrame()
+        logger.warning("DuckDB history load failed: %s", e)
+
+    return pl.DataFrame()
 
 
 def compute_enriched_single(daily_for_symbol: pl.DataFrame) -> pl.DataFrame:

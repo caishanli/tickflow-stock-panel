@@ -30,17 +30,12 @@ class TickflowSource(DataSource):
 
     def __init__(self, db_path: str | Path | None = None):
         from app.tickflow.repository import DataStore, KlineRepository
-        from app.parquet import scan_enriched_parquet
         if db_path is not None:
             data_dir = Path(db_path).parent
             self._store = DataStore(data_dir=data_dir)
         else:
             self._store = DataStore()
         self._repo = KlineRepository(self._store)
-        self._scan = scan_enriched_parquet
-        self._enriched_glob = str(
-            self._store.data_dir / "kline_daily_enriched" / "**" / "*.parquet"
-        )
 
     def get_daily(self, code, start, end):
         sym = _to_tf_code(code)

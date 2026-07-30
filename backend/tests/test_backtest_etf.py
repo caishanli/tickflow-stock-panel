@@ -26,56 +26,48 @@ def test_panel_cache_key_isolates_asset_type():
 
 
 def test_engine_loads_from_etf_dir(monkeypatch, tmp_path):
-    """asset_type='etf' 时, load_panel 应扫 ETF enriched 目录, 不走 stock 缓存。"""
+    """asset_type='etf' 时, load_panel 应查询 ETF enriched 表。"""
     captured = {}
 
-    def fake_scan(path, *a, **k):
-        captured["path"] = str(path)
-        return pl.LazyFrame({
-            "symbol": pl.Series("symbol", [], dtype=pl.Utf8),
-            "date": pl.Series("date", [], dtype=pl.Date),
-            "open": pl.Series("open", [], dtype=pl.Float64),
-            "high": pl.Series("high", [], dtype=pl.Float64),
-            "low": pl.Series("low", [], dtype=pl.Float64),
-            "close": pl.Series("close", [], dtype=pl.Float64),
-            "volume": pl.Series("volume", [], dtype=pl.Float64),
-        })
+    def fake_execute(sql, params=None):
+        captured["sql"] = sql
+        return types.SimpleNamespace(
+            pl=lambda: pl.DataFrame({
+                "symbol": [], "date": [], "open": [], "high": [], "low": [], "close": [], "volume": [],
+            })
+        )
 
-    monkeypatch.setattr("app.backtest.engine.pl.scan_parquet", fake_scan)
-
-    # get_enriched_range 返回 None: 即便被调也不命中缓存; etf 分支本就不该调它
+    mock_db = types.SimpleNamespace(execute=fake_execute)
     repo = types.SimpleNamespace(
         store=types.SimpleNamespace(data_dir=tmp_path),
+        db=mock_db,
         get_enriched_range=lambda *a, **k: None,
     )
     eng = BacktestEngine(repo)
     eng._load_panel_inner(["510300"], date(2026, 1, 1), date(2026, 1, 2), None, "etf")
-    assert "kline_etf_enriched" in captured["path"]
+    assert "kline_etf_enriched" in captured.get("sql", "")
 
 
 def test_engine_stock_uses_daily_enriched_dir(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_scan(path, *a, **k):
-        captured["path"] = str(path)
-        return pl.LazyFrame({
-            "symbol": pl.Series("symbol", [], dtype=pl.Utf8),
-            "date": pl.Series("date", [], dtype=pl.Date),
-            "open": pl.Series("open", [], dtype=pl.Float64),
-            "high": pl.Series("high", [], dtype=pl.Float64),
-            "low": pl.Series("low", [], dtype=pl.Float64),
-            "close": pl.Series("close", [], dtype=pl.Float64),
-            "volume": pl.Series("volume", [], dtype=pl.Float64),
-        })
+    def fake_execute(sql, params=None):
+        captured["sql"] = sql
+        return types.SimpleNamespace(
+            pl=lambda: pl.DataFrame({
+                "symbol": [], "date": [], "open": [], "high": [], "low": [], "close": [], "volume": [],
+            })
+        )
 
-    monkeypatch.setattr("app.backtest.engine.pl.scan_parquet", fake_scan)
+    mock_db = types.SimpleNamespace(execute=fake_execute)
     repo = types.SimpleNamespace(
         store=types.SimpleNamespace(data_dir=tmp_path),
+        db=mock_db,
         get_enriched_range=lambda *a, **k: None,
     )
     eng = BacktestEngine(repo)
     eng._load_panel_inner(["600519"], date(2026, 1, 1), date(2026, 1, 2), None, "stock")
-    assert "kline_daily_enriched" in captured["path"]
+    assert "kline_daily_enriched" in captured.get("sql", "")
 
 
 def test_panel_cache_single_flight_computes_once():

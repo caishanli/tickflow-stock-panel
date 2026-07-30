@@ -26,7 +26,6 @@ from app.backtest.matrix import (
     load_market_data_matrix_from_parquet,
 )
 from app.config import settings
-from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
@@ -524,28 +523,38 @@ class BacktestEngine:
             logger.debug("backtest load panel cache miss: %s", e)
 
         from app.tickflow.repository import enriched_dirname
-        enriched_glob = str(self.repo.store.data_dir / enriched_dirname(asset_type) / "**" / "*.parquet")
+        table = enriched_dirname(asset_type)
 
         try:
-            lf = scan_enriched_parquet(enriched_glob)
+            conditions = []
+            params: list = []
             if symbols is not None:
-                lf = lf.filter(pl.col("symbol").is_in(symbols))
+                sym_placeholders = ", ".join(["?"] * len(symbols))
+                conditions.append(f"symbol IN ({sym_placeholders})")
+                params.extend(symbols)
+            conditions.append("date >= ?")
+            params.append(start)
+            conditions.append("date <= ?")
+            params.append(end)
+            where = " AND ".join(conditions)
+
             if columns is not None:
-                available = set(lf.collect_schema().names())
-                selected = [c for c in columns if c in available]
-                if "symbol" not in selected and "symbol" in available:
+                available_cols = set(self.repo.db.execute(
+                    f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table}'"
+                ).pl()["column_name"].to_list())
+                selected = [c for c in columns if c in available_cols]
+                if "symbol" not in selected and "symbol" in available_cols:
                     selected.insert(0, "symbol")
-                if "date" not in selected and "date" in available:
+                if "date" not in selected and "date" in available_cols:
                     selected.insert(1, "date")
-                lf = lf.select(selected)
-            df = (
-                lf.filter(
-                    (pl.col("date") >= start)
-                    & (pl.col("date") <= end)
-                )
-                .sort(["symbol", "date"])
-                .collect(streaming=True)
-            )
+                select = ", ".join(selected)
+            else:
+                select = "*"
+
+            df = self.repo.db.execute(
+                f"SELECT {select} FROM {table} WHERE {where} ORDER BY symbol, date",
+                params,
+            ).pl()
         except Exception as e:
             logger.warning("backtest load panel failed: %s", e)
             return pl.DataFrame()
