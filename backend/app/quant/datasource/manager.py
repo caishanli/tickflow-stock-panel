@@ -177,10 +177,88 @@ class QuantDataProvider:
             logging.getLogger(__name__).warning("[QuantDataProvider] 分钟数据落盘失败 %s: %s", code, e)
 
     def get_stock_list(self):
-        return self._fetch_noarg("get_stock_list")
+        import logging
+        log = logging.getLogger(__name__)
+
+        # 1) DuckDB 有就直接读
+        tf = self.sources.get("tickflow")
+        if tf is not None:
+            try:
+                df = tf.get_stock_list()
+                if df is not None and len(df) > 0:
+                    return df
+            except Exception as e:
+                log.warning("[QuantDataProvider] tickflow 股票列表失败: %s", e)
+
+        # 2) DuckDB 没有, TickFlow API 回源并落盘
+        if tf is not None and hasattr(tf, "_repo"):
+            try:
+                from app.tickflow.client import get_client
+                client = get_client()
+                if client is not None:
+                    symbols = []
+                    for ex in ["SZ", "SH"]:
+                        try:
+                            items = client.exchanges.get_instruments(ex, instrument_type="stock")
+                            for it in items or []:
+                                sym = (it if isinstance(it, dict) else {}).get("symbol")
+                                if sym:
+                                    symbols.append(str(sym))
+                        except Exception:
+                            continue
+                    if symbols:
+                        import polars as pl
+                        df = pl.DataFrame({"symbol": symbols})
+                        tf._repo.save_instruments(df)
+                        log.info("[QuantDataProvider] 股票列表从TickFlow API回源: %d 只", len(symbols))
+                        return symbols
+            except Exception as e:
+                log.warning("[QuantDataProvider] TickFlow API 股票列表失败: %s", e)
+
+        # 3) 都没有
+        raise RuntimeError("[QuantDataProvider] 股票列表获取失败: 所有数据源均无数据")
 
     def get_etf_list(self):
-        return self._fetch_noarg("get_etf_list")
+        import logging
+        log = logging.getLogger(__name__)
+
+        # 1) DuckDB 有就直接读
+        tf = self.sources.get("tickflow")
+        if tf is not None:
+            try:
+                df = tf.get_etf_list()
+                if df is not None and len(df) > 0:
+                    return df
+            except Exception as e:
+                log.warning("[QuantDataProvider] tickflow ETF列表失败: %s", e)
+
+        # 2) DuckDB 没有, TickFlow API 回源并落盘
+        if tf is not None and hasattr(tf, "_repo"):
+            try:
+                from app.tickflow.client import get_client
+                client = get_client()
+                if client is not None:
+                    symbols = []
+                    for ex in ["SZ", "SH"]:
+                        try:
+                            items = client.exchanges.get_instruments(ex, instrument_type="etf")
+                            for it in items or []:
+                                sym = (it if isinstance(it, dict) else {}).get("symbol")
+                                if sym:
+                                    symbols.append(str(sym))
+                        except Exception:
+                            continue
+                    if symbols:
+                        import polars as pl
+                        df = pl.DataFrame({"symbol": symbols})
+                        tf._repo.save_etf_instruments(df)
+                        log.info("[QuantDataProvider] ETF列表从TickFlow API回源: %d 只", len(symbols))
+                        return symbols
+            except Exception as e:
+                log.warning("[QuantDataProvider] TickFlow API ETF列表失败: %s", e)
+
+        # 3) 都没有
+        raise RuntimeError("[QuantDataProvider] ETF列表获取失败: 所有数据源均无数据")
 
     def _fetch_noarg(self, method):
         last = None
