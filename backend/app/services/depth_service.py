@@ -114,23 +114,31 @@ class DepthService:
             return
         try:
             result = self._repo.db.execute(
-                "SELECT symbol, sealed, bid1_volume, ask1_volume FROM depth5 WHERE date = ?", [d]
+                "SELECT symbol, sealed, bid1_volume, ask1_volume, status FROM depth5 WHERE date = ?", [d]
             ).fetchall()
             if not result:
                 return
             cache: dict[str, dict] = {}
             for row in result:
-                sym, sealed, bid1_vol, ask1_vol = row
+                sym, sealed, bid1_vol, ask1_vol, status = row
                 if not sym:
                     continue
-                # 从 sealed 和 bid1_vol/ask1_vol 反推 status
-                # 简化恢复: 默认设为 limit_up (sealed 对应 sealed_up)
+                # 根据 status 恢复 sealed_up / sealed_down
+                if status == "limit_up":
+                    sealed_up = sealed
+                    sealed_down = None
+                elif status == "limit_down":
+                    sealed_up = None
+                    sealed_down = sealed
+                else:
+                    sealed_up = None
+                    sealed_down = None
                 cache[sym] = {
-                    "sealed_up": sealed,
-                    "sealed_down": None,
+                    "sealed_up": sealed_up,
+                    "sealed_down": sealed_down,
                     "ask1_vol": ask1_vol,
                     "bid1_vol": bid1_vol,
-                    "status": "limit_up",
+                    "status": status or "limit_up",
                     "fetched_ts": None,
                 }
             with self._lock:
@@ -340,6 +348,7 @@ class DepthService:
                 "ask1_price": 0.0,
                 "ask1_volume": e.get("ask1_vol"),
                 "sealed": sealed,
+                "status": status,
             })
         df = pl.DataFrame(rows, schema={
             "symbol": pl.Utf8,
@@ -349,6 +358,7 @@ class DepthService:
             "ask1_price": pl.Float64,
             "ask1_volume": pl.Float64,
             "sealed": pl.Boolean,
+            "status": pl.Utf8,
         })
         # 先删除当天旧数据, 再插入新数据
         self._repo.db.execute("DELETE FROM depth5 WHERE date = ?", [today])
@@ -406,7 +416,7 @@ class DepthService:
             return {}
         try:
             result = self._repo.db.execute(
-                "SELECT symbol, sealed, bid1_volume, ask1_volume FROM depth5 WHERE date = ?",
+                "SELECT symbol, sealed, bid1_volume, ask1_volume, status FROM depth5 WHERE date = ?",
                 [target_date],
             ).fetchall()
         except Exception as e:
@@ -415,8 +425,13 @@ class DepthService:
         # 封单量: 涨停=买一量, 跌停=卖一量
         data = {}
         for row in result:
-            sym, sealed, bid1_vol, ask1_vol = row
+            sym, sealed, bid1_vol, ask1_vol, status = row
             if not sym:
+                continue
+            # 按请求方向过滤: is_down=True 只返回 limit_down 股票, 反之亦然
+            if is_down and status != "limit_down":
+                continue
+            if not is_down and status != "limit_up":
                 continue
             vol = ask1_vol if is_down else bid1_vol
             data[sym] = {

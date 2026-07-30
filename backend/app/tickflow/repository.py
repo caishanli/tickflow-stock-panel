@@ -219,9 +219,10 @@ class DataStore:
             """CREATE TABLE IF NOT EXISTS depth5 (
                 symbol VARCHAR, date DATE,
                 bid1_price DOUBLE, bid1_volume DOUBLE, ask1_price DOUBLE, ask1_volume DOUBLE,
-                sealed BOOLEAN,
+                sealed BOOLEAN, status VARCHAR,
                 PRIMARY KEY (symbol, date)
             )""",
+            """ALTER TABLE depth5 ADD COLUMN IF NOT EXISTS status VARCHAR""",
             """CREATE TABLE IF NOT EXISTS kline_ext (
                 symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
                 volume DOUBLE, amount DOUBLE, quote_ts BIGINT,

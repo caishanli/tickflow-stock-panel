@@ -27,6 +27,7 @@ class TestDepthServiceDuckDB:
             "ask1_price": [10.1],
             "ask1_volume": [200.0],
             "sealed": [True],
+            "status": ["limit_up"],
         })
         repo.db.execute("INSERT INTO depth5 SELECT * FROM df")
         result = repo.db.execute("SELECT count(*) FROM depth5").fetchone()
