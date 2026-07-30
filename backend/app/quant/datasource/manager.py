@@ -71,20 +71,52 @@ class QuantDataProvider:
 
     def get_minute(self, code, date):
         import logging
-        for name in self.priority:
-            src = self.sources.get(name)
-            if src is None:
-                continue
+        log = logging.getLogger(__name__)
+
+        # 1) DuckDB 有就直接读
+        tf = self.sources.get("tickflow")
+        if tf is not None:
             try:
-                df = src.get_minute(code, date)
+                df = tf.get_minute(code, date)
                 if df is not None and not df.empty:
                     return df
             except Exception as e:
-                logging.warning("[QuantDataProvider] %s 分钟数据失败 %s: %s", name, code, e)
+                log.warning("[QuantDataProvider] tickflow 分钟数据失败 %s: %s", code, e)
+
+        # 2) DuckDB 没有, mootdx 回源并落盘
+        mx = self.sources.get("mootdx")
+        if mx is not None:
+            try:
+                df = mx.get_minute(code, date)
+                if df is not None and not df.empty:
+                    self._persist_minute_to_duckdb(code, date, df)
+                    return df
+            except Exception as e:
+                log.warning("[QuantDataProvider] mootdx 分钟数据失败 %s: %s", code, e)
+
+        # 3) 都没有, 返回错误
         raise RuntimeError(
             f"[QuantDataProvider] 持仓 {code} 分钟数据获取失败: "
-            f"所有数据源均返回空或异常"
+            f"DuckDB 和 mootdx 均无数据"
         )
+
+    def _persist_minute_to_duckdb(self, code: str, date, df) -> None:
+        """mootdx 回源数据落盘 DuckDB, 供后续读取。"""
+        import logging
+        try:
+            import polars as pl
+            pldf = pl.from_pandas(df)
+            sym = code.split(".")[0]
+            if "symbol" not in pldf.columns:
+                pldf = pldf.with_columns(pl.lit(sym).alias("symbol"))
+            keep = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+                    if c in pldf.columns]
+            pldf = pldf.select(keep)
+            tf = self.sources.get("tickflow")
+            if tf is not None and hasattr(tf, "_repo"):
+                tf._repo._upsert_daily(pldf, "kline_minute")
+        except Exception as e:
+            logging.getLogger(__name__).warning("[QuantDataProvider] 分钟数据落盘失败 %s: %s", code, e)
 
     def get_stock_list(self):
         return self._fetch_noarg("get_stock_list")
