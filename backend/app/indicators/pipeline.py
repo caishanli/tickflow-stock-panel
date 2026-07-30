@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
 
@@ -30,6 +31,9 @@ from app.price_limits import (
     polars_price_limit_pct,
 )
 from app.share_capital import apply_historical_float_shares, load_share_history
+
+if TYPE_CHECKING:
+    from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
 
@@ -999,7 +1003,8 @@ def _select_storage_cols(df: pl.DataFrame) -> pl.DataFrame:
 def run_pipeline(data_dir: Path | None = None,
                  symbols: list[str] | None = None,
                  new_dates_only: bool = False,
-                 on_batch_done: Callable[[int, int], None] | None = None) -> int:
+                 on_batch_done: Callable[[int, int], None] | None = None,
+                 repo: 'KlineRepository | None' = None) -> int:
     """运行盘后管道:读 kline_daily + adj_factor → 前复权 + 计算存储列 → 写 enriched。
 
     enriched 表仅存储 14 列基础行情窄表 (OHLCV + raw_close/high/low + turnover_rate + 连板数)。
@@ -1027,13 +1032,17 @@ def run_pipeline(data_dir: Path | None = None,
     factor_path = d / "adj_factor" / "all.parquet"
     inst_glob = str(d / "instruments" / "**" / "*.parquet")
 
-    if not daily_dir.exists() or not any(daily_dir.rglob("*.parquet")):
+    if repo is None and (not daily_dir.exists() or not any(daily_dir.rglob("*.parquet"))):
         logger.info("无日K数据, 跳过管道")
         return 0
 
     daily_glob = (daily_dir / "**" / "*.parquet").as_posix()
     _cast = pl.ScanCastOptions(integer_cast="allow-float")
     written = 0
+
+    daily_df: pl.DataFrame | None = None
+    if repo is not None:
+        daily_df = repo._scan_daily("kline_daily")
 
     # 加载 instruments (涨跌停+换手率需要)
     instruments = pl.DataFrame()
@@ -1045,34 +1054,57 @@ def run_pipeline(data_dir: Path | None = None,
 
     if new_dates_only:
         # ── 向后增量模式 ──
-        # 1. 找出 daily 有但 enriched 还没有的日期
-        enriched_dates = set()
-        if enriched_base.exists():
-            enriched_dates = {p.stem.split("=")[1] for p in enriched_base.glob("date=*")}
-
-        # 读新增日期的 daily 数据 (所有标的)
-        new_date_dirs = sorted(
-            p for p in daily_dir.glob("date=*")
-            if p.stem.split("=")[1] not in enriched_dates
-        )
-        if not new_date_dirs and not symbols:
-            logger.info("增量模式: 无新日期, 无需重算")
-            return 0
-
         # 加载复权因子 (全量,因为所有标的都可能需要)
         factors = _load_factors(factor_path)
 
-        # 2. 为新日期计算 enriched (所有标的)
-        if new_date_dirs:
-            raw_new = scan_daily_parquet(new_date_dirs[0] / "*.parquet", cast_options=_cast)
-            for nd in new_date_dirs[1:]:
-                raw_new = pl.concat([raw_new, scan_daily_parquet(nd / "*.parquet", cast_options=_cast)], how="diagonal_relaxed")
-            raw_new = raw_new.sort(["symbol", "date"]).collect(streaming=True)
+        if repo is not None:
+            # DuckDB 模式: 查询已有 enriched 日期
+            enriched_dates = set()
+            try:
+                rows = repo.db.execute("SELECT DISTINCT date FROM kline_daily_enriched").fetchall()
+                enriched_dates = {str(r[0]) for r in rows}
+            except Exception:  # noqa: BLE001
+                pass
+
+            if daily_df is None or daily_df.is_empty():
+                logger.info("增量模式: 无 daily 数据, 跳过")
+                return 0
+            all_dates = daily_df["date"].unique().to_list()
+            new_dates = [d for d in all_dates if str(d) not in enriched_dates]
+            if not new_dates and not symbols:
+                logger.info("增量模式: 无新日期, 无需重算")
+                return 0
+            raw_new: pl.DataFrame = daily_df.filter(pl.col("date").is_in(new_dates)).sort(["symbol", "date"]) if new_dates else pl.DataFrame()
+        else:
+            # 1. 找出 daily 有但 enriched 还没有的日期
+            enriched_dates = set()
+            if enriched_base.exists():
+                enriched_dates = {p.stem.split("=")[1] for p in enriched_base.glob("date=*")}
+
+            # 读新增日期的 daily 数据 (所有标的)
+            new_date_dirs = sorted(
+                p for p in daily_dir.glob("date=*")
+                if p.stem.split("=")[1] not in enriched_dates
+            )
+            if not new_date_dirs and not symbols:
+                logger.info("增量模式: 无新日期, 无需重算")
+                return 0
+
+            # 2. 为新日期计算 enriched (所有标的)
+            if new_date_dirs:
+                raw_new_lf = scan_daily_parquet(new_date_dirs[0] / "*.parquet", cast_options=_cast)
+                for nd in new_date_dirs[1:]:
+                    raw_new_lf = pl.concat([raw_new_lf, scan_daily_parquet(nd / "*.parquet", cast_options=_cast)], how="diagonal_relaxed")
+                raw_new = raw_new_lf.sort(["symbol", "date"]).collect(streaming=True)
+            else:
+                raw_new = pl.DataFrame()
+
+        if not raw_new.is_empty():
 
             # 增量模式: 只算新日期, 但指标需要历史窗口
             # 读已有 enriched 最近 60 天作为历史前缀
             sym_list = raw_new["symbol"].unique().to_list()
-            hist_df = _load_recent_history(enriched_base, sym_list, days=60)
+            hist_df = _load_recent_history(enriched_base, sym_list, days=60, repo=repo)
 
             # 合并历史 + 新数据
             if not hist_df.is_empty():
@@ -1108,10 +1140,13 @@ def run_pipeline(data_dir: Path | None = None,
                 for date_df in enriched_new.partition_by("date"):
                     dt = date_df["date"][0]
                     ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-                    out = enriched_base / f"date={ds}" / "part.parquet"
-                    out.parent.mkdir(parents=True, exist_ok=True)
                     date_df = _select_storage_cols(date_df).sort(["symbol"])
-                    date_df.write_parquet(out)
+                    if repo is not None:
+                        repo._upsert_daily(date_df, "kline_daily_enriched")
+                    else:
+                        out = enriched_base / f"date={ds}" / "part.parquet"
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        date_df.write_parquet(out)
                     written += date_df.height
                 t_write_new = _t.perf_counter()
                 logger.info("增量写入: %.2fs, %d 行", t_write_new - t_new, written)
@@ -1119,9 +1154,12 @@ def run_pipeline(data_dir: Path | None = None,
         # 3. 受除权因子影响的个股: 重算全部已有日期 (累积因子链变了)
         if symbols:
             sym_set = set(symbols)
-            raw_sym = scan_daily_parquet(daily_glob, cast_options=_cast).sort(["symbol", "date"])
-            raw_sym = raw_sym.filter(pl.col("symbol").is_in(list(sym_set)))
-            raw_sym = raw_sym.collect(streaming=True)
+            if repo is not None and daily_df is not None:
+                raw_sym = daily_df.filter(pl.col("symbol").is_in(list(sym_set)))
+            else:
+                raw_sym_lf = scan_daily_parquet(daily_glob, cast_options=_cast).sort(["symbol", "date"])
+                raw_sym_lf = raw_sym_lf.filter(pl.col("symbol").is_in(list(sym_set)))
+                raw_sym = raw_sym_lf.collect(streaming=True)
             if not raw_sym.is_empty():
                 factors_sym = factors.filter(pl.col("symbol").is_in(list(sym_set))) if not factors.is_empty() else factors
                 inst_sym = instruments.filter(pl.col("symbol").is_in(list(sym_set))) if not instruments.is_empty() else instruments
@@ -1135,15 +1173,18 @@ def run_pipeline(data_dir: Path | None = None,
                 for date_df in enriched_sym.partition_by("date"):
                     dt = date_df["date"][0]
                     ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-                    out = enriched_base / f"date={ds}" / "part.parquet"
-                    out.parent.mkdir(parents=True, exist_ok=True)
                     date_df_storage = _select_storage_cols(date_df)
-                    if out.exists():
-                        existing = pl.read_parquet(out)
-                        existing = existing.filter(~pl.col("symbol").is_in(list(sym_set)))
-                        date_df_storage = pl.concat([existing, date_df_storage], how="diagonal_relaxed")
-                    date_df_storage = date_df_storage.sort(["symbol"])
-                    date_df_storage.write_parquet(out)
+                    if repo is not None:
+                        repo._upsert_daily(date_df_storage, "kline_daily_enriched")
+                    else:
+                        out = enriched_base / f"date={ds}" / "part.parquet"
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        if out.exists():
+                            existing = pl.read_parquet(out)
+                            existing = existing.filter(~pl.col("symbol").is_in(list(sym_set)))
+                            date_df_storage = pl.concat([existing, date_df_storage], how="diagonal_relaxed")
+                        date_df_storage = date_df_storage.sort(["symbol"])
+                        date_df_storage.write_parquet(out)
                     written += date_df.height
                 logger.info("除权重算: %d 只, 共写入 %d 行", len(sym_set), written)
 
@@ -1165,15 +1206,23 @@ def run_pipeline(data_dir: Path | None = None,
 
     # ── 按 symbol 分批处理: 每只股只有 ~244 行, 无冗余计算 ──
     # 先获取全部 symbol 列表
-    lf_all = scan_daily_parquet(daily_glob, cast_options=_cast)
-    if symbols:
-        sym_set = set(symbols)
-        lf_all = lf_all.filter(pl.col("symbol").is_in(list(sym_set)))
-
-    all_symbols = (
-        lf_all.select("symbol").unique().sort("symbol")
-        .collect(streaming=True)["symbol"].to_list()
-    )
+    if repo is not None:
+        if daily_df is None or daily_df.is_empty():
+            logger.info("无日K数据, 跳过管道")
+            return 0
+        if symbols:
+            sym_set = set(symbols)
+            daily_df = daily_df.filter(pl.col("symbol").is_in(list(sym_set)))
+        all_symbols = daily_df.select("symbol").unique().sort("symbol")["symbol"].to_list()
+    else:
+        lf_all = scan_daily_parquet(daily_glob, cast_options=_cast)
+        if symbols:
+            sym_set = set(symbols)
+            lf_all = lf_all.filter(pl.col("symbol").is_in(list(sym_set)))
+        all_symbols = (
+            lf_all.select("symbol").unique().sort("symbol")
+            .collect(streaming=True)["symbol"].to_list()
+        )
     if not all_symbols:
         logger.info("无日K数据, 跳过管道")
         return 0
@@ -1201,9 +1250,13 @@ def run_pipeline(data_dir: Path | None = None,
         batch_syms = all_symbols[batch_start:batch_end]
 
         # 只读取本批 symbol 的数据
-        lf_batch = scan_daily_parquet(daily_glob, cast_options=_cast)
-        lf_batch = lf_batch.filter(pl.col("symbol").is_in(batch_syms))
-        raw = lf_batch.sort(["symbol", "date"]).collect(streaming=True)
+        if repo is not None and daily_df is not None:
+            raw = daily_df.filter(pl.col("symbol").is_in(batch_syms))
+            raw = raw.sort(["symbol", "date"])
+        else:
+            lf_batch = scan_daily_parquet(daily_glob, cast_options=_cast)
+            lf_batch = lf_batch.filter(pl.col("symbol").is_in(batch_syms))
+            raw = lf_batch.sort(["symbol", "date"]).collect(streaming=True)
 
         if raw.is_empty():
             continue
@@ -1236,15 +1289,18 @@ def run_pipeline(data_dir: Path | None = None,
                 for date_df in enriched.partition_by("date"):
                     dt = date_df["date"][0]
                     ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-                    out = base / f"date={ds}" / "part.parquet"
-                    out.parent.mkdir(parents=True, exist_ok=True)
                     date_df_storage = _select_storage_cols(date_df)
-                    if out.exists():
-                        existing = pl.read_parquet(out)
-                        existing = existing.filter(~pl.col("symbol").is_in(batch_syms))
-                        date_df_storage = pl.concat([existing, date_df_storage], how="diagonal_relaxed")
-                    date_df_storage = date_df_storage.sort(["symbol"])
-                    date_df_storage.write_parquet(out)
+                    if repo is not None:
+                        repo._upsert_daily(date_df_storage, "kline_daily_enriched")
+                    else:
+                        out = base / f"date={ds}" / "part.parquet"
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        if out.exists():
+                            existing = pl.read_parquet(out)
+                            existing = existing.filter(~pl.col("symbol").is_in(batch_syms))
+                            date_df_storage = pl.concat([existing, date_df_storage], how="diagonal_relaxed")
+                        date_df_storage = date_df_storage.sort(["symbol"])
+                        date_df_storage.write_parquet(out)
                     written += date_df_storage.height
             else:
                 # 全量模式: 缓冲到 date_buffers, 最后一次性写入
@@ -1268,24 +1324,31 @@ def run_pipeline(data_dir: Path | None = None,
 
     # 全量模式: 按日期分区写入
     if not symbols and date_buffers:
-        existing_dates = {
-            p.name.removeprefix("date=")
-            for p in base.glob("date=*")
-            if p.is_dir()
-        }
-        rebuilt_dates = set(date_buffers)
-        missing_dates = existing_dates - rebuilt_dates
-        if missing_dates:
-            sample = ", ".join(sorted(missing_dates)[:5])
-            raise RuntimeError(f"全量重建结果缺少已有日期分区,拒绝覆盖: {sample}")
+        if repo is not None:
+            merged = pl.concat(
+                [df for dfs in date_buffers.values() for df in dfs],
+                how="diagonal_relaxed",
+            ).sort(["symbol"])
+            repo._upsert_daily(merged, "kline_daily_enriched")
+        else:
+            existing_dates = {
+                p.name.removeprefix("date=")
+                for p in base.glob("date=*")
+                if p.is_dir()
+            }
+            rebuilt_dates = set(date_buffers)
+            missing_dates = existing_dates - rebuilt_dates
+            if missing_dates:
+                sample = ", ".join(sorted(missing_dates)[:5])
+                raise RuntimeError(f"全量重建结果缺少已有日期分区,拒绝覆盖: {sample}")
 
-        base.mkdir(parents=True, exist_ok=True)
+            base.mkdir(parents=True, exist_ok=True)
 
-        for ds, dfs in date_buffers.items():
-            out = base / f"date={ds}" / "part.parquet"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            merged = pl.concat(dfs, how="diagonal_relaxed").sort(["symbol"])
-            merged.write_parquet(out)
+            for ds, dfs in date_buffers.items():
+                out = base / f"date={ds}" / "part.parquet"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                merged = pl.concat(dfs, how="diagonal_relaxed").sort(["symbol"])
+                merged.write_parquet(out)
 
         date_buffers.clear()
         gc.collect()
@@ -1364,13 +1427,29 @@ def _load_factors(factor_path: Path) -> pl.DataFrame:
         return pl.DataFrame()
 
 
-def _load_recent_history(enriched_base: Path, symbols: list[str], days: int) -> pl.DataFrame:
-    """从已有 enriched parquet 加载最近 N 天的历史数据(用于增量模式的指标计算窗口)。
+def _load_recent_history(enriched_base: Path, symbols: list[str], days: int,
+                         repo: 'KlineRepository | None' = None) -> pl.DataFrame:
+    """从已有 enriched 加载最近 N 天的历史数据(用于增量模式的指标计算窗口)。
 
     只读基础行情列, 作为指标计算的历史前缀。
+    当 repo 提供时优先从 DuckDB 读取, 否则回退到 Parquet。
     """
     from datetime import date, timedelta
     cutoff = date.today() - timedelta(days=days + 30)  # 多读 30 天余量
+
+    if repo is not None:
+        try:
+            sym_placeholders = ", ".join(["?"] * len(symbols))
+            cols = "symbol, date, open, high, low, close, volume, amount, raw_close, raw_high, raw_low"
+            df = repo.db.execute(
+                f"SELECT {cols} FROM kline_daily_enriched "
+                f"WHERE symbol IN ({sym_placeholders}) AND date >= ? ORDER BY symbol, date",
+                [*symbols, cutoff],
+            ).pl()
+            if not df.is_empty():
+                return df
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DuckDB history load failed, falling back to Parquet: %s", e)
 
     try:
         lf = (
