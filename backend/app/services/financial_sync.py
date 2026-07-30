@@ -31,7 +31,16 @@ FINANCIAL_TABLES = ("metrics", "income", "balance_sheet", "cash_flow", "shares")
 # ================================================================
 
 def _get_symbols(data_dir: Path) -> list[str]:
-    """从 instruments 表获取标的列表。"""
+    """从 instruments 表获取标的列表。优先 DuckDB，回退 Parquet。"""
+    duckdb_path = data_dir / "stock.duckdb"
+    if duckdb_path.exists():
+        try:
+            conn = duckdb.connect(str(duckdb_path))
+            result = conn.execute("SELECT symbol FROM instruments").fetchall()
+            conn.close()
+            return [r[0] for r in result] if result else []
+        except Exception as e:
+            logger.debug("DuckDB instruments read failed: %s", e)
     inst_path = data_dir / "instruments" / "instruments.parquet"
     if not inst_path.exists():
         return []

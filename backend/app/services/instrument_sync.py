@@ -122,6 +122,7 @@ def sync_instruments(repo: KlineRepository) -> int:
 def enrich_names_from_quotes(
     data_dir: Path,
     quotes_data: list[dict],
+    repo: KlineRepository | None = None,
 ) -> int:
     """从 quotes 响应中提取 name，更新 instruments 维表（兜底补充）。
 
@@ -131,7 +132,6 @@ def enrich_names_from_quotes(
     if not quotes_data:
         return 0
 
-    # 构建 symbol → name 映射
     name_map: dict[str, str] = {}
     for q in quotes_data:
         symbol = q.get("symbol", "")
@@ -143,13 +143,14 @@ def enrich_names_from_quotes(
     if not name_map:
         return 0
 
-    inst_path = data_dir / "instruments" / "instruments.parquet"
-    if not inst_path.exists():
-        return 0
+    if repo is not None:
+        df = repo.db.execute("SELECT * FROM instruments").pl()
+    else:
+        inst_path = data_dir / "instruments" / "instruments.parquet"
+        if not inst_path.exists():
+            return 0
+        df = pl.read_parquet(inst_path)
 
-    df = pl.read_parquet(inst_path)
-
-    # 只更新空 name 的行
     updates = pl.DataFrame({
         "symbol": list(name_map.keys()),
         "_new_name": list(name_map.values()),
@@ -162,6 +163,12 @@ def enrich_names_from_quotes(
         .alias("name"),
     ).drop("_new_name")
 
-    df.write_parquet(inst_path)
+    if repo is not None:
+        repo.db.execute("DELETE FROM instruments")
+        repo.db.execute("INSERT INTO instruments SELECT * FROM df")
+    else:
+        inst_path = data_dir / "instruments" / "instruments.parquet"
+        df.write_parquet(inst_path)
+
     logger.info("instruments name enriched from quotes: %d names", len(name_map))
     return len(name_map)
