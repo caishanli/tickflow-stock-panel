@@ -28,7 +28,7 @@ def load_config():
     return {
         "DATASOURCE_PRIORITY": [
             s.strip()
-            for s in os.getenv("DATASOURCE_PRIORITY", "mootdx,astock").split(",")
+            for s in os.getenv("DATASOURCE_PRIORITY", "duckdb,mootdx,astock").split(",")
             if s.strip()
         ],
         "FEE_RATE": float(os.getenv("FEE_RATE", "0.0003")),

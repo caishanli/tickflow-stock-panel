@@ -150,13 +150,13 @@ def _migrate_astock_daily(con, dry_run: bool) -> int:
         return total
 
     con.execute(f"""
-        INSERT INTO kline_daily
+        INSERT OR REPLACE INTO kline_daily
         SELECT
             regexp_replace(
                 regexp_replace(filename, '.*/astock_', ''),
                 '\\.parquet$', ''
             ) AS symbol,
-            strptime(time, '%Y-%m-%d')::DATE AS date,
+            to_timestamp(timestamp)::DATE AS date,
             open::DOUBLE, high::DOUBLE, low::DOUBLE, close::DOUBLE,
             volume::DOUBLE, amount::DOUBLE,
             0::BIGINT AS quote_ts

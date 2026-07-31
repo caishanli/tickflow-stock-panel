@@ -1463,8 +1463,23 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
 
     try:
         from rqalpha import run as rq_run
-        _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
-        result = rq_run(config, source_code=strategy_code)
+        # Monkey-patch _adjust_start_date: our JqDataSource handles date range
+        # validation, but rqalpha's version runs before our data source is injected.
+        import rqalpha.main as _rqmain
+        _orig_adjust = _rqmain._adjust_start_date
+        def _noop_adjust(config, data_proxy):
+            # Still need to set trading_calendar from config dates
+            # The actual trading dates come from our JqDataSource later
+            import pandas as pd
+            config.base.trading_calendar = pd.date_range(
+                config.base.start_date, config.base.end_date, freq="B"
+            )
+        _rqmain._adjust_start_date = _noop_adjust
+        try:
+            _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
+            result = rq_run(config, source_code=strategy_code)
+        finally:
+            _rqmain._adjust_start_date = _orig_adjust
 
         equity = _extract_equity(result, benchmark=benchmark, dm=dm, start=start, end=end)
         trades = _extract_trades(result)
