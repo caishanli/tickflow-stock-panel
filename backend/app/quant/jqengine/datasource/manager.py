@@ -3,6 +3,7 @@
 import logging
 import os
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,133 @@ from .astock_src import AStockSource
 from .base import DataSourceError
 from ..config import CONFIG, REPO_ROOT
 
-SOURCES = {"mootdx": MootdxSource, "astock": AStockSource}
+
+# ---------------------------------------------------------------------------
+# DuckDB 数据源：直接读 stock.duckdb，不依赖外部 parquet 缓存
+# ---------------------------------------------------------------------------
+_DUCKDB_PATH = os.getenv(
+    "TICKFLOW_DB_PATH",
+    str(Path(REPO_ROOT).parent / "data" / "stock.duckdb"),
+)
+
+
+def _jq_to_duckdb(code: str) -> str:
+    """聚宽代码 600000.XSHG -> DuckDB symbol 600000.SH。"""
+    if "." not in code:
+        return code
+    pure, suffix = code.split(".", 1)
+    su = suffix.upper()
+    if su == "XSHG":
+        return f"{pure}.SH"
+    if su == "XSHE":
+        return f"{pure}.SZ"
+    return code  # 已是 .SH/.SZ
+
+
+class DuckDBSource:
+    """直接从 stock.duckdb 读取日线/分钟线，免 parquet 缓存。"""
+
+    name = "duckdb"
+
+    def __init__(self):
+        self._conn = None
+        self._etf_symbols: set[str] | None = None
+
+    def _get_etf_symbols(self) -> set[str]:
+        if self._etf_symbols is None:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute("SELECT symbol FROM instruments_etf").fetchall()
+                self._etf_symbols = {r[0] for r in rows}
+            except Exception:
+                self._etf_symbols = set()
+        return self._etf_symbols
+
+    def _get_conn(self):
+        if self._conn is None:
+            import duckdb
+            self._conn = duckdb.connect(_DUCKDB_PATH, read_only=True)
+        return self._conn
+
+    def get_daily(self, code, start, end):
+        sym = _jq_to_duckdb(code)
+        conn = self._get_conn()
+        etf_syms = self._get_etf_symbols()
+        table = "kline_etf_daily" if sym in etf_syms else "kline_daily"
+        try:
+            rows = conn.execute(
+                f"SELECT date, open, high, low, close, volume, amount "
+                f"FROM {table} WHERE symbol = ? AND date >= ? AND date <= ? "
+                f"ORDER BY date",
+                [sym, str(start)[:10], str(end)[:10]],
+            ).fetchall()
+            if not rows:
+                raise DataSourceError(f"duckdb 无日线: {code}")
+            df = pd.DataFrame(
+                rows, columns=["date", "open", "high", "low", "close", "volume", "amount"]
+            )
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            return df
+        except DataSourceError:
+            raise
+        except Exception as e:
+            raise DataSourceError(f"duckdb 日线失败: {e}")
+
+    def get_minute(self, code, date, start_date=None):
+        sym = _jq_to_duckdb(code)
+        conn = self._get_conn()
+        etf_syms = self._get_etf_symbols()
+        table = "kline_etf_minute" if sym in etf_syms else "kline_minute"
+        try:
+            rows = conn.execute(
+                f"SELECT datetime, open, high, low, close, volume, amount "
+                f"FROM {table} WHERE symbol = ? AND datetime::DATE = ? "
+                f"ORDER BY datetime",
+                [sym, str(date)[:10]],
+            ).fetchall()
+            if not rows:
+                raise DataSourceError(f"duckdb 无分钟: {code} {date}")
+            df = pd.DataFrame(
+                rows, columns=["datetime", "open", "high", "low", "close", "volume", "amount"]
+            )
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            return df
+        except DataSourceError:
+            raise
+        except Exception as e:
+            raise DataSourceError(f"duckdb 分钟失败: {e}")
+
+    def get_etf_list(self):
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("SELECT symbol FROM instruments_etf").fetchall()
+            return [r[0] for r in rows]
+        except Exception:
+            return []
+
+    def get_stock_list(self):
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("SELECT symbol FROM instruments").fetchall()
+            return [r[0] for r in rows]
+        except Exception:
+            return []
+
+    def get_index_realtime(self, codes):
+        raise DataSourceError("duckdb 源不提供实时指数")
+
+    def get_us_index(self):
+        raise DataSourceError("duckdb 源不提供美股")
+
+    def test_connection(self):
+        try:
+            self._get_conn().execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+
+SOURCES = {"duckdb": DuckDBSource, "mootdx": MootdxSource, "astock": AStockSource}
 
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
