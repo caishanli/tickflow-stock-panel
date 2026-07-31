@@ -101,15 +101,20 @@ def _fetch_instruments_by_type(instrument_type: str, asset_type_label: str) -> p
     if not rows:
         return pl.DataFrame()
 
-    return (
+    df = (
         pl.DataFrame(rows)
         .with_columns([
-            pl.col("symbol").str.split(".").list.first().alias("code"),
             pl.lit(asset_type_label).alias("asset_type"),
         ])
         .unique(subset=["symbol"], keep="last")
         .sort("symbol")
     )
+    # Drop columns not in target table (e.g. code)
+    target_cols = {"symbol", "name", "exchange", "asset_type", "list_date", "total_shares", "float_shares"}
+    extra = [c for c in df.columns if c not in target_cols]
+    if extra:
+        df = df.drop(extra)
+    return df
 
 
 def sync_index_instruments(
