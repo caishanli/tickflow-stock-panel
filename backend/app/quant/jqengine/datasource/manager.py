@@ -356,14 +356,65 @@ class DataManager:
                 continue
         print(f"[preload] 分钟线: {count}/{len(codes)} 只")
 
+    def _preload_from_duckdb(self):
+        """从 DuckDB 批量加载全市场日线到 _daily_mem。"""
+        from collections import defaultdict
+        src = self.sources.get("duckdb")
+        if src is None:
+            return False
+        try:
+            conn = src._get_conn()
+
+            # 批量查 kline_daily（stock）
+            stock_rows = conn.execute(
+                "SELECT symbol, date, open, high, low, close, volume, amount "
+                "FROM kline_daily ORDER BY symbol, date"
+            ).fetchall()
+            # 批量查 kline_etf_daily（ETF）
+            etf_rows = conn.execute(
+                "SELECT symbol, date, open, high, low, close, volume, amount "
+                "FROM kline_etf_daily ORDER BY symbol, date"
+            ).fetchall()
+
+            all_rows = stock_rows + etf_rows
+            if not all_rows:
+                return False
+
+            # 按 symbol 分组
+            by_sym = defaultdict(list)
+            for row in all_rows:
+                by_sym[row[0]].append(row)
+
+            cols = ["date", "open", "high", "low", "close", "volume", "amount"]
+            count = 0
+            for sym, rows in by_sym.items():
+                df = pd.DataFrame(rows, columns=["symbol"] + cols)
+                df = df.drop(columns=["symbol"])
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date")
+                df = _ensure_money_yuan(df, "duckdb")
+                df = _ensure_volume_shares(df, "duckdb")
+                # 转 JQ 代码格式
+                jq_code = self._to_jq_code(sym)
+                self._daily_mem[f"get_daily_{jq_code}"] = df
+                count += 1
+
+            self._daily_ver += 1
+            print(f"[preload] DuckDB 日线: {count} 只, {len(all_rows)} 行")
+            return True
+        except Exception as e:
+            logger.warning("DuckDB preload 失败: %s", e)
+            return False
+
     def preload_daily(self):
         """一次性加载全部日线缓存到内存，避免回测中逐文件读取。
 
-        一条查询把整库日线缓存读入内存，同一代码多源缓存并存时按数据源
-        优先级 + 复权口径选帧（:func:`_pick_daily_frame`：优先非 raw 的
-        前复权帧，全 raw 才用 raw，保证回测内复权口径尽量统一），存入
-        _daily_mem。
+        优先从 DuckDB 批量加载；DuckDB 不可用时 fallback 到 parquet 缓存。
         """
+        # 优先从 DuckDB 批量加载
+        if self._preload_from_duckdb():
+            return
+        # DuckDB 不可用时 fallback 到 parquet 缓存（兼容旧模式）
         all_daily = self.cache.get_all("daily")
         if not all_daily:
             print("[preload] 日线缓存为空")
