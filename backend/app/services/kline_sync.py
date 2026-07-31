@@ -1008,7 +1008,17 @@ def sync_and_persist_minute(
     written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
 
     def _persist(seg_df: pl.DataFrame) -> None:
-        written_box[0] += _write_minute_partition(seg_df, repo, asset_type="stock")
+        if not seg_df.is_empty() and "symbol" in seg_df.columns:
+            etf_set = repo.get_etf_symbol_set()
+            etf_mask = seg_df["symbol"].is_in(list(etf_set)) if etf_set else pl.Series([False] * len(seg_df))
+            etf_df = seg_df.filter(etf_mask)
+            stock_df = seg_df.filter(~etf_mask)
+            if not etf_df.is_empty():
+                written_box[0] += _write_minute_partition(etf_df, repo, asset_type="etf")
+            if not stock_df.is_empty():
+                written_box[0] += _write_minute_partition(stock_df, repo, asset_type="stock")
+        else:
+            written_box[0] += _write_minute_partition(seg_df, repo, asset_type="stock")
 
     segment_days = preferences.get_minute_sync_segment_days()
     sync_minute_batch(
