@@ -180,7 +180,7 @@ class MinuteKService:
                 time.sleep(0.5)
                 waited += 0.5
 
-    def _fetch_symbols(self, symbols: list[str], label: str) -> None:
+    def _fetch_symbols(self, symbols: list[str], label: str, asset_type: str = "stock") -> None:
         if not symbols or not self._servers:
             return
         with self._fetch_lock:
@@ -208,7 +208,7 @@ class MinuteKService:
             elapsed = time.perf_counter() - t0
             if results:
                 df = pl.concat(results, how="diagonal_relaxed")
-                self._write_to_duckdb(df)
+                self._write_to_duckdb(df, asset_type=asset_type)
                 logger.info("分钟K %s: %d 只, %d 条, %.1fs", label, len(symbols), df.height, elapsed)
             else:
                 logger.warning("分钟K %s: 无数据 (%.1fs, %d 错误)", label, elapsed, len(errors))
@@ -218,7 +218,7 @@ class MinuteKService:
         if etf_inst.is_empty() or "symbol" not in etf_inst.columns:
             return
         symbols = sorted(set(etf_inst["symbol"].cast(pl.Utf8).to_list()))
-        self._fetch_symbols(symbols, "ETF")
+        self._fetch_symbols(symbols, "ETF", asset_type="etf")
 
     def _fetch_stock_minute_k(self) -> None:
         inst = self._repo.get_instruments()
@@ -227,7 +227,7 @@ class MinuteKService:
         symbols = sorted(set(inst["symbol"].cast(pl.Utf8).to_list()))
         self._fetch_symbols(symbols, "全市场股票")
 
-    def _write_to_duckdb(self, df: pl.DataFrame) -> None:
+    def _write_to_duckdb(self, df: pl.DataFrame, asset_type: str = "stock") -> None:
         if df.is_empty():
             return
         keep = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in df.columns]
@@ -236,4 +236,5 @@ class MinuteKService:
             df = df.with_columns(pl.col("volume").cast(pl.Float64))
         if "amount" in df.columns:
             df = df.with_columns(pl.col("amount").cast(pl.Float64))
-        self._repo._upsert_daily(df, "kline_minute")
+        table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
+        self._repo._upsert_daily(df, table)
