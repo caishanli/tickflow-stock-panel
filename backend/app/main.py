@@ -79,6 +79,13 @@ async def lifespan(app: FastAPI):
     qs.set_repo(repo)
     qs.boot_check()
 
+    # ETF 回源: 检查缺失 ETF 日线数据并从 mootdx 补齐 (不影响启动)
+    try:
+        from app.services.etf_backfill import backfill_etf_data
+        backfill_etf_data(repo)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ETF 回源检查失败（不影响启动）: %s", e)
+
     # 分钟K实时行情服务 (mootdx多线程)
     from app.services.minute_k_service import MinuteKService
     mks = MinuteKService(repo)
