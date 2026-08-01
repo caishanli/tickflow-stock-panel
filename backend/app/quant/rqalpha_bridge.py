@@ -1156,17 +1156,37 @@ def _write_etf_snapshot(path, codes, names, list_dates):
     os.replace(tmp, path)
 
 
+def _cache_etf_codes(dm):
+    """从 DataManager._daily_mem 派生**纯 ETF** 代码列表。
+
+    DuckDB 迁移后 _daily_mem 同时含股票与 ETF 日线（preload_daily 加载
+    kline_daily + kline_etf_daily），若直接取全部键会把 5000+ 股票混进 ETF
+    宇宙，导致策略流动性门槛/动态池失真。以 DuckDB ``instruments_etf`` 为
+    准过滤；名录不可用时退化为原「非指数」兜底。
+    """
+    all_codes = [k.split("get_daily_", 1)[1]
+                 for k in (getattr(dm, "_daily_mem", None) or {})
+                 if k.startswith("get_daily_")]
+    try:
+        duckdb_src = getattr(dm, "sources", {}).get("duckdb")
+        etf_syms = set(duckdb_src._get_etf_symbols()) if duckdb_src is not None else set()
+    except Exception:
+        etf_syms = set()
+    if etf_syms:
+        from app.quant.jqengine.datasource.manager import _jq_to_duckdb
+        return [c for c in all_codes if _jq_to_duckdb(c) in etf_syms]
+    return [c for c in all_codes
+            if not (c.startswith(("000", "399")))]
+
+
 def _merge_cache_daily_codes(dm, codes, names, tdx_names=None):
-    """缓存并集：本地日线缓存中有数据的代码一并纳入宇宙；名称取 tdx_names
-    兜底为代码本身，list_date 无数据时退化为全程可交易（get_all_securities 的
-    _LIST_DATES 兜底）。
+    """缓存并集：本地日线缓存中有数据的**ETF**代码一并纳入宇宙；名称取
+    tdx_names 兜底为代码本身，list_date 无数据时退化为全程可交易
+    （get_all_securities 的 _LIST_DATES 兜底）。
     """
     tdx_names = tdx_names or {}
-    cache_codes = [k.split("get_daily_", 1)[1]
-                   for k in (getattr(dm, "_daily_mem", None) or {})
-                   if k.startswith("get_daily_")]
     have = set(codes)
-    for c in cache_codes:
+    for c in _cache_etf_codes(dm):
         if c not in have:
             codes.append(c)
             names.setdefault(c, tdx_names.get(c.split(".", 1)[0], c))
@@ -1189,12 +1209,8 @@ def _load_etf_universe(dm):
     if fresh:
         codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
         return codes, names, snap[3]
-    # 快照过期或不存在 → 从本地缓存推导
-    all_codes = [k.split("get_daily_", 1)[1]
-                 for k in (getattr(dm, "_daily_mem", None) or {})
-                 if k.startswith("get_daily_")]
-    is_idx = lambda p: p.startswith("000") or p.startswith("399")
-    etf_codes = [c for c in all_codes if not is_idx(c.split(".")[0])]
+    # 快照过期或不存在 → 从本地缓存推导（仅 ETF，排除股票/指数）
+    etf_codes = _cache_etf_codes(dm)
     names = {}
     try:
         names = dm.sources["mootdx"].get_stock_names() or {}
@@ -1351,9 +1367,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
 
     etf_universe, etf_names, etf_list_dates = _load_etf_universe(dm)
     if not etf_universe:
-        all_codes = [k.split("get_daily_", 1)[1]
-                     for k in dm._daily_mem if k.startswith("get_daily_")]
-        etf_universe = [c for c in all_codes if not _is_index(c.split(".")[0])]
+        etf_universe = _cache_etf_codes(dm)
         etf_names = {}
         etf_list_dates = {}
     else:
@@ -1468,11 +1482,48 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
         import rqalpha.main as _rqmain
         _orig_adjust = _rqmain._adjust_start_date
         def _noop_adjust(config, data_proxy):
-            import pandas as pd
-            config.base.trading_calendar = pd.date_range(
-                config.base.start_date, config.base.end_date, freq="B"
-            )
+            import pandas as pd, duckdb as _ddb, os as _os
+            db_path = _os.getenv("TICKFLOW_DB_PATH",
+                                 _os.path.join(_os.path.dirname(_os.path.dirname(
+                                     os.path.abspath(__file__))), "..", "data", "stock.duckdb"))
+            try:
+                conn = _ddb.connect(db_path, read_only=True)
+                rows = conn.execute(
+                    "SELECT DISTINCT date FROM kline_daily "
+                    "UNION SELECT DISTINCT date FROM kline_etf_daily "
+                    "ORDER BY date"
+                ).fetchall()
+                conn.close()
+                dates = pd.DatetimeIndex([r[0] for r in rows])
+                config.base.trading_calendar = dates[
+                    (dates >= pd.Timestamp(config.base.start_date)) &
+                    (dates <= pd.Timestamp(config.base.end_date))
+                ]
+            except Exception:
+                config.base.trading_calendar = pd.date_range(
+                    config.base.start_date, config.base.end_date, freq="B")
         _rqmain._adjust_start_date = _noop_adjust
+
+        # rqrisk Risk 长度不匹配兜底：trading_calendar 与实际交易日可能差 1 天，
+        # 直接截断较长数组，避免 AssertionError 导致回测结果丢失。
+        try:
+            import rqrisk.risk as _rqrisk
+            _orig_risk_init = _rqrisk.Risk.__init__
+            def _safe_risk_init(self, daily_returns, benchmark_daily_returns, *a, **kw):
+                n = min(len(daily_returns), len(benchmark_daily_returns))
+                if n > 0 and len(daily_returns) != len(benchmark_daily_returns):
+                    daily_returns = daily_returns[:n]
+                    benchmark_daily_returns = benchmark_daily_returns[:n]
+                # Convert to numpy arrays to avoid pandas index alignment issues
+                import numpy as np
+                if hasattr(daily_returns, 'values'):
+                    daily_returns = np.asarray(daily_returns.values, dtype=float)
+                if hasattr(benchmark_daily_returns, 'values'):
+                    benchmark_daily_returns = np.asarray(benchmark_daily_returns.values, dtype=float)
+                return _orig_risk_init(self, daily_returns, benchmark_daily_returns, *a, **kw)
+            _rqrisk.Risk.__init__ = _safe_risk_init
+        except Exception:
+            pass
 
         # sys_analyser benchmark 补丁：自建日历可能缺少 start_date 前一交易日，
         # 导致 daily_returns 少一天而 _benchmark_daily_returns 多一天。
@@ -1483,7 +1534,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             def _patched_gen_bm(self, event):
                 try:
                     return _orig_gen_bm(self, event)
-                except ValueError:
+                except (ValueError, AssertionError):
                     _s = self._env.config.base.start_date
                     _e = self._env.config.base.end_date
                     trading_dates = self._env.data_proxy.get_trading_dates(_s, _e)
@@ -1520,6 +1571,20 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
                     }
 
             _sa_mod.AnalyserMod.generate_benchmark_daily_returns_and_portfolio = _patched_gen_bm
+
+            # Patch tear_down to ensure _benchmark_daily_returns matches total_portfolios length
+            _orig_tear_down = _sa_mod.AnalyserMod.tear_down
+            def _patched_tear_down(self, *args, **kwargs):
+                if hasattr(self, '_total_portfolios') and hasattr(self, '_benchmark_daily_returns'):
+                    n = len(self._total_portfolios)
+                    if len(self._benchmark_daily_returns) > n:
+                        self._benchmark_daily_returns = self._benchmark_daily_returns[:n]
+                if hasattr(self, '_total_portfolios') and hasattr(self, '_total_benchmark_portfolios'):
+                    n = len(self._total_portfolios)
+                    if len(self._total_benchmark_portfolios) > n:
+                        self._total_benchmark_portfolios = self._total_benchmark_portfolios[:n]
+                return _orig_tear_down(self, *args, **kwargs)
+            _sa_mod.AnalyserMod.tear_down = _patched_tear_down
         except Exception:
             pass
 

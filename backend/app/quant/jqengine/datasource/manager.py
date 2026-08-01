@@ -28,8 +28,12 @@ _DUCKDB_PATH = os.getenv(
 
 
 def _jq_to_duckdb(code: str) -> str:
-    """聚宽代码 -> DuckDB symbol（两者均用 .XSHG/.XSHE 格式，直接透传）。"""
-    return code
+    """聚宽代码 -> DuckDB symbol（.XSHG -> .SH, .XSHE -> .SZ）。"""
+    if "." not in code:
+        return code
+    pure, exch = code.rsplit(".", 1)
+    exch_map = {"XSHG": "SH", "XSHE": "SZ", "SH": "SH", "SZ": "SZ", "BJ": "BJ"}
+    return f"{pure}.{exch_map.get(exch, exch)}"
 
 
 class DuckDBSource:
@@ -328,16 +332,14 @@ class DataManager:
     def preload_minute(self, codes):
         """预加载指定标的的分钟线到 _minute_mem（整段窗口，供时钟 feed 使用）。
 
-        一次性把分钟线缓存整库读入内存（``get_all``），再逐标的合并，
-        避免回测中反复打开小文件。预加载的标的一般是时钟 feed 与候选池，
-        其余标的由策略按需走滑窗加载。
+        逐标的从 DuckDB（kline_etf_minute / kline_minute）加载整段窗口，
+        预加载的标的一般是时钟 feed 与候选池，其余标的由策略按需走滑窗加载。
         """
-        all_min = self.cache.get_all("minute")
         win = self._minute_win
         count = 0
         for code in codes:
             try:
-                df = self._load_minute_merged(code, all_min, full=True)
+                df = self._load_minute_merged(code, None, full=True)
                 if df is not None and not df.empty:
                     self._minute_mem[code] = df
                     if win:
@@ -386,6 +388,11 @@ class DataManager:
                 df = df.set_index("date")
                 df = _ensure_money_yuan(df, "duckdb")
                 df = _ensure_volume_shares(df, "duckdb")
+                # 预计算 trade_dt（date 对象）列：_build_money_full 依赖该列
+                # （否则 DuckDB 帧被 continue 跳过，全市场成交额只剩 parquet
+                # 缓存的 ~113 只 ETF，流动性门槛/动态池严重失真）。
+                df = df.copy()
+                df["trade_dt"] = df.index.date
                 # 转 JQ 代码格式
                 jq_code = self._to_jq_code(sym)
                 self._daily_mem[f"get_daily_{jq_code}"] = df
@@ -401,67 +408,12 @@ class DataManager:
     def preload_daily(self):
         """一次性加载全部日线缓存到内存，避免回测中逐文件读取。
 
-        优先从 DuckDB 批量加载；DuckDB 不可用时 fallback 到 parquet 缓存。
+        仅从 DuckDB 批量加载（kline_daily + kline_etf_daily）；DuckDB 不可用
+        时不再回退 parquet（数据源已整体迁移 DuckDB）。
         """
-        # 优先从 DuckDB 批量加载
         if self._preload_from_duckdb():
             return
-        # DuckDB 不可用时 fallback 到 parquet 缓存（兼容旧模式）
-        all_daily = self.cache.get_all("daily")
-        if not all_daily:
-            print("[preload] 日线缓存为空")
-            return
-        priority = self._priority()
-        # 收集每只标的的全部源候选帧（按优先级升序），交由 _pick_daily_frame
-        # 做"qfq 优先于 raw"的混源防护选帧（空帧不参与候选）
-        cands = {}  # jq_code -> [(pri_idx, src_name, key, df)]
-        for key, df in all_daily.items():
-            if "_" not in key:
-                continue
-            src_name, raw_code = key.split("_", 1)
-            if df is None or (hasattr(df, "empty") and df.empty):
-                continue
-            jq_code = self._to_jq_code(raw_code)
-            pri = priority.index(src_name) if src_name in priority else len(priority)
-            cands.setdefault(jq_code, []).append((pri, src_name, key, df))
-        count = 0
-        for jq_code, lst in cands.items():
-            lst.sort(key=lambda c: c[0])
-            picked = _pick_daily_frame(lst)
-            if picked is None:
-                continue
-            src_name, key, df = picked[1], picked[2], picked[3]
-            # 预计算 trade_dt 列（date 对象），避免 get_daily_money_cached
-            # 每天对每只重复 pd.to_datetime（全市场 1600+ 只 × 130 天极慢）。
-            if "trade_dt" not in df.columns:
-                if "trade_date" in df.columns:
-                    df = df.copy()
-                    df["trade_dt"] = pd.to_datetime(
-                        df["trade_date"].astype(str)).dt.date
-                elif "datetime" in df.columns:
-                    df = df.copy()
-                    df["trade_dt"] = pd.to_datetime(
-                        df["datetime"]).dt.date
-            # 成交额单位归一（amount → money，单位：元），下游
-            # get_daily_money_cached / total_turnover 统一用 money(元)
-            df = _ensure_money_yuan(df, src_name)
-            # 成交量单位归一（vol → volume，单位：股），与 money 同模式
-            df = _ensure_volume_shares(df, src_name)
-            # 确保 index 是 DatetimeIndex：批量路径 _get_price_batch_daily
-            # 依赖 isinstance(idx, DatetimeIndex) 做日期切片，若为 RangeIndex
-            # 会被全部跳过导致 get_price 返回空。
-            if not isinstance(df.index, pd.DatetimeIndex):
-                if "trade_date" in df.columns:
-                    df.index = pd.to_datetime(df["trade_date"].astype(str))
-                elif "datetime" in df.columns:
-                    df.index = pd.to_datetime(df["datetime"])
-                elif "timestamp" in df.columns:
-                    df.index = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
-            self._daily_mem[f"get_daily_{jq_code}"] = df
-            count += 1
-        # 日线内存已整体刷新：递增数据版本号，使 money memo 按新版本键重建
-        self._daily_ver += 1
-        print(f"[preload] 日线: {count} 只ETF, {len(cands)} 缓存键")
+        print("[preload] DuckDB 不可用，日线预加载为空")
 
     def _priority(self):
         return [s for s in CONFIG["DATASOURCE_PRIORITY"] if s in self.sources]
@@ -793,13 +745,13 @@ class DataManager:
 
     def _load_minute_merged(self, code, all_min=None,
                             as_of=None, full=False, lo_hi=None):
-        """仅使用真实 mootdx 分钟数据（无合成/插值兜底）。
+        """真实分钟数据（DuckDB 唯一本地源，无合成/插值兜底）。
 
-        - 本地分钟缓存（``minute/real_<code>.parquet``）里的真实 1 分钟：查到多少用多少（基底）；
-        - 本地数据**之后**的缺口 → 回源 mootdx 获取（见 ``_load_real_minute``）；
+        - DuckDB ``kline_etf_minute`` / ``kline_minute`` 的真实 1 分钟（见
+          ``_load_real_minute``），不再读写 parquet；
         - 无真实数据时返回 None。
 
-        ``all_min`` 可选，传入 ``cache.get_all`` 的结果以跳过逐键查询。
+        ``all_min`` 参数保留仅为兼容调用签名，已不使用。
         ``lo_hi`` 显式指定加载窗口 [lo, hi]（feed 整段区间用），优先级最高；
         否则 ``full`` 展开整段回测区间（feed 用），``full=False`` 只展开截至
         ``as_of`` 最近 ``minute_lookback`` 天（滑窗，默认）。
@@ -846,66 +798,24 @@ class DataManager:
         return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
 
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
-        """缺口感知的真实分钟线获取（本地基底 + mootdx 仅补后续缺口）。
+        """真实分钟线获取（DuckDB 唯一本地源 + mootdx 仅兜底缺失标的）。
 
-        本地命中 → 作为基底返回；仅当请求超出本地末端时才对"本地之后的缺口"
-        回源 mootdx 并合并写回。这样不会用 mootdx 全量窗口覆盖掉本地较早的真实
-        1 分钟——否则缓存会随"今天"推移不断缩水。
+        DuckDB（kline_etf_minute / kline_minute）为唯一本地分钟数据源，不再
+        读写 parquet（``minute/real_*.parquet``）。DuckDB 缺失时仅当非离线
+        （``not self._offline``）才回源 mootdx；获取结果不落盘（数据入库由
+        专门的抓取脚本负责），避免回测路径产生导出文件。
 
-        请求整体早于本地最早日期（且本地无数据）→ mootdx 也取不到 → 返回 None。
+        ``all_min`` 参数保留仅为兼容调用签名，已不使用。
         """
-        real_key = f"real_{code}"
-        if all_min is not None:
-            local = all_min.get(real_key)
-        else:
-            local = self.cache.peek("minute", real_key)
-        if local is not None and not local.empty:
+        df = self._load_minute_from_duckdb(code, lo_ts, hi_ts)
+        if df is not None and not df.empty:
             self._minute_real_cov.setdefault(
-                code, (local.index.min(), local.index.max()))
-            local_end = local.index.max()
-            if hi_ts > local_end:
-                # 仅补本地之后的缺口，避免覆盖本地较早的真实 1 分钟
-                fresh = None
-                if not self._offline:
-                    # 优先从 DuckDB 补缺口
-                    fresh = self._load_minute_from_duckdb(code, local_end + pd.Timedelta(minutes=1), hi_ts)
-                if fresh is None or fresh.empty:
-                    if not self._offline:
-                        try:
-                            gap_days = max((hi_ts - local_end).days, 1)
-                            max_bars = min(gap_days * 360, 30000)
-                            fresh = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
-                        except Exception:
-                            fresh = None
-                if fresh is not None and not fresh.empty:
-                    fresh = fresh[fresh.index > local_end]
-                    if not fresh.empty:
-                        combined = pd.concat([local, fresh]).sort_index()
-                        combined = combined[~combined.index.duplicated(keep="last")]
-                        # C1 绝对约束：本地缺失段由 mootdx 真实获取后必须落盘，
-                        # 下次回测直接命中本地，避免反复联网。仅真实 1m 落盘。
-                        try:
-                            self.cache.put("minute", real_key, combined)
-                        except Exception as e:
-                            import logging
-                            logging.warning("[DataManager] real_ 落盘失败 %s: %s", code, e)
-                        self._minute_real_cov[code] = (
-                            combined.index.min(), combined.index.max())
-                        return combined
-            return local
+                code, (df.index.min(), df.index.max()))
+            return df
         cov = self._minute_real_cov.get(code)
         if cov is not None and hi_ts < cov[0]:
             # 请求区间整体早于已知最早日期，回源也取不到 -> 跳过
             return None
-        # DuckDB 分钟数据回退：本地 parquet 无数据时从 DuckDB 读取
-        df = self._load_minute_from_duckdb(code, lo_ts, hi_ts)
-        if df is not None and not df.empty:
-            try:
-                self.cache.put("minute", real_key, df)
-            except Exception:
-                pass
-            self._minute_real_cov[code] = (df.index.min(), df.index.max())
-            return df
         if self._offline:
             # 离线：完全缺失的标的不再联网回源，直接返回 None 由上层跳过
             return None
@@ -916,15 +826,9 @@ class DataManager:
             df = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
         except Exception as e:
             import logging
-            logging.warning("[DataManager] mootdx首次获取分钟数据失败 %s: %s", code, e)
+            logging.warning("[DataManager] mootdx获取分钟数据失败 %s: %s", code, e)
             return None
         if df is not None and not df.empty:
-            # C1 绝对约束：mootdx 真实获取的 1m 必须落盘，供后续回测复用。
-            try:
-                self.cache.put("minute", real_key, df)
-            except Exception as e:
-                import logging
-                logging.warning("[DataManager] real_ 首次落盘失败 %s: %s", code, e)
             self._minute_real_cov[code] = (df.index.min(), df.index.max())
             return df
         return None
@@ -1018,60 +922,34 @@ class DataManager:
         列：``code`` / ``time``(Timestamp) / ``money``，按 (code, time) 升序，
         仅含成交额>0 的行。H7 修复：此处不再 ``tail(count)`` 截断——截断推迟
         到 get_daily_money_cached 按 end_date 过滤之后 per-code 进行。
+
+        DuckDB 单一数据源：kline_etf_daily / kline_daily 的 amount 已归一为元
+        （ETF 日线经 scripts/normalize_etf_daily_units.py 归一；股票 amount 亦为
+        元），直接查询即可，不再读 parquet 缓存、也不再按"今天"做过期判定
+        （回测历史数据不受实时新鲜度影响）。
         """
+        duckdb_src = self.sources.get("duckdb")
+        if duckdb_src is None:
+            return pd.DataFrame(columns=["code", "time", "money"])
+        try:
+            etf_syms = set(duckdb_src._get_etf_symbols())
+            conn = duckdb_src._get_conn()
+        except Exception:
+            return pd.DataFrame(columns=["code", "time", "money"])
         frames = []
         for code in codes:
             try:
-                # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘。
-                ddf = self._daily_mem.get("get_daily_" + code)
-                # 覆盖检查：_daily_mem 可能来自 preload_daily() 加载的旧缓存
-                if (ddf is not None and not (hasattr(ddf, "empty") and ddf.empty)
-                        and self.cache._is_stale(ddf)):
-                    ddf = None
-                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
-                    # peek 兜底顺序与 preload/fetch 一致复用 _priority()：
-                    for src in self._priority():
-                        cached = self.cache.peek("daily", f"{src}_{code}")
-                        if cached is not None and not (hasattr(cached, "empty") and cached.empty):
-                            ddf = _ensure_money_yuan(cached, src)
-                            ddf = _ensure_volume_shares(ddf, src)
-                            break
-                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
-                    # 本地全源缺失 -> 回源获取（C3：daily 必须真实，不得跳过）
-                    try:
-                        ddf = self.fetch("get_daily", code)
-                    except Exception:
-                        continue
-                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
+                sym = _jq_to_duckdb(code)
+                table = "kline_etf_daily" if sym in etf_syms else "kline_daily"
+                rows = conn.execute(
+                    f"SELECT date, amount FROM {table} "
+                    "WHERE symbol = ? AND amount > 0 ORDER BY date",
+                    [sym],
+                ).fetchall()
+                if not rows:
                     continue
-                # daily_mem/preload 已预存 trade_dt 列（date 对象），直接复用。
-                if "trade_dt" not in ddf.columns:
-                    ddf = ddf.copy()
-                    if "trade_date" in ddf.columns:
-                        ddf["trade_dt"] = pd.to_datetime(
-                            ddf["trade_date"].astype(str)).dt.date
-                    elif "datetime" in ddf.columns:
-                        ddf["trade_dt"] = pd.to_datetime(
-                            ddf["datetime"]).dt.date
-                    else:
-                        continue
-                money_col = ddf["money"] if "money" in ddf.columns else None
-                amt_col = ddf["amount"] if "amount" in ddf.columns else None
-                if money_col is None:
-                    money_col = amt_col
-                elif amt_col is not None:
-                    money_col = money_col.fillna(amt_col)
-                if money_col is None:
-                    continue
-                # 统一转 numpy 再组帧，避免 ddf 非 RangeIndex 时索引对齐错位
-                sub = pd.DataFrame({
-                    "time": pd.to_datetime(ddf["trade_dt"]).to_numpy(),
-                    "money": money_col.astype(float).to_numpy(),
-                })
-                sub = sub[sub["money"] > 0]
-                if sub.empty:
-                    continue
-                sub = sub.copy()
+                sub = pd.DataFrame(rows, columns=["time", "money"])
+                sub["time"] = pd.to_datetime(sub["time"])
                 sub["code"] = code
                 frames.append(sub[["code", "time", "money"]])
             except Exception:

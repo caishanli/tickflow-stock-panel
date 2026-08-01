@@ -759,7 +759,7 @@ class _DayBarStore:
     def preload(self, all_daily, codes, data_start=None, data_end=None):
         """一次性把内存缓存中的日线铺进 _bars，避免回测中逐标的 fetch（SQLite）。
 
-        all_daily: cache.get_all("daily") 返回的 {key: DataFrame}（已全在内存）。
+        all_daily: DataManager._daily_mem（DuckDB 日线帧，键 get_daily_<code>）。
         codes: 标的 order_book_id 列表（形如 512670.XSHG）。
         缓存数据不足时自动走 dm.fetch 网络回源补齐。
         """
@@ -1065,18 +1065,20 @@ class JqDataSource:
         self._instruments = {}
         all_dates = set()
 
-        # 全量日线内存缓存（一次性取出，供日历并集与日线预加载复用，避免回测中
-        # 逐标的 fetch 触发 SQLite 查询；聚宽同类数据常驻内存，这是本地慢的主因）。
-        try:
-            _all_daily = dm.cache.get_all("daily")
-        except Exception:
-            _all_daily = {}
+        # 全量日线内存缓存（DuckDB 单一数据源）：直接复用 preload_daily() 已
+        # 加载进 _daily_mem 的日线帧（键 get_daily_<code>），供日历并集与日线
+        # 预加载使用；不再读取/导出 parquet 缓存。
+        _all_daily = getattr(dm, "_daily_mem", {}) or {}
 
-        # 交易日历来源：直接用缓存里所有日线数据的日期并集（不依赖单个标的
-        # fetch，避免 offline 模式下缓存未命中即 raise 导致日历为空、回测报
-        # "区间内无数据"）。
+        # 交易日历来源：直接用所有日线数据的日期并集（DuckDB 帧以 date 为索引，
+        # 或带 date/trade_date 列），不依赖单个标的 fetch，避免 offline 模式下
+        # 缓存未命中即 raise 导致日历为空、回测报"区间内无数据"。
         for _k, _df in _all_daily.items():
             if _df is None or getattr(_df, "empty", True):
+                continue
+            if isinstance(getattr(_df, "index", None), pd.DatetimeIndex):
+                for _d in _df.index.date:
+                    all_dates.add(_d)
                 continue
             _col = "date" if "date" in _df.columns else (
                 "trade_date" if "trade_date" in _df.columns else None)
@@ -1084,6 +1086,22 @@ class JqDataSource:
                 continue
             for _d in _df[_col]:
                 all_dates.add(pd.Timestamp(_d).date())
+
+        # Fallback: DuckDB 帧未覆盖时，直接从 DuckDB 加载交易日历
+        if not all_dates:
+            try:
+                _duckdb_src = dm.sources.get("duckdb")
+                if _duckdb_src is not None:
+                    conn = _duckdb_src._get_conn()
+                    for tbl in ("kline_daily", "kline_etf_daily"):
+                        try:
+                            rows = conn.execute(f"SELECT DISTINCT date FROM {tbl}").fetchall()
+                            for r in rows:
+                                all_dates.add(r[0])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # 日线预加载：把内存缓存直接铺进 _DayBarStore._bars，回测期间 get_price
         # / history 全部命中内存，零 SQLite、零重复 _normalize_daily。
