@@ -28,16 +28,8 @@ _DUCKDB_PATH = os.getenv(
 
 
 def _jq_to_duckdb(code: str) -> str:
-    """聚宽代码 600000.XSHG -> DuckDB symbol 600000.SH。"""
-    if "." not in code:
-        return code
-    pure, suffix = code.split(".", 1)
-    su = suffix.upper()
-    if su == "XSHG":
-        return f"{pure}.SH"
-    if su == "XSHE":
-        return f"{pure}.SZ"
-    return code  # 已是 .SH/.SZ
+    """聚宽代码 -> DuckDB symbol（两者均用 .XSHG/.XSHE 格式，直接透传）。"""
+    return code
 
 
 class DuckDBSource:
@@ -874,18 +866,17 @@ class DataManager:
             if hi_ts > local_end:
                 # 仅补本地之后的缺口，避免覆盖本地较早的真实 1 分钟
                 fresh = None
-                if self._offline:
-                    pass  # 离线：不联网补缺口
-                else:
-                    try:
-                        # 限制拉取量：缺口约 N 个交易日 × 240 bar/天，加 50% 余量
-                        gap_days = max((hi_ts - local_end).days, 1)
-                        max_bars = min(gap_days * 360, 30000)
-                        fresh = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
-                    except Exception as e:
-                        import logging
-                        logging.warning("[DataManager] mootdx回源补充缺口失败 %s: %s", code, e)
-                        fresh = None
+                if not self._offline:
+                    # 优先从 DuckDB 补缺口
+                    fresh = self._load_minute_from_duckdb(code, local_end + pd.Timedelta(minutes=1), hi_ts)
+                if fresh is None or fresh.empty:
+                    if not self._offline:
+                        try:
+                            gap_days = max((hi_ts - local_end).days, 1)
+                            max_bars = min(gap_days * 360, 30000)
+                            fresh = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
+                        except Exception:
+                            fresh = None
                 if fresh is not None and not fresh.empty:
                     fresh = fresh[fresh.index > local_end]
                     if not fresh.empty:
@@ -906,6 +897,15 @@ class DataManager:
         if cov is not None and hi_ts < cov[0]:
             # 请求区间整体早于已知最早日期，回源也取不到 -> 跳过
             return None
+        # DuckDB 分钟数据回退：本地 parquet 无数据时从 DuckDB 读取
+        df = self._load_minute_from_duckdb(code, lo_ts, hi_ts)
+        if df is not None and not df.empty:
+            try:
+                self.cache.put("minute", real_key, df)
+            except Exception:
+                pass
+            self._minute_real_cov[code] = (df.index.min(), df.index.max())
+            return df
         if self._offline:
             # 离线：完全缺失的标的不再联网回源，直接返回 None 由上层跳过
             return None
@@ -928,6 +928,36 @@ class DataManager:
             self._minute_real_cov[code] = (df.index.min(), df.index.max())
             return df
         return None
+
+    def _load_minute_from_duckdb(self, code, lo_ts, hi_ts):
+        """从 DuckDB kline_minute / kline_etf_minute 表读取分钟数据。"""
+        try:
+            sym = _jq_to_duckdb(code)
+            duckdb_src = self.sources.get("duckdb")
+            if duckdb_src is None:
+                return None
+            etf_syms = duckdb_src._get_etf_symbols()
+            table = "kline_etf_minute" if sym in etf_syms else "kline_minute"
+            conn = duckdb_src._get_conn()
+            start_date = lo_ts.date() if lo_ts else None
+            end_date = hi_ts.date() if hi_ts else None
+            sql = f"SELECT datetime, open, high, low, close, volume, amount FROM {table} WHERE symbol = ?"
+            params = [sym]
+            if start_date:
+                sql += " AND datetime::DATE >= ?"
+                params.append(start_date)
+            if end_date:
+                sql += " AND datetime::DATE <= ?"
+                params.append(end_date)
+            sql += " ORDER BY datetime"
+            df_db = conn.execute(sql, params).pl().to_pandas()
+            if df_db.empty:
+                return None
+            df_db["datetime"] = pd.to_datetime(df_db["datetime"])
+            df_db = df_db.set_index("datetime")
+            return df_db
+        except Exception:
+            return None
 
     @staticmethod
     def _slice_minute(df, end_date, start_date=None):

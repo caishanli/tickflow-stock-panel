@@ -180,7 +180,7 @@ def _make_dm():
 
     dm = get_data_manager()
     dm._use_real_minute = True
-    dm._offline = False
+    dm._offline = True
     try:
         dm.preload_daily()
     except Exception as e:  # noqa: BLE001

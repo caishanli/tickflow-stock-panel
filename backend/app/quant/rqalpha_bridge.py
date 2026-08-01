@@ -1468,13 +1468,61 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
         import rqalpha.main as _rqmain
         _orig_adjust = _rqmain._adjust_start_date
         def _noop_adjust(config, data_proxy):
-            # Still need to set trading_calendar from config dates
-            # The actual trading dates come from our JqDataSource later
             import pandas as pd
             config.base.trading_calendar = pd.date_range(
                 config.base.start_date, config.base.end_date, freq="B"
             )
         _rqmain._adjust_start_date = _noop_adjust
+
+        # sys_analyser benchmark 补丁：自建日历可能缺少 start_date 前一交易日，
+        # 导致 daily_returns 少一天而 _benchmark_daily_returns 多一天。
+        try:
+            import rqalpha.mod.rqalpha_mod_sys_analyser.mod as _sa_mod
+            _orig_gen_bm = _sa_mod.AnalyserMod.generate_benchmark_daily_returns_and_portfolio
+
+            def _patched_gen_bm(self, event):
+                try:
+                    return _orig_gen_bm(self, event)
+                except ValueError:
+                    _s = self._env.config.base.start_date
+                    _e = self._env.config.base.end_date
+                    trading_dates = self._env.data_proxy.get_trading_dates(_s, _e)
+                    self._benchmark_daily_returns = np.zeros(len(trading_dates))
+                    if self._benchmark is None:
+                        return
+                    weights = 0
+                    for order_book_id, weight in self._benchmark:
+                        if order_book_id in self.NULL_OID:
+                            continue
+                        ins = self._env.data_proxy.instrument_not_none(order_book_id)
+                        try:
+                            bars = self._env.data_proxy.history_bars(
+                                order_book_id=ins.order_book_id,
+                                bar_count=None, frequency="1d",
+                                field=["datetime", "close"], dt=_e,
+                                skip_suspended=False,
+                            )
+                            if bars is None or len(bars) < 2:
+                                continue
+                            close = bars["close"]
+                            dr = (close[1:] / close[:-1] - 1.0)
+                            n = min(len(dr), len(self._benchmark_daily_returns))
+                            self._benchmark_daily_returns[:n] += dr[:n] * weight
+                            weights += weight
+                        except Exception:
+                            continue
+                    if weights > 0:
+                        self._benchmark_daily_returns /= weights
+                    unit_net_value = (self._benchmark_daily_returns + 1).cumprod()
+                    self._total_benchmark_portfolios = {
+                        "date": list(trading_dates.date),
+                        "unit_net_value": unit_net_value,
+                    }
+
+            _sa_mod.AnalyserMod.generate_benchmark_daily_returns_and_portfolio = _patched_gen_bm
+        except Exception:
+            pass
+
         try:
             _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
             result = rq_run(config, source_code=strategy_code)

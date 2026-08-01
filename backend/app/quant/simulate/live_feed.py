@@ -55,10 +55,41 @@ def _file_lock(path):
 
 
 def _fetch_recent(dm, code):
+    if getattr(dm, "_offline", False):
+        return _fetch_recent_from_duckdb(dm, code)
     src = dm.sources.get("mootdx")
     if src is None:
         raise RuntimeError("mootdx 源不可用")
     return src.get_minute_recent(code)
+
+
+def _fetch_recent_from_duckdb(dm, code):
+    """从 DuckDB 读取当日分钟数据（离线模式）。"""
+    try:
+        from app.tickflow.repository import DataStore
+        from ..jqengine.datasource.manager import _jq_to_duckdb
+        store = DataStore()
+        sym = _jq_to_duckdb(code)
+        etf_syms = dm._get_etf_symbols() if hasattr(dm, "_get_etf_symbols") else set()
+        table = "kline_etf_minute" if sym in etf_syms else "kline_minute"
+        today = pd.Timestamp.now().date()
+        rows = store.db.execute(
+            f"SELECT datetime, open, high, low, close, volume, amount "
+            f"FROM {table} WHERE symbol = ? AND datetime::DATE = ? ORDER BY datetime",
+            [sym, today],
+        ).fetchall()
+        store.db.close()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            rows, columns=["datetime", "open", "high", "low", "close", "volume", "amount"]
+        )
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime")
+        return df
+    except Exception as e:
+        log.warning("[live_feed] DuckDB 分钟读取失败 %s: %s", code, e)
+        return pd.DataFrame()
 
 
 def refresh(dm, codes, now=None, fresh_acc=None):
