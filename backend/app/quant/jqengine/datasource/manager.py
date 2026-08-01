@@ -12,8 +12,6 @@ from dotenv import set_key
 logger = logging.getLogger("jqengine.dm")
 
 from .cache import DataCache
-from .mootdx_src import MootdxSource
-from .astock_src import AStockSource
 from .base import DataSourceError
 from ..config import CONFIG, REPO_ROOT
 
@@ -44,6 +42,7 @@ class DuckDBSource:
     def __init__(self):
         self._conn = None
         self._etf_symbols: set[str] | None = None
+        self._index_symbols: set[str] | None = None
 
     def _get_etf_symbols(self) -> set[str]:
         if self._etf_symbols is None:
@@ -55,6 +54,23 @@ class DuckDBSource:
                 self._etf_symbols = set()
         return self._etf_symbols
 
+    def _get_index_symbols(self) -> set[str]:
+        if self._index_symbols is None:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute("SELECT symbol FROM instruments_index").fetchall()
+                self._index_symbols = {r[0] for r in rows}
+            except Exception:
+                self._index_symbols = set()
+        return self._index_symbols
+
+    def _table_for(self, sym: str) -> str:
+        if sym in self._get_index_symbols():
+            return "kline_index_daily"
+        if sym in self._get_etf_symbols():
+            return "kline_etf_daily"
+        return "kline_daily"
+
     def _get_conn(self):
         if self._conn is None:
             import duckdb
@@ -64,8 +80,7 @@ class DuckDBSource:
     def get_daily(self, code, start, end):
         sym = _jq_to_duckdb(code)
         conn = self._get_conn()
-        etf_syms = self._get_etf_symbols()
-        table = "kline_etf_daily" if sym in etf_syms else "kline_daily"
+        table = self._table_for(sym)
         try:
             rows = conn.execute(
                 f"SELECT date, open, high, low, close, volume, amount "
@@ -88,8 +103,7 @@ class DuckDBSource:
     def get_minute(self, code, date, start_date=None):
         sym = _jq_to_duckdb(code)
         conn = self._get_conn()
-        etf_syms = self._get_etf_symbols()
-        table = "kline_etf_minute" if sym in etf_syms else "kline_minute"
+        table = "kline_etf_minute" if sym in self._get_etf_symbols() else "kline_minute"
         try:
             rows = conn.execute(
                 f"SELECT datetime, open, high, low, close, volume, amount "
@@ -125,6 +139,20 @@ class DuckDBSource:
         except Exception:
             return []
 
+    def get_stock_names(self):
+        """返回 {纯代码: 名称} 字典，来自本地 instruments_* 名录表。"""
+        conn = self._get_conn()
+        out = {}
+        try:
+            for tbl in ("instruments_etf", "instruments", "instruments_index"):
+                rows = conn.execute(f"SELECT symbol, name FROM {tbl}").fetchall()
+                for sym, name in rows:
+                    if name:
+                        out[sym.split(".")[0]] = name
+        except Exception:
+            pass
+        return out
+
     def get_index_realtime(self, codes):
         raise DataSourceError("duckdb 源不提供实时指数")
 
@@ -139,7 +167,7 @@ class DuckDBSource:
             return False
 
 
-SOURCES = {"duckdb": DuckDBSource, "mootdx": MootdxSource, "astock": AStockSource}
+SOURCES = {"duckdb": DuckDBSource}
 
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
@@ -195,9 +223,8 @@ class _MinuteLRU(OrderedDict):
 def _ensure_money_yuan(df, src_name):
     """保证日线帧带 ``money`` 列（单位：元）。
 
-    各数据源 amount 单位不一：mootdx/astock 为元；mootdx 源已自带
-    money(元)（见 mootdx_src.get_daily 的 amount→money 映射）。未归一时直接
-    把 amount 当元用会让全市场成交额聚合失真，流动性门槛/池过滤全面失真。
+    DuckDB 日线帧自带 ``money`` 列；其余来源（如有）未归一 amount 时
+    直接把 amount 当元用会让全市场成交额聚合失真，流动性门槛/池过滤全面失真。
     """
     if df is None or getattr(df, "empty", True):
         return df
@@ -213,9 +240,7 @@ def _ensure_money_yuan(df, src_name):
 def _ensure_volume_shares(df, src_name):
     """保证日线帧带 ``volume`` 列（单位：股）。
 
-    mootdx 源内已 vol×100→volume(股)（见 mootdx_src.get_daily），astock
-    的 volume 单位即为股（astock 实测小 ETF 约 5e7 量级），已有 ``volume``
-    列的帧不动。
+    DuckDB 日线帧自带 ``volume``（股）；已有 ``volume`` 列的帧不动。
     """
     if df is None or getattr(df, "empty", True):
         return df
@@ -229,25 +254,21 @@ def _ensure_volume_shares(df, src_name):
 
 
 def _infer_adj(df, src_name):
-    """推断日线帧的复权口径：优先读 ``df.attrs["adj"]``（各源 get_daily
-    已标注）；旧缓存帧（pickle/parquet）没有 attrs，按源名回退推断——
-    mootdx 通达信原始价按 "raw"、其余（如 astock）按 "unknown"。
+    """推断日线帧的复权口径：优先读 ``df.attrs["adj"]``（源 get_daily
+    已标注）；旧缓存帧（pickle/parquet）没有 attrs，按源名回退推断。
     """
     adj = getattr(df, "attrs", None)
     adj = adj.get("adj") if adj else None
     if adj:
         return adj
-    return {"mootdx": "raw"}.get(src_name, "unknown")
+    return "unknown"
 
 
 def _pick_daily_frame(candidates):
     """同一代码多源缓存并存时的选帧：按优先级取第一个非 raw 帧，全 raw 才用 raw。
 
-    背景：mootdx 为通达信原始不复权价（raw）；若只按源优先级选帧，
-    同一回测内价格帧可能来自不同复权口径。``candidates`` 为
-    ``(pri, src_name, key, df)`` 元组、已按优先级升序；"非 raw" 含
-    qfq/unknown（unknown 可能是前复权，raw 一定不是）。返回选中的元组；
-    无候选返回 None。
+    ``candidates`` 为 ``(pri, src_name, key, df)`` 元组、已按优先级升序；
+    "非 raw" 含 qfq/unknown。返回选中的元组；无候选返回 None。
     """
     first_raw = None
     for cand in candidates:
@@ -269,7 +290,7 @@ class DataManager:
     def __init__(self, token=None, cache=None, minute_mem_cap=None):
         self.cache = cache or DataCache()
         self.sources = {k: v() for k, v in SOURCES.items()}
-        # 历史分钟线：优先走真实源（mootdx 分页回看）
+        # 历史分钟线：DuckDB 唯一数据源
         self._minute_win = None  # (start, end) 回测窗口
         self._minute_cov = {}  # code -> (lo_ts, hi_ts) 缓存帧已覆盖区间
         # M11 修复：分钟帧内存缓存改为有界 LRU（原无界 dict 永久持有帧，
@@ -292,7 +313,7 @@ class DataManager:
         # 分钟线滑窗：回测中不持有整个回测区间的分钟数据，只保留最近 N 天，
         # 既省内存又避免每次按需加载都展开整段历史（见 get_minute / _ensure_minute_windowed）
         self.minute_lookback = pd.Timedelta(days=15)
-        self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
+        self._minute_real_cov = {}  # code -> (min_ts, max_ts) 本地分钟覆盖区间
         self._offline = False       # 回测离线模式：本地优先，缺失不联网回源
         # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
         # 避免低效源反复先试。
@@ -302,6 +323,7 @@ class DataManager:
 
     def set_minute_window(self, start, end):
         """设定分钟线展开区间（回测前调用），避免生成超长历史。
+
 
         注意：只重置分钟线缓存(_minute_mem)及其覆盖区间元数据(_minute_cov)，
         不清空日线缓存(_daily_mem)。日线数据与分钟窗口无关；若在此清空
@@ -369,8 +391,16 @@ class DataManager:
                 "SELECT symbol, date, open, high, low, close, volume, amount "
                 "FROM kline_etf_daily ORDER BY symbol, date"
             ).fetchall()
+            # 批量查 kline_index_daily（指数：走弱期判定等）
+            try:
+                index_rows = conn.execute(
+                    "SELECT symbol, date, open, high, low, close, volume, amount "
+                    "FROM kline_index_daily ORDER BY symbol, date"
+                ).fetchall()
+            except Exception:
+                index_rows = []
 
-            all_rows = stock_rows + etf_rows
+            all_rows = stock_rows + etf_rows + index_rows
             if not all_rows:
                 return False
 
@@ -416,7 +446,10 @@ class DataManager:
         print("[preload] DuckDB 不可用，日线预加载为空")
 
     def _priority(self):
-        return [s for s in CONFIG["DATASOURCE_PRIORITY"] if s in self.sources]
+        ordered = [s for s in CONFIG["DATASOURCE_PRIORITY"] if s in self.sources]
+        if ordered:
+            return ordered
+        return list(self.sources)
 
     def fetch(self, method, *args, **kwargs):
         if method == "get_minute":
@@ -425,8 +458,8 @@ class DataManager:
             start_date = args[2] if len(args) > 2 else None
             return self.get_minute(code, end_date, start_date)
         cache_key = f"{method}_{args[0] if args else ''}"
-        # C3：daily 本地优先。_daily_mem 命中即返回；未命中或覆盖不足时，
-        # cache.get 会调 loader 回源（mootdx）并落盘。回测中
+        # C3：daily 本地优先。_daily_mem 命中即返回；未命中或覆盖不足时走
+        # duckdb 源。回测中
         # preload_daily 已预加载全量日线，此处一般命中内存。
         if cache_key in self._daily_mem:
             mem = self._daily_mem[cache_key]
@@ -434,7 +467,7 @@ class DataManager:
                 # 内存命中仍需检查是否覆盖请求区间：preload 可能加载了截断的本地
                 # 日线（如某 ETF 本地只到 1/30），若不检查覆盖会误当完整返回，
                 # 导致 6-7 月数据缺失、候选池错位。未覆盖则删除内存缓存，走
-                # 下方 cache.get 回源补齐。
+                # 下方 cache.get 兜底。
                 req_start = args[1] if len(args) > 1 else None
                 req_end = args[2] if len(args) > 2 else None
                 # 只在实时请求（end >= 今天）时检查过期；历史请求直接用内存数据
@@ -446,13 +479,13 @@ class DataManager:
                     except Exception:
                         _is_live_req = True
                 if (DataCache._covers(mem, req_start, req_end)
-                        and not (self.cache._is_stale(mem) and _is_live_req)):
+                        and not (self.cache._is_stale(mem) and _is_live_req and not self._offline)):
                     return mem
             del self._daily_mem[cache_key]
             self._daily_ver += 1  # 日线内存有删除，money memo 旧版本键失效
         if self._offline:
-            # 回测离线：本地缺失即视为无数据，不联网回源（避免 mootdx 选服务器
-            # 联网超时卡死；缺数据的标的由策略侧容忍/跳过）。
+        # 回测离线：本地缺失即视为无数据，不回源网络（缺数据的标的由策略侧
+        # 容忍/跳过）。
             raise DataSourceError(f"离线模式本地缺失: {cache_key}")
         last_err = ""
         for name in self._priority():
@@ -504,7 +537,7 @@ class DataManager:
         """某数据源连续取数失败达阈值 -> 降到优先级末位并持久化到 .env。
 
         典型场景：某数据源对 ETF 日线始终返回空，前几次逐标的联网试探既慢又无意义；
-        累计失败达阈值后自动把该源挪到最后，后续取数直接走 mootdx/astock，并把新
+        累计失败达阈值后自动把该源挪到最后，并把新
         顺序写回 .env，使后续运行也受益。已降级或本就在末位则跳过。
         """
         if name in self._demoted:
@@ -553,7 +586,7 @@ class DataManager:
         与 :meth:`get_minute` 的滑窗不同，feed 需覆盖全部回测区间以驱动回放，
         因此按完整窗口加载（仅 1~2 只标的）。窗口上界用回测 end（而非 today）。
 
-        H6a 修复：feed 改走 :meth:`_load_minute_merged` 真实 mootdx 分钟数据。
+        H6a 修复：feed 改走 :meth:`_load_minute_merged` 本地分钟数据。
         H6c 修复：命中缓存前校验覆盖区间包含 [start, end]，覆盖不足重新合并，
         不再"先到先得"。
         """
@@ -670,7 +703,7 @@ class DataManager:
         for code in codes:
             try:
                 # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
-                # 超出 mootdx 实际覆盖范围。
+                # 超出本地覆盖范围。
                 df = self._ensure_minute_windowed(code, as_of_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     loaded += 1
@@ -775,7 +808,7 @@ class DataManager:
                 layers.append(real)
 
         if not layers:
-            # 无真实 mootdx 数据 → 返回 None。
+            # 无本地数据 → 返回 None。
             return None
 
         numeric_cols = ["open", "high", "low", "close", "volume", "money", "amount"]
@@ -798,12 +831,10 @@ class DataManager:
         return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
 
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
-        """真实分钟线获取（DuckDB 唯一本地源 + mootdx 仅兜底缺失标的）。
+        """真实分钟线获取（DuckDB 唯一数据源）。
 
-        DuckDB（kline_etf_minute / kline_minute）为唯一本地分钟数据源，不再
-        读写 parquet（``minute/real_*.parquet``）。DuckDB 缺失时仅当非离线
-        （``not self._offline``）才回源 mootdx；获取结果不落盘（数据入库由
-        专门的抓取脚本负责），避免回测路径产生导出文件。
+        DuckDB（kline_etf_minute / kline_minute）为唯一分钟数据源，不再
+        读写 parquet（``minute/real_*.parquet``），也不回源任何网络数据。
 
         ``all_min`` 参数保留仅为兼容调用签名，已不使用。
         """
@@ -816,21 +847,7 @@ class DataManager:
         if cov is not None and hi_ts < cov[0]:
             # 请求区间整体早于已知最早日期，回源也取不到 -> 跳过
             return None
-        if self._offline:
-            # 离线：完全缺失的标的不再联网回源，直接返回 None 由上层跳过
-            return None
-        try:
-            # 无本地缓存：按请求窗口估算拉取量，避免默认30000全量拉取
-            win_days = max((hi_ts - lo_ts).days, 1) if lo_ts and hi_ts else 15
-            max_bars = min(win_days * 360, 30000)
-            df = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
-        except Exception as e:
-            import logging
-            logging.warning("[DataManager] mootdx获取分钟数据失败 %s: %s", code, e)
-            return None
-        if df is not None and not df.empty:
-            self._minute_real_cov[code] = (df.index.min(), df.index.max())
-            return df
+        # 本地无数据：直接返回 None 由上层跳过（不回源网络）
         return None
 
     def _load_minute_from_duckdb(self, code, lo_ts, hi_ts):
@@ -972,7 +989,7 @@ class DataManager:
                 ",".join(CONFIG["DATASOURCE_PRIORITY"]))
 
     def verify_token(self, token):
-        return MootdxSource().test_connection()
+        return bool(self.sources.get("duckdb"))
 
     def list_sources(self):
         return [{"name": n, "priority": i, "available": True}

@@ -201,15 +201,7 @@ def _is_trading_day(dm, today) -> bool:
         return td.weekday() < 5
     try:
         start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
-        df = None
-        mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
-        if mootdx_src is not None:
-            try:
-                df = mootdx_src.get_daily("000300.XSHG", start, str(today))
-            except Exception:
-                df = None
-        if df is None:
-            df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
+        df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
         if df is None or df.empty:
             raise RuntimeError("指数日线为空")
         idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
@@ -476,22 +468,11 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
 # ---------------------------------------------------------------------------
 
 def _trade_days_between(dm, start, end) -> list:
-    """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。
-
-    优先用 dm 已有的 mootdx 源（避免重复建连），回退到 dm.fetch。
-    """
-    df = None
-    mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
-    if mootdx_src is not None:
-        try:
-            df = mootdx_src.get_daily("000300.XSHG", str(start), str(end))
-        except Exception:
-            df = None
-    if df is None:
-        try:
-            df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
-        except Exception:
-            pass
+    """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。"""
+    try:
+        df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+    except Exception:
+        df = None
     if df is None or df.empty:
         return []
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None

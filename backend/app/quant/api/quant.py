@@ -427,10 +427,14 @@ def datasource_priority(body: dict):
 @router.post("/datasource/verify")
 def datasource_verify():
     try:
-        from ..jqengine.datasource.mootdx_src import MootdxSource
-        src = MootdxSource()
-        ok, msg = src.test_connection()
-        return {"data": {"ok": ok, "error": msg if not ok else None}}
+        from ..jqengine.datasource.manager import get_data_manager
+
+        dm = get_data_manager()
+        src = dm.sources.get("duckdb")
+        if src is None:
+            return {"data": {"ok": False, "error": "无可用数据源"}}
+        ok = src.test_connection()
+        return {"data": {"ok": ok, "error": None if ok else "DuckDB 连接失败"}}
     except Exception as e:  # noqa: BLE001
         return {"data": {"ok": False, "error": str(e)}}
 

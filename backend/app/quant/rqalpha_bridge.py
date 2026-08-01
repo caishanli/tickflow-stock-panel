@@ -212,7 +212,7 @@ class QuantRQAlphaDataSource:
             for _k, _df in _all_daily.items():
                 if _df is None or getattr(_df, "empty", True):
                     continue
-                # 各源日线 schema 先归一（mootdx datetime 索引等），
+                # 各源日线 schema 先归一（datetime 索引等），
                 # 否则非 date 列命名的缓存帧被跳过、交易日历覆盖不足
                 _df = self._normalize_daily_df(_df)
                 if "date" not in _df.columns:
@@ -229,7 +229,7 @@ class QuantRQAlphaDataSource:
                 df = None
             if df is None or len(df) == 0:
                 continue
-            # 列名归一：mootdx 返回 datetime 索引 + vol，与下方 date/volume 契约不一致会 KeyError 致整个 run failed
+            # 列名归一：返回 datetime 索引 + vol，与下方 date/volume 契约不一致会 KeyError 致整个 run failed
             df = self._normalize_daily_df(df)
             self._bars[code] = self._df_to_recarray(df, code=code)
             self._instruments[code] = self._make_instrument(code)
@@ -260,7 +260,7 @@ class QuantRQAlphaDataSource:
     def _normalize_daily_df(df: pd.DataFrame) -> pd.DataFrame:
         """各数据源日线 schema 归一到桥接契约（date/volume 列）。
 
-        - mootdx：datetime 索引 → date 列（其源已自行补 volume，不再重复换算）；
+        - duckdb：datetime 索引 → date 列（已自行补 volume，不再重复换算）；
         - 已有 date/volume 列（如 bundle CSV）：原样返回，不改变既有行为。
         """
         if "date" not in df.columns:
@@ -1201,7 +1201,7 @@ def _load_etf_universe(dm):
     快照机制（保证同一策略结果可复现，不随每次启动的实时拉取漂移）：
     - 快照存在且 fetched_at 距今 ≤7 天：直接使用（离线/在线都优先）；
     - 快照缺失或过期：从本地缓存推导 ETF 代码列表；
-    - 名称通过 mootdx get_stock_names() 获取（不依赖外部网络）。
+    - 名称通过 duckdb get_stock_names() 获取（不依赖外部网络）。
     """
     snap = _read_etf_snapshot(_ETF_UNIVERSE_SNAPSHOT)
     fresh = (snap is not None
@@ -1213,7 +1213,7 @@ def _load_etf_universe(dm):
     etf_codes = _cache_etf_codes(dm)
     names = {}
     try:
-        names = dm.sources["mootdx"].get_stock_names() or {}
+        names = dm.sources["duckdb"].get_stock_names() or {}
     except Exception:
         pass
     return etf_codes, names, {}
@@ -1247,9 +1247,9 @@ def run_jq_backtest(strategy_path: str, params: dict,
 
     # ---- 构造 DataManager，加载原始缓存（离线，无网络回源） ----
     # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
-    # 等开关不一致（策略侧单例默认 True 会仍走 mootdx 实时分钟线网络）。
+    # 等开关不一致（策略侧单例默认 True 会仍走实时分钟线网络）。
     dm = get_data_manager()
-    # 回测使用真实 1 分钟数据（real_ 基底），缺口由 mootdx 5 分钟插值补齐。
+    # 回测使用真实 1 分钟数据（real_ 基底，DuckDB 唯一数据源）。
     dm._use_real_minute = True
     _log_progress(params.get("run_id"),
                   f"加载行情缓存与 ETF 宇宙（{start} ~ {end}，此阶段耗时较长，进度会持续更新）…")

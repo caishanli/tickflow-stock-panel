@@ -55,12 +55,7 @@ def _file_lock(path):
 
 
 def _fetch_recent(dm, code):
-    if getattr(dm, "_offline", False):
-        return _fetch_recent_from_duckdb(dm, code)
-    src = dm.sources.get("mootdx")
-    if src is None:
-        raise RuntimeError("mootdx 源不可用")
-    return src.get_minute_recent(code)
+    return _fetch_recent_from_duckdb(dm, code)
 
 
 def _fetch_recent_from_duckdb(dm, code):

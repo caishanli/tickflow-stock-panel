@@ -5,8 +5,6 @@ import pandas as pd
 
 from .base import DataSourceError
 from .cache import DataCache
-from .mootdx_src import MootdxSource
-from .astock_src import AStockSource
 
 from ..config import CONFIG
 
@@ -22,8 +20,6 @@ def _lazy_tickflow():
 
 SOURCES = {
     "tickflow": None,
-    "mootdx": MootdxSource,
-    "astock": AStockSource,
 }
 
 

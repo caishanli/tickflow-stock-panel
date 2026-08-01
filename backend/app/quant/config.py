@@ -32,7 +32,7 @@ def _data_path(sub: str) -> str:
 @dataclass
 class QuantConfig:
     data_priority: list[str] = field(
-        default_factory=lambda: ["tickflow", "mootdx", "astock"]
+        default_factory=lambda: ["tickflow"]
     )
     fee_rate: float = 0.0003
     slippage: float = 0.001
@@ -47,7 +47,7 @@ def load_config() -> QuantConfig:
     return QuantConfig(
         data_priority=_csv_list(
             _env("QUANT_DATA_PRIORITY"),
-            ["tickflow", "mootdx", "astock"],
+            ["tickflow"],
         ),
         fee_rate=float(_env("QUANT_FEE_RATE", "0.0003") or "0.0003"),
         slippage=float(_env("QUANT_SLIPPAGE", "0.001") or "0.001"),

@@ -812,17 +812,17 @@ def get_security_name(code):
         return names[code]
     mgr = _state.get("manager")
     if mgr:
-        # 先尝试 mootdx 通达信简称
-        if "mootdx" in mgr.sources:
+        # 本地名录简称
+        if "duckdb" in mgr.sources:
             try:
-                mootdx_names = mgr.sources["mootdx"].get_stock_names()
+                local_names = mgr.sources["duckdb"].get_stock_names()
                 pure = code.split(".")[0]
-                if pure in mootdx_names:
+                if pure in local_names:
                     if names is None:
                         names = {}
-                    names[code] = mootdx_names[pure]
+                    names[code] = local_names[pure]
                     _state["sec_names"] = names
-                    return mootdx_names[pure]
+                    return local_names[pure]
             except Exception:
                 pass
         try:
@@ -857,11 +857,11 @@ def get_all_securities(types=None, date=None):
     if mgr is None:
         return pd.DataFrame()
     types = types or ["etf"]
-    # 从 mootdx 获取通达信简称（与聚宽 display_name 一致）
-    mootdx_names = {}
-    if "mootdx" in mgr.sources:
+    # 本地名录简称
+    local_names = {}
+    if "duckdb" in mgr.sources:
         try:
-            mootdx_names = mgr.sources["mootdx"].get_stock_names()
+            local_names = mgr.sources["duckdb"].get_stock_names()
         except Exception:
             pass
     records = []
@@ -877,7 +877,7 @@ def get_all_securities(types=None, date=None):
                 if isinstance(item, str):
                     code = _ts_code_to_jq_code(item)
                     pure = code.split(".")[0]
-                    name = mootdx_names.get(pure, code)
+                    name = local_names.get(pure, code)
                     records.append({"code": code, "display_name": name,
                                     "name": name, "start_date": "2000-01-01",
                                     "end_date": "2200-01-01", "type": t})
@@ -885,7 +885,7 @@ def get_all_securities(types=None, date=None):
                     ts_code = item.get("ts_code", "")
                     code = _ts_code_to_jq_code(ts_code)
                     pure = code.split(".")[0]
-                    name = mootdx_names.get(pure, item.get("name", code))
+                    name = local_names.get(pure, item.get("name", code))
                     list_date = item.get("list_date", "")
                     if list_date and len(str(list_date)) == 8:
                         sd = f"{list_date[:4]}-{list_date[4:6]}-{list_date[6:8]}"

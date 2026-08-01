@@ -44,10 +44,11 @@ class _DM:
         self.cache = _Cache()
 
 
-def test_refresh_merges_into_minute_mem_and_snapshots():
+def test_refresh_merges_into_minute_mem_and_snapshots(monkeypatch):
     old = _frame(["2026-07-16 14:59", "2026-07-16 15:00"], [9.9, 10.0])
     fresh = _frame(["2026-07-17 09:30", "2026-07-17 09:31"], [10.1, 10.2])
     dm = _DM(_Mootdx({"510300.XSHG": fresh}))
+    monkeypatch.setattr(live_feed, "_fetch_recent", lambda dm, code: _Mootdx({"510300.XSHG": fresh}).get_minute_recent(code))
     dm._minute_mem["510300.XSHG"] = old
     dm._minute_cov["510300.XSHG"] = (old.index.min(), old.index.max())
     acc = {}
@@ -61,10 +62,11 @@ def test_refresh_merges_into_minute_mem_and_snapshots():
     assert acc["510300.XSHG"] is fresh          # 原始帧累积供收盘落盘
 
 
-def test_refresh_dedupes_overlapping_bars_keep_last():
+def test_refresh_dedupes_overlapping_bars_keep_last(monkeypatch):
     old = _frame(["2026-07-17 09:30", "2026-07-17 09:31"], [10.0, 10.1])
     fresh = _frame(["2026-07-17 09:31", "2026-07-17 09:32"], [99.0, 10.2])
     dm = _DM(_Mootdx({"510300.XSHG": fresh}))
+    monkeypatch.setattr(live_feed, "_fetch_recent", lambda dm, code: _Mootdx({"510300.XSHG": fresh}).get_minute_recent(code))
     dm._minute_mem["510300.XSHG"] = old
     now = pd.Timestamp("2026-07-17 09:32:10")
     prices, _ = live_feed.refresh(dm, ["510300.XSHG"], now)

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date
 
 import polars as pl
 
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def backfill_etf_data(repo) -> dict:
-    """检查 ETF 日线数据完整性，缺失的从 mootdx 回源补齐。
+    """检查 ETF 日线数据完整性（DuckDB 唯一数据源，无网络回源渠道）。
 
     返回统计 dict: {"daily_backfilled": int, "errors": int}
     """
@@ -47,36 +47,7 @@ def backfill_etf_data(repo) -> dict:
         logger.info("ETF 回源: 全部 %d 只 ETF 数据完整", len(symbols))
         return stats
 
-    logger.info("ETF 回源: %d/%d 只 ETF 需要补齐", len(need_backfill), len(symbols))
-
-    # 从 mootdx 回源日线
-    try:
-        from app.quant.jqengine.datasource.mootdx_src import MootdxSource
-
-        msrc = MootdxSource()
-        for sym in need_backfill:
-            try:
-                latest = latest_map.get(sym)
-                start = latest + timedelta(days=1) if latest else today - timedelta(days=365)
-                # mootdx 需要纯数字代码
-                pure = sym.split(".")[0]
-                df = msrc.get_daily(pure, start, today)
-                if df is not None and not df.empty:
-                    pdf = pl.from_pandas(df)
-                    pdf = pdf.with_columns(pl.lit(sym).alias("symbol"))
-                    # 列映射: mootdx 返回 money/volume, 需要 amount/volume
-                    if "money" in pdf.columns and "amount" not in pdf.columns:
-                        pdf = pdf.rename({"money": "amount"})
-                    cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-                    available = [c for c in cols if c in pdf.columns]
-                    pdf = pdf.select(available)
-                    repo.append_etf_daily(pdf)
-                    stats["daily_backfilled"] += 1
-            except Exception as e:
-                stats["errors"] += 1
-                logger.debug("ETF 日线回源失败 %s: %s", sym, e)
-    except Exception as e:
-        logger.warning("ETF 日线回源 mootdx 初始化失败: %s", e)
+    logger.info("ETF 回源: %d/%d 只 ETF 缺失/过期，无网络回源渠道，跳过", len(need_backfill), len(symbols))
 
     logger.info(
         "ETF 回源完成: 日线 %d 只, 错误 %d",
