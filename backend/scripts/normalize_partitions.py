@@ -36,15 +36,19 @@ def _normalize_partition_files(partition_dir: Path) -> int:
     merged = merged.unique(subset=key_cols, keep="last").sort(key_cols)
     tmp = partition_dir / "part.parquet.tmp"
     merged.write_parquet(tmp)
-    for f in files:
-        f.unlink()
+    # 先原子替换 part.parquet，再删源文件：任何一步失败，重跑都能从
+    # 保留的源文件（或完整 part.parquet）恢复，避免先删后写的数据丢失
     tmp.rename(partition_dir / "part.parquet")
+    for f in files:
+        # part.parquet 已被 rename 原子替换为新内容，不能连同源文件一起删
+        if f.name != "part.parquet":
+            f.unlink()
     return len(files)
 
 
 def normalize_partitions(partition_root: str = str(DATA_ROOT)) -> dict:
     root = Path(partition_root)
-    stats = {"renamed": 0, "deleted": 0}
+    stats = {"renamed": 0, "deleted": 0, "skipped": 0}
     for subdir in ("kline_daily", "kline_etf_daily", "kline_minute", "kline_etf_minute"):
         base = root / subdir
         if not base.is_dir():
@@ -55,6 +59,7 @@ def normalize_partitions(partition_root: str = str(DATA_ROOT)) -> dict:
             except Exception as exc:
                 # 记录并跳过异常分区，不让整体迁移中断
                 print(f"[skip] {pdir}: {exc}", file=sys.stderr)
+                stats["skipped"] += 1
     # 删除每股票缓存
     for path in (root / "quant_kline" / "daily").glob("*.parquet"):
         path.unlink()
