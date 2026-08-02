@@ -71,6 +71,31 @@ def _dt_to_int(dt, freq):
     return base
 
 
+def _is_jq_etf_code(code):
+    """聚宽 get_all_securities(['etf']) 的 ETF 判定。
+
+    深市只认 159xxx；沪市排除 506/508（科创板REIT/定开）、501-505/507（LOF/封闭式）、
+    511xxx 只认债券 ETF（511580 及以下，货币 ETF 511600+ 不属于 ETF）。
+    另需排除沪市 A 股（600/601/603/605/688/689）与北交所（BJ）——duckdb-storage
+    中该函数只在上游已过滤出 ETF 名录后做 guard；本分支 preload_daily 会把全市场
+    日线（含股票）灌进 _daily_mem，直接套用会把股票混入 ETF 宇宙。
+    支持 .XSHE/.XSHG 与 .SZ/.SH 两种后缀。
+    """
+    pure, _, exch = code.partition(".")
+    exch = exch.upper()
+    if exch in ("XSHE", "SZ"):
+        return pure.startswith("159")
+    if exch in ("XSHG", "SH"):
+        if pure.startswith(("600", "601", "603", "605", "688", "689")):
+            return False
+        return not (
+            pure.startswith(("506", "508"))
+            or pure.startswith(("501", "502", "503", "504", "505", "507"))
+            or (pure.startswith("511") and int(pure[3:6]) >= 600)
+        )
+    return False
+
+
 def _instrument(code):
     try:
         return Environment.get_instance().data_proxy.get_instrument(code)
@@ -1084,6 +1109,18 @@ class JqDataSource:
                 continue
             for _d in _df[_col]:
                 all_dates.add(pd.Timestamp(_d).date())
+        # 分区优先后 cache.get_all 可能为空（数据已迁到按日分区 Parquet，
+        # 旧 SQLite/文件缓存未再回填），此时以 preload_daily 灌入的
+        # _daily_mem（全市场分区日线，DatetimeIndex）为日历来源，否则
+        # rqalpha 在账户初始化 get_previous_trading_date 会拿到空日历报
+        # "index 0 is out of bounds"。
+        if not all_dates:
+            for _mem_k, _df in (getattr(dm, "_daily_mem", None) or {}).items():
+                if _df is None or getattr(_df, "empty", True):
+                    continue
+                if _df.index is not None and len(_df.index):
+                    for _d in _df.index:
+                        all_dates.add(pd.Timestamp(_d).date())
 
         # 日线预加载：把内存缓存直接铺进 _DayBarStore._bars，回测期间 get_price
         # / history 全部命中内存，零 SQLite、零重复 _normalize_daily。

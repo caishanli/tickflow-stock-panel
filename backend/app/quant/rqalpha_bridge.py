@@ -1160,11 +1160,17 @@ def _merge_cache_daily_codes(dm, codes, names, tdx_names=None):
     """缓存并集：本地日线缓存中有数据的代码一并纳入宇宙；名称取 tdx_names
     兜底为代码本身，list_date 无数据时退化为全程可交易（get_all_securities 的
     _LIST_DATES 兜底）。
+
+    _daily_mem 现含全市场股票日线，必须用 _is_jq_etf_code 过滤，否则 5000+ 只
+    股票会被并进 ETF 宇宙。
     """
+    from .jqcompat import _is_jq_etf_code
+
     tdx_names = tdx_names or {}
     cache_codes = [k.split("get_daily_", 1)[1]
                    for k in (getattr(dm, "_daily_mem", None) or {})
-                   if k.startswith("get_daily_")]
+                   if k.startswith("get_daily_")
+                   and _is_jq_etf_code(k.split("get_daily_", 1)[1])]
     have = set(codes)
     for c in cache_codes:
         if c not in have:
@@ -1189,12 +1195,14 @@ def _load_etf_universe(dm):
     if fresh:
         codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
         return codes, names, snap[3]
-    # 快照过期或不存在 → 从本地缓存推导
+    # 快照过期或不存在 → 从本地缓存推导（_daily_mem 含全市场股票，
+    # 必须用 _is_jq_etf_code 过滤，否则股票会混进 ETF 宇宙）
+    from .jqcompat import _is_jq_etf_code
+
     all_codes = [k.split("get_daily_", 1)[1]
                  for k in (getattr(dm, "_daily_mem", None) or {})
                  if k.startswith("get_daily_")]
-    is_idx = lambda p: p.startswith("000") or p.startswith("399")
-    etf_codes = [c for c in all_codes if not is_idx(c.split(".")[0])]
+    etf_codes = [c for c in all_codes if _is_jq_etf_code(c)]
     names = {}
     try:
         names = dm.sources["mootdx"].get_stock_names() or {}
@@ -1351,9 +1359,11 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
 
     etf_universe, etf_names, etf_list_dates = _load_etf_universe(dm)
     if not etf_universe:
+        from .jqcompat import _is_jq_etf_code
+
         all_codes = [k.split("get_daily_", 1)[1]
                      for k in dm._daily_mem if k.startswith("get_daily_")]
-        etf_universe = [c for c in all_codes if not _is_index(c.split(".")[0])]
+        etf_universe = [c for c in all_codes if _is_jq_etf_code(c)]
         etf_names = {}
         etf_list_dates = {}
     else:
@@ -1462,6 +1472,43 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     os.makedirs(out_dir, exist_ok=True)
 
     try:
+        # 交易日历补丁：rqalpha 默认从 bundle 推导 start/end 可用区间，旧实现依赖
+        # 已删除的 stock.duckdb，会报「未在 … 区间内查询到数据」。这里改为从按日
+        # 分区 Parquet（data/kline_daily 与 data/kline_etf_daily 的 date=* 目录）
+        # 扫描交易日，并复刻原 _adjust_start_date 的裁剪语义（start/end 对齐到
+        # 日历首尾、日历只含回测区间内日期，保证 sys_progress 进度条长度正确）。
+        import rqalpha.main as _rqmain
+
+        def _noop_adjust(config, data_proxy):
+            import pandas as _pd
+
+            data_root = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))), "..", "data")
+            all_dates = set()
+            for sub in ("kline_daily", "kline_etf_daily"):
+                d = os.path.join(data_root, sub)
+                if os.path.isdir(d):
+                    for name in os.listdir(d):
+                        if name.startswith("date="):
+                            all_dates.add(name[len("date="):])
+            if all_dates:
+                idx = _pd.DatetimeIndex(sorted(all_dates))
+                start = _pd.Timestamp(config.base.start_date)
+                end = _pd.Timestamp(config.base.end_date)
+                mask = (idx >= start) & (idx <= end)
+                calendar = idx[mask]
+                if len(calendar) == 0:
+                    calendar = _pd.date_range(start, end, freq="B")
+                config.base.trading_calendar = calendar
+                config.base.start_date = calendar[0].date()
+                config.base.end_date = calendar[-1].date()
+            else:
+                config.base.trading_calendar = _pd.date_range(
+                    config.base.start_date, config.base.end_date, freq="B")
+
+        _rqmain._adjust_start_date = _noop_adjust
+
         from rqalpha import run as rq_run
         _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
         result = rq_run(config, source_code=strategy_code)
