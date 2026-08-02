@@ -8,6 +8,13 @@ import pandas as pd
 from jqdata import *
 from datetime import datetime, date, timedelta
 
+import warnings
+# 抑制 pandas 2.3 对 Series 位置索引（s[-1] 等）的弃用警告：
+# 策略沿用聚宽原版索引写法，大量 s[-1] 触发 FutureWarning，静默处理。
+warnings.filterwarnings(
+    "ignore", message=r".*treating keys as positions is deprecated.*"
+)
+
 
 def initialize(context):
     set_option("avoid_future_data", True)                               # 避免未来数据：防止回测中使用未来信息导致虚高收益
