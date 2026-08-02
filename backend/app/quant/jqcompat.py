@@ -311,15 +311,56 @@ def _is_index_code(code):
         exch == "XSHE" and pure.startswith("399"))
 
 
+def _is_jq_etf_code(code):
+    """聚宽 ``get_all_securities(['etf'])`` 的 ETF 判定。
+
+    与聚宽宇宙对齐（实测 2026-04-21 过滤结果 1459 只，零误杀）：
+    - 深市只认 159xxx（排除 16xxxx LOF/定开、18xxxx REIT 等被上游误标为 ETF 的品种）；
+    - 沪市排除 506/508（科创板定开 LOF / REIT）；
+    - 沪市排除 501-505、507（LOF/封闭式）；
+    - 沪市 511xxx 只认债券 ETF（511580 及以下），货币 ETF（511600+，如 511880 银华日利
+      等）在聚宽不属于 ETF。
+    支持 .XSHE/.XSHG 与 .SZ/.SH 两种后缀。
+    """
+    pure, _, exch = code.partition(".")
+    exch = exch.upper()
+    if exch in ("XSHE", "SZ"):
+        return pure.startswith("159")
+    if exch in ("XSHG", "SH"):
+        return not (
+            pure.startswith(("506", "508"))
+            or pure.startswith(("501", "502", "503", "504", "505", "507"))
+            or (pure.startswith("511") and int(pure[3:6]) >= 600)
+        )
+    return True
+
+
 def get_all_securities(types=None, date=None):
     """对齐聚宽 get_all_securities：date 给定（'YYYY-MM-DD'）时按上市/退市日期过滤。
 
     types 过滤：指数代码只在 types 含 'index' 时返回（对齐聚宽
     get_all_securities(['etf']) 只含真实 ETF）；types 为 None 时返回全部。
+    当 types 含 'etf' 时额外用 ``_is_jq_etf_code`` 剔除 LOF/REIT/货币 ETF 等
+    聚宽不视为 ETF 的品种（防止固定池/缓存并集把非 ETF 混进动态池）。
+
+    date 缺省时退化为当前回测交易日（``Environment.trading_dt``）做 point-in-time
+    过滤，对齐聚宽回测内 get_all_securities(['etf']) 无日期调用的行为（ref_log 显示
+    09:00 带日期与 09:40 无日期调用都返回同一份当日 ETF 列表）；回测环境不可用时
+    不做日期过滤（保持旧行为）。
     起止日期来自 install_jqcompat 注入的 _LIST_DATES（list_date/delist_date）；数据不可得的标的退化为全程可交易
     （2000-01-01 ~ 2999-12-31），保持修复前行为，避免误杀。
     """
-    cutoff = str(pd.Timestamp(date).date()) if date is not None else None
+    cutoff = None
+    if date is not None:
+        cutoff = str(pd.Timestamp(date).date())
+    else:
+        try:
+            env = Environment.get_instance()
+            dt = getattr(env, "trading_dt", None)
+            if dt is not None:
+                cutoff = str(pd.Timestamp(dt).date())
+        except Exception:
+            cutoff = None
     type_set = None
     if types is not None:
         type_set = {str(t).lower() for t in (types if isinstance(types, (list, tuple, set)) else [types])}
@@ -330,6 +371,8 @@ def get_all_securities(types=None, date=None):
             if is_idx and "index" not in type_set:
                 continue
             if not is_idx and type_set == {"index"}:
+                continue
+            if not is_idx and "etf" in type_set and not _is_jq_etf_code(code):
                 continue
         start_s, end_s = _LIST_DATES.get(code, ("2000-01-01", "2999-12-31"))
         if cutoff is not None and not (start_s <= cutoff <= end_s):
@@ -1066,9 +1109,14 @@ class JqDataSource:
         all_dates = set()
 
         # 全量日线内存缓存（DuckDB 单一数据源）：直接复用 preload_daily() 已
-        # 加载进 _daily_mem 的日线帧（键 get_daily_<code>），供日历并集与日线
-        # 预加载使用；不再读取/导出 parquet 缓存。
-        _all_daily = getattr(dm, "_daily_mem", {}) or {}
+        # 加载进 _daily_mem 的日线帧（键 get_daily_<code>），重新包装为
+        # duckdb_<code> 格式（与 _DayBarStore 的 src_prefix 单下划线约定一致），
+        # 供日历并集与日线预加载使用；不再读取/导出 parquet 缓存。
+        _all_daily = {}
+        for _k, _df in (getattr(dm, "_daily_mem", {}) or {}).items():
+            if _k.startswith("get_daily_") and _df is not None:
+                _code = _k.split("get_daily_", 1)[1]
+                _all_daily[f"duckdb_{_code}"] = _df
 
         # 交易日历来源：直接用所有日线数据的日期并集（DuckDB 帧以 date 为索引，
         # 或带 date/trade_date 列），不依赖单个标的 fetch，避免 offline 模式下

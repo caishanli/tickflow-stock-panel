@@ -80,6 +80,31 @@ def test_money_filter_before_tail(tmp_path):
                                       for d in expect_dates]
 
 
+def test_money_window_aligned_to_global_trade_days(tmp_path):
+    """窗口对齐到 end_date 前最近 count 个交易日：单只标的截止更早时不得把
+    窗口外的旧日期混入（否则策略侧 groupby('time') 聚合出 >count 个交易日、
+    日均被摊薄）。用 monkeypatch 控制 _build_money_full 返回合成帧。"""
+    dm = _make_dm(tmp_path, set_window=False)
+    # 全球市场日期（bdate 含 3/26~3/31 间隔）；B 数据截止更早（仅到 3/26）
+    dates = pd.bdate_range("2026-03-24", "2026-04-01")
+    rows = []
+    for c, base in (("510300.XSHG", 1e6), ("159915.XSHE", 5e6)):
+        for i, d in enumerate(dates):
+            if c == "159915.XSHE" and d > pd.Timestamp("2026-03-26"):
+                break
+            rows.append({"code": c, "time": d, "money": float(base + i)})
+    full = pd.DataFrame(rows).sort_values(["code", "time"]).reset_index(drop=True)
+    dm._build_money_full = lambda codes: full
+
+    res = dm.get_daily_money_cached(["510300.XSHG", "159915.XSHE"], "2026-03-31", count=3)
+    # 窗口应只有 3 个交易日（3/27、3/30、3/31），不得混入 B 的 3/24~3/26
+    assert res["time"].nunique() == 3
+    assert res["time"].max() <= pd.Timestamp("2026-03-31")
+    assert set(res["time"].dt.date) == {pd.Timestamp(d).date() for d in ("2026-03-27", "2026-03-30", "2026-03-31")}
+    # B 数据截止 3/26：不在窗口内，不应有任何行
+    assert not (res["code"] == "159915.XSHE").any()
+
+
 def test_money_memo_full_frame_and_version(tmp_path):
     """memo 缓存未截断全量帧：同一 codes 不同 end_date/count 各自正确；
     日线数据版本号递增（fetch/preload_daily 写路径）后 memo 重建。"""

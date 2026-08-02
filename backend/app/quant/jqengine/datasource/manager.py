@@ -930,7 +930,17 @@ class DataManager:
         sub = full[full["time"].dt.date <= end_dt]
         if sub.empty:
             return pd.DataFrame(columns=["code", "time", "money"])
-        # full 已按 (code, time) 升序，groupby tail 即每只 end_date 前最近 count 行
+        # 对齐聚宽 get_daily_money：窗口取 end_date 前最近 count 个交易日。
+        # 不能 per-code 直接 tail(count)——若某只标的数据截止更早（如新上市/
+        # 停牌/数据缺口），其"最近 count 行"会把窗口外的旧日期带进来，导致
+        # 策略侧 groupby('time') 聚合出多于 count 个交易日、把日均摊薄
+        # （实测 4/1 窗口混入 3/26 的 1 只标的 0.12 亿，阈值偏低 ~25%）。
+        # 先取全局（跨所有 codes）最近 count 个交易日，再过滤、再 per-code
+        # 截尾（覆盖个别标的多出数据的情况）。
+        dates = sub["time"].dt.date.unique()
+        if len(dates) > count:
+            keep = set(sorted(dates)[-count:])
+            sub = sub[sub["time"].dt.date.isin(keep)]
         return sub.groupby("code", sort=False).tail(count)
 
     def _build_money_full(self, codes):

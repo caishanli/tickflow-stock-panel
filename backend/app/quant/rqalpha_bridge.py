@@ -1162,7 +1162,8 @@ def _cache_etf_codes(dm):
     DuckDB 迁移后 _daily_mem 同时含股票与 ETF 日线（preload_daily 加载
     kline_daily + kline_etf_daily），若直接取全部键会把 5000+ 股票混进 ETF
     宇宙，导致策略流动性门槛/动态池失真。以 DuckDB ``instruments_etf`` 为
-    准过滤；名录不可用时退化为原「非指数」兜底。
+    准过滤；名录不可用时退化为原「非指数」兜底。最后再用 ``_is_jq_etf_code``
+    剔除上游误标为 ETF 的 LOF/REIT/货币 ETF（对齐聚宽 get_all_securities(['etf'])）。
     """
     all_codes = [k.split("get_daily_", 1)[1]
                  for k in (getattr(dm, "_daily_mem", None) or {})
@@ -1173,10 +1174,13 @@ def _cache_etf_codes(dm):
     except Exception:
         etf_syms = set()
     if etf_syms:
+        from app.quant.jqcompat import _is_jq_etf_code
         from app.quant.jqengine.datasource.manager import _jq_to_duckdb
-        return [c for c in all_codes if _jq_to_duckdb(c) in etf_syms]
+        return [c for c in all_codes
+                if _jq_to_duckdb(c) in etf_syms and _is_jq_etf_code(c)]
+    from app.quant.jqcompat import _is_jq_etf_code
     return [c for c in all_codes
-            if not (c.startswith(("000", "399")))]
+            if not (c.startswith(("000", "399"))) and _is_jq_etf_code(c)]
 
 
 def _merge_cache_daily_codes(dm, codes, names, tdx_names=None):
@@ -1202,12 +1206,28 @@ def _load_etf_universe(dm):
     - 快照存在且 fetched_at 距今 ≤7 天：直接使用（离线/在线都优先）；
     - 快照缺失或过期：从本地缓存推导 ETF 代码列表；
     - 名称通过 duckdb get_stock_names() 获取（不依赖外部网络）。
+
+    名称清洗：快照中的名称可能含噪声词（如 'AH'、'150' 等），这些词在
+    策略侧会导致特殊组误匹配或排除词误杀。加载后统一清洗，与聚宽真实名称对齐。
+    注意：只清洗已知会引发策略误判的特定模式，避免影响排除词匹配。
     """
+    _CLEAN_PATTERNS = ['AH', '150', '250', '350', '450', '550', '650', '750', '850', '950']
+
+    def _clean_name(raw):
+        c = raw
+        for pat in _CLEAN_PATTERNS:
+            c = c.replace(pat, '')
+        return c.strip()
+
     snap = _read_etf_snapshot(_ETF_UNIVERSE_SNAPSHOT)
     fresh = (snap is not None
              and _dt.datetime.now() - snap[0] <= _ETF_SNAPSHOT_MAX_AGE)
     if fresh:
+        from app.quant.jqcompat import _is_jq_etf_code
         codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
+        # 清洗名称，对齐聚宽真实名称
+        names = {k: _clean_name(v) for k, v in names.items()}
+        codes = [c for c in codes if _is_jq_etf_code(c)]
         return codes, names, snap[3]
     # 快照过期或不存在 → 从本地缓存推导（仅 ETF，排除股票/指数）
     etf_codes = _cache_etf_codes(dm)
