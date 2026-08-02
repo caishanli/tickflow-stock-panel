@@ -874,9 +874,13 @@ class DataManager:
             if not np.isfinite(ratio) or ratio <= 0:
                 continue
             mask = result.index < split_date
+            # 向前复权到最新口径：拆股/合股后，历史价应乘以 ratio
+            # （ratio = 次日首价/前日末价，如 3.08x 拆分 ratio=0.325 → 历史价 ×0.325
+            # 缩小到与最新价连续）。原实现 `col / ratio` 反向放大（×3.08），
+            # 把动量窗口价格整体抬升，污染动量分（对齐 bug：159667 拆分类）。
             for col in price_cols:
                 if col in result.columns:
-                    result.loc[mask, col] = result.loc[mask, col] / ratio
+                    result.loc[mask, col] = result.loc[mask, col] * ratio
         return result
 
     def _load_minute_merged(self, code, all_min=None,
