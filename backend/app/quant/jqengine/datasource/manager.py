@@ -452,12 +452,6 @@ class DataManager:
                 pdf["trade_dt"] = g["_trade_dt"].values
                 pdf = _ensure_money_yuan(pdf, "partition")
                 pdf = _ensure_volume_shares(pdf, "partition")
-                # 日线拆分/合股前复权（与分钟 _adjust_for_splits 同口径）：
-                # 拆分类标的日线若保留原始价，会与已复权的分钟价口径不一致，
-                # 导致动量/均线计算错乱（对齐 bug：159667 拆分类）。
-                # 先按 index 排序（groupby 后可能乱序），否则隔夜缺口检测错位。
-                pdf = pdf.sort_index()
-                pdf = self._adjust_for_splits(pdf)
                 out[jq] = pdf
                 total_rows += len(pdf)
             print(f"[preload] 日线分区: {len(out)} 只, {total_rows} 行")
