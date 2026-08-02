@@ -407,8 +407,8 @@ def filter_global_pool_by_volume(context):
     TRADE_DAYS_COUNT = 3
     try:
         # 直接从 DataManager 缓存读取日线成交额
-        from app.quant.jqengine.datasource.manager import DataManager
-        dm = DataManager()
+        from app.quant.jqengine.datasource.manager import get_data_manager
+        dm = get_data_manager()
         price_data = dm.get_daily_money_cached(g.global_etf_pool, end_date=end_date, count=TRADE_DAYS_COUNT)
         if price_data is None or price_data.empty:
             log.warning("【全球池过滤】缓存中无成交额数据，使用原始全球池")
