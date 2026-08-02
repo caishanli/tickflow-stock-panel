@@ -1126,21 +1126,26 @@ class DataManager:
                     _td_arr = _td.to_numpy()
                 else:
                     _td_arr = pd.to_datetime(_td).to_numpy()
-                sub = pd.DataFrame({
-                    "time": _td_arr,
-                    "money": money_col.astype(float).to_numpy(),
-                })
-                sub = sub[sub["money"] > 0]
-                if sub.empty:
+                money_arr = money_col.astype(float).to_numpy()
+                mask = money_arr > 0
+                if not mask.any():
                     continue
-                sub = sub.copy()
-                sub["code"] = code
-                frames.append(sub[["code", "time", "money"]])
+                # 用 numpy 数组直接拼，避免逐 code 建 DataFrame + concat（130万行）
+                n = int(mask.sum())
+                frames.append({
+                    "code": np.full(n, code, dtype=object),
+                    "time": _td_arr[mask],
+                    "money": money_arr[mask],
+                })
             except Exception:
                 continue
         if not frames:
             return pd.DataFrame(columns=["code", "time", "money"])
-        full = pd.concat(frames, ignore_index=True)
+        full = pd.DataFrame({
+            "code": np.concatenate([f["code"] for f in frames]),
+            "time": np.concatenate([f["time"] for f in frames]),
+            "money": np.concatenate([f["money"] for f in frames]),
+        })
         return full.sort_values(["code", "time"], kind="stable").reset_index(drop=True)
 
     def set_priority(self, order):
