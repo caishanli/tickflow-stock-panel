@@ -797,6 +797,10 @@ class _DayBarStore:
         for k in all_daily:
             if "_" in k:
                 src_prefixes.add(k.split("_", 1)[0])
+        # 分区数据源：DataManager preload_daily 已把全市场日线灌入 _daily_mem
+        # （键 get_daily_<jqcode>）。旧每股票缓存已删，all_daily 常为空，必须
+        # 从 _daily_mem 取候选，否则每个标的走 dm.fetch 回源（1600+ 次，慢）。
+        mem_daily = getattr(self._dm, "_daily_mem", None) or {}
         for code in codes:
             if code in self._bars:
                 continue
@@ -807,19 +811,29 @@ class _DayBarStore:
                 df = all_daily.get(key)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     candidates.append(df)
+            # 分区内存帧（优先）：get_daily_<code>
+            mem_df = mem_daily.get(f"get_daily_{code}")
+            if mem_df is not None and not (hasattr(mem_df, "empty") and mem_df.empty):
+                candidates.append(mem_df)
             # 回退：bare code key
             if not candidates:
                 df = all_daily.get(code)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     candidates.append(df)
-            # 选日期范围最广的帧
+            # 选日期范围最广的帧。帧已是 DatetimeIndex（_daily_mem 分区产物）
+            # 时直接用 index 算跨度，避免对每只全帧 _normalize_daily（pandas
+            # 全帧 astype×5+建 DataFrame，1600+ 只 × 2 次是回测预热热点）。
             best_df = None
             best_span = 0
             for df in candidates:
                 try:
-                    tmp = _normalize_daily(df)
-                    tmp = tmp[(tmp["date"] >= ds) & (tmp["date"] <= de)]
-                    span = len(tmp)
+                    if isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+                        sub = df.index[(df.index >= ds) & (df.index <= de)]
+                        span = len(sub)
+                    else:
+                        tmp = _normalize_daily(df)
+                        tmp = tmp[(tmp["date"] >= ds) & (tmp["date"] <= de)]
+                        span = len(tmp)
                 except Exception:
                     span = 0
                 if span > best_span:

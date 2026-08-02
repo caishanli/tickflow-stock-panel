@@ -163,6 +163,7 @@ class DataManager:
             on_evict=lambda k, _v: self._minute_cov.pop(k, None))
         self._minute_empty = set()  # 已知无分钟数据的标的，避免重复网络请求
         self._daily_mem = {}
+        self._daily_preloaded = False  # preload_daily 幂等标志（分区数据已载入）
         # _daily_mem 数据版本号：每次写入/删除递增，money memo 键含版本据此失效
         self._daily_ver = 0
         self._money_memo = {}  # (codes_tuple, daily_ver) -> 全量成交额明细 DataFrame
@@ -265,13 +266,19 @@ class DataManager:
 
         优先从按日分区 Parquet（data/kline_daily/date=.../）加载全市场日线；
         分区不存在时回退读 quant_kline/daily 每股票缓存。
+
+        幂等：同一实例已加载过（_daily_mem 已有分区数据）时直接返回，避免
+        run_jq_backtest 调两次 preload_daily 各做一次全市场重读（64s×2 冗余）。
         """
+        if getattr(self, "_daily_preloaded", False):
+            return
         # 分区优先：按日分区 Parquet 是全市场日线的权威来源（列存、无锁）。
         from_part = self._load_daily_from_partitions(asof=None)
         if from_part:
             for jq, df in from_part.items():
                 self._daily_mem[f"get_daily_{jq}"] = df
             self._daily_ver += 1
+            self._daily_preloaded = True
             return
         all_daily = self.cache.get_all("daily")
         if not all_daily:
@@ -368,20 +375,22 @@ class DataManager:
             df = pl.concat(parts).collect()
             if df.is_empty():
                 return {}
+            # 一次 to_pandas 拿全市场宽表，再按 symbol 切片，避免 7000+ 次
+            # 独立 to_pandas/set_index 转换（回测预热头号热点之一）
+            df = df.with_columns(
+                pl.col("date").cast(pl.Datetime).dt.date().alias("_trade_dt"),
+            )
+            all_pd = df.to_pandas()
+            all_pd = all_pd.set_index(pd.to_datetime(all_pd["date"]))
+            all_pd.index.name = None
             out: dict[str, pd.DataFrame] = {}
             total_rows = 0
-            for sym_t, sub in df.group_by("symbol", maintain_order=True):
-                # Polars group_by 迭代键是单元素 tuple，取标量
-                sym = sym_t[0] if isinstance(sym_t, tuple) else sym_t
+            for sym, g in all_pd.groupby("symbol"):
                 jq = self._to_jq_code(sym)
-                pdf = sub.to_pandas()
-                pdf = pdf.set_index(pd.to_datetime(pdf["date"]))
-                pdf.index.name = None
-                pdf = pdf.drop(columns=["date", "symbol"])
+                pdf = g.drop(columns=["date", "symbol", "_trade_dt"]).copy()
+                pdf["trade_dt"] = g["_trade_dt"].values
                 pdf = _ensure_money_yuan(pdf, "partition")
                 pdf = _ensure_volume_shares(pdf, "partition")
-                if "trade_dt" not in pdf.columns:
-                    pdf["trade_dt"] = pdf.index.date
                 out[jq] = pdf
                 total_rows += len(pdf)
             print(f"[preload] 日线分区: {len(out)} 只, {total_rows} 行")
@@ -628,6 +637,69 @@ class DataManager:
             self._minute_empty.add(code)
         return df
 
+    def _load_minute_pool_from_partitions(self, codes, lo_ts, hi_ts):
+        """批量从按日分区 Parquet 加载多个标的的分钟数据（一次 scan）。
+
+        供 ``preload_minute_for_pool`` 使用：把 codes 中所有标的在 [lo_ts, hi_ts]
+        滑窗内的分钟一次性取回，替代逐标的 ``_load_minute_from_partitions``
+        各自的 scan_parquet（数百次全目录扫描 → 1~2 次）。
+
+        返回 {jq_code: DataFrame}，帧为 DatetimeIndex 索引；无数据的标的不在返回中。
+        """
+        if not codes:
+            return {}
+        try:
+            import polars as pl
+            lo_d = pd.Timestamp(lo_ts).date() if lo_ts is not None else None
+            hi_d = pd.Timestamp(hi_ts).date() if hi_ts is not None else None
+            # code -> 分区内的 .SH/.SZ 符号
+            syms = []
+            for code in codes:
+                sym_tf = code.split(".", 1)
+                tf_sym = sym_tf[0] + ("." + ("SH" if sym_tf[1] in ("XSHG", "SH") else "SZ")
+                                      if len(sym_tf) > 1 else "")
+                syms.append(tf_sym)
+            out: dict[str, pd.DataFrame] = {}
+            for subdir in ("kline_etf_minute", "kline_minute"):
+                root = os.path.join(self._partition_root(), subdir)
+                if not os.path.isdir(root):
+                    continue
+                # 只 glob 请求日期区间内的分区目录（避免 **/*.parquet 全扫）
+                import glob as _glob
+                paths = []
+                for name in os.listdir(root):
+                    if not name.startswith("date="):
+                        continue
+                    ds = name[len("date="):]
+                    if lo_d is not None and ds < str(lo_d):
+                        continue
+                    if hi_d is not None and ds > str(hi_d):
+                        continue
+                    paths.extend(_glob.glob(os.path.join(root, name, "*.parquet")))
+                if not paths:
+                    continue
+                lf = pl.scan_parquet(paths, hive_partitioning=True)
+                lf = lf.filter(pl.col("symbol").is_in(syms))
+                df = lf.select(["symbol", "datetime", "open", "high", "low",
+                                "close", "volume", "amount"]).collect()
+                if df.is_empty():
+                    continue
+                sym_to_jq = {s: c for c, s in zip(codes, syms)}
+                for sym, sub in df.group_by("symbol", maintain_order=True):
+                    s = sym[0] if isinstance(sym, tuple) else sym
+                    jq = sym_to_jq.get(s)
+                    if jq is None:
+                        continue
+                    pdf = sub.to_pandas()
+                    pdf = pdf.set_index(pd.to_datetime(pdf["datetime"]))
+                    pdf.index.name = None
+                    pdf = pdf.drop(columns=["symbol", "datetime"])
+                    out[jq] = pdf
+            return out
+        except Exception as e:
+            logger.warning("[DataManager] 分钟池批量读取失败: %s", e)
+            return {}
+
     def preload_minute_for_pool(self, codes, as_of=None):
         """批量预热分钟线缓存：把 codes 中所有标的的分钟数据加载到 _minute_mem。
 
@@ -638,14 +710,42 @@ class DataManager:
         H6c 修复：原实现对 ``code in _minute_mem`` 的标的直接跳过，滑窗前移后
         旧帧覆盖不足仍被复用；现交给 _ensure_minute_windowed 做覆盖校验，
         覆盖不足的标的会重新加载，保证池内帧始终覆盖 as_of。
+
+        Perf：同一 as_of 下 pool 内标的多达数百只，逐标的 scan_parquet 各自
+        全目录扫描是回测头号热点（620 次 collect ≈ 90s）。改为一次批量
+        scan（_load_minute_pool_from_partitions）取回所有标的分钟，再逐标的
+        覆盖校验/裁剪填入 _minute_mem；未命中/覆盖不足的标的后回退单标的加载。
         """
         as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
         logger.info("[DataManager] 开始预热分钟线缓存，标的数=%d", len(codes))
         loaded = 0
-        for code in codes:
+        # 过滤已知无分钟的标的
+        todo = [c for c in codes if c not in self._minute_empty]
+        if not todo:
+            logger.info("[DataManager] 分钟线预热完成: 成功 0/%d，已缓存 %d 只",
+                        len(codes), len(self._minute_mem))
+            return
+        # 统一滑窗（同日 as_of 对所有标的一致）
+        lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=False)
+        hi_eff = self._hi_eff(hi_ts)
+        batch = self._load_minute_pool_from_partitions(todo, lo_ts, hi_ts)
+        for code in todo:
             try:
-                # 滑窗加载（最近 minute_lookback 天），避免 full=True 触发全周期窗口
-                # 超出 mootdx 实际覆盖范围。
+                # 覆盖命中则跳过
+                if self._minute_cached(code, lo_ts, hi_eff) is not None:
+                    loaded += 1
+                    continue
+                df = batch.get(code)
+                if df is not None and not df.empty:
+                    df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]
+                    df = self._adjust_for_splits(df)
+                    df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]
+                    if not df.empty:
+                        self._minute_mem[code] = df
+                        self._minute_cov[code] = (lo_ts, hi_eff)
+                        loaded += 1
+                        continue
+                # 批量缺失 → 回退单标的路径（保 _minute_empty 语义）
                 df = self._ensure_minute_windowed(code, as_of_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     loaded += 1
@@ -779,8 +879,12 @@ class DataManager:
         data/kline_minute/date=YYYY-MM-DD/（股票）。用 Polars 惰性扫描
         [lo_ts, hi_ts] 覆盖的日期分区，过滤 symbol 后返回 DatetimeIndex
         索引的 DataFrame；分区不存在/无该标的数据返回 None。
+
+        Perf：只 glob 请求日期区间内的分区目录（而非 `**/*.parquet` 全目录
+        扫描），实测单标的单窗口从 ~220ms 降到 ~30ms。
         """
         try:
+            import glob as _glob
             import polars as pl
             lo_d = pd.Timestamp(lo_ts).date() if lo_ts is not None else None
             hi_d = pd.Timestamp(hi_ts).date() if hi_ts is not None else None
@@ -791,15 +895,20 @@ class DataManager:
                 root = os.path.join(self._partition_root(), subdir)
                 if not os.path.isdir(root):
                     continue
-                lf = pl.scan_parquet(
-                    os.path.join(root, "**", "*.parquet"),
-                    hive_partitioning=True,
-                )
+                paths = []
+                for name in os.listdir(root):
+                    if not name.startswith("date="):
+                        continue
+                    ds = name[len("date="):]
+                    if lo_d is not None and ds < str(lo_d):
+                        continue
+                    if hi_d is not None and ds > str(hi_d):
+                        continue
+                    paths.extend(_glob.glob(os.path.join(root, name, "*.parquet")))
+                if not paths:
+                    continue
+                lf = pl.scan_parquet(paths, hive_partitioning=True)
                 lf = lf.filter(pl.col("symbol") == tf_sym)
-                if lo_d is not None:
-                    lf = lf.filter(pl.col("datetime").cast(pl.Date) >= lo_d)
-                if hi_d is not None:
-                    lf = lf.filter(pl.col("datetime").cast(pl.Date) <= hi_d)
                 df = lf.select(["datetime", "open", "high", "low", "close",
                                 "volume", "amount"]).collect()
                 if df.is_empty():
@@ -968,9 +1077,11 @@ class DataManager:
             try:
                 # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘。
                 ddf = self._daily_mem.get("get_daily_" + code)
-                # 覆盖检查：_daily_mem 可能来自 preload_daily() 加载的旧缓存
+                # 覆盖检查：_daily_mem 可能来自 preload_daily() 加载的旧缓存。
+                # 离线回测中数据静态、不会过期，跳过 _is_stale 的 pandas 日期
+                # 计算（全市场 1600+ 只 × 每次 3.5s，回测流动性过滤的头号热点）。
                 if (ddf is not None and not (hasattr(ddf, "empty") and ddf.empty)
-                        and self.cache._is_stale(ddf)):
+                        and not self._offline and self.cache._is_stale(ddf)):
                     ddf = None
                 if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
                     # peek 兜底顺序与 preload/fetch 一致复用 _priority()：
@@ -1007,9 +1118,16 @@ class DataManager:
                     money_col = money_col.fillna(amt_col)
                 if money_col is None:
                     continue
-                # 统一转 numpy 再组帧，避免 ddf 非 RangeIndex 时索引对齐错位
+                # 统一转 numpy 再组帧，避免 ddf 非 RangeIndex 时索引对齐错位。
+                # trade_dt 是 datetime 列时直接取 .to_numpy()，跳过重复
+                # pd.to_datetime（1600+ 只 × 11 次调用，回测流动性热点）。
+                _td = ddf["trade_dt"]
+                if _td.dtype.kind == "M":
+                    _td_arr = _td.to_numpy()
+                else:
+                    _td_arr = pd.to_datetime(_td).to_numpy()
                 sub = pd.DataFrame({
-                    "time": pd.to_datetime(ddf["trade_dt"]).to_numpy(),
+                    "time": _td_arr,
                     "money": money_col.astype(float).to_numpy(),
                 })
                 sub = sub[sub["money"] > 0]
