@@ -206,6 +206,32 @@ class DataManager:
             return f"{pure}.XSHG"
         return code
 
+    # ---- 按日分区 Parquet 读取（分钟/日线统一按日期分文件） ----
+    # 分区根目录在项目根 data/ 下（与 tickflow 数据层同根）：
+    #   data/kline_etf_minute/date=YYYY-MM-DD/data_*.parquet（ETF 分钟）
+    #   data/kline_minute/date=YYYY-MM-DD/data_*.parquet      （股票分钟）
+    #   data/kline_daily/date=YYYY-MM-DD/data_*.parquet       （日线）
+    # 分区内列：symbol（.SH/.SZ）、datetime/date、OHLCV、volume、amount。
+    # 通过环境变量 PARTITION_DATA_ROOT 可覆盖根目录（默认项目根 data/）。
+    @staticmethod
+    def _partition_root() -> str:
+        root = os.getenv("PARTITION_DATA_ROOT", "")
+        if root:
+            return root
+        return os.path.join(os.path.dirname(REPO_ROOT), "data")
+
+    @classmethod
+    def _partition_dates(cls, subdir: str) -> list[str]:
+        """返回某分钟/日线子目录下全部 date=YYYY-MM-DD 分区目录名（升序）。"""
+        d = os.path.join(cls._partition_root(), subdir)
+        if not os.path.isdir(d):
+            return []
+        out = []
+        for name in os.listdir(d):
+            if name.startswith("date="):
+                out.append(name)
+        return sorted(out)
+
     def preload_minute(self, codes):
         """预加载指定标的的分钟线到 _minute_mem（整段窗口，供时钟 feed 使用）。
 
@@ -236,7 +262,17 @@ class DataManager:
         优先级 + 复权口径选帧（:func:`_pick_daily_frame`：优先非 raw 的
         前复权帧，全 raw 才用 raw，保证回测内复权口径尽量统一），存入
         _daily_mem。
+
+        优先从按日分区 Parquet（data/kline_daily/date=.../）加载全市场日线；
+        分区不存在时回退读 quant_kline/daily 每股票缓存。
         """
+        # 分区优先：按日分区 Parquet 是全市场日线的权威来源（列存、无锁）。
+        from_part = self._load_daily_from_partitions(asof=None)
+        if from_part:
+            for jq, df in from_part.items():
+                self._daily_mem[f"get_daily_{jq}"] = df
+            self._daily_ver += 1
+            return
         all_daily = self.cache.get_all("daily")
         if not all_daily:
             print("[preload] 日线缓存为空")
@@ -292,6 +328,67 @@ class DataManager:
         # 日线内存已整体刷新：递增数据版本号，使 money memo 按新版本键重建
         self._daily_ver += 1
         print(f"[preload] 日线: {count} 只ETF, {len(cands)} 缓存键")
+
+    def _load_daily_from_partitions(self, asof: pd.Timestamp) -> dict[str, pd.DataFrame]:
+        """从按日分区 Parquet（data/kline_daily/ 与 data/kline_etf_daily/）加载全市场日线。
+
+        返回 {jq_code(.XSHG/.XSHE): DataFrame}，帧为 DatetimeIndex 索引、
+        含 trade_dt/money/volume 列（与 preload_daily 内存帧同口径）。
+        分区不存在/为空时返回 {}，调用方回退原缓存路径。
+
+        用 Polars 惰性扫描全部 date= 分区（hive 分区自动识别），一次 collect
+        后按 symbol 分组转 pandas，避免 pandas 逐文件读数百分区（极慢）。
+        ETF 日线（kline_etf_daily）与股票日线（kline_daily）合并加载，
+        二者 schema 一致。
+
+        volume 单位：A股日线（kline_daily）存盘为「手」，读取时 ×100 归一
+        为「股」；ETF 日线（kline_etf_daily）存盘即为「股」，不换算。
+        asof 过滤用 date 列（hive_partitioning 会把分区键 date 暴露为列，
+        文件内部无 date 列的分区也能正确过滤）。
+        """
+        roots = [(os.path.join(self._partition_root(), "kline_daily"), True),
+                 (os.path.join(self._partition_root(), "kline_etf_daily"), False)]
+        roots = [(r, a) for r, a in roots if os.path.isdir(r)]
+        if not roots:
+            return {}
+        try:
+            import polars as pl
+            parts = []
+            for root, is_a_stock in roots:
+                lf = pl.scan_parquet(
+                    os.path.join(root, "**", "*.parquet"),
+                    hive_partitioning=True,
+                )
+                if asof is not None:
+                    lf = lf.filter(pl.col("date") <= pd.Timestamp(asof).date())
+                if is_a_stock:
+                    lf = lf.with_columns((pl.col("volume") * 100).alias("volume"))
+                parts.append(lf.select(["symbol", "date", "open", "high", "low",
+                                        "close", "volume", "amount"]))
+            df = pl.concat(parts).collect()
+            if df.is_empty():
+                return {}
+            out: dict[str, pd.DataFrame] = {}
+            total_rows = 0
+            for sym_t, sub in df.group_by("symbol", maintain_order=True):
+                # Polars group_by 迭代键是单元素 tuple，取标量
+                sym = sym_t[0] if isinstance(sym_t, tuple) else sym_t
+                jq = self._to_jq_code(sym)
+                pdf = sub.to_pandas()
+                pdf = pdf.set_index(pd.to_datetime(pdf["date"]))
+                pdf.index.name = None
+                pdf = pdf.drop(columns=["date", "symbol"])
+                pdf = _ensure_money_yuan(pdf, "partition")
+                pdf = _ensure_volume_shares(pdf, "partition")
+                if "trade_dt" not in pdf.columns:
+                    pdf["trade_dt"] = pdf.index.date
+                out[jq] = pdf
+                total_rows += len(pdf)
+            print(f"[preload] 日线分区: {len(out)} 只, {total_rows} 行")
+            return out
+        except Exception as e:
+            logger.warning("[DataManager] 日线分区读取失败: %s", e)
+            return {}
 
     def _priority(self):
         return [s for s in CONFIG["DATASOURCE_PRIORITY"] if s in self.sources]
@@ -675,6 +772,48 @@ class DataManager:
         # H6b：合并结果裁剪到请求窗口 [lo, hi] 闭区间（防越界/未来泄漏）。
         return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
 
+    def _load_minute_from_partitions(self, code, lo_ts, hi_ts):
+        """从按日分区 Parquet 读取某标的的分钟数据。
+
+        分区根：data/kline_etf_minute/date=YYYY-MM-DD/（ETF）或
+        data/kline_minute/date=YYYY-MM-DD/（股票）。用 Polars 惰性扫描
+        [lo_ts, hi_ts] 覆盖的日期分区，过滤 symbol 后返回 DatetimeIndex
+        索引的 DataFrame；分区不存在/无该标的数据返回 None。
+        """
+        try:
+            import polars as pl
+            lo_d = pd.Timestamp(lo_ts).date() if lo_ts is not None else None
+            hi_d = pd.Timestamp(hi_ts).date() if hi_ts is not None else None
+            sym_tf = code.split(".", 1)
+            tf_sym = sym_tf[0] + ("." + ("SH" if sym_tf[1] in ("XSHG", "SH") else "SZ")
+                                  if len(sym_tf) > 1 else "")
+            for subdir in ("kline_etf_minute", "kline_minute"):
+                root = os.path.join(self._partition_root(), subdir)
+                if not os.path.isdir(root):
+                    continue
+                lf = pl.scan_parquet(
+                    os.path.join(root, "**", "*.parquet"),
+                    hive_partitioning=True,
+                )
+                lf = lf.filter(pl.col("symbol") == tf_sym)
+                if lo_d is not None:
+                    lf = lf.filter(pl.col("datetime").cast(pl.Date) >= lo_d)
+                if hi_d is not None:
+                    lf = lf.filter(pl.col("datetime").cast(pl.Date) <= hi_d)
+                df = lf.select(["datetime", "open", "high", "low", "close",
+                                "volume", "amount"]).collect()
+                if df.is_empty():
+                    continue
+                pdf = df.to_pandas()
+                pdf = pdf.set_index(pd.to_datetime(pdf["datetime"]))
+                pdf.index.name = None
+                pdf = pdf.drop(columns=["datetime"])
+                return pdf
+            return None
+        except Exception as e:
+            logger.warning("[DataManager] 分钟分区读取失败 %s: %s", code, e)
+            return None
+
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
         """缺口感知的真实分钟线获取（本地基底 + mootdx 仅补后续缺口）。
 
@@ -683,7 +822,14 @@ class DataManager:
         1 分钟——否则缓存会随"今天"推移不断缩水。
 
         请求整体早于本地最早日期（且本地无数据）→ mootdx 也取不到 → 返回 None。
+
+        优先从按日分区 Parquet（data/kline_etf_minute/date=.../）读取；
+        分区命中即返回（离线回测不联网补缺口）。
         """
+        from_part = self._load_minute_from_partitions(code, lo_ts, hi_ts)
+        if from_part is not None and not from_part.empty:
+            self._minute_real_cov[code] = (from_part.index.min(), from_part.index.max())
+            return from_part
         real_key = f"real_{code}"
         if all_min is not None:
             local = all_min.get(real_key)
