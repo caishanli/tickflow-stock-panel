@@ -824,14 +824,20 @@ class DataManager:
         请求整体早于本地最早日期（且本地无数据）→ mootdx 也取不到 → 返回 None。
 
         优先从按日分区 Parquet（data/kline_etf_minute/date=.../）读取；
-        分区命中即返回（离线回测不联网补缺口）。
+        分区命中时：离线回测直接返回不联网；在线/模拟盘则以分区为基底，
+        仅对分区末端之后的缺口回源 mootdx（避免在线分钟数据陈旧）。
         """
         from_part = self._load_minute_from_partitions(code, lo_ts, hi_ts)
+        real_key = f"real_{code}"
+        local = None
         if from_part is not None and not from_part.empty:
             self._minute_real_cov[code] = (from_part.index.min(), from_part.index.max())
-            return from_part
-        real_key = f"real_{code}"
-        if all_min is not None:
+            if self._offline:
+                # 离线回测：分区命中即返回，不联网补缺口
+                return from_part
+            # 在线/模拟盘：分区作为基底，后续对分区末端之后的缺口补 mootdx
+            local = from_part
+        elif all_min is not None:
             local = all_min.get(real_key)
         else:
             local = self.cache.peek("minute", real_key)
