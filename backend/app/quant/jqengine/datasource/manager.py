@@ -170,6 +170,8 @@ class DataManager:
         # 分钟线滑窗：回测中不持有整个回测区间的分钟数据，只保留最近 N 天，
         # 既省内存又避免每次按需加载都展开整段历史（见 get_minute / _ensure_minute_windowed）
         self.minute_lookback = pd.Timedelta(days=15)
+        # 日线回看窗口：预加载时只扫最近 N 天分区（策略动量回看 ~65 日 + 余量）
+        self._DAILY_LOOKBACK_DAYS = 400
         self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
         self._offline = False       # 回测离线模式：本地优先，缺失不联网回源
         # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
@@ -359,11 +361,40 @@ class DataManager:
         if not roots:
             return {}
         try:
+            import glob as _glob
             import polars as pl
+            # 只扫描「回看窗口内」的日期分区：策略动量回看 ~65 日、流动性 3 日，
+            # 全历史扫描（kline_etf_daily 自 2005 年、5211 分区）纯属浪费——
+            # 从目录名反推下限，只读最近 lookback 天，回测预加载从 ~17s 降到秒级。
+            from datetime import timedelta
+            _limit_date = None
+            if asof is not None:
+                _limit_date = (pd.Timestamp(asof).normalize()
+                               - timedelta(days=self._DAILY_LOOKBACK_DAYS))
+            elif getattr(self, "_minute_win", None) is not None:
+                _limit_date = (pd.Timestamp(self._minute_win[0]).normalize()
+                               - timedelta(days=self._DAILY_LOOKBACK_DAYS))
+            else:
+                # 无窗口（首次 preload 在 set_minute_window 之前）：也限制最近
+                # N 天，避免全历史扫描（kline_etf_daily 自 2005 年 5211 分区）。
+                _limit_date = (pd.Timestamp.now().normalize()
+                               - timedelta(days=self._DAILY_LOOKBACK_DAYS))
             parts = []
             for root, is_a_stock in roots:
+                scan_paths = []
+                if _limit_date is not None:
+                    lo_s = _limit_date.strftime("%Y-%m-%d")
+                    for name in os.listdir(root):
+                        if not name.startswith("date="):
+                            continue
+                        if name[len("date="):] >= lo_s:
+                            scan_paths.extend(_glob.glob(
+                                os.path.join(root, name, "*.parquet")))
+                    if not scan_paths:
+                        continue
                 lf = pl.scan_parquet(
-                    os.path.join(root, "**", "*.parquet"),
+                    scan_paths if scan_paths
+                    else os.path.join(root, "**", "*.parquet"),
                     hive_partitioning=True,
                 )
                 if asof is not None:
