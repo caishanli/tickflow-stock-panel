@@ -105,6 +105,32 @@ def _ensure_volume_shares(df, src_name):
     return df
 
 
+def _normalize_etf_volume_unit(df):
+    """ETF 日线 volume 单位归一为「股」。
+
+    上游数据个别标的（如 159939）volume 存成「手」（amount/(volume*close)≈100），
+    绝大多数为「股」（≈1）。按 symbol 用成交额反推单位并换算，保证成交量/
+    量比口径与聚宽一致。输入输出均为 Polars DataFrame（含 symbol/close/volume/amount）。
+    """
+    import polars as pl
+    if df is None or df.is_empty() or "volume" not in df.columns:
+        return df
+    # 每股 symbol 取一行估算 ratio（amount/(volume*close)），>50 视为「手」
+    ratio = (pl.col("amount") / (pl.col("volume") * pl.col("close"))).alias("_ratio")
+    per_sym = df.group_by("symbol", maintain_order=True).agg(ratio.first())
+    hand_syms = per_sym.filter(pl.col("_ratio") > 50).select("symbol")
+    if hand_syms.is_empty():
+        return df
+    hand_set = set(hand_syms["symbol"].to_list())
+    df = df.with_columns(
+        pl.when(pl.col("symbol").is_in(list(hand_set)))
+        .then(pl.col("volume") * 100)
+        .otherwise(pl.col("volume"))
+        .alias("volume")
+    )
+    return df
+
+
 def _infer_adj(df, src_name):
     """推断日线帧的复权口径：优先读 ``df.attrs["adj"]``（各源 get_daily
     已标注）；旧缓存帧（pickle/parquet）没有 attrs，按源名回退推断——
@@ -406,6 +432,10 @@ class DataManager:
             df = pl.concat(parts).collect()
             if df.is_empty():
                 return {}
+            # ETF 日线 volume 单位归一：上游个别标的（如 159939）volume 存成
+            # 「手」而绝大多数是「股」（amount/(volume*close)≈100 vs ≈1）。
+            # 按 symbol 检测并换算为股，保证成交量/量比口径与聚宽一致。
+            df = _normalize_etf_volume_unit(df)
             # 一次 to_pandas 拿全市场宽表，再按 symbol 切片，避免 7000+ 次
             # 独立 to_pandas/set_index 转换（回测预热头号热点之一）
             df = df.with_columns(
