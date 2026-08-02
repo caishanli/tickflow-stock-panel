@@ -1099,12 +1099,29 @@ _FUND_COMPANIES = sorted(set([
 # 注意：宽基 ETF 清洗后仍保留 300/500/1000 等数字，会被策略 exclude 正确排除。
 _INDEX_MAKERS = ['中证', '上证', '深证', '国证', '沪深', '中华', '中国']
 
+# 与策略 wufu-v5.2 clean_name 的 NOISE_WORDS 对齐的噪声词（安全子集），按长度降序匹配。
+# 刻意排除以下会"过度清洗"的词（删除它们会把原本能区分的分组合并，或破坏 exclude 判定）：
+# - 纯数字 30/50/100/300/500/1000/2000：聚宽短名常保留（如 创业板50ETF / 沪深300ETF），
+#   删掉会导致本地 exclude 失效、与聚宽分组不一致；
+# - 单字母 B/C/E 与 HGS/HK/H 等特殊组关键词：会误删拉丁字母名（如 "伊塔乌巴西IBOVESPAETF"），
+#   或让本地不再命中策略香港组（'H'/'H股'/'HGS' 等需保留）。
+# 'AH' 必须清洗：否则 "银行AH价格优选ETF"(517900) 含 'H' 会被策略香港组关键词误分类。
+_ETF_NOISE_WORDS = sorted(set([
+    'AH', 'A类', 'C类', 'E类',
+    'ETF基金', 'ETF联接', 'ETF', 'LOF基金', 'LOF联接', 'LOF', '上市开放式',
+    '指数ETF', '指数基金', '指数A', '指数C', '指数', '联接基金',
+    '板块', '策略', '产业', '场内', '场外', '低波', '基本面', '基金', '精选',
+    '联接', '量化', '龙头', '民企', '民营', '国企', '央企', '智能', '全指',
+    '指基', '指增', '主题', '增强', '上海', '四川', '浙江', '湖北',
+]), key=len, reverse=True)
+
 
 def _clean_etf_name(name: str) -> str:
     """把 ETF 全称清洗成近似聚宽 display_name 的简称。
 
-    仅去除基金公司前缀与指数编制机构词（不动行业/主题/数字），使策略的
-    exclude / 行业分组逻辑能像在聚宽 display_name 上一样工作。
+    去除基金公司前缀、指数编制机构词与策略噪声词（NOISE_WORDS 安全子集），
+    使策略的 exclude / SPECIAL_GROUPS / 行业分组逻辑能像在聚宽
+    display_name 上一样工作。幂等：清洗结果再清洗不变。
     """
     if not name:
         return name
@@ -1113,6 +1130,8 @@ def _clean_etf_name(name: str) -> str:
         s = s.replace(c, "")
     for m in _INDEX_MAKERS:
         s = s.replace(m, "")
+    for w in _ETF_NOISE_WORDS:
+        s = s.replace(w, "")
     return s.strip()
 
 
@@ -1194,6 +1213,7 @@ def _load_etf_universe(dm):
              and _dt.datetime.now() - snap[0] <= _ETF_SNAPSHOT_MAX_AGE)
     if fresh:
         codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
+        names = {c: _clean_etf_name(n) for c, n in names.items()}
         return codes, names, snap[3]
     # 快照过期或不存在 → 从本地缓存推导（_daily_mem 含全市场股票，
     # 必须用 _is_jq_etf_code 过滤，否则股票会混进 ETF 宇宙）
@@ -1208,6 +1228,7 @@ def _load_etf_universe(dm):
         names = dm.sources["mootdx"].get_stock_names() or {}
     except Exception:
         pass
+    names = {c: _clean_etf_name(n) for c, n in names.items()}
     return etf_codes, names, {}
 
 

@@ -304,14 +304,14 @@ def _write_snapshot(path, codes=("510300.XSHG",), days_ago=0):
 
 
 def test_snapshot_fresh_used_without_network(tmp_path, monkeypatch):
-    """快照存在且 ≤7 天：直接用（在线也不联网），保证可复现。"""
+    """快照存在且 ≤7 天：直接用（在线也不联网），保证可复现。名称经清洗。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
     dm = _UniverseDM(offline=False)
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]
-    assert names["510300.XSHG"] == "ETF-510300"
+    assert names["510300.XSHG"] == "-510300"
     assert list_dates["510300.XSHG"] == ("2020-01-01", "2999-12-31")
 
 
