@@ -14,10 +14,25 @@ def _to_symbol(code):
 
 
 def _is_index(code):
-    """判断是否为指数代码（000xxx.SH / 399xxx.SZ）。"""
+    """判断是否为指数代码。
+
+    - 399xxx.SZ（深证系列指数，如 399001 深证成指）
+    - 000001~000999.SH（上证系列指数，如 000001 上证指数、000300 沪深300）
+    注意：SZ 市场的 000xxx（如 000001 平安银行、000157）是**股票**不是指数，
+    必须用 ``bars`` 而非 ``index_bars`` 取数 —— 否则对退市/旧代码的 SZ 000xxx
+    误走指数接口返回空，触发全服务器轮换（每只 ~8.5s，批量回源累计数十分钟）。
+    同时沪市 000001~000999 是真实指数（000001 上证指数），不能被排除。
+    """
     pure = code.split(".")[0]
-    return pure.startswith("399") or (pure.startswith("000") and len(pure) == 6) \
-        and not pure.startswith("0000")
+    suffix = code.split(".")[1] if "." in code else ""
+    if pure.startswith("399"):
+        return True
+    if suffix in ("SH", "XSHG") and pure.startswith("000") and len(pure) == 6:
+        # 沪市 000xxx 为指数（000001 上证指数 … 000999）；排除个别指数段外的
+        # 处理：000xxx 沪市基本都是指数（无沪市 000 股票，沪市股票是 600/601/
+        # 603/605/688 等）
+        return True
+    return False
 
 
 # 显式 mootdx 行情服务器列表（TCP 7709）。顺序探测，用第一个可达的，
@@ -132,10 +147,15 @@ class MootdxSource(DataSource):
         """换服务器重建客户端（运行时取数超时/失败兜底）。
 
         按 _TDX_SERVERS 顺序轮换，每次都用 pytdx 替换底层 tdxpy。
+        列表用尽时**回绕到 -1**（下次取数从首个可达服务器重新探测），
+        而不是停在末位 —— 否则批量取数时一次"全服务器超时"会让后续所有
+        请求都钉在坏服务器上快速失败（实测 1660 只批量同步 921 只失败）。
         返回新客户端；全部失败返回 None。
         """
         self._server_idx += 1
         if self._server_idx >= len(_TDX_SERVERS):
+            self._server_idx = -1  # 回绕：下次从首地址重新探测
+            self._client = None    # 同时丢弃坏客户端，_api() 将重建探测
             return None
         ip, port = _TDX_SERVERS[self._server_idx]
         if not _probe(ip, port):

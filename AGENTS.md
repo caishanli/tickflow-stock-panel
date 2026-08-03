@@ -37,6 +37,21 @@ uv run --extra dev mypy app               # 类型检查
 - 插件/数据源：`backend/app/plugins/`（内置 `stocksdk`）。第三方数据接入走 YAML，见 `docs/custom-data-source.md` 与 `docs/plugin-development.md`。
 - 多数 `/api/*` 需鉴权（未登录返回 401）。
 
+## mootdx 数据服务（quant/回测侧）
+
+- `backend/app/services/mootdx_service.py`：独立于模拟盘的 mootdx 数据服务。
+  - `sync_etf_minute(day)`：拉当日全部 ETF 真实 1m → `data/kline_etf_minute/date=YYYY-MM-DD/part.parquet`。
+  - `sync_adj_factor()`：mootdx xdxr 事件重建逐日前复权因子 → 增量合并 `data/adj_factor_etf/all.parquet`。
+  - `sync_daily(day)`：mootdx 回源全市场日线 → `data/kline_daily`（股票，volume 手）+ `data/kline_etf_daily`（ETF，volume 股）。**北交所（920xxx.BJ）mootdx 无数据，跳过**。
+  - `sync_stock_minute(limit=None)`：回源 **4/1 起全市场 A 股分钟** → `data/kline_minute/date=*/`。每只拉一次全量（~3 个月 22560 bar），按交易日分组后**每攒满 100 只批量写分区**（避免逐只逐分区 IO）；北交所跳过。全市场 ~5200 只约 2.2 小时。`limit=N` 只处理前 N 只缺口（增量慢跑：resume 按**最新分区**跳过已覆盖，多轮后自动补齐）；调度场景传 `STOCK_MINUTE_BATCH_LIMIT`（20 只/批）。
+  - `backfill_to_now()`：补齐到当前时间缺失的 ETF 分钟 + 全市场日线 + **一批股票分钟**（幂等，只补最新分区之后的交易日）。
+- 触发：
+  - **系统启动**：`app/main.py` lifespan 后台线程调 `backfill_to_now()`（~13 分钟，不阻塞启动）。
+  - **收盘后**：`daily_pipeline.start_scheduler` 注册 `mootdx_sync` cron（工作日 15:35）——ETF 分钟 + 因子表 + 一批股票分钟增量回源。
+- 回测/模拟盘只读落盘分区（`DataManager._adj_factor_map` / `_load_minute_from_partitions`），不联网。
+- 失败标的（超时/异常/空）追加写入 `data/mootdx_sync_failures.csv`（symbol, 原因, 时间）；`get_minute`/`get_daily` 均有墙钟守护（30s/20s）防 socket 挂起卡死整批，超时重建 `MootdxSource`。
+- `mootdx_src._is_index` 注意：**深市 000xxx 是股票**（000001 平安银行），仅沪市 000xxx 是指数。误判会把 SZ 000xxx 走 index_bars 返回空，触发全服务器轮换（每只 ~8.5s）。
+
 ## 部署
 
 - 单容器 Docker：`Dockerfile` 两阶段，前端 `dist` 拷进后端镜像，`docker compose up --build` 后访问 `http://localhost:3018`。进阶见 `docs/deployment.md`。
