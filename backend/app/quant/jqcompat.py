@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import types
 
@@ -345,6 +346,17 @@ def get_all_securities(types=None, date=None):
     （2000-01-01 ~ 2999-12-31），保持修复前行为，避免误杀。
     """
     cutoff = str(pd.Timestamp(date).date()) if date is not None else None
+    if cutoff is None:
+        # 聚宽 get_all_securities(['etf']) 不带 date 时返回「当前日期」的证券
+        #（回测中 = 当日）。必须过滤上市/退市日期，否则未来上市的 ETF
+        #（含 PH/TH 等英文缩写名）混入导致策略分组/排除逻辑误判。
+        try:
+            env = Environment.get_instance()
+            _td = getattr(env, "trading_dt", None)
+            if _td is not None:
+                cutoff = str(pd.Timestamp(_td).date())
+        except Exception:
+            cutoff = None
     type_set = None
     if types is not None:
         type_set = {str(t).lower() for t in (types if isinstance(types, (list, tuple, set)) else [types])}
@@ -1291,6 +1303,36 @@ class JqDataSource:
             return self._ensure_minute(instrument.order_book_id)
         return self._day_bar_stores[(instrument.type, instrument.market)].get_bars(instrument.order_book_id)
 
+    def _apply_qfq_bars(self, bars, order_book_id, dt):
+        """对日线 recarray 应用动态前复权（聚宽 get_price fq="pre" 语义）。
+
+        决策日 dt 之前发生的除权事件折算历史价；未来事件不参与。无事件标的
+        或事件都在 dt 之后时返回原帧。bars 为 numpy recarray（含 datetime
+        int64 YYYYMMDDHHMMSS 与 OHLC 列）。"""
+        try:
+            dm = self._dm
+            events = dm._adj_events().get(order_book_id)
+            if not events:
+                return bars
+            dt_ts = pd.Timestamp(dt)
+            events = [e for e in events if e[0] <= dt_ts]
+            if not events:
+                return bars
+            dates = bars["datetime"] // 1000000  # YYYYMMDD int
+            factors = np.ones(len(dates), dtype=float)
+            for ex_ts, f in events:
+                ex_int = ex_ts.year * 10000 + ex_ts.month * 100 + ex_ts.day
+                factors[dates < ex_int] *= f
+            if np.allclose(factors, 1.0):
+                return bars
+            bars = bars.copy()
+            for col in ("open", "high", "low", "close"):
+                if col in bars.dtype.names:
+                    bars[col] = bars[col] * factors
+            return bars
+        except Exception:
+            return bars
+
     def history_bars(self, instrument, bar_count, frequency, fields, dt, **kwargs):
         freq = _norm_freq(frequency)
         bars = self._all_bars_of(instrument, freq)
@@ -1306,6 +1348,9 @@ class JqDataSource:
         else:
             left = i - bar_count if i >= bar_count else 0
         bars = bars[left:i]
+        if freq == "1d":
+            if os.getenv("DISABLE_JQ_QFQ") != "1":
+                bars = self._apply_qfq_bars(bars, instrument.order_book_id, dt)
         if fields is None:
             return bars
         if isinstance(fields, str):
@@ -1338,6 +1383,8 @@ class JqDataSource:
             i = bars["datetime"].searchsorted(dt_int, side=side)
             left = i - bar_count if i >= bar_count else 0
             bars = bars[left:i]
+            if freq == "1d" and os.getenv("DISABLE_JQ_QFQ") != "1":
+                bars = self._apply_qfq_bars(bars, code, dt)
             if fields is not None:
                 if isinstance(fields, str):
                     bars = bars[["datetime", fields] if fields != "datetime" else ["datetime"]]

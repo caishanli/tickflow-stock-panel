@@ -205,6 +205,104 @@ class DataManager:
         self._src_fail = {}
         self._demote_threshold = 3
         self._demoted = set()
+        # 前复权因子缓存（jq_code -> {trade_date: ex_factor}）：从
+        # data/adj_factor_etf/all.parquet 惰性加载。分区日线为原始不复权价，
+        # 聚宽 get_price(fq="pre") 对有拆分/分红事件的历史价按 ex_factor 折算
+        # 对齐最新口径；此处复现该语义（仅作用于日线价格列，分钟/当前价保持
+        # 真实价，与聚宽 use_real_price 行为一致）。
+        self._adj_factor = None  # 惰性：None=未加载，{} = 已加载但空
+        self._adj_events_cache = None  # 惰性：从因子表重建的除权事件
+
+    def _adj_factor_map(self) -> dict[str, dict]:
+        """加载前复权因子表：{jq_code: {trade_date(date): ex_factor}}。"""
+        if self._adj_factor is not None:
+            return self._adj_factor
+        self._adj_factor = {}
+        import glob as _glob
+        roots = [
+            os.path.join(self._partition_root(), "adj_factor_etf"),
+        ]
+        paths = []
+        for r in roots:
+            if os.path.isdir(r):
+                paths.extend(_glob.glob(
+                    os.path.join(r, "**", "*.parquet"), recursive=True))
+        if not paths:
+            return self._adj_factor
+        try:
+            import polars as pl
+            lf = pl.scan_parquet(paths, hive_partitioning=True)
+            cols = lf.columns if isinstance(lf, pl.LazyFrame) else []
+            if "symbol" not in cols:
+                lf = lf.with_columns(pl.lit("").alias("symbol"))
+            df = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
+            for row in df.iter_rows():
+                jq = self._to_jq_code(row[0])
+                self._adj_factor.setdefault(jq, {})[pd.Timestamp(row[1])] = float(row[2])
+        except Exception as e:
+            logger.warning("[DataManager] adj_factor 加载失败: %s", e)
+        return self._adj_factor
+
+    def _apply_qfq(self, pdf: pd.DataFrame, jq: str, cutoff=None) -> pd.DataFrame:
+        """对日线帧价格列应用前复权因子（有拆分/分红的标的）。
+
+        聚宽 get_price(fq="pre") 为**动态前复权**：在决策日 D 调用时，只用
+        事件日 <= D 的除权事件折算历史价，未来事件不参与（避免 515880 在
+        7/6 拆分前被 7/6 因子影响）。``cutoff`` 为决策日（None 时用全量
+        事件，即"最新口径"）。无事件/无因子表时原样返回。
+        """
+        events = self._adj_events().get(jq)
+        if not events:
+            return pdf
+        if cutoff is not None:
+            cutoff = pd.Timestamp(cutoff).normalize()
+            events = [e for e in events if e[0] <= cutoff]
+            if not events:
+                return pdf
+        dates = pd.to_datetime(pdf["trade_dt"]).values
+        factors = np.ones(len(dates), dtype=float)
+        for ex_dt, f in events:
+            mask = dates < ex_dt
+            factors[mask] *= f
+        if np.allclose(factors, 1.0):
+            return pdf
+        pdf = pdf.copy()
+        for col in ("open", "high", "low", "close"):
+            if col in pdf.columns:
+                pdf[col] = pdf[col].astype(float) * factors
+        return pdf
+
+    def _adj_events(self) -> dict[str, list[tuple[pd.Timestamp, float]]]:
+        """从累计因子表重建除权事件：{jq_code: [(ex_date, factor), ...]}。
+
+        累计因子表每日期 ex_factor = 所有 > 该日事件因子的连乘。相邻日期
+        因子跳变即暴露事件：f = ex_factor(prev) / ex_factor(curr)，事件日 =
+        curr。示例：159667 6/9=0.333, 6/10=1.0 → 事件 (6/10, 0.333/1.0)。
+
+        聚宽 pre/none 比值含 4 位价格精度噪声（±0.1% 级微小波动），需过滤：
+        仅保留因子明显偏离 1 的真实除权事件（阈值 10%），忽略噪声。
+        """
+        if self._adj_events_cache is not None:
+            return self._adj_events_cache
+        self._adj_events_cache = {}
+        fmap = self._adj_factor_map()
+        for jq, m in fmap.items():
+            items = sorted(m.items())
+            if len(items) < 2:
+                continue
+            events = []
+            for i in range(1, len(items)):
+                prev_dt, prev_f = items[i - 1]
+                cur_dt, cur_f = items[i]
+                if cur_f != prev_f:
+                    f = prev_f / cur_f if cur_f else 0.0
+                    # 阈值：除权事件因子偏离 1 至少 10%（0.1 < f < 0.9 或
+                    # f > 1.1），过滤聚宽价格精度噪声产生的伪事件
+                    if (f < 0.9 or f > 1.1) and 0.0 < f < 10.0:
+                        events.append((cur_dt, f))
+            if events:
+                self._adj_events_cache[jq] = events
+        return self._adj_events_cache
 
     def set_minute_window(self, start, end):
         """设定分钟线展开区间（回测前调用），避免生成超长历史。

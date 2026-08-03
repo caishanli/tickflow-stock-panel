@@ -1140,7 +1140,7 @@ def _clean_etf_name(name: str) -> str:
 # 与行情缓存同目录（jqengine DATA_DIR，默认仓库根 data/quant_kline）。
 _ETF_UNIVERSE_SNAPSHOT = os.path.join(
     _JQ_ENGINE_CONFIG["DATA_DIR"], "etf_universe_snapshot.json")
-_ETF_SNAPSHOT_MAX_AGE = _dt.timedelta(days=7)
+_ETF_SNAPSHOT_MAX_AGE = _dt.timedelta(days=30)
 
 
 def _read_etf_snapshot(path):
