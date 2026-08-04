@@ -708,23 +708,26 @@ def sync_index_daily(day: _date) -> dict:
     day_str = day.strftime("%Y%m%d")
     frames: list[pl.DataFrame] = []
     for i, sym in enumerate(indices):
-        df = _guarded_get_daily(src, sym, day_str, day_str)
-        if df is None or df.empty:
+        try:
+            df = _guarded_get_daily(src, sym, day_str, day_str)
+            if df is None or df.empty:
+                continue
+            hit = df[[x.date() == day for x in df.index]]
+            if hit.empty:
+                continue
+            row = hit.iloc[-1]
+            frames.append(pl.DataFrame({
+                "symbol": [sym],
+                "date": [day],
+                "open": [float(row["open"])],
+                "high": [float(row["high"])],
+                "low": [float(row["low"])],
+                "close": [float(row["close"])],
+                "volume": [float(row["volume"])],
+                "amount": [float(row["amount"])],
+            }))
+        except Exception:  # noqa: BLE001
             continue
-        hit = df[[x.date() == day for x in df.index]]
-        if hit.empty:
-            continue
-        row = hit.iloc[-1]
-        frames.append(pl.DataFrame({
-            "symbol": [sym],
-            "date": [day],
-            "open": [float(row["open"])],
-            "high": [float(row["high"])],
-            "low": [float(row["low"])],
-            "close": [float(row["close"])],
-            "volume": [float(row["volume"])],
-            "amount": [float(row["amount"])],
-        }))
         if (i + 1) % 500 == 0:
             try:
                 src._client = None
@@ -757,6 +760,8 @@ def _adj_factor_stale() -> bool:
         if df.is_empty():
             return True
         factor_latest = df["trade_date"].max()
+        if not isinstance(factor_latest, _date):
+            return True
     except Exception:  # noqa: BLE001
         return True
     etf_days = _partition_dates(ETF_DAILY_ROOT)
@@ -768,7 +773,7 @@ def _adj_factor_stale() -> bool:
 
 
 def _notify_missing(missing: dict) -> None:
-    """空分区/缺口时打 ERROR 日志并尝试钉钉站内信通知用户。fire-and-forget。"""
+    """空分区/缺口时打 WARNING 日志并尝试钉钉站内信通知用户。fire-and-forget。"""
     lines = []
     for name, st in missing.items():
         latest = st.get("latest") or "无"

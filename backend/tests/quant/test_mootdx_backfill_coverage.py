@@ -144,3 +144,70 @@ def test_backfill_noop_when_all_current(monkeypatch, tmp_path):
     res = ms.backfill_to_now()
     assert calls["n"] == 0
     assert not any(st["missing"] or st["empty"] for st in res["missing"].values())
+
+
+def test_backfill_runs_sync_per_gap_day(monkeypatch, tmp_path):
+    """日线缺 2 个交易日 → 每个缺日都调 sync_daily。"""
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+    for name in ["kline_etf_minute", "kline_etf_daily", "kline_index_daily"]:
+        (tmp_path / name / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "kline_daily" / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"], "trade_date": [_d(2026, 8, 4)], "ex_factor": [1.0],
+    }).write_parquet(tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    # 股票+ETF 日线都缺 8/5、8/6 两个交易日
+    gap = [_d(2026, 8, 5), _d(2026, 8, 6)]
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: list(gap))
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    days = []
+    monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+
+    res = ms.backfill_to_now()
+    assert days == gap
+    assert res["daily_days"] == ["2026-08-05", "2026-08-06"]
+
+
+def test_backfill_seeds_window_when_root_empty(monkeypatch, tmp_path):
+    """股票日线根目录为空 → 用 _trade_days_up_to 窗口 seed。"""
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+    for name in ["kline_etf_minute", "kline_etf_daily", "kline_index_daily"]:
+        (tmp_path / name / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"], "trade_date": [_d(2026, 8, 4)], "ex_factor": [1.0],
+    }).write_parquet(tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")  # 该目录不创建 = 空
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])  # 空根返回 []（既有语义）
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_d(2026, 8, 3), _d(2026, 8, 4)])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    days = []
+    monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+
+    res = ms.backfill_to_now()
+    assert days == [_d(2026, 8, 3), _d(2026, 8, 4)]
+    assert res["daily_days"] == ["2026-08-03", "2026-08-04"]
