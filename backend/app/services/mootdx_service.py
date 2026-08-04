@@ -706,12 +706,6 @@ def sync_index_daily(day: _date) -> dict:
     indices = [s for s in _index_universe() if not s.endswith(".BJ")]
     src = MootdxSource()
     day_str = day.strftime("%Y%m%d")
-    listing = _listing_date_map()
-    if listing:
-        def _active(sym: str) -> bool:
-            ld = listing.get(sym, _date(1970, 1, 1))
-            return ld > _date(1970, 1, 1) and ld <= day
-        indices = [s for s in indices if _active(s)]
     frames: list[pl.DataFrame] = []
     for i, sym in enumerate(indices):
         df = _guarded_get_daily(src, sym, day_str, day_str)

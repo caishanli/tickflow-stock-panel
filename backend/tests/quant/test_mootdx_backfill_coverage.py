@@ -5,7 +5,6 @@ import datetime as _dt
 
 import pandas as pd
 import polars as pl
-import pytest
 
 from app.services import mootdx_service as ms
 
@@ -16,7 +15,6 @@ class _FakeSrc:
         self.day = day
 
     def get_daily(self, code, start, end):
-        pure = code.split(".")[0]
         ts = pd.Timestamp(f"{self.day} 15:00:00")
         return pd.DataFrame(
             {"open": [1.0], "high": [2.0], "low": [0.5], "close": [1.5],
@@ -32,7 +30,6 @@ def test_sync_index_daily_writes_partition(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
     monkeypatch.setattr(ms, "MootdxSource", lambda: _FakeSrc(_dt.date(2026, 8, 5)))
-    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
     _patch_index_universe(monkeypatch, ["000300.SH", "000510.SH", "899050.BJ"])
 
     res = ms.sync_index_daily(_dt.date(2026, 8, 5))
