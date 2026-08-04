@@ -711,19 +711,27 @@ class _BundleProvider:
 def _compute_trade_metrics(trades):
     """从成交序列（含每笔已实现 pnl）计算胜率/盈亏比/交易次数。
 
-    trades 为 _extract_trades 输出：每笔 dict 含 side / pnl。以「平仓（SELL）
-    且 pnl 非空」的成交作为一轮完整交易样本；BUY 的 pnl 恒为 0 不参与统计。
+    trades 支持两类结构：
+    - _extract_trades 输出的元组 ``(ts, code, side, price, qty, pnl, pnl_pct, cost)``；
+    - dict（含 side/pnl 键或 side/action 键的旧结构）。
+    以「平仓（SELL）且 pnl 非空」的成交作为一轮完整交易样本；BUY 的 pnl 恒为 0 不参与统计。
     """
     wins, losses, gross_win, gross_loss = 0, 0, 0.0, 0.0
     closed = 0
     for t in trades or []:
-        _side = (t.get("side") if isinstance(t, dict) else getattr(t, "side", None)) \
-            or (t.get("action") if isinstance(t, dict) else getattr(t, "action", None))
-        side = str(_side or "")
-        try:
-            pnl = float(t.get("pnl", 0.0) if isinstance(t, dict) else getattr(t, "pnl", 0.0))
-        except Exception:
-            pnl = 0.0
+        if isinstance(t, dict):
+            side = str(t.get("side") or t.get("action") or "")
+            try:
+                pnl = float(t.get("pnl", 0.0))
+            except Exception:
+                pnl = 0.0
+        else:
+            # 元组结构：dt, code, side, price, qty, pnl, pnl_pct, cost
+            side = str(t[2]) if len(t) > 2 else ""
+            try:
+                pnl = float(t[5]) if len(t) > 5 else 0.0
+            except Exception:
+                pnl = 0.0
         if "SELL" not in side.upper():
             continue
         if pnl != pnl:  # NaN 跳过
