@@ -743,6 +743,30 @@ def _missing_index_daily_days() -> list[_date]:
     return _missing_daily_days(INDEX_DAILY_ROOT)
 
 
+def _adj_factor_stale() -> bool:
+    """判断 ETF 前复权因子表是否落后于 ETF 日线最新交易日。
+
+    因子表 ``all.parquet`` 的 ``max(trade_date)`` 落后于 ``kline_etf_daily``
+    最新分区日期（或有新增交易日）即视为 stale，需重新 ``sync_adj_factor``。
+    文件不存在视为 stale（首次部署）。
+    """
+    if not ADJ_FACTOR_PATH.exists():
+        return True
+    try:
+        df = pl.read_parquet(ADJ_FACTOR_PATH, columns=["trade_date"])
+        if df.is_empty():
+            return True
+        factor_latest = df["trade_date"].max()
+    except Exception:  # noqa: BLE001
+        return True
+    etf_days = _partition_dates(ETF_DAILY_ROOT)
+    if not etf_days:
+        # 无 ETF 日线分区：以因子表自身为基准，不误判（有分区时以下逻辑生效）
+        return factor_latest < _date.today()
+    etf_latest = _date.fromisoformat(etf_days[-1])
+    return factor_latest < etf_latest
+
+
 def backfill_to_now() -> dict[str, Any]:
     """启动回源：补齐到当前时间缺失的 ETF 分钟 + 全市场日线 + 股票分钟一批。
 

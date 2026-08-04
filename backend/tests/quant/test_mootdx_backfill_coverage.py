@@ -46,3 +46,30 @@ def test_index_universe_fallback_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path / "nova")
     out = ms._index_universe()
     assert out == ["000300.SH", "000510.SH", "399006.SZ", "399101.SZ"]
+
+
+def test_adj_factor_stale(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+
+    # 因子表不存在 → stale
+    assert ms._adj_factor_stale() is True
+
+    # 因子表最新（ETF 日线也有同日分区）→ not stale
+    (tmp_path / "kline_etf_daily").mkdir()
+    (tmp_path / "kline_etf_daily" / "date=2026-08-05").mkdir()
+    (tmp_path / "adj_factor_etf").mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"],
+        "trade_date": [_dt.date(2026, 8, 5)],
+        "ex_factor": [1.0],
+    }).write_parquet(ms.ADJ_FACTOR_PATH)
+    assert ms._adj_factor_stale() is False
+
+    # 因子表落后 → stale
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"],
+        "trade_date": [_dt.date(2026, 8, 3)],
+        "ex_factor": [1.0],
+    }).write_parquet(ms.ADJ_FACTOR_PATH)
+    assert ms._adj_factor_stale() is True
