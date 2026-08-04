@@ -187,14 +187,61 @@ def test_preload_minute_for_pool_single_definition():
 
 
 def test_preload_minute_for_pool_functional(tmp_path):
-    """合并后的实现：as_of 可缺省语义保留；预热帧按滑窗裁剪并记录覆盖。"""
+    """合并后的实现：as_of 可缺省语义保留；预热帧按 _minute_win 全窗口加载并记录覆盖。"""
     dm = _make_dm(tmp_path)
     _seed_minute_caches(dm)
     dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
     df = dm._minute_mem.get(CODE)
     assert df is not None and not df.empty
-    assert df.index.max() == pd.Timestamp("2026-03-25 15:00")
-    assert dm._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
+    assert df.index.min() >= pd.Timestamp(WIN_START)
+    assert df.index.max() <= pd.Timestamp(WIN_END + " 15:00")
+    assert dm._minute_cov[CODE][0] == pd.Timestamp(WIN_START)
+    assert dm._minute_cov[CODE][1] == pd.Timestamp(WIN_END + " 15:00")
+
+
+def test_preload_minute_for_pool_covers_full_window(tmp_path, monkeypatch):
+    """预热按 _minute_win 全窗口覆盖后，整段 feed 命中缓存、不触发逐标的合并。
+
+    回归：原预热只覆盖 as_of 前 15 天滑窗，动量循环里每次 get_price(1m)
+    都走 get_minute_feed 请求整段回测区间，覆盖不足 → 每标的串行
+    _load_minute_merged 全量回载（~0.2s/只 × 195 ≈ 39s）。
+    """
+    dm = _make_dm(tmp_path)
+    _seed_minute_caches(dm)
+    calls = []
+    orig = DataManager._load_minute_merged
+
+    def spy(self, code, lo_hi=None, **kw):
+        calls.append(code)
+        return orig(self, code, lo_hi=lo_hi, **kw)
+
+    monkeypatch.setattr(DataManager, "_load_minute_merged", spy)
+    dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
+    # 覆盖区间 = 全窗口（_minute_win），而非 as_of 前 15 天滑窗
+    assert dm._minute_cov[CODE][0] == pd.Timestamp(WIN_START)
+    assert dm._minute_cov[CODE][1] == pd.Timestamp(WIN_END + " 15:00")
+    calls.clear()  # 预热阶段回退加载（测试环境无分区）不计入
+    feed = dm.get_minute_feed(CODE, WIN_START, WIN_END)
+    assert not feed.empty
+    assert calls == []  # 全窗口预热 → feed 零重载
+    assert feed.loc[pd.Timestamp("2026-03-17 10:00"), "close"] == REAL_CLOSE
+
+
+def test_preload_minute_for_pool_skips_scan_when_covered(tmp_path, monkeypatch):
+    """池内标的已全窗口覆盖时，再次预热不触发批量扫描（逐日 ~2s 开销回归）。"""
+    dm = _make_dm(tmp_path)
+    _seed_minute_caches(dm)
+    dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
+    calls = []
+    orig = DataManager._load_minute_pool_from_partitions
+
+    def spy(self, codes, lo_ts, hi_ts):
+        calls.append(list(codes))
+        return orig(self, codes, lo_ts, hi_ts)
+
+    monkeypatch.setattr(DataManager, "_load_minute_pool_from_partitions", spy)
+    dm.preload_minute_for_pool([CODE], as_of="2026-03-26")
+    assert calls == []  # 全部已覆盖 → 零扫描
 
 
 # ---------------- M11：_minute_mem 有界 LRU ----------------
@@ -220,3 +267,22 @@ def test_minute_mem_default_cap(tmp_path):
     """容量默认 800（与 scripts/run_jq_rqalpha.py --minute_cache_cap 一致）。"""
     dm = _make_dm(tmp_path)
     assert dm._minute_mem.cap == 800
+
+
+# ---------------- 分钟数据覆盖告警：回测起点早于分钟数据首日 ----------------
+
+def test_minute_coverage_start(tmp_path, monkeypatch):
+    """最早分钟分区日期：无分区返回 None；以 ETF 分钟覆盖为准（回测宇宙为
+    ETF），股票分钟（kline_minute，2018 起）仅作无 ETF 目录时的兜底——
+    避免股票分钟的历史覆盖掩盖 ETF 分钟缺口导致告警漏报。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    dm = _make_dm(tmp_path)
+    assert dm.minute_coverage_start() is None
+    (tmp_path / "kline_etf_minute" / "date=2026-04-01").mkdir(parents=True)
+    assert dm.minute_coverage_start() == pd.Timestamp("2026-04-01").date()
+    (tmp_path / "kline_minute" / "date=2018-02-09").mkdir(parents=True)
+    assert dm.minute_coverage_start() == pd.Timestamp("2026-04-01").date()
+    # 无 ETF 分钟目录时兜底到股票分钟
+    import shutil
+    shutil.rmtree(tmp_path / "kline_etf_minute")
+    assert dm.minute_coverage_start() == pd.Timestamp("2018-02-09").date()

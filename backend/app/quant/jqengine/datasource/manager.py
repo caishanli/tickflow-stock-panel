@@ -3,6 +3,7 @@
 import logging
 import os
 from collections import OrderedDict
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -358,6 +359,23 @@ class DataManager:
             if name.startswith("date="):
                 out.append(name)
         return sorted(out)
+
+    @classmethod
+    def minute_coverage_start(cls) -> date | None:
+        """本地分钟线数据最早覆盖日期。
+
+        以 ETF 分钟分区（kline_etf_minute）为准——jqcompat 回测宇宙为 ETF；
+        股票分钟（kline_minute）历史更早（2018 起），若混用会掩盖 ETF 分钟
+        缺口导致告警漏报。无 ETF 分钟目录时兜底到股票分钟，两者皆无返回 None。
+
+        用于回测起点早于分钟数据覆盖的告警：覆盖前时段无分钟成交，动量/停牌
+        判定会全部按「盘中临时停牌」跳过，结果与聚宽不可比。
+        """
+        for subdir in ("kline_etf_minute", "kline_minute"):
+            dates = cls._partition_dates(subdir)
+            if dates:
+                return pd.Timestamp(dates[0][len("date="):]).date()
+        return None
 
     def preload_minute(self, codes):
         """预加载指定标的的分钟线到 _minute_mem（整段窗口，供时钟 feed 使用）。
@@ -884,16 +902,27 @@ class DataManager:
             logger.info("[DataManager] 分钟线预热完成: 成功 0/%d，已缓存 %d 只",
                         len(codes), len(self._minute_mem))
             return
-        # 统一滑窗（同日 as_of 对所有标的一致）
-        lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=False)
+        # 统一窗口（同日 as_of 对所有标的一致）：回测中 _minute_win 由
+        # set_minute_window 设为整段回测区间；全窗口预热后动量循环的
+        # get_minute_feed 覆盖校验直接命中，避免每标的串行 _load_minute_merged
+        # 全量回载（~0.2s/只 × 数百只 ≈ 40s）。未设窗口（如 live 路径）退回收缩
+        # 滑窗，避免一次预热 400 天历史。
+        if self._minute_win:
+            lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=True)
+        else:
+            lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=False)
         hi_eff = self._hi_eff(hi_ts)
+        # 已全窗口覆盖的标的无需再次扫描（每日预热只处理新进池/覆盖不足标的，
+        # 避免每日对数百只标的重复全区间分区扫描的 ~2s 开销）
+        covered = [c for c in todo if self._minute_cached(c, lo_ts, hi_eff) is not None]
+        todo = [c for c in todo if c not in covered]
+        if not todo:
+            logger.info("[DataManager] 分钟线预热完成: 全部已覆盖 %d 只", len(covered))
+            return
         batch = self._load_minute_pool_from_partitions(todo, lo_ts, hi_ts)
+        loaded = len(covered)
         for code in todo:
             try:
-                # 覆盖命中则跳过
-                if self._minute_cached(code, lo_ts, hi_eff) is not None:
-                    loaded += 1
-                    continue
                 df = batch.get(code)
                 if df is not None and not df.empty:
                     df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]
@@ -904,8 +933,9 @@ class DataManager:
                         self._minute_cov[code] = (lo_ts, hi_eff)
                         loaded += 1
                         continue
-                # 批量缺失 → 回退单标的路径（保 _minute_empty 语义）
-                df = self._ensure_minute_windowed(code, as_of_ts)
+                # 批量缺失 → 回退单标的加载：与 feed 同路径（覆盖整段窗口并
+                # 记录覆盖区间），保证后续 get_minute_feed 命中（保 _minute_empty 语义）
+                df = self.get_minute_feed(code, lo_ts, hi_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     loaded += 1
             except Exception as e:
