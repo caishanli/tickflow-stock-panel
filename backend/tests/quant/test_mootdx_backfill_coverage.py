@@ -73,3 +73,74 @@ def test_adj_factor_stale(tmp_path, monkeypatch):
         "ex_factor": [1.0],
     }).write_parquet(ms.ADJ_FACTOR_PATH)
     assert ms._adj_factor_stale() is True
+
+
+def test_backfill_to_now_includes_index_and_adj(monkeypatch, tmp_path):
+    """空分区场景：因子表空 → 触发 sync_adj_factor；结果含 missing；触发钉钉。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    # %s 空 → 无分区，回源窗口为空
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: True)  # 空文件 → stale
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    adj = {"written_symbols": 1, "rows": 5, "total_symbols": 2}
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda: adj)
+    sent = []
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: sent.append(m))
+
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+
+    res = ms.backfill_to_now()
+
+    assert res["adj_factor"] == adj       # 因子表空 → 跑
+    assert "index_daily_days" in res
+    assert "missing" in res
+    assert any(v["empty"] for v in res["missing"].values())
+    assert sent, "空分区应触发钉钉告警"
+
+
+def test_backfill_noop_when_all_current(monkeypatch, tmp_path):
+    """全部数据最新（且非空）→ 不触发任何回源、无 missing。"""
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+    # 每类都给一个最新分区，使 empty=False
+    for name in ["kline_etf_minute", "kline_daily", "kline_etf_daily", "kline_index_daily"]:
+        (tmp_path / name / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"],
+        "trade_date": [_d(2026, 8, 4)],
+        "ex_factor": [1.0],
+    }).write_parquet(tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    calls = {"n": 0}
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+
+    res = ms.backfill_to_now()
+    assert calls["n"] == 0
+    assert not any(st["missing"] or st["empty"] for st in res["missing"].values())
