@@ -31,6 +31,7 @@ DATA_ROOT = Path(_env_root) if _env_root else Path(
     "/home/caisl/tickflow-stock-panel/data")
 ETF_MINUTE_ROOT = DATA_ROOT / "kline_etf_minute"
 ADJ_FACTOR_PATH = DATA_ROOT / "adj_factor_etf" / "all.parquet"
+INDEX_DAILY_ROOT = DATA_ROOT / "kline_index_daily"
 # 回源失败标的落盘（symbol, 原因, 时间），供用户手动核查
 FAILURE_LOG_PATH = DATA_ROOT / "mootdx_sync_failures.csv"
 
@@ -674,6 +675,78 @@ def _write_daily_partition(df: pl.DataFrame, root: Path) -> None:
         merged = df.sort(["symbol", "date"])
     merged.write_parquet(tmp)
     tmp.rename(part)
+
+
+def _index_universe() -> list[str]:
+    """返回指数日线回源 symbol 列表（.SH/.SZ，优先 instruments_index 表）。
+
+    指数宇宙：``data/instruments_index/instruments_index.parquet`` 的 symbol 列。
+    缺失/读取失败时兜底模拟盘固定 4 只（000300/000510/399006/399101），确保
+    弱市判断/基准数据始终可用。
+    """
+    inst_path = DATA_ROOT / "instruments_index" / "instruments_index.parquet"
+    if inst_path.exists():
+        try:
+            df = pl.read_parquet(inst_path, columns=["symbol"])
+            syms = df["symbol"].to_list()
+            if syms:
+                return sorted(syms)
+        except Exception:  # noqa: BLE001
+            logger.warning("mootdx_service: instruments_index 读取失败, 用兜底指数")
+    return ["000300.SH", "000510.SH", "399006.SZ", "399101.SZ"]
+
+
+def sync_index_daily(day: _date) -> dict:
+    """回源指定交易日全市场指数日线到 ``kline_index_daily`` 分区。
+
+    逐个指数用 mootdx ``get_daily``（指数自动走 index_bars）拉最近日线，
+    取 ``day`` 那根写按日分区。跳过北交所（899xxx.BJ mootdx 无数据）。
+    返回 {"written": 写入指数数, "symbols": 尝试数}。
+    """
+    indices = [s for s in _index_universe() if not s.endswith(".BJ")]
+    src = MootdxSource()
+    day_str = day.strftime("%Y%m%d")
+    listing = _listing_date_map()
+    if listing:
+        def _active(sym: str) -> bool:
+            ld = listing.get(sym, _date(1970, 1, 1))
+            return ld > _date(1970, 1, 1) and ld <= day
+        indices = [s for s in indices if _active(s)]
+    frames: list[pl.DataFrame] = []
+    for i, sym in enumerate(indices):
+        df = _guarded_get_daily(src, sym, day_str, day_str)
+        if df is None or df.empty:
+            continue
+        hit = df[[x.date() == day for x in df.index]]
+        if hit.empty:
+            continue
+        row = hit.iloc[-1]
+        frames.append(pl.DataFrame({
+            "symbol": [sym],
+            "date": [day],
+            "open": [float(row["open"])],
+            "high": [float(row["high"])],
+            "low": [float(row["low"])],
+            "close": [float(row["close"])],
+            "volume": [float(row["volume"])],
+            "amount": [float(row["amount"])],
+        }))
+        if (i + 1) % 500 == 0:
+            try:
+                src._client = None
+                src._server_idx = -1
+            except Exception:  # noqa: BLE001
+                pass
+    if not frames:
+        return {"written": 0, "symbols": len(indices)}
+    _write_daily_partition(pl.concat(frames), INDEX_DAILY_ROOT)
+    logger.info("mootdx_service: 指数日线回源 %s 完成: %d 只", day, len(frames))
+    return {"written": len(frames), "symbols": len(indices)}
+
+
+def _missing_index_daily_days() -> list[_date]:
+    """找出 ``kline_index_daily`` 分区缺失的交易日。"""
+    return _missing_daily_days(INDEX_DAILY_ROOT)
 
 
 def backfill_to_now() -> dict[str, Any]:
