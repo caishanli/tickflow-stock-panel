@@ -112,6 +112,18 @@ wheels = [
 ]
 
 [[package]]
+name = "baostock"
+version = "0.9.3"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "pandas" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/f3/1d/e62f47577d49d5dd98ff20c2e3fccc318e2b7984a06fb9abb9b1136f046c/baostock-0.9.3.tar.gz", hash = "sha256:16699d82d05037a8c133577fcdeb9ac0d5a7f31edc2432c4e883004e0a95e3f7" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/d2/16/f28fef16a5d9af31def7435b73efd91ed66b40b9c249387d6c11cdf2ba35/baostock-0.9.3-py3-none-any.whl", hash = "sha256:acbd19403285bc4e254cee8297cf0e2646ae2276e5af7e549deed3988ab02293" },
+]
+
+[[package]]
 name = "bottle"
 version = "0.13.4"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -2947,6 +2959,7 @@ version = "0.1.83"
 source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },
+    { name = "baostock" },
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "fastexcel" },
@@ -2997,6 +3010,7 @@ quant = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10" },
+    { name = "baostock", specifier = ">=0.9" },
     { name = "duckdb", specifier = ">=1.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastexcel", specifier = ">=0.10" },

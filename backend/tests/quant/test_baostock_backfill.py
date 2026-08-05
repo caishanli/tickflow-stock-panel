@@ -47,7 +47,7 @@ class _FakeBS:
         self.calls.append(("adj", code))
         return _FakeRS([["sh.600036", "2025-07-16", "0.95", "12.76", "12.76"]])
 
-    def query_dividend_data(self, code, year, yearType):
+    def query_dividend_data(self, code, year, yearType):  # noqa: N803  # baostock API 参数名
         self.calls.append(("dividend", code, year))
         return _FakeRS([["sh.600036", "2025-07-11", "2025-07-11", "2", "1.8",
                          "0.000000", "10派20元", "0"]],

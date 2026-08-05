@@ -52,6 +52,20 @@ uv run --extra dev mypy app               # 类型检查
 - 失败标的（超时/异常/空）追加写入 `data/mootdx_sync_failures.csv`（symbol, 原因, 时间）；`get_minute`/`get_daily` 均有墙钟守护（30s/20s）防 socket 挂起卡死整批，超时重建 `MootdxSource`。
 - `mootdx_src._is_index` 注意：**深市 000xxx 是股票**（000001 平安银行），仅沪市 000xxx 是指数。误判会把 SZ 000xxx 走 index_bars 返回空，触发全服务器轮换（每只 ~8.5s）。
 
+## baostock 回源脚本（一次性全量回源）
+
+- `backend/scripts/backfill_baostock_3y.py`（逻辑在 `backend/app/services/baostock_backfill.py`）：
+  回源全市场近 3 年 **股票 5min 真实数据** → `data/kline_5min/date=YYYY-MM-DD/part.parquet`
+  （baostock 无 1min/ETF分钟/指数分钟，实测 `frequency="1"` 返回错误）；
+  ETF/指数**日线** → `kline_etf_daily` / `kline_index_daily`（指数 volume 股÷100 转手，
+  ETF 不换算；baostock ETF 日线仅 2026-01-05 起）；复权因子（分红/送转/配股/缩股净效果）
+  → `data/adj_factor/all.parquet`（与 `adj_factor_etf` 同构，DataManager 自动加载）；
+  分红送转明细 → `data/dividends/all.parquet`。
+- 断点续传：`data/baostock_backfill_state.json`；`--retry-failed` 重试失败，
+  `--reset-state` 清空重跑；失败记录 `data/baostock_backfill_failures.csv`。
+- baostock 服务器吞吐波动大（单只 3 年 5min 实测 47s~100s+），串行执行，全量约几十小时，
+  靠 resume 分多轮跑完。运行：`cd backend && uv run python scripts/backfill_baostock_3y.py [--stage minute|daily|corporate|all]`。
+
 ## 部署
 
 - 单容器 Docker：`Dockerfile` 两阶段，前端 `dist` 拷进后端镜像，`docker compose up --build` 后访问 `http://localhost:3018`。进阶见 `docs/deployment.md`。

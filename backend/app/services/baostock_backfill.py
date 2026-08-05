@@ -16,10 +16,11 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import date as _date
 from datetime import datetime as _datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import polars as pl
 
@@ -46,7 +47,7 @@ def _bs():
     """惰性加载 baostock 模块（测试可 monkeypatch _bs_module）。"""
     global _bs_module
     if _bs_module is None:
-        import baostock as bs
+        import baostock as bs  # type: ignore[import-untyped]
 
         _bs_module = bs
     return _bs_module
@@ -143,7 +144,7 @@ def query_dividend_rows(code: str, year: int, timeout: float = 120, retries: int
             raise RuntimeError(f"query_dividend_data 失败: {getattr(rs, 'error_code', None)}")
         rows = []
         while rs.error_code == "0" and rs.next():
-            rows.append(dict(zip(rs.fields, rs.get_row_data())))
+            rows.append(dict(zip(rs.fields, rs.get_row_data(), strict=False)))
         return rows
 
     return _retry(_q, timeout, retries)
@@ -172,7 +173,7 @@ def _safe_float(v) -> float | None:
 
 def load_state(path: Path = STATE_PATH) -> dict:
     """读断点状态；不存在/损坏时返回默认空状态。"""
-    default = {
+    default: dict[str, Any] = {
         "start": None, "end": None,
         "minute_done": [], "daily_done": [], "adj_done": [], "dividends_done": [],
         "failed": {},
@@ -350,7 +351,7 @@ def listing_date_map() -> dict[str, _date]:
     return out
 
 
-_MIN5_SCHEMA = {
+_MIN5_SCHEMA: dict[str, type[pl.DataType] | pl.DataType] = {
     "symbol": pl.Utf8, "datetime": pl.Datetime("us"),
     "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
     "close": pl.Float64, "volume": pl.Float64, "amount": pl.Float64,
@@ -451,11 +452,13 @@ def sync_minute(start: _date, end: _date, state: dict, timeout: float = 300,
         for s in chunk_syms:
             mark_done(state, "minute", s)
         save_state(state)
+        if progress:
+            progress("minute", i, len(todo), total)
     logger.info("[minute] 完成 %d 只, 累计 %d 行", len(todo), total)
     return {"symbols": len(todo), "rows": total}
 
 
-_DAILY_SCHEMA = {
+_DAILY_SCHEMA: dict[str, type[pl.DataType] | pl.DataType] = {
     "symbol": pl.Utf8, "date": pl.Date,
     "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
     "close": pl.Float64, "volume": pl.Float64, "amount": pl.Float64,
@@ -482,7 +485,7 @@ def _flush_daily_batch(frames: list[pl.DataFrame], root: Path) -> None:
     if not frames:
         return
     all_df = pl.concat(frames).unique(subset=["symbol", "date"], keep="last")
-    for d, g in all_df.group_by("date"):
+    for _, g in all_df.group_by("date"):
         write_daily_partition(g, root)
 
 
@@ -539,6 +542,8 @@ def sync_daily(start: _date, end: _date, state: dict, timeout: float = 300,
             for s, _ in batch:
                 mark_done(state, "daily", s)
             save_state(state)
+            if progress:
+                progress(f"daily:{name}", i, len(todo), total)
         stats[name] = {"symbols": len(todo), "rows": total}
     return stats
 
@@ -656,6 +661,7 @@ def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
                 all_ok = False
                 mark_failed(state, "dividends", sym, f"{y}:{str(e)[:100]}")
                 append_failure(sym, f"dividend:{y}:{str(e)[:100]}")
+                save_state(state)
                 continue
             for rec in recs:
                 ex = (rec.get("dividOperateDate") or "").strip()
