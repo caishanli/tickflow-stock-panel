@@ -33,13 +33,13 @@
 FastAPI 主进程（前端 + 守护）
   └─ stockdata_guardian（PID 锁 + 3s 自愈，泛化自 intraday_guardian）
         └─ Popen ──► scripts/run_stockdata_service.py
-                         └─ TCP server（ThreadingTCPServer, msgpack 帧）
-                              ├─ 读取: 本地 parquet 分区 / mootdx / astock
-                              ├─ 现场回源: 缺口分钟/日线 → 返回 + 原子落盘
-                              └─ 自治调度线程:
-                                   ├─ 启动 backfill（补齐到当前时间缺失数据）
-                                   ├─ intraday 循环（交易时段全量 ETF 分钟）
-                                   └─ 15:35 定时同步（ETF 分钟 + 因子表 + 股票分钟增量）
+                          └─ TCP server（ThreadingTCPServer, msgpack 帧）
+                               ├─ 读取: 本地 parquet 分区 / mootdx / astock
+                               ├─ 现场回源: 客户端请求到的标的实时分钟 → 进当日内存库
+                               └─ 自治调度线程:
+                                    ├─ 启动 backfill（补齐到当前时间缺失数据）
+                                    ├─ 15:35 定时同步（收盘后一次性拉全量 ETF 分钟 + 因子表 + 股票分钟增量落盘）
+                                    └─ 00:00 清空前一日分钟内存库
 
 量化侧进程（模拟盘/回测）── TCP ──► 客户端 SDK ──► stock data 服务
 ```
@@ -47,11 +47,11 @@ FastAPI 主进程（前端 + 守护）
 **新增/改造文件**
 - `backend/scripts/run_stockdata_service.py` — 服务进程入口（TCP server + 调度线程）。
 - `backend/app/services/stockdata/server.py` — ThreadingTCPServer + msgpack 帧编解码 + method 分发（薄层，委托给既有 `mootdx_service` / 分区读取器 / 实时回源）。
-- `backend/app/services/stockdata/scheduler.py` — 自治调度：启动 backfill + intraday 循环 + 15:35 cron（线程）。
-- `backend/app/services/stockdata/sources.py` — 数据源聚合（可插拔：parquet 读 / mootdx / astock），带墙钟守护与失败计数。
-- `backend/app/services/stockdata_guardian.py` — 由 `intraday_guardian.py` 泛化（守护任意脚本，PID 锁 + 3s 自愈）。
+- `backend/app/services/stockdata/scheduler.py` — 自治调度：启动 backfill + 15:35 cron + 00:00 内存清理（线程）。
+- `backend/app/services/stockdata/sources.py` — 数据源聚合（可插拔：parquet 读 / mootdx / astock）+ 当日分钟内存库，带墙钟守护与失败计数。
+- `backend/app/services/stockdata_guardian.py` — 守护 stock data 服务（PID 锁 + 3s 自愈，泛化自 `intraday_guardian` 思路）。
 - `backend/app/quant/datasource/network_client.py` — 客户端 SDK（jqdata 风格，阻塞式，重连/超时/请求 id 关联）。
-- 删除/停用：`mootdx_intraday.py` 的进程托管逻辑并入 `scheduler.py`；`run_mootdx_intraday.py` 被 `run_stockdata_service.py` 取代；`intraday_guardian.py` 泛化为 `stockdata_guardian.py`。
+- **不移植/删除**：`mootdx_intraday.py`（主动盘中全量轮询循环）**不再需要**——实时改为客户端按需触发；`run_mootdx_intraday.py`/`intraday_guardian.py` 被 `run_stockdata_service.py`/`stockdata_guardian.py` 取代。
 
 ## 传输协议
 
@@ -75,7 +75,7 @@ FastAPI 主进程（前端 + 守护）
 | `get_all_securities(types=['stock','etf','index'], date=None)` | 全市场标的列表（name/上市日/退市日） |
 | `get_security_info(code)` | 单只标的元数据 |
 | `get_index_stocks(index_code, date=None)` | 指数成分股 |
-| `current_snapshot(codes)` | **批量最新行情**（当日分区 + 未覆盖标的 mootdx 并发补实时），对应模拟盘每轮 tick 的批量最新分钟线 |
+| `current_snapshot(codes)` | **批量最新行情**（当日分钟内存库 + 未覆盖标的 mootdx 按需并发补实时），对应模拟盘每轮 tick 的批量最新分钟线 |
 | `get_adj_factors(code)` | 前复权因子表 |
 
 **服务专用批量扩展**（jqdata 无全市场批量，模拟盘盘前/回测预载需要）
@@ -98,16 +98,28 @@ FastAPI 主进程（前端 + 守护）
 - `current_snapshot` 服务端并发回源口径沿用现有 `_guarded_get_minute`（墙钟 30s/只，超时重建 `MootdxSource`，指数标的排除）。
 - 服务端单只失败只标记该标的，不拖垮整批。
 
-## 并发去重回源（single-flight + 短 TTL 缓存）
+## 并发去重回源（single-flight + 当日分钟内存库）
 
 多个客户端可能同时请求同一标的的相同数据（如多个模拟盘账户同时 `current_snapshot` 同一 watch 集合、回测与模拟盘同时 `preload_daily`）。规则：
 
 - 服务端数据层对**每个数据键**做 single-flight 去重：同一键的并发请求只触发一次网络回源，其余请求等待同一 in-flight 结果并共享返回值，不重复回源。
-- **去重粒度是标的级（per-symbol），不是整批请求级**：两个交叉的批量请求（如 `current_snapshot([A,B,C])` 与 `current_snapshot([B,C,D])`）在 `rt:{B}`、`rt:{C}` 键上共享 in-flight/缓存结果，重叠部分 B、C 只回源一次，各自新标的 A、D 各自回源。
-- **实时键不含时间分量**：实时分钟键为 `rt:{code}`（不带 as_of），配合短 TTL 内存缓存（~10s），同一窗口内先后到达的交叉请求直接命中缓存，不回源——目标就是「实时数据不重复回源」。
+- **去重粒度是标的级（per-symbol），不是整批请求级**：两个交叉的批量请求（如 `current_snapshot([A,B,C])` 与 `current_snapshot([B,C,D])`）在 `rt:{B}`、`rt:{C}` 键上共享 in-flight/内存结果，重叠部分 B、C 只回源一次，各自新标的 A、D 各自回源。
+- **实时键不含时间分量**：实时分钟键为 `rt:{code}`（不带 as_of），同一分钟内到达的交叉请求直接命中共享结果，不回源——目标就是「实时数据不重复回源」。
 - 数据键粒度：实时分钟 `rt:{code}`、日线 `daily:{code}:{start}:{end}`、分钟 `min:{code}:{lo}:{hi}`、全市场日线 `preload_daily:{lookback_days}`。
 - 网络回源失败时释放该键并允许下一次重试（失败结果不入缓存）；请求方按各自 as_of 在返回帧上切片，不共享「时间」只共享「数据」。
 - 落盘仍走现有原子 `tmp→rename` 写分区；single-flight 只防重复网络拉取，不改变落盘语义。
+
+## 当日分钟内存库（按需回源，无主动轮询）
+
+**取消主动 intraday 全市场轮询进程**。实时分钟的取数完全由客户端请求驱动：
+
+1. **按需回源**：`current_snapshot(codes)` 只对「客户端请求到的、且内存缺失或最新 bar 过期」的标的现场拉 mootdx 实时分钟；不主动拉客户端没要的标的。
+2. **纯 lazy 内存库**：当日分钟内存库是空的 dict，**服务启动不预载、不预分配**；客户端没请求过的标的，不为其占用任何内存。只有被请求过的标的才进内存，当日驻留。
+3. **收盘后一次性拉取落盘**：客户端没请求过的标的，当天不拉——等 15:35 cron 收盘后批量同步（`sync_etf_minute` + `sync_stock_minute` 增量），全市场一次性拉取落盘到当日分区。
+4. **00:00 清空**：次日 00:00 定时清空前一日分钟内存库（或在首次访问发现日期已变时 lazy 清空兜底）。
+5. **交易时段门控**：实时回源只在交易时段（周一~五 09:30-11:30 / 13:00-15:00）执行；非交易时段 `current_snapshot` 只读内存/分区，不触网（避免收盘后对每只标的发起无效网络请求）。
+6. 指数标的（000300/399006 等）不参与实时回源（仅用日线，mootdx 无指数分钟，请求必超时）。
+7. 内存库容量 ≈ 当日被请求标的数 × 240 bar/日，通常仅几十只（模拟盘 watch 集合），几十 MB 以内。
 
 ## 数据流
 
@@ -115,8 +127,8 @@ FastAPI 主进程（前端 + 守护）
 ```
 runner._pre_market（盘前）: client.preload_daily(force=True)   ← 全市场日线到昨收（TCP 批量）
 runner 主循环每分钟      : feed.refresh → client.current_snapshot(watch_codes)
-                           → 服务端读当日 ETF 分钟分区 + 未覆盖标的 mootdx 并发补实时
-                           → 返回 {code: 最新 bar}
+                           → 服务端读当日分钟内存库 + 未覆盖标的 mootdx 并发补实时（按需）
+                           → 内存库更新 → 返回 {code: 最新 bar}
 策略 get_history/get_price: DataManager → client.get_price / get_minute_pool → TCP
 ```
 
@@ -164,10 +176,10 @@ uv run --extra dev mypy app
 
 ## 实施顺序
 
-1. **分支与移植**：从 `custom-main` 新建 `feature/stockdata-service`；从 `feature/mootdx-intraday` 移植 `mootdx_intraday.py`（并入服务调度）、`run_mootdx_intraday.py`/`intraday_guardian.py`（泛化为服务守护）、`mootdx_service.py` 的 `sync_index_daily` 及 staleness 检查。`minute_realtime_backfill` 不移植。
-2. **服务骨架**：TCP server + msgpack 协议 + 客户端 SDK 最小可用（`ping`/`get_price`/`current_snapshot`）。
-3. **服务自治调度**：启动 backfill + intraday 循环 + 15:35 cron 从主后端挪进服务；服务内自跑。
-4. **主后端集成**：guardian 泛化守护 stock data 服务；删除启动 backfill 与 15:35 mootdx_sync cron；前端不动。
+1. **分支与移植**：从 `custom-main` 新建 `feature/stockdata-service`；只移植 `mootdx_service.py` 的 `sync_index_daily` 及 staleness/告警检查（`mootdx_intraday.py` 主动轮询循环**不移植**——实时改为客户端按需回源）。
+2. **服务骨架**：TCP server + msgpack 协议 + 当日分钟内存库 + 客户端 SDK 最小可用（`ping`/`get_price`/`current_snapshot`）。
+3. **服务自治调度**：启动 backfill + 15:35 cron + 00:00 内存清理从主后端挪进服务；服务内自跑。
+4. **主后端集成**：guardian 守护 stock data 服务；删除启动 backfill 与 15:35 mootdx_sync cron；前端不动。
 5. **量化侧改造**：`DataManager` 改走 network_client（回测 + 模拟盘策略模式核心路径）。
 6. **量化侧改造**：`QuantDataProvider`（看护）+ `live_feed`（盘中分钟）改走 network_client；删除 `minute_realtime_backfill` 开关。
 7. **测试与回归**：新单测 + 既有测试改造 + wufu_v52 回测/模拟盘对齐验收 + 真实交易时段线上验证。
@@ -177,7 +189,8 @@ uv run --extra dev mypy app
 ## 成功标准
 
 - [ ] 量化回测/模拟盘运行期**零本地 parquet 读取、零 mootdx/astock 直连**，全部数据经 TCP 从 stock data 服务获取（可 grep 验证量化进程不再引用分区读取/mootdx 网络源代码路径）。
-- [ ] stock data 服务自治完成启动 backfill、盘中 intraday、15:35 同步；FastAPI 主进程只做守护（PID 锁 + 3s 自愈）。
+- [ ] stock data 服务自治完成启动 backfill、15:35 收盘批量同步、00:00 清空当日分钟内存；**无主动盘中全市场轮询**，实时分钟只在客户端请求时按需回源；FastAPI 主进程只做守护（PID 锁 + 3s 自愈）。
+- [ ] 当日分钟内存库为纯 lazy dict：未请求标的零内存占用，00:00 清空；实时分钟同键 1 分钟内最多回源一次。
 - [ ] 服务端单只失败不影响整批；客户端服务中断不崩模拟盘（沿用旧帧 + 重连）。
 - [ ] `get_price`/`current_snapshot`/`preload_daily` 与改造前输出一致。
 - [ ] wufu_v52 回归：回测对齐 `backtest_260401-260716`、模拟盘对齐 `sim_260710`，结果与改造前基线一致。
