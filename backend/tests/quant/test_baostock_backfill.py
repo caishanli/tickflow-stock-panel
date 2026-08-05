@@ -455,3 +455,42 @@ def test_sync_corporate_incremental_flush_no_loss(tmp_data, monkeypatch):
     adj2 = pl.read_parquet(tmp_data / "adj_factor_baostock" / "all.parquet")
     assert adj2["symbol"].n_unique() == 3
     assert set(st2["adj_done"]) == set(syms)
+
+
+class _Kill(BaseException):
+    """模拟运行中途被杀（BaseException 不被 except Exception 捕获）。"""
+
+
+def test_sync_corporate_kill_midrun_no_data_loss(tmp_data, monkeypatch):
+    """kill-window 判别测试：杀掉时已落盘的行 + done 标记必须一致（resume 不丢数据）。
+
+    旧实现（循环结束后才写表）在此测试下必挂：kill 发生在首批 flush 之后，
+    表文件不存在 → read_parquet 抛错。
+    """
+    syms = ["600036.SH", "000001.SZ", "600519.SH"]
+    monkeypatch.setattr(bb, "stock_universe", lambda: syms)
+    n = {"calls": 0}
+
+    def killing_adj(*a, **k):
+        n["calls"] += 1
+        if n["calls"] == 3:
+            raise _Kill()
+        return [["sh.600036", "2025-07-16", "0.95", "12.76", "12.76"]]
+
+    monkeypatch.setattr(bb, "query_adjust_factor_rows", killing_adj)
+    monkeypatch.setattr(bb, "query_dividend_rows", lambda *a, **k: [])
+    st = bb.load_state()
+    with pytest.raises(_Kill):
+        bb.sync_corporate(_date(2025, 1, 1), _date(2025, 12, 31), st,
+                          timeout=5, flush_batch=2)
+    adj = pl.read_parquet(tmp_data / "adj_factor_baostock" / "all.parquet")
+    assert adj["symbol"].n_unique() == 2  # 首批已落盘，kill 不丢
+    assert set(st["adj_done"]) == {"600036.SH", "000001.SZ"}
+    monkeypatch.setattr(bb, "query_adjust_factor_rows", lambda *a, **k: [
+        ["sh.600519", "2025-07-16", "0.95", "12.76", "12.76"]])
+    st2 = bb.load_state()
+    bb.sync_corporate(_date(2025, 1, 1), _date(2025, 12, 31), st2,
+                      timeout=5, flush_batch=2)
+    adj2 = pl.read_parquet(tmp_data / "adj_factor_baostock" / "all.parquet")
+    assert adj2["symbol"].n_unique() == 3
+    assert set(st2["adj_done"]) == set(syms)
