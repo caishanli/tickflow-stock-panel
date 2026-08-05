@@ -31,7 +31,8 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
       仅供兼容调用方传参）；
     - enabled: 向后兼容保留，不再启用任何 mootdx 直连路径。
 
-    单 code 失败保留内存旧帧并告警，不中断本轮。
+    loader 整体抛异常时本轮全量回退旧帧（单条告警）；单个 code 帧为 None/空
+    时仅该 code 保留内存旧帧并告警，不中断本轮。
     """
     now = pd.Timestamp(now or datetime.datetime.now())
     if loader is None:

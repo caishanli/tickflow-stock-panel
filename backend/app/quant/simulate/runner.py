@@ -482,20 +482,12 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
 def _trade_days_between(dm, start, end) -> list:
     """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。
 
-    优先用 dm 已有的 mootdx 源（避免重复建连），回退到 dm.fetch。
+    经 dm.fetch 走网络客户端取数，异常时回退为空列表。
     """
-    df = None
-    mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
-    if mootdx_src is not None:
-        try:
-            df = mootdx_src.get_daily("000300.XSHG", str(start), str(end))
-        except Exception:
-            df = None
-    if df is None:
-        try:
-            df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
-        except Exception:
-            pass
+    try:
+        df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+    except Exception:
+        df = None
     if df is None or df.empty:
         return []
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None

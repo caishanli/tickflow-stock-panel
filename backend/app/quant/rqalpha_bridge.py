@@ -1215,7 +1215,7 @@ def _load_etf_universe(dm):
     快照机制（保证同一策略结果可复现，不随每次启动的实时拉取漂移）：
     - 快照存在且 fetched_at 距今 ≤7 天：直接使用（离线/在线都优先）；
     - 快照缺失或过期：从本地缓存推导 ETF 代码列表；
-    - 名称通过 mootdx get_stock_names() 获取（不依赖外部网络）。
+    - 名称通过 network 源 get_stock_names() 获取（不依赖外部网络）。
     """
     snap = _read_etf_snapshot(_ETF_UNIVERSE_SNAPSHOT)
     fresh = (snap is not None
@@ -1234,7 +1234,7 @@ def _load_etf_universe(dm):
     etf_codes = [c for c in all_codes if _is_jq_etf_code(c)]
     names = {}
     try:
-        names = dm.sources["mootdx"].get_stock_names() or {}
+        names = dm.sources["network"].get_stock_names() or {}
     except Exception:
         pass
     names = {c: _clean_etf_name(n) for c, n in names.items()}

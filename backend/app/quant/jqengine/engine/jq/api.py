@@ -812,10 +812,10 @@ def get_security_name(code):
         return names[code]
     mgr = _state.get("manager")
     if mgr:
-        # 先尝试 mootdx 通达信简称
-        if "mootdx" in mgr.sources:
+        # 先尝试网络源通达信简称
+        if "network" in mgr.sources:
             try:
-                mootdx_names = mgr.sources["mootdx"].get_stock_names()
+                mootdx_names = mgr.sources["network"].get_stock_names()
                 pure = code.split(".")[0]
                 if pure in mootdx_names:
                     if names is None:
@@ -857,11 +857,11 @@ def get_all_securities(types=None, date=None):
     if mgr is None:
         return pd.DataFrame()
     types = types or ["etf"]
-    # 从 mootdx 获取通达信简称（与聚宽 display_name 一致）
+    # 从网络源获取通达信简称（与聚宽 display_name 一致）
     mootdx_names = {}
-    if "mootdx" in mgr.sources:
+    if "network" in mgr.sources:
         try:
-            mootdx_names = mgr.sources["mootdx"].get_stock_names()
+            mootdx_names = mgr.sources["network"].get_stock_names()
         except Exception:
             pass
     records = []
