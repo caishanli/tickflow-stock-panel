@@ -373,3 +373,55 @@ def test_etf_universe_fallback_partitions(tmp_data):
         "close": [1.0, 1.0], "volume": [1.0, 1.0], "amount": [1.0, 1.0],
     }), tmp_data / "kline_etf_daily")
     assert bb.etf_universe() == ["159919.SZ", "510300.SH"]
+
+
+def test_build_ex_factor_table():
+    # back 因子在除权日单调累积：1.0 → 2.0 → 4.0（两次 10送10）
+    events = {"sh.600036": [
+        (_date(2024, 6, 1), 1.0),
+        (_date(2025, 6, 1), 2.0),
+        (_date(2026, 6, 1), 4.0),
+    ]}
+    df = bb.build_ex_factor_table(events)
+    assert df["symbol"].to_list() == ["600036.SH"] * 3
+    # ex_factor = back/latest：1/4, 2/4, 4/4
+    assert [round(x, 4) for x in df["ex_factor"].to_list()] == [0.25, 0.5, 1.0]
+    # DataManager._adj_events 口径：相邻行 prev/curr = 0.5（10送10 事件因子）
+    f1 = df["ex_factor"][0] / df["ex_factor"][1]
+    f2 = df["ex_factor"][1] / df["ex_factor"][2]
+    assert f1 == 0.5 and f2 == 0.5
+
+
+def test_write_append_table_idempotent(tmp_path):
+    p = tmp_path / "all.parquet"
+    df = pl.DataFrame({"symbol": ["600036.SH"], "trade_date": [_date(2025, 7, 16)],
+                       "ex_factor": [0.9]})
+    bb._write_append_table(df, p, ["symbol", "trade_date"])
+    bb._write_append_table(df, p, ["symbol", "trade_date"])
+    out = pl.read_parquet(p)
+    assert out.height == 1
+    assert not (p.with_name(p.name + ".tmp")).exists()
+
+
+def test_sync_corporate_writes_adj_and_dividends(tmp_data, monkeypatch):
+    monkeypatch.setattr(bb, "stock_universe", lambda: ["600036.SH"])
+    monkeypatch.setattr(bb, "query_adjust_factor_rows", lambda *a, **k: [
+        ["sh.600036", "2025-07-16", "0.954887", "12.763991", "12.763991"],
+    ])
+    monkeypatch.setattr(bb, "query_dividend_rows", lambda *a, **k: [
+        {"code": "sh.600036", "dividOperateDate": "2025-07-11",
+         "dividPayDate": "2025-07-11", "dividCashPsBeforeTax": "2",
+         "dividCashPsAfterTax": "1.8", "dividStocksPs": "0.000000",
+         "dividCashStock": "", "dividReserveToStockPs": ""},
+    ])
+    st = bb.load_state()
+    out = bb.sync_corporate(_date(2025, 1, 1), _date(2025, 12, 31), st, timeout=5)
+    assert out["adj"] == 1 and out["dividends"] == 1
+    adj = pl.read_parquet(tmp_data / "adj_factor" / "all.parquet")
+    assert adj["symbol"].to_list() == ["600036.SH"]
+    assert adj["trade_date"][0] == _date(2025, 7, 16)
+    assert adj["ex_factor"][0] == pytest.approx(1.0)  # 唯一事件=最新 → 1.0
+    div = pl.read_parquet(tmp_data / "dividends" / "all.parquet")
+    assert div["cash_ps_before_tax"][0] == 2.0
+    assert set(st["adj_done"]) == {"600036.SH"}
+    assert set(st["dividends_done"]) == {"600036.SH"}

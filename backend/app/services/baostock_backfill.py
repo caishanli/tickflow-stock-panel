@@ -541,3 +541,150 @@ def sync_daily(start: _date, end: _date, state: dict, timeout: float = 300,
             save_state(state)
         stats[name] = {"symbols": len(todo), "rows": total}
     return stats
+
+
+def build_ex_factor_table(events: dict[str, list[tuple[_date, float]]]) -> pl.DataFrame:
+    """backAdjustFactor 事件 → 动态前复权累计 ex_factor（锚定最新事件日 = 1.0）。
+
+    事件行 ex_factor = back(d) / back(latest)。DataManager._adj_events 用相邻行
+    比例重建事件因子（prev/curr）：10送10 → 0.5 跳变 ✓（与 adj_factor_etf 同构）。
+    """
+    frames = []
+    for code, evs in events.items():
+        evs = sorted(set(evs))
+        if not evs:
+            continue
+        latest_back = evs[-1][1]
+        if latest_back <= 0:
+            continue
+        frames.append(pl.DataFrame({
+            "symbol": [from_baostock_code(code)] * len(evs),
+            "trade_date": [d for d, _ in evs],
+            "ex_factor": [b / latest_back for _, b in evs],
+        }))
+    if not frames:
+        return pl.DataFrame(schema={
+            "symbol": pl.Utf8, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    return pl.concat(frames).sort(["symbol", "trade_date"])
+
+
+def _write_append_table(df: pl.DataFrame, path: Path, keys: list[str]) -> None:
+    """整表原子写（读旧→concat→unique keep=last→tmp→rename），幂等。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        old = pl.read_parquet(path)
+        df = pl.concat([old, df]).unique(subset=keys, keep="last").sort(keys)
+    tmp = path.with_name(path.name + ".tmp")
+    df.write_parquet(tmp)
+    tmp.rename(path)
+
+
+def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
+                   retry_failed: bool = False, limit: int | None = None,
+                   progress=None) -> dict:
+    """复权因子 + 分红送转明细回源（全市场股票）。
+
+    - adj：逐只 query_adjust_factor → 事件行 ex_factor 表 → data/adj_factor/all.parquet
+    - dividends：逐只 × 逐年（start.year..end.year）query_dividend_data →
+      data/dividends/all.parquet；只保留 start<=ex_date<=end 且 ex_date 非空的行
+    - 断点：state['adj_done'] / state['dividends_done']（按 symbol 粒度）
+    """
+    stats = {"adj": 0, "dividends": 0}
+    syms = stock_universe()
+    # ---- 复权因子 ----
+    done_adj = set(state["adj_done"])
+    failed_adj = state["failed"].get("adj", {})
+    todo_adj = [s for s in syms if s not in done_adj]
+    if not retry_failed:
+        todo_adj = [s for s in todo_adj if s not in failed_adj]
+    if limit is not None:
+        todo_adj = todo_adj[:limit]
+    logger.info("[adj] 回源 %d 只（已覆盖 %d）", len(todo_adj), len(done_adj))
+    events: dict[str, list[tuple[_date, float]]] = {}
+    for i, sym in enumerate(todo_adj, 1):
+        code = to_baostock_code(sym)
+        try:
+            rows = query_adjust_factor_rows(code, start.isoformat(), end.isoformat(), timeout)
+            evs = []
+            for r in rows:
+                if len(r) < 4 or not r[1]:
+                    continue
+                b = _safe_float(r[3])  # backAdjustFactor
+                if b is None or b <= 0:
+                    continue
+                try:
+                    evs.append((_date.fromisoformat(r[1]), b))
+                except Exception:  # noqa: BLE001
+                    continue
+            if evs:
+                events[code] = evs
+        except Exception as e:  # noqa: BLE001
+            mark_failed(state, "adj", sym, str(e)[:120])
+            append_failure(sym, f"adj:{str(e)[:120]}")
+            save_state(state)
+            continue
+        mark_done(state, "adj", sym)
+        if i % 100 == 0:
+            save_state(state)
+            if progress:
+                progress("adj", i, len(todo_adj), len(events))
+    save_state(state)
+    if events:
+        df = build_ex_factor_table(events)
+        _write_append_table(df, ADJ_FACTOR_PATH, ["symbol", "trade_date"])
+        stats["adj"] = df.height
+        logger.info("[adj] 因子表 %d 行 → %s", df.height, ADJ_FACTOR_PATH)
+    # ---- 分红送转明细 ----
+    years = list(range(start.year, end.year + 1))
+    done_div = set(state["dividends_done"])
+    failed_div = state["failed"].get("dividends", {})
+    todo_div = [s for s in syms if s not in done_div]
+    if not retry_failed:
+        todo_div = [s for s in todo_div if s not in failed_div]
+    if limit is not None:
+        todo_div = todo_div[:limit]
+    logger.info("[dividends] 回源 %d 只 × %d 年（已覆盖 %d）",
+                len(todo_div), len(years), len(done_div))
+    div_frames: list[pl.DataFrame] = []
+    for i, sym in enumerate(todo_div, 1):
+        code = to_baostock_code(sym)
+        all_ok = True
+        for y in years:
+            try:
+                recs = query_dividend_rows(code, y, timeout)
+            except Exception as e:  # noqa: BLE001
+                all_ok = False
+                mark_failed(state, "dividends", sym, f"{y}:{str(e)[:100]}")
+                append_failure(sym, f"dividend:{y}:{str(e)[:100]}")
+                continue
+            for rec in recs:
+                ex = (rec.get("dividOperateDate") or "").strip()
+                if not ex:
+                    continue
+                try:
+                    ex_d = _date.fromisoformat(ex)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not (start <= ex_d <= end):
+                    continue
+                div_frames.append(pl.DataFrame({
+                    "symbol": [sym], "ex_date": [ex_d],
+                    "cash_ps_before_tax": [_safe_float(rec.get("dividCashPsBeforeTax"))],
+                    "cash_ps_after_tax": [_safe_float(rec.get("dividCashPsAfterTax"))],
+                    "stocks_ps": [_safe_float(rec.get("dividStocksPs"))],
+                    "reserve_to_stock_ps": [_safe_float(rec.get("dividReserveToStockPs"))],
+                }))
+        if all_ok:
+            mark_done(state, "dividends", sym)
+        if i % 100 == 0:
+            save_state(state)
+            if progress:
+                progress("dividends", i, len(todo_div), len(div_frames))
+    save_state(state)
+    if div_frames:
+        df = pl.concat(div_frames).unique(
+            subset=["symbol", "ex_date"], keep="last").sort(["symbol", "ex_date"])
+        _write_append_table(df, DIVIDENDS_PATH, ["symbol", "ex_date"])
+        stats["dividends"] = df.height
+        logger.info("[dividends] 明细 %d 行 → %s", df.height, DIVIDENDS_PATH)
+    return stats
