@@ -162,6 +162,11 @@ def test_response_parquet():
 Run: `uv run --extra dev pytest tests/quant/test_stockdata_protocol.py -q`
 Expected: FAIL（`ModuleNotFoundError`）。
 
+- [ ] **Step 2b: 添加 msgpack 依赖**
+
+Run: `uv add msgpack`
+Expected: 成功更新 `pyproject.toml` 与 `uv.lock`（`msgpack` 为唯一新增依赖）。
+
 - [ ] **Step 3: 实现 protocol.py**
 
 ```python
@@ -350,10 +355,11 @@ from typing import Any
 
 
 class _Flight:
-    __slots__ = ("ev", "result", "error")
+    __slots__ = ("ev", "started", "result", "error")
 
     def __init__(self) -> None:
         self.ev = threading.Event()
+        self.started = False
         self.result: Any = None
         self.error: BaseException | None = None
 
@@ -371,18 +377,11 @@ class SingleFlight:
             if flight is None:
                 flight = _Flight()
                 self._inflight[key] = flight
-        if flight.ev.is_set() and flight is self._inflight.get(key):
-            # 已完成的缓存值（调用方仅在同 key 未完成时第二次进入，见 DedupCache）
-            if flight.error is not None:
-                raise flight.error
-            return flight.result
-        if not flight.ev.is_set() and self._inflight.get(key) is not flight:
-            # 有更新的一批在跑，等它
-            pass
-        if self._inflight.get(key) is flight and not flight.ev.is_set():
-            is_leader = True
-        else:
-            is_leader = False
+            if not flight.started:
+                flight.started = True  # 原子选举 leader：并发只有一个真 leader
+                is_leader = True
+            else:
+                is_leader = False
         if is_leader:
             try:
                 flight.result = loader()
@@ -537,10 +536,14 @@ def test_minute_memory_store_lazy_and_clear():
     assert ms.day() == day
     got = ms.get_slice({"600000.SH"}, "2000-01-01 00:00:00", f"{day} 15:00:00")
     assert not got.is_empty()
-    # 换日 lazy 清空
-    ms.ensure_day(_dt.date.today() + _dt.timedelta(days=1))
-    assert ms.day() is None
+    # 换日 lazy 清空：ensure_day(次日) 后旧帧全部清空
+    nxt = day + _dt.timedelta(days=1)
+    ms.ensure_day(nxt)
+    assert ms.day() == nxt
     assert ms.get_slice({"600000.SH"}, "2000-01-01 00:00:00", f"{day} 15:00:00").is_empty()
+    # clear() 显式清空后回到初始态
+    ms.clear()
+    assert ms.day() is None
 
 
 def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
@@ -1547,10 +1550,10 @@ from app.services.stockdata.server import StockDataServer
 from app.services.stockdata.sources import DataSources
 
 
-@pytest.fixture(scope="module")
-def server_and_client(tmp_path_factory):
+@pytest.fixture
+def server_and_client(tmp_path, monkeypatch):
     import socket
-    root = tmp_path_factory.mktemp("sd")
+    root = tmp_path / "sd"
     day = _dt.date.today().isoformat()
     for sub, sym, ts, close in (
         ("kline_etf_minute", "512670.SH", f"{day} 10:00:00", 1.05),
@@ -1562,6 +1565,8 @@ def server_and_client(tmp_path_factory):
             "symbol": [sym], "datetime": [ts], "open": [close], "high": [close],
             "low": [close], "close": [close], "volume": [1000], "amount": [close * 1000.0],
         }).write_parquet(os.path.join(d, "part.parquet"))
+    # 非交易时段门控：current_snapshot 不触网（fixture 无 mootdx，测试只验读路径）
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
     srv = StockDataServer(("127.0.0.1", 0), DataSources(data_root=str(root), mootdx_factory=None))
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -2076,8 +2081,8 @@ def test_network_source_get_daily():
     assert df["close"].iloc[-1] == 1.1
 
 
-def test_datamanager_preload_via_client():
-    dm = DataManager(cache=DataCache(root="/tmp/opencode/sd-cache"),
+def test_datamanager_preload_via_client(tmp_path):
+    dm = DataManager(cache=DataCache(root=str(tmp_path / "cache")),
                      client=FakeClient())
     dm.preload_daily()
     assert "get_daily_512670.XSHG" in dm._daily_mem
