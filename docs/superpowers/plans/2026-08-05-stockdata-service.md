@@ -282,11 +282,13 @@ from app.services.stockdata.single_flight import DedupCache, SingleFlight, TTLCa
 def test_single_flight_only_fetches_once():
     sf = SingleFlight()
     calls = []
-    barrier = threading.Barrier(5)
+    entered = threading.Event()
+    release = threading.Event()
 
     def loader():
         calls.append(1)
-        barrier.wait()  # 让所有并发请求都到达 single-flight 再返回
+        entered.set()       # leader 进入 loader
+        release.wait(5)     # 保持 loader 挂起，等 4 个 follower 阻塞在 ev.wait
         return 42
 
     results = []
@@ -295,9 +297,14 @@ def test_single_flight_only_fetches_once():
 
     ts = [threading.Thread(target=worker) for _ in range(5)]
     for t in ts: t.start()
+    entered.wait(2)         # 等 leader 已进 loader
+    time.sleep(0.05)        # 让 follower 全部到达 sf.run 并 park
+    release.set()
     for t in ts: t.join()
     assert results == [42] * 5
     assert len(calls) == 1  # 只回源一次
+    # 说明：不能用 Barrier(5) 在 loader 里等——single-flight 下 loader 只执行一次，
+    # 永远凑不齐 5 人必死锁；用事件保持 + 短暂 sleep 保证 follower 并发到达。
 
 
 def test_single_flight_releases_on_error():
