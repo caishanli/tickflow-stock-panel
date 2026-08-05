@@ -12,11 +12,11 @@ logger = logging.getLogger("jqengine.dm")
 
 from .cache import DataCache
 from .mootdx_src import MootdxSource
-from .astock_src import AStockSource
 from .base import DataSourceError
+from .network_source import NetworkSource
 from ..config import CONFIG, REPO_ROOT
 
-SOURCES = {"mootdx": MootdxSource, "astock": AStockSource}
+SOURCES = {"network": NetworkSource}
 
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
@@ -169,9 +169,16 @@ class DataManager:
     重复读取不重复请求接口。
     """
 
-    def __init__(self, token=None, cache=None, minute_mem_cap=None):
+    def __init__(self, token=None, cache=None, minute_mem_cap=None, **kwargs):
         self.cache = cache or DataCache()
-        self.sources = {k: v() for k, v in SOURCES.items()}
+        self.client = kwargs.pop("client", None)
+        if self.client is None:
+            from app.quant.datasource.network_client import StockDataClient
+            self.client = StockDataClient()
+        self.sources = {k: v(self.client) for k, v in SOURCES.items()}
+        # 网络单一数据源：把优先级固定为 network（避免旧 mootdx/astock 键
+        # 参与 _maybe_demote / _priority 导致空列表）
+        CONFIG["DATASOURCE_PRIORITY"] = ["network"]
         # 历史分钟线：优先走真实源（mootdx 分页回看）
         self._minute_win = None  # (start, end) 回测窗口
         self._minute_cov = {}  # code -> (lo_ts, hi_ts) 缓存帧已覆盖区间
@@ -218,27 +225,12 @@ class DataManager:
         if self._adj_factor is not None:
             return self._adj_factor
         self._adj_factor = {}
-        import glob as _glob
-        roots = [
-            os.path.join(self._partition_root(), "adj_factor_etf"),
-        ]
-        paths = []
-        for r in roots:
-            if os.path.isdir(r):
-                paths.extend(_glob.glob(
-                    os.path.join(r, "**", "*.parquet"), recursive=True))
-        if not paths:
-            return self._adj_factor
         try:
-            import polars as pl
-            lf = pl.scan_parquet(paths, hive_partitioning=True)
-            cols = lf.columns if isinstance(lf, pl.LazyFrame) else []
-            if "symbol" not in cols:
-                lf = lf.with_columns(pl.lit("").alias("symbol"))
-            df = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
-            for row in df.iter_rows():
-                jq = self._to_jq_code(row[0])
-                self._adj_factor.setdefault(jq, {})[pd.Timestamp(row[1])] = float(row[2])
+            df = self.client.get_adj_factors()
+            if df is not None and not df.empty:
+                for row in df.to_dict("records"):
+                    jq = self._to_jq_code(row["symbol"])
+                    self._adj_factor.setdefault(jq, {})[pd.Timestamp(row["trade_date"])] = float(row["ex_factor"])
         except Exception as e:
             logger.warning("[DataManager] adj_factor 加载失败: %s", e)
         return self._adj_factor
@@ -382,85 +374,22 @@ class DataManager:
                 continue
         print(f"[preload] 分钟线: {count}/{len(codes)} 只")
 
-    def preload_daily(self):
-        """一次性加载全部日线缓存到内存，避免回测中逐文件读取。
-
-        一条查询把整库日线缓存读入内存，同一代码多源缓存并存时按数据源
-        优先级 + 复权口径选帧（:func:`_pick_daily_frame`：优先非 raw 的
-        前复权帧，全 raw 才用 raw，保证回测内复权口径尽量统一），存入
-        _daily_mem。
-
-        优先从按日分区 Parquet（data/kline_daily/date=.../）加载全市场日线；
-        分区不存在时回退读 quant_kline/daily 每股票缓存。
-
-        幂等：同一实例已加载过（_daily_mem 已有分区数据）时直接返回，避免
-        run_jq_backtest 调两次 preload_daily 各做一次全市场重读（64s×2 冗余）。
-        """
-        if getattr(self, "_daily_preloaded", False):
+    def preload_daily(self, force: bool = False):
+        if getattr(self, "_daily_preloaded", False) and not force:
             return
-        # 分区优先：按日分区 Parquet 是全市场日线的权威来源（列存、无锁）。
-        from_part = self._load_daily_from_partitions(asof=None)
-        if from_part:
-            for jq, df in from_part.items():
-                self._daily_mem[f"get_daily_{jq}"] = df
-            self._daily_ver += 1
-            self._daily_preloaded = True
-            return
-        all_daily = self.cache.get_all("daily")
-        if not all_daily:
-            print("[preload] 日线缓存为空")
-            return
-        priority = self._priority()
-        # 收集每只标的的全部源候选帧（按优先级升序），交由 _pick_daily_frame
-        # 做"qfq 优先于 raw"的混源防护选帧（空帧不参与候选）
-        cands = {}  # jq_code -> [(pri_idx, src_name, key, df)]
-        for key, df in all_daily.items():
-            if "_" not in key:
-                continue
-            src_name, raw_code = key.split("_", 1)
-            if df is None or (hasattr(df, "empty") and df.empty):
-                continue
-            jq_code = self._to_jq_code(raw_code)
-            pri = priority.index(src_name) if src_name in priority else len(priority)
-            cands.setdefault(jq_code, []).append((pri, src_name, key, df))
-        count = 0
-        for jq_code, lst in cands.items():
-            lst.sort(key=lambda c: c[0])
-            picked = _pick_daily_frame(lst)
-            if picked is None:
-                continue
-            src_name, key, df = picked[1], picked[2], picked[3]
-            # 预计算 trade_dt 列（date 对象），避免 get_daily_money_cached
-            # 每天对每只重复 pd.to_datetime（全市场 1600+ 只 × 130 天极慢）。
-            if "trade_dt" not in df.columns:
-                if "trade_date" in df.columns:
-                    df = df.copy()
-                    df["trade_dt"] = pd.to_datetime(
-                        df["trade_date"].astype(str)).dt.date
-                elif "datetime" in df.columns:
-                    df = df.copy()
-                    df["trade_dt"] = pd.to_datetime(
-                        df["datetime"]).dt.date
-            # 成交额单位归一（amount → money，单位：元），下游
-            # get_daily_money_cached / total_turnover 统一用 money(元)
-            df = _ensure_money_yuan(df, src_name)
-            # 成交量单位归一（vol → volume，单位：股），与 money 同模式
-            df = _ensure_volume_shares(df, src_name)
-            # 确保 index 是 DatetimeIndex：批量路径 _get_price_batch_daily
-            # 依赖 isinstance(idx, DatetimeIndex) 做日期切片，若为 RangeIndex
-            # 会被全部跳过导致 get_price 返回空。
-            if not isinstance(df.index, pd.DatetimeIndex):
-                if "trade_date" in df.columns:
-                    df.index = pd.to_datetime(df["trade_date"].astype(str))
-                elif "datetime" in df.columns:
-                    df.index = pd.to_datetime(df["datetime"])
-                elif "timestamp" in df.columns:
-                    df.index = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
-            self._daily_mem[f"get_daily_{jq_code}"] = df
-            count += 1
-        # 日线内存已整体刷新：递增数据版本号，使 money memo 按新版本键重建
-        self._daily_ver += 1
-        print(f"[preload] 日线: {count} 只ETF, {len(cands)} 缓存键")
+        try:
+            from_part = self.client.preload_daily(
+                lookback_days=self._DAILY_LOOKBACK_DAYS,
+                asof=pd.Timestamp.now().normalize().date() - pd.Timedelta(days=1))
+            if from_part:
+                for jq, df in from_part.items():
+                    self._daily_mem[f"get_daily_{jq}"] = df
+                self._daily_ver += 1
+                self._daily_preloaded = True
+                return
+        except Exception as e:
+            logger.warning("[DataManager] preload_daily 网络取数失败: %s", e)
+        print("[preload] 日线缓存为空")
 
     def _load_daily_from_partitions(self, asof: pd.Timestamp) -> dict[str, pd.DataFrame]:
         """从按日分区 Parquet（data/kline_daily/ 与 data/kline_etf_daily/）加载全市场日线。
@@ -599,38 +528,19 @@ class DataManager:
             raise DataSourceError(f"离线模式本地缺失: {cache_key}")
         last_err = ""
         for name in self._priority():
-            src = self.sources[name]
             try:
                 if method in ("get_daily",):
                     code = args[0]
-                    fetch_args = list(args)
-                    df = self.cache.get(
-                        "daily", f"{name}_{code}",
-                        lambda s=src, a=fetch_args: getattr(s, method)(*a, **kwargs),
-                        *(fetch_args[1:3] if len(fetch_args) > 1 else []),
-                    )
+                    df = getattr(self.sources["network"], method)(*args, **kwargs)
                     if df is None or (hasattr(df, "empty") and df.empty):
-                        raise DataSourceError(f"{name} 空数据")
-                    # 与 preload 同口径：成交额单位归一为 money(元)、
-                    # 成交量单位归一为 volume(股)
-                    df = _ensure_money_yuan(df, name)
-                    df = _ensure_volume_shares(df, name)
-                    # 确保 index 是 DatetimeIndex（同 preload_daily 逻辑）
-                    if not isinstance(df.index, pd.DatetimeIndex):
-                        if "trade_date" in df.columns:
-                            df.index = pd.to_datetime(df["trade_date"].astype(str))
-                        elif "datetime" in df.columns:
-                            df.index = pd.to_datetime(df["datetime"])
-                        elif "timestamp" in df.columns:
-                            df.index = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+                        raise DataSourceError(f"network 空数据")
                     self._daily_mem[cache_key] = df
-                    self._daily_ver += 1  # 日线内存有写入，money memo 旧版本键失效
-                    self._src_fail[name] = 0  # 该源成功取数，重置连续失败计数
+                    self._daily_ver += 1
+                    self._src_fail["network"] = 0
                     return df
-                result = getattr(src, method)(*args, **kwargs)
+                result = getattr(self.sources["network"], method)(*args, **kwargs)
                 self._daily_mem[cache_key] = result
                 self._daily_ver += 1
-                self._src_fail[name] = 0
                 return result
             except Exception as e:
                 last_err = f"{name}: {e}"
@@ -797,66 +707,12 @@ class DataManager:
         return df
 
     def _load_minute_pool_from_partitions(self, codes, lo_ts, hi_ts):
-        """批量从按日分区 Parquet 加载多个标的的分钟数据（一次 scan）。
-
-        供 ``preload_minute_for_pool`` 使用：把 codes 中所有标的在 [lo_ts, hi_ts]
-        滑窗内的分钟一次性取回，替代逐标的 ``_load_minute_from_partitions``
-        各自的 scan_parquet（数百次全目录扫描 → 1~2 次）。
-
-        返回 {jq_code: DataFrame}，帧为 DatetimeIndex 索引；无数据的标的不在返回中。
-        """
         if not codes:
             return {}
         try:
-            import polars as pl
-            lo_d = pd.Timestamp(lo_ts).date() if lo_ts is not None else None
-            hi_d = pd.Timestamp(hi_ts).date() if hi_ts is not None else None
-            # code -> 分区内的 .SH/.SZ 符号
-            syms = []
-            for code in codes:
-                sym_tf = code.split(".", 1)
-                tf_sym = sym_tf[0] + ("." + ("SH" if sym_tf[1] in ("XSHG", "SH") else "SZ")
-                                      if len(sym_tf) > 1 else "")
-                syms.append(tf_sym)
-            out: dict[str, pd.DataFrame] = {}
-            for subdir in ("kline_etf_minute", "kline_minute"):
-                root = os.path.join(self._partition_root(), subdir)
-                if not os.path.isdir(root):
-                    continue
-                # 只 glob 请求日期区间内的分区目录（避免 **/*.parquet 全扫）
-                import glob as _glob
-                paths = []
-                for name in os.listdir(root):
-                    if not name.startswith("date="):
-                        continue
-                    ds = name[len("date="):]
-                    if lo_d is not None and ds < str(lo_d):
-                        continue
-                    if hi_d is not None and ds > str(hi_d):
-                        continue
-                    paths.extend(_glob.glob(os.path.join(root, name, "*.parquet")))
-                if not paths:
-                    continue
-                lf = pl.scan_parquet(paths, hive_partitioning=True)
-                lf = lf.filter(pl.col("symbol").is_in(syms))
-                df = lf.select(["symbol", "datetime", "open", "high", "low",
-                                "close", "volume", "amount"]).collect()
-                if df.is_empty():
-                    continue
-                sym_to_jq = {s: c for c, s in zip(codes, syms)}
-                for sym, sub in df.group_by("symbol", maintain_order=True):
-                    s = sym[0] if isinstance(sym, tuple) else sym
-                    jq = sym_to_jq.get(s)
-                    if jq is None:
-                        continue
-                    pdf = sub.to_pandas()
-                    pdf = pdf.set_index(pd.to_datetime(pdf["datetime"]))
-                    pdf.index.name = None
-                    pdf = pdf.drop(columns=["symbol", "datetime"])
-                    out[jq] = pdf
-            return out
+            return self.client.get_minute_pool(codes, lo_ts, hi_ts)
         except Exception as e:
-            logger.warning("[DataManager] 分钟池批量读取失败: %s", e)
+            logger.warning("[DataManager] 分钟池网络取数失败: %s", e)
             return {}
 
     def preload_minute_for_pool(self, codes, as_of=None):
@@ -1036,143 +892,22 @@ class DataManager:
         return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
 
     def _load_minute_from_partitions(self, code, lo_ts, hi_ts):
-        """从按日分区 Parquet 读取某标的的分钟数据。
-
-        分区根：data/kline_etf_minute/date=YYYY-MM-DD/（ETF）或
-        data/kline_minute/date=YYYY-MM-DD/（股票）。用 Polars 惰性扫描
-        [lo_ts, hi_ts] 覆盖的日期分区，过滤 symbol 后返回 DatetimeIndex
-        索引的 DataFrame；分区不存在/无该标的数据返回 None。
-
-        Perf：只 glob 请求日期区间内的分区目录（而非 `**/*.parquet` 全目录
-        扫描），实测单标的单窗口从 ~220ms 降到 ~30ms。
-        """
         try:
-            import glob as _glob
-            import polars as pl
-            lo_d = pd.Timestamp(lo_ts).date() if lo_ts is not None else None
-            hi_d = pd.Timestamp(hi_ts).date() if hi_ts is not None else None
-            sym_tf = code.split(".", 1)
-            tf_sym = sym_tf[0] + ("." + ("SH" if sym_tf[1] in ("XSHG", "SH") else "SZ")
-                                  if len(sym_tf) > 1 else "")
-            for subdir in ("kline_etf_minute", "kline_minute"):
-                root = os.path.join(self._partition_root(), subdir)
-                if not os.path.isdir(root):
-                    continue
-                paths = []
-                for name in os.listdir(root):
-                    if not name.startswith("date="):
-                        continue
-                    ds = name[len("date="):]
-                    if lo_d is not None and ds < str(lo_d):
-                        continue
-                    if hi_d is not None and ds > str(hi_d):
-                        continue
-                    paths.extend(_glob.glob(os.path.join(root, name, "*.parquet")))
-                if not paths:
-                    continue
-                lf = pl.scan_parquet(paths, hive_partitioning=True)
-                lf = lf.filter(pl.col("symbol") == tf_sym)
-                df = lf.select(["datetime", "open", "high", "low", "close",
-                                "volume", "amount"]).collect()
-                if df.is_empty():
-                    continue
-                pdf = df.to_pandas()
-                pdf = pdf.set_index(pd.to_datetime(pdf["datetime"]))
-                pdf.index.name = None
-                pdf = pdf.drop(columns=["datetime"])
-                return pdf
-            return None
+            out = self.client.get_price(code, frequency="1m",
+                                        start_date=str(lo_ts) if lo_ts is not None else None,
+                                        end_date=str(hi_ts) if hi_ts is not None else None)
+            return out.get(code)
         except Exception as e:
-            logger.warning("[DataManager] 分钟分区读取失败 %s: %s", code, e)
+            logger.warning("[DataManager] 分钟网络取数失败 %s: %s", code, e)
             return None
 
     def _load_real_minute(self, code, lo_ts, hi_ts, all_min):
-        """缺口感知的真实分钟线获取（本地基底 + mootdx 仅补后续缺口）。
-
-        本地命中 → 作为基底返回；仅当请求超出本地末端时才对"本地之后的缺口"
-        回源 mootdx 并合并写回。这样不会用 mootdx 全量窗口覆盖掉本地较早的真实
-        1 分钟——否则缓存会随"今天"推移不断缩水。
-
-        请求整体早于本地最早日期（且本地无数据）→ mootdx 也取不到 → 返回 None。
-
-        优先从按日分区 Parquet（data/kline_etf_minute/date=.../）读取；
-        分区命中时：离线回测直接返回不联网；在线/模拟盘则以分区为基底，
-        仅对分区末端之后的缺口回源 mootdx（避免在线分钟数据陈旧）。
-        """
-        from_part = self._load_minute_from_partitions(code, lo_ts, hi_ts)
-        real_key = f"real_{code}"
-        local = None
-        if from_part is not None and not from_part.empty:
-            self._minute_real_cov[code] = (from_part.index.min(), from_part.index.max())
-            if self._offline:
-                # 离线回测：分区命中即返回，不联网补缺口
-                return from_part
-            # 在线/模拟盘：分区作为基底，后续对分区末端之后的缺口补 mootdx
-            local = from_part
-        elif all_min is not None:
-            local = all_min.get(real_key)
-        else:
-            local = self.cache.peek("minute", real_key)
-        if local is not None and not local.empty:
-            self._minute_real_cov.setdefault(
-                code, (local.index.min(), local.index.max()))
-            local_end = local.index.max()
-            if hi_ts > local_end:
-                # 仅补本地之后的缺口，避免覆盖本地较早的真实 1 分钟
-                fresh = None
-                if self._offline:
-                    pass  # 离线：不联网补缺口
-                else:
-                    try:
-                        # 限制拉取量：缺口约 N 个交易日 × 240 bar/天，加 50% 余量
-                        gap_days = max((hi_ts - local_end).days, 1)
-                        max_bars = min(gap_days * 360, 30000)
-                        fresh = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
-                    except Exception as e:
-                        import logging
-                        logging.warning("[DataManager] mootdx回源补充缺口失败 %s: %s", code, e)
-                        fresh = None
-                if fresh is not None and not fresh.empty:
-                    fresh = fresh[fresh.index > local_end]
-                    if not fresh.empty:
-                        combined = pd.concat([local, fresh]).sort_index()
-                        combined = combined[~combined.index.duplicated(keep="last")]
-                        # C1 绝对约束：本地缺失段由 mootdx 真实获取后必须落盘，
-                        # 下次回测直接命中本地，避免反复联网。仅真实 1m 落盘。
-                        try:
-                            self.cache.put("minute", real_key, combined)
-                        except Exception as e:
-                            import logging
-                            logging.warning("[DataManager] real_ 落盘失败 %s: %s", code, e)
-                        self._minute_real_cov[code] = (
-                            combined.index.min(), combined.index.max())
-                        return combined
-            return local
-        cov = self._minute_real_cov.get(code)
-        if cov is not None and hi_ts < cov[0]:
-            # 请求区间整体早于已知最早日期，回源也取不到 -> 跳过
-            return None
-        if self._offline:
-            # 离线：完全缺失的标的不再联网回源，直接返回 None 由上层跳过
-            return None
-        try:
-            # 无本地缓存：按请求窗口估算拉取量，避免默认30000全量拉取
-            win_days = max((hi_ts - lo_ts).days, 1) if lo_ts and hi_ts else 15
-            max_bars = min(win_days * 360, 30000)
-            df = self.sources["mootdx"].get_minute(code, max_bars=max_bars)
-        except Exception as e:
-            import logging
-            logging.warning("[DataManager] mootdx首次获取分钟数据失败 %s: %s", code, e)
-            return None
+        df = self._load_minute_from_partitions(code, lo_ts, hi_ts)
         if df is not None and not df.empty:
-            # C1 绝对约束：mootdx 真实获取的 1m 必须落盘，供后续回测复用。
-            try:
-                self.cache.put("minute", real_key, df)
-            except Exception as e:
-                import logging
-                logging.warning("[DataManager] real_ 首次落盘失败 %s: %s", code, e)
             self._minute_real_cov[code] = (df.index.min(), df.index.max())
             return df
+        if getattr(self, "_offline_missing_warn", False):
+            logger.warning("[DataManager] 离线分钟缺失（网络无数据）: %s", code)
         return None
 
     @staticmethod
