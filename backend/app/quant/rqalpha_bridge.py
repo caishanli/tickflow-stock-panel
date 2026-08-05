@@ -207,20 +207,21 @@ class QuantRQAlphaDataSource:
         # 交易日历来源：直接用缓存里所有日线数据的日期并集（不依赖
         # provider.get_daily，避免 offline 模式下缓存未命中即 raise 导致
         # 日历为空、回测报"区间内无数据"）。
-        try:
-            _all_daily = provider.cache.get_all("daily")
-            for _k, _df in _all_daily.items():
-                if _df is None or getattr(_df, "empty", True):
-                    continue
-                # 各源日线 schema 先归一（mootdx datetime 索引等），
-                # 否则非 date 列命名的缓存帧被跳过、交易日历覆盖不足
-                _df = self._normalize_daily_df(_df)
-                if "date" not in _df.columns:
-                    continue
-                for _d in _df["date"]:
-                    all_dates.add(pd.Timestamp(_d).date())
-        except Exception:
-            pass
+        if getattr(provider, "cache", None) is not None:
+            try:
+                _all_daily = provider.cache.get_all("daily")
+                for _k, _df in _all_daily.items():
+                    if _df is None or getattr(_df, "empty", True):
+                        continue
+                    # 各源日线 schema 先归一（mootdx datetime 索引等），
+                    # 否则非 date 列命名的缓存帧被跳过、交易日历覆盖不足
+                    _df = self._normalize_daily_df(_df)
+                    if "date" not in _df.columns:
+                        continue
+                    for _d in _df["date"]:
+                        all_dates.add(pd.Timestamp(_d).date())
+            except Exception:
+                pass
 
         for code in symbols:
             try:
