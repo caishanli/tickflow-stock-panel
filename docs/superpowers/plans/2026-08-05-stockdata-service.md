@@ -2671,6 +2671,95 @@ git commit -m "docs: AGENTS.md 记录 stock data 服务架构与验收命令"
 
 ---
 
+### Task 17: wufu v5.2 回测性能门禁（260401-260716 ≤ 2 分钟）
+
+**Files:**
+- Create: `backend/scripts/time_wufu_backtest.py`（或复用 `scripts/time_backtest.py` 的形态，输出各阶段耗时）
+- Test: `backend/tests/quant/test_wufu_backtest_perf.py`（集成测试，需真实 `data/`，标记 `@pytest.mark.integration` 或独立脚本门禁）
+
+**Interfaces:**
+- Consumes: 完整网络数据路径（Task 10-13）+ stock data 服务（Task 7）。
+
+**目标**：wufu-v5.2 回测 `260401-260716`（与 Task 15 同一区间、同一 `run_quant_backtest.py` / `run_jq_backtest` 路径）**全程 ≤ 120 秒**。超时即失败，须优化到达标。
+
+**验收测试（断言 120s）**
+
+```python
+# backend/tests/quant/test_wufu_backtest_perf.py
+"""集成：wufu-v5.2 回测 260401-260716 全程 ≤120s（需真实 data/，非默认运行）。
+
+标记 @pytest.mark.integration，默认跳过；CI/验收时显式跑：
+  uv run --extra dev pytest -m integration tests/quant/test_wufu_backtest_perf.py -q
+"""
+import os
+import time
+
+import pytest
+
+pytestmark = pytest.mark.integration
+
+STRATEGY = "tests/fixtures/wufu_v52/wufu-v5.2.py"
+START, END = "2026-04-01", "2026-07-16"
+PERF_BUDGET_S = 120
+
+
+@pytest.mark.skipif(not os.path.isdir("data/kline_daily"),
+                    reason="需要真实 data/ 分区")
+def test_wufu_backtest_within_120s():
+    from app.quant.rqalpha_bridge import run_jq_backtest
+    t0 = time.monotonic()
+    run_jq_backtest(STRATEGY, {"start": START, "end": END,
+                               "benchmark": "510300.XSHG", "minute_cache_cap": 800},
+                    db_path="data/quant.db")
+    elapsed = time.monotonic() - t0
+    assert elapsed <= PERF_BUDGET_S, f"回测耗时 {elapsed:.1f}s 超过 {PERF_BUDGET_S}s 预算"
+```
+
+- [ ] **Step 1: 建性能测试文件**
+
+按上面的代码创建 `backend/tests/quant/test_wufu_backtest_perf.py`（含 `pytestmark = pytest.mark.integration`）。确认 `pytest.ini_options` 里 `markers` 可加 `integration`（加到 `backend/pyproject.toml` 的 `[tool.pytest.ini_options]`）。
+
+- [ ] **Step 2: 启动服务 + 跑基线计时**
+
+```bash
+cd backend
+STOCKDATA_PORT=3322 nohup uv run --extra dev python scripts/run_stockdata_service.py > /tmp/stockdata.log 2>&1 &
+time uv run --extra dev python -c "from app.quant.rqalpha_bridge import run_jq_backtest; run_jq_backtest('tests/fixtures/wufu_v52/wufu-v5.2.py', {'start':'2026-04-01','end':'2026-07-16','benchmark':'510300.XSHG','minute_cache_cap':800}, db_path='data/quant.db')"
+```
+记下总耗时。
+
+- [ ] **Step 3: 若 >120s，定位热点并优化**
+
+按耗时排序排查（每个候选给出量化判断依据）：
+1. **客户端连接复用**：确认 `StockDataClient` 单连接复用（`_sock_lock` 串行），无每次请求重连（`_request` 的 retry 只在失败时重连）。
+2. **preload_daily 批量**：全市场日线一次批量（`client.preload_daily`）应已在服务端一次扫分区；确认无逐标的请求。
+3. **分钟池批量**：确认回测 `get_minute_pool`/`preload_minute_for_pool` 走一次批量，而非逐标的 `get_price('1m')`。
+4. **服务端分区读**：`_scan_partitions` 只 glob 请求日期区间（已实现）；若 preload_daily 慢，考虑服务端把全市场日线结果短 TTL 缓存（已有 `preload_daily:` 键 60s）。
+5. **帧序列化**：parquet 字节嵌入 msgpack 已是最优；若 still 慢，量化 client 侧是否把同一批重复请求（DataManager 缓存应挡住）。
+6. **DataManager 侧**：`_daily_mem`/`_minute_mem` 内存缓存覆盖命中（Task 10 已保留逻辑），确认热点路径命中缓存而非重复请求。
+
+优化后回到 Step 2 重测，直到 ≤120s。
+
+- [ ] **Step 4: 跑验收测试**
+
+```bash
+uv run --extra dev pytest -m integration tests/quant/test_wufu_backtest_perf.py -q
+```
+Expected: PASS（回测 ≤120s）。
+
+- [ ] **Step 5: 确认无回归**
+
+Run: `uv run --extra dev pytest -q`（全量，与基线一致）+ `uv run --extra dev ruff check app` / `uv run --extra dev mypy app`（无新增错误类别）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/scripts/time_wufu_backtest.py backend/tests/quant/test_wufu_backtest_perf.py backend/pyproject.toml
+git commit -m "test(quant): wufu v5.2 回测 260401-260716 性能门禁（≤120s）"
+```
+
+---
+
 ## Self-Review
 
 **Spec 覆盖核对**
@@ -2684,6 +2773,7 @@ git commit -m "docs: AGENTS.md 记录 stock data 服务架构与验收命令"
 - 历史数据不驻留（仅短 TTL 突发去重）：Task 4（_HIST_TTL）+ Task 3 ✓
 - 前端/DuckDB/主后端其余不动：Global Constraints + Task 9 只删回源 ✓
 - wufu_v52 回测/模拟盘对齐：Task 15、16 ✓
+- 回测性能门禁（260401-260716 ≤ 2 分钟 + 优化）：Task 17 ✓
 - 测试/回归/ruff/mypy：Task 14 ✓
 
 **Placeholder 扫描**：无 TBD/TODO；每个改动步骤均给出代码/命令。
