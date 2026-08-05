@@ -50,6 +50,34 @@ def test_preload_daily_reads_partitions(src):
     assert df["volume"].to_list() == [100000]
 
 
+def test_preload_daily_excludes_index_but_get_daily_serves(tmp_path):
+    """预载批量不含指数（防 932xxx 等指数代码污染 ETF 宇宙），
+    但 get_daily 按需仍服务指数（策略 get_price 指数走这条）。"""
+    import os
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    day = _dt.date.today().isoformat()
+    etf = {"symbol": "512670.SH", "date": day, "open": 1.0, "high": 1.0,
+           "low": 1.0, "close": 1.0, "volume": 10000, "amount": 10000.0}
+    idx = {"symbol": "932000.SH", "date": day, "open": 3000.0, "high": 3000.0,
+           "low": 3000.0, "close": 3000.0, "volume": 100.0, "amount": 300000.0}
+    d = os.path.join(str(tmp_path), "kline_etf_daily", f"date={day}")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame([etf]).write_parquet(os.path.join(d, "part.parquet"))
+    d2 = os.path.join(str(tmp_path), "kline_index_daily", f"date={day}")
+    os.makedirs(d2, exist_ok=True)
+    pl.DataFrame([idx]).write_parquet(os.path.join(d2, "part.parquet"))
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
+    try:
+        pre = s.preload_daily(lookback_days=400)
+        assert "932000.SH" not in pre["symbol"].to_list()
+        assert "512670.SH" in pre["symbol"].to_list()
+        got = s.get_daily(["932000.XSHG"], day, day)
+        assert not got.is_empty()
+        assert got["symbol"].to_list() == ["932000.SH"]
+    finally:
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
 def test_minute_memory_store_lazy_and_clear():
     ms = MinuteMemoryStore()
     day = _dt.date.today()

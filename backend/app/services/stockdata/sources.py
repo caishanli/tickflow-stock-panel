@@ -301,8 +301,10 @@ class DataSources:
         lo, hi = self._daily_days(lookback_days, asof)
         cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
         parts = []
-        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
-                                 ("kline_index_daily", False)):
+        # 批量预载只含股票+ETF：指数（kline_index_daily）会污染下游 ETF 宇宙
+        # （_is_jq_etf_code 放行 932xxx 等指数代码，如 932000.XSHG）。指数日线
+        # 仍走 get_daily 按需服务（策略 get_price 指数等），不入预载。
+        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
             df = self._scan_partitions(subdir, lo, hi, None, cols)
             if df.is_empty():
                 continue
