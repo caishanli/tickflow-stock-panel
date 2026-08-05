@@ -239,3 +239,72 @@ def test_listing_date_map(tmp_data):
     }).write_parquet(inst / "instruments.parquet")
     m = bb.listing_date_map()
     assert m["600036.SH"] == _date(2002, 4, 9)
+
+
+def test_to_5min_df_parses_baostock_time():
+    df = bb._to_5min_df("sh.600036", [
+        ["2025-07-01", "20250701093500000", "1.0", "2.0", "1.5", "1.8", "100", "200"],
+    ])
+    assert df["symbol"].to_list() == ["600036.SH"]
+    assert str(df["datetime"][0]) == "2025-07-01 09:35:00"
+    assert df["volume"][0] == 100.0
+    empty = bb._to_5min_df("sh.600036", [])
+    assert empty.is_empty() and "symbol" in empty.columns
+
+
+def test_sync_minute_writes_partitions_and_state(tmp_data, monkeypatch):
+    monkeypatch.setattr(bb, "stock_universe",
+                        lambda: ["600036.SH", "000001.SZ", "600519.SH"])
+    monkeypatch.setattr(bb, "listing_date_map", lambda: {})
+
+    calls = []
+
+    def fake_query(code, fields, start, end, frequency, adjustflag, timeout, retries=3):
+        calls.append(code)
+        return [["2025-07-01", "20250701093500000", "1", "2", "1.5", "1.8", "100", "200"]]
+
+    monkeypatch.setattr(bb, "query_kline", fake_query)
+    st = bb.load_state(tmp_data / "state.json")
+    out = bb.sync_minute(_date(2025, 7, 1), _date(2025, 7, 2), st,
+                         timeout=5, flush_batch=2, limit=3)
+    assert out["symbols"] == 3
+    assert len(calls) == 3
+    df = pl.read_parquet(tmp_data / "kline_5min" / "date=2025-07-01" / "part.parquet")
+    assert df["symbol"].n_unique() == 3
+    assert set(st["minute_done"]) == {"600036.SH", "000001.SZ", "600519.SH"}
+
+
+def test_sync_minute_resume_skips_done(tmp_data, monkeypatch):
+    monkeypatch.setattr(bb, "stock_universe", lambda: ["600036.SH", "000001.SZ"])
+    monkeypatch.setattr(bb, "listing_date_map", lambda: {})
+    calls = []
+    monkeypatch.setattr(bb, "query_kline",
+                        lambda *a, **k: (calls.append(a[0]) or
+                                         [["2025-07-01", "20250701093500000",
+                                           "1", "2", "1.5", "1.8", "100", "200"]]))
+    st = bb.load_state(tmp_data / "state.json")
+    bb.mark_done(st, "minute", "600036.SH")
+    bb.save_state(st, tmp_data / "state.json")
+    st2 = bb.load_state(tmp_data / "state.json")
+    bb.sync_minute(_date(2025, 7, 1), _date(2025, 7, 2), st2, timeout=5)
+    assert calls == ["sz.000001"]  # 已完成的 600036.SH 不重拉
+
+
+def test_sync_minute_failure_recorded(tmp_data, monkeypatch):
+    monkeypatch.setattr(bb, "stock_universe", lambda: ["600036.SH"])
+    monkeypatch.setattr(bb, "listing_date_map", lambda: {})
+    monkeypatch.setattr(bb, "query_kline",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    st = bb.load_state(tmp_data / "state.json")
+    bb.sync_minute(_date(2025, 7, 1), _date(2025, 7, 2), st, timeout=5)
+    assert "600036.SH" in st["failed"]["minute"]
+    assert st["minute_done"] == []
+    assert tmp_data / "failures.csv" in list(tmp_data.iterdir()) or \
+        (tmp_data / "failures.csv").exists()
+
+
+def test_make_progress_printer_prints(capsys):
+    p = bb.make_progress_printer()
+    p("minute", 10, 100, 1234)
+    out = capsys.readouterr().out
+    assert "minute" in out and "10/100" in out

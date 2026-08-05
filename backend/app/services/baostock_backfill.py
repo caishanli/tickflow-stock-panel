@@ -348,3 +348,108 @@ def listing_date_map() -> dict[str, _date]:
     except Exception as e:  # noqa: BLE001
         logger.warning("上市日期读取失败: %s", e)
     return out
+
+
+_MIN5_SCHEMA = {
+    "symbol": pl.Utf8, "datetime": pl.Datetime("us"),
+    "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
+    "close": pl.Float64, "volume": pl.Float64, "amount": pl.Float64,
+}
+
+
+def _to_5min_df(code: str, rows: list[list[str]]) -> pl.DataFrame:
+    """baostock 5min 行 → polars 帧（symbol .SH/.SZ；volume 股不换算）。"""
+    if not rows:
+        return pl.DataFrame(schema=_MIN5_SCHEMA)
+    ts = [_datetime.strptime(r[1][:14], "%Y%m%d%H%M%S") for r in rows]
+    return pl.DataFrame({
+        "symbol": [from_baostock_code(code)] * len(rows),
+        "datetime": ts,
+        "open": [float(r[2]) for r in rows],
+        "high": [float(r[3]) for r in rows],
+        "low": [float(r[4]) for r in rows],
+        "close": [float(r[5]) for r in rows],
+        "volume": [float(r[6]) for r in rows],
+        "amount": [float(r[7]) for r in rows],
+    }).with_columns(pl.col("datetime").cast(pl.Datetime("us")))
+
+
+def make_progress_printer():
+    """返回 progress(stage, i, total, rows) 回调：stdout 打印进度 + 速率 + ETA。"""
+    t0 = time.time()
+
+    def _p(stage: str, i: int, total: int, rows: int) -> None:
+        elapsed = max(time.time() - t0, 0.001)
+        rate = i / elapsed * 60.0
+        eta = (total - i) / (i / elapsed) / 3600.0 if i > 0 else float("nan")
+        print(f"[{stage}] {i}/{total} 累计{rows}行 "
+              f"速率={rate:.1f}只/min ETA={eta:.1f}h", flush=True)
+
+    return _p
+
+
+def sync_minute(start: _date, end: _date, state: dict, timeout: float = 300,
+                flush_batch: int = 100, retry_failed: bool = False,
+                limit: int | None = None, progress=None) -> dict:
+    """股票 5min 回源主循环：逐只拉 3 年 5min → 批量 flush 分区 → 断点标记。
+
+    - resume：跳过 state['minute_done']；非 --retry-failed 时跳过 failed
+    - 上市日期约束：起始 = max(start, listing_date)；1970 占位（退市/异常）跳过
+    - 进度：每 flush_batch 只打一次 progress；失败落 failed + CSV
+    """
+    syms = stock_universe()
+    listing = listing_date_map()
+    done = set(state["minute_done"])
+    failed = state["failed"].get("minute", {})
+    todo = [s for s in syms if s not in done]
+    if not retry_failed:
+        todo = [s for s in todo if s not in failed]
+    if limit is not None:
+        todo = todo[:limit]
+    pre_delisted = [s for s in todo if listing.get(s) == _date(1970, 1, 1)]
+    if pre_delisted:
+        logger.info("[minute] 跳过 %d 只退市/异常标的（上市日期占位）", len(pre_delisted))
+        todo = [s for s in todo if s not in set(pre_delisted)]
+    logger.info("[minute] 回源 %d 只（已覆盖 %d）", len(todo), len(done))
+    total = 0
+    chunk: list[pl.DataFrame] = []
+    chunk_syms: list[str] = []
+    for i, sym in enumerate(todo, 1):
+        sym_start = start
+        ld = listing.get(sym)
+        if ld is not None and ld > sym_start:
+            sym_start = ld
+        code = to_baostock_code(sym)
+        try:
+            rows = query_kline(code, KLINE_5MIN_FIELDS,
+                               sym_start.isoformat(), end.isoformat(),
+                               "5", "3", timeout)
+            df = _to_5min_df(code, rows)
+            if df.is_empty():
+                raise RuntimeError("empty")
+            df = df.filter(pl.col("datetime").dt.date() >= sym_start)
+            if df.is_empty():
+                raise RuntimeError(f"no_data_since_{sym_start}")
+        except Exception as e:  # noqa: BLE001
+            mark_failed(state, "minute", sym, str(e)[:120])
+            append_failure(sym, f"minute:{str(e)[:120]}")
+            save_state(state)
+            continue
+        chunk.append(df)
+        chunk_syms.append(sym)
+        total += df.height
+        if len(chunk) >= flush_batch:
+            flush_minute_batch(chunk, KLINE_5MIN_ROOT)
+            for s in chunk_syms:
+                mark_done(state, "minute", s)
+            save_state(state)
+            chunk, chunk_syms = [], []
+            if progress:
+                progress("minute", i, len(todo), total)
+    if chunk:
+        flush_minute_batch(chunk, KLINE_5MIN_ROOT)
+        for s in chunk_syms:
+            mark_done(state, "minute", s)
+        save_state(state)
+    logger.info("[minute] 完成 %d 只, 累计 %d 行", len(todo), total)
+    return {"symbols": len(todo), "rows": total}
