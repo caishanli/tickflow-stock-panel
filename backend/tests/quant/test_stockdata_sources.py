@@ -4,7 +4,13 @@ import datetime as _dt
 import polars as pl
 import pytest
 
-from app.services.stockdata.sources import DataSources, MinuteMemoryStore
+from app.services.stockdata.sources import (
+    DataSources,
+    MinuteMemoryStore,
+    NetworkPuller,
+    _is_index,
+    _pull_recent_guarded,
+)
 
 
 def _write_daily(root, day, rows):
@@ -76,3 +82,88 @@ def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
     df = src.get_realtime_snapshot(["512670.XSHG"])
     assert not df.is_empty()
     assert df["close"].to_list() == [1.0]
+
+
+def test_realtime_snapshot_empty_no_crash(src, monkeypatch):
+    """标的当日无分区、非交易时段不触网：返回空帧而非 Utf8 与 datetime 比较崩溃。"""
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
+    df = src.get_realtime_snapshot(["600000.XSHG"])
+    assert df.is_empty()
+    assert list(df.columns) == ["symbol", "datetime", "open", "high", "low",
+                                "close", "volume", "amount"]
+
+
+def test_realtime_snapshot_empty_in_trading_no_crash(tmp_path, monkeypatch):
+    """交易时段但当日无分区/内存（回源也拿不到数据）：仍返回空帧、不崩溃。"""
+    class StubSrc:
+        def get_minute_recent(self, code, pages=1):
+            import pandas as pd
+            return pd.DataFrame()
+
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=lambda: StubSrc(), fetch_workers=1)
+    try:
+        monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: True)
+        df = s.get_realtime_snapshot(["600000.XSHG"])
+        assert df.is_empty()
+    finally:
+        s.puller.shutdown()
+
+
+def test_is_index_suffix_based():
+    assert _is_index("000001.XSHE") is False   # 深市 000001 平安银行是股票
+    assert _is_index("000157.XSHE") is False   # 深市 000157 中联重科是股票
+    assert _is_index("000300.XSHG") is True    # 沪市 000xxx 是指数
+    assert _is_index("399006.XSHE") is True    # 399 深证指数，任意市场
+    assert _is_index("512670.XSHG") is False   # ETF 不是指数
+
+
+def test_pull_recent_guarded_timeout_raises():
+    class HangSrc:
+        def get_minute_recent(self, code, pages=1):
+            import time
+            time.sleep(60)
+
+    with pytest.raises(TimeoutError):
+        _pull_recent_guarded(HangSrc(), "600000.XSHG", timeout=0.05)
+
+
+def test_fetch_one_rebuilds_source_on_timeout(monkeypatch):
+    """超时后线程本地数据源被重置：下次 fetch 重建（factory 调用次数递增）。"""
+    calls = []
+
+    def fake_factory():
+        calls.append(object())
+        return calls[-1]
+
+    def fake_pull(src, code):
+        raise TimeoutError(f"timeout {code}")
+
+    monkeypatch.setattr("app.services.stockdata.sources._pull_recent_guarded", fake_pull)
+    p = NetworkPuller(factory=fake_factory, workers=1)
+    try:
+        assert p._fetch_one("600000.XSHG").is_empty()
+        assert len(calls) == 1
+        assert getattr(p._local, "src", None) is None  # 已重置，不复用坏 socket
+        assert p._fetch_one("600000.XSHG").is_empty()
+        assert len(calls) == 2  # 第二次 fetch 重建数据源
+    finally:
+        p.shutdown()
+
+
+def test_metadata_methods_with_ohlcv_only_partitions(src):
+    """分区仅 symbol/OHLCV：元数据方法不再因缺 name/list_date 列而崩。"""
+    df = src.get_all_securities(["stock"], None)
+    assert not df.is_empty()
+    assert list(df.columns) == ["symbol", "type", "name", "list_date"]
+    row = df.to_dicts()[0]
+    assert row["symbol"] == "600000.SH"
+    assert row["type"] == "stock"
+    assert row["name"] is None and row["list_date"] is None
+
+    info = src.get_security_info("600000.XSHG")
+    assert info["code"] == "600000.XSHG"
+    assert info["type"] == "stock"
+    assert info["name"] is None and info["start_date"] is None
+    assert info["end_date"] is None
+
+    assert src.get_stock_names() == {}

@@ -9,12 +9,12 @@
 from __future__ import annotations
 
 import datetime as _dt
-import itertools
 import logging
 import os
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from typing import TypeVar
 
 import polars as pl
 
@@ -23,6 +23,8 @@ from .single_flight import DedupCache, SingleFlight
 logger = logging.getLogger("app.services.stockdata.sources")
 
 _HIST_TTL = 60.0  # 历史日线/分钟短 TTL（仅突发去重，不驻留）
+
+_T = TypeVar("_T")
 
 
 def _tf_symbol(code: str) -> str:
@@ -41,9 +43,17 @@ def _to_jq(code: str) -> str:
 
 
 def _is_index(code: str) -> bool:
+    """指数判定：399 开头任意市场；000xxx 仅沪市（SH/XSHG）是指数。
+
+    深市 000xxx（如 000001 平安银行）是股票，不能误走指数通道（mootdx 深市
+    000xxx 走 index_bars 返回空）。同 mootdx_src._is_index。
+    """
     pure = code.split(".", 1)[0]
-    return pure.startswith("399") or (pure.startswith("000") and len(pure) == 6
-                                      and not pure.startswith("0000"))
+    suffix = code.split(".", 1)[1] if "." in code else ""
+    if pure.startswith("399"):
+        return True
+    return (suffix in ("SH", "XSHG") and pure.startswith("000")
+            and len(pure) == 6 and not pure.startswith("0000"))
 
 
 def _in_trading(now: _dt.datetime | None = None) -> bool:
@@ -169,7 +179,12 @@ class NetworkPuller:
         return src
 
     def _fetch_one(self, code: str) -> pl.DataFrame:
-        df = _pull_recent_guarded(self._source(), code)
+        try:
+            df = _pull_recent_guarded(self._source(), code)
+        except TimeoutError:
+            # 超时：复用 socket 可能已坏，重置本线程数据源，下次 fetch 重建
+            self._local.src = None
+            return pl.DataFrame()
         if df is None or df.empty:
             return pl.DataFrame()
         pdf = df.reset_index()
@@ -201,7 +216,11 @@ class NetworkPuller:
 
 
 def _pull_recent_guarded(src, code: str, timeout: float = 30.0):
-    """墙钟守护的单只 mootdx 实时分钟拉取；超时/异常返回空帧。"""
+    """墙钟守护的单只 mootdx 实时分钟拉取。
+
+    超时抛 TimeoutError（调用方需重建数据源，避免复用可能已坏的非线程安全 socket）；
+    异常/空帧返回 None。
+    """
     import threading as _th
     box: dict = {}
 
@@ -215,8 +234,8 @@ def _pull_recent_guarded(src, code: str, timeout: float = 30.0):
     t.start()
     t.join(timeout)
     if t.is_alive():
-        logger.warning("[sources] %s 实时回源超时(%ss)", code, timeout)
-        return None
+        logger.warning("[sources] %s 实时回源超时(%ss)，将重建数据源", code, timeout)
+        raise TimeoutError(f"mootdx realtime pull timeout: {code}")
     if "err" in box:
         logger.warning("[sources] %s 实时回源失败: %s", code, box["err"])
         return None
@@ -243,11 +262,9 @@ class DataSources:
         self.dedup = DedupCache()
         self.minute_store = MinuteMemoryStore()
         self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
-        self.fail_counts: dict[str, int] = {}
-        self._fail_lock = threading.Lock()
 
     # ---- 去重透传 ----
-    def get_or_fetch(self, key: str, ttl: float, loader: Callable) -> object:
+    def get_or_fetch(self, key: str, ttl: float, loader: Callable[[], _T]) -> _T:
         return self.dedup.get_or_fetch(key, ttl, loader)
 
     # ---- 分区扫描 ----
@@ -306,48 +323,54 @@ class DataSources:
                                  lambda: self._load_daily(lookback_days, asof))
 
     def get_daily(self, codes: list[str], start_date: str, end_date: str) -> pl.DataFrame:
-        syms = {_tf_symbol(c) for c in codes}
-        cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-        parts = []
-        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
-                                 ("kline_index_daily", False)):
-            df = self._scan_partitions(subdir, start_date, end_date, syms, cols)
-            if df.is_empty():
-                continue
-            if is_stock:
-                df = df.with_columns((pl.col("volume") * 100).alias("volume"))
-            parts.append(df)
-        if not parts:
-            return pl.DataFrame()
-        return _normalize_etf_volume_unit(pl.concat(parts))
+        def _load():
+            syms = {_tf_symbol(c) for c in codes}
+            cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+            parts = []
+            for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
+                                     ("kline_index_daily", False)):
+                df = self._scan_partitions(subdir, start_date, end_date, syms, cols)
+                if df.is_empty():
+                    continue
+                if is_stock:
+                    df = df.with_columns((pl.col("volume") * 100).alias("volume"))
+                parts.append(df)
+            if not parts:
+                return pl.DataFrame()
+            return _normalize_etf_volume_unit(pl.concat(parts))
+
+        # 短 TTL 仅突发去重，不驻留内存（历史数据每轮仍按需读盘）
+        key = f"daily:{','.join(sorted(codes))}:{start_date}:{end_date}"
+        return self.get_or_fetch(key, _HIST_TTL, _load)
 
     def get_minute(self, codes: list[str], lo_ts, hi_ts) -> pl.DataFrame:
         """历史分钟读分区；若请求范围包含今日，叠加当日分钟内存库（网络数据）。"""
-        lo_d = str(pd_to_date(lo_ts)) if lo_ts is not None else None
-        hi_d = str(pd_to_date(hi_ts)) if hi_ts is not None else None
-        syms = {_tf_symbol(c) for c in codes}
-        parts = []
-        for subdir in ("kline_etf_minute", "kline_minute"):
-            df = self._scan_partitions(subdir, lo_d, hi_d, syms, _MINUTE_COLS)
-            if not df.is_empty():
-                parts.append(df)
-        today = _dt.date.today()
-        if (lo_d is None or lo_d <= today.isoformat()) and (hi_d is None or hi_d >= today.isoformat()):
-            mem = self.minute_store.get_slice(syms, str(lo_ts or today), str(hi_ts or f"{today} 15:00:00"))
-            if not mem.is_empty():
-                parts.append(mem)
-        if not parts:
-            return pl.DataFrame()
-        out = pl.concat(parts).unique(subset=["symbol", "datetime"], keep="last")
-        if lo_ts is not None:
-            out = out.filter(pl.col("datetime") >= pd_to_ts(lo_ts))
-        if hi_ts is not None:
-            out = out.filter(pl.col("datetime") <= pd_to_ts(hi_ts))
-        return out
+        def _load():
+            lo_d = str(pd_to_date(lo_ts)) if lo_ts is not None else None
+            hi_d = str(pd_to_date(hi_ts)) if hi_ts is not None else None
+            syms = {_tf_symbol(c) for c in codes}
+            parts = []
+            for subdir in ("kline_etf_minute", "kline_minute"):
+                df = self._scan_partitions(subdir, lo_d, hi_d, syms, _MINUTE_COLS)
+                if not df.is_empty():
+                    parts.append(df)
+            today = _dt.date.today()
+            if (lo_d is None or lo_d <= today.isoformat()) and (hi_d is None or hi_d >= today.isoformat()):
+                mem = self.minute_store.get_slice(syms, str(lo_ts or today), str(hi_ts or f"{today} 15:00:00"))
+                if not mem.is_empty():
+                    parts.append(mem)
+            if not parts:
+                return pl.DataFrame()
+            out = pl.concat(parts).unique(subset=["symbol", "datetime"], keep="last")
+            if lo_ts is not None:
+                out = out.filter(pl.col("datetime") >= pd_to_ts(lo_ts))
+            if hi_ts is not None:
+                out = out.filter(pl.col("datetime") <= pd_to_ts(hi_ts))
+            return out
 
-    def _bump_fail(self, code: str) -> None:
-        with self._fail_lock:
-            self.fail_counts[code] = self.fail_counts.get(code, 0) + 1
+        # 短 TTL 仅突发去重；10s 保证当日内存库叠加层不过期
+        key = f"min:{','.join(sorted(codes))}:{lo_ts}:{hi_ts}"
+        return self.get_or_fetch(key, 10.0, _load)
 
     def get_realtime_snapshot(self, codes: list[str], as_of=None) -> pl.DataFrame:
         """当日分钟内存库 + 未覆盖标的共享拉取池按需补实时（per-symbol 去重）。
@@ -390,8 +413,11 @@ class DataSources:
             if fills:
                 self.minute_store.update(today.isoformat(), fills)
 
-        out = pl.concat(base_parts + fills).unique(subset=["symbol", "datetime"], keep="last") \
-            if (fills or base_parts) else base
+        if not (base_parts or fills):
+            # 无基础帧也无实时填充：返回空帧、跳过过滤（空帧 datetime 为 Utf8，
+            # 不能与 datetime 字面量比较 → InvalidOperationError）
+            return pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
+        out = pl.concat(base_parts + fills).unique(subset=["symbol", "datetime"], keep="last")
         out = out.filter(pl.col("datetime") <= asof_ts)
         return out.sort(["symbol", "datetime"])
 
@@ -403,30 +429,33 @@ class DataSources:
         return sorted(str(d) for d in df["date"].to_list())
 
     def get_all_securities(self, types: list[str] | None, date: str | None) -> pl.DataFrame:
-        cols = ["symbol", "name", "list_date"]
+        # 分区仅落 symbol/OHLCV（无 name/list_date）：只选 symbol，其余列以空值补齐
+        # 保证客户端 schema 稳定
         parts = []
         if types is None or "stock" in types:
-            df = self._scan_partitions("kline_daily", None, None, None, cols) if os.path.isdir(
+            df = self._scan_partitions("kline_daily", None, None, None, ["symbol"]) if os.path.isdir(
                 os.path.join(self.data_root, "kline_daily")) else pl.DataFrame()
             if not df.is_empty():
-                parts.append(df.select(["symbol", "name", "list_date"])
-                              .unique(subset=["symbol"]).with_columns(pl.lit("stock").alias("type")))
+                parts.append(df.unique(subset=["symbol"])
+                              .with_columns(pl.lit("stock").alias("type")))
         if types is None or "etf" in types:
-            df = self._scan_partitions("kline_etf_daily", None, None, None, cols) if os.path.isdir(
+            df = self._scan_partitions("kline_etf_daily", None, None, None, ["symbol"]) if os.path.isdir(
                 os.path.join(self.data_root, "kline_etf_daily")) else pl.DataFrame()
             if not df.is_empty():
-                parts.append(df.select(["symbol", "name", "list_date"])
-                              .unique(subset=["symbol"]).with_columns(pl.lit("etf").alias("type")))
+                parts.append(df.unique(subset=["symbol"])
+                              .with_columns(pl.lit("etf").alias("type")))
         if types is None or "index" in types:
-            df = self._scan_partitions("kline_index_daily", None, None, None, cols) if os.path.isdir(
+            df = self._scan_partitions("kline_index_daily", None, None, None, ["symbol"]) if os.path.isdir(
                 os.path.join(self.data_root, "kline_index_daily")) else pl.DataFrame()
             if not df.is_empty():
-                parts.append(df.select(["symbol", "name", "list_date"])
-                              .unique(subset=["symbol"]).with_columns(pl.lit("index").alias("type")))
+                parts.append(df.unique(subset=["symbol"])
+                              .with_columns(pl.lit("index").alias("type")))
         if not parts:
             return pl.DataFrame(schema={"symbol": pl.Utf8, "name": pl.Utf8,
                                         "list_date": pl.Utf8, "type": pl.Utf8})
-        return pl.concat(parts)
+        return pl.concat(parts).with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias("name"),
+            pl.lit(None, dtype=pl.Utf8).alias("list_date"))
 
     def get_security_info(self, code: str) -> dict:
         df = self.get_all_securities(None, None)
@@ -444,13 +473,8 @@ class DataSources:
         return sorted(set(df["symbol"].to_list()))
 
     def get_stock_names(self, codes: list[str] | None = None) -> dict:
-        df = self._scan_partitions("kline_daily", None, None, None,
-                                   ["symbol", "name"]).unique(subset=["symbol"])
-        out = {}
-        for r in df.iter_rows(named=True):
-            if codes is None or _tf_symbol(r["symbol"]) in {_tf_symbol(c) for c in codes}:
-                out[_tf_symbol(r["symbol"])] = r.get("name")
-        return out
+        # 股票名称分区暂未落盘（partition 仅 symbol/OHLCV）；名称属展示层，空降级
+        return {}
 
     def get_adj_factors(self) -> pl.DataFrame:
         root = os.path.join(self.data_root, "adj_factor_etf")
