@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -102,24 +103,22 @@ async def lifespan(app: FastAPI):
         logger.warning("scheduler not started: %s", e)
         app.state.scheduler = None
 
-    # mootdx 启动回源：后台补齐到当前时间缺失的 ETF 分钟 + 全市场日线。
-    # 不阻塞启动（约 10-15 分钟，daemon 线程），幂等（只补最新分区之后的交易日）。
+    # stock data 服务：主进程只做守护（PID 锁 + 3s 自愈），
+    # 回源落盘（启动 backfill / intraday / 15:35 同步）全在服务内自治。
     try:
-        def _mootdx_backfill() -> None:
-            try:
-                from app.services import mootdx_service
-                result = mootdx_service.backfill_to_now()
-                logger.info("mootdx startup backfill done: %s", result)
-            except Exception:  # noqa: BLE001
-                logger.exception("mootdx startup backfill failed")
-
-        threading.Thread(
-            target=_mootdx_backfill,
-            name="mootdx-startup-backfill",
-            daemon=True,
-        ).start()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("mootdx startup backfill not started: %s", e)
+        if os.getenv("STOCKDATA_ENABLED", "true").lower() not in ("0", "false", "no"):
+            from app.services.stockdata_guardian import StockDataGuardian
+            _script_path = (Path(__file__).resolve().parent.parent
+                            / "scripts" / "run_stockdata_service.py")
+            _guardian = StockDataGuardian(
+                pidfile=store.data_dir / ".stockdata.pid",
+                script=_script_path,
+            )
+            _guardian.start()
+            app.state.stockdata_guardian = _guardian
+            logger.info("stockdata guardian started")
+    except Exception:  # noqa: BLE001
+        logger.warning("stockdata guardian not started: %s", exc_info=True)
 
     # depth sealed: 启动补跑(当天文件不存在) + 盘中轮询(有能力时)
     try:
@@ -293,6 +292,9 @@ async def lifespan(app: FastAPI):
     wbot = getattr(app.state, "wecom_bot_service", None)
     if wbot:
         wbot.stop()
+    sg = getattr(app.state, "stockdata_guardian", None)
+    if sg:
+        sg.stop()
     logger.info("shutdown")
 
 
