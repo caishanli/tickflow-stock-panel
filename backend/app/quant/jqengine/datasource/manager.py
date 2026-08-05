@@ -738,23 +738,26 @@ class DataManager:
         """
         as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()
         logger.info("[DataManager] 开始预热分钟线缓存，标的数=%d", len(codes))
-        loaded = 0
-        # 过滤已知无分钟的标的
-        todo = [c for c in codes if c not in self._minute_empty]
-        if not todo:
-            logger.info("[DataManager] 分钟线预热完成: 成功 0/%d，已缓存 %d 只",
-                        len(codes), len(self._minute_mem))
-            return
-        # 统一滑窗（同日 as_of 对所有标的一致）
-        lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=False)
+        # 回测（已 set_minute_window）加载整段回测窗口并去重：池内标的一次性把
+        # 全窗口分钟取回，JqDataSource 的 get_minute_feed 直接命中 _minute_mem，
+        # 不再逐标的按全窗口联网回源（T17 实测 291 次单标的 1m 全窗口 ≈ 68s）。
+        # 实时/模拟盘（无 _minute_win）保持滑窗语义，帧随 as_of 前移由
+        # _ensure_minute_windowed 覆盖校验自愈。
+        full = bool(getattr(self, "_minute_win", None))
+        lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=full)
         hi_eff = self._hi_eff(hi_ts)
+        loaded = 0
+        # 过滤已知无分钟的标的 + 已覆盖标点（同日重复预热直接跳过，只批新入池）
+        todo = [c for c in codes
+                if c not in self._minute_empty
+                and self._minute_cached(c, lo_ts, hi_eff) is None]
+        if not todo:
+            logger.info("[DataManager] 分钟线预热完成: 成功 %d/%d，已缓存 %d 只",
+                        len(codes) - len(todo), len(codes), len(self._minute_mem))
+            return
         batch = self._load_minute_pool_from_partitions(todo, lo_ts, hi_ts)
         for code in todo:
             try:
-                # 覆盖命中则跳过
-                if self._minute_cached(code, lo_ts, hi_eff) is not None:
-                    loaded += 1
-                    continue
                 df = batch.get(code)
                 if df is not None and not df.empty:
                     df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]

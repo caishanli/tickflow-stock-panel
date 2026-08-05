@@ -234,14 +234,25 @@ def test_preload_minute_for_pool_single_definition():
 
 
 def test_preload_minute_for_pool_functional(tmp_path):
-    """合并后的实现：as_of 可缺省语义保留；预热帧按滑窗裁剪并记录覆盖。"""
+    """合并后的实现：as_of 可缺省语义保留；回测（已 set_minute_window）加载整段
+    回测窗口并记录覆盖（T17：整窗帧供 get_minute_feed 命中，免逐标的全窗口联网）；
+    未设窗口（实时/模拟盘）保持滑窗裁剪。"""
     dm = _make_dm(tmp_path)
     _seed_minute_caches(dm)
     dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
     df = dm._minute_mem.get(CODE)
     assert df is not None and not df.empty
-    assert df.index.max() == pd.Timestamp("2026-03-25 15:00")
-    assert dm._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
+    # 已 set_minute_window → 整段回测窗口（superset of 滑窗）
+    assert df.index.max() == pd.Timestamp(WIN_END + " 15:00")
+    assert dm._minute_cov[CODE][1] == pd.Timestamp(WIN_END + " 15:00")
+    # 无窗口（实时/模拟盘）→ 滑窗截至 as_of
+    dm2 = _make_dm(tmp_path, set_window=False)
+    _seed_minute_caches(dm2)
+    dm2.preload_minute_for_pool([CODE], as_of="2026-03-25")
+    df2 = dm2._minute_mem.get(CODE)
+    assert df2 is not None and not df2.empty
+    assert df2.index.max() == pd.Timestamp("2026-03-25 15:00")
+    assert dm2._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
 
 
 # ---------------- M11：_minute_mem 有界 LRU ----------------

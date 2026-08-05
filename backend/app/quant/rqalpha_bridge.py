@@ -1283,13 +1283,17 @@ def run_jq_backtest(strategy_path: str, params: dict,
         _load_etf_universe(dm)
     except Exception:
         pass
-    # 离线回测前，先把「回测区间所需的日线」在线补齐到本地缓存：rqalpha 会对
+    # 离线回测前，先把「回测区间所需的日线」在线补齐到内存缓存：rqalpha 会对
     # benchmark 做「数据区间必须覆盖回测区间」的校验，本地日线若差最后一天
     # （如盘后管道尚未追到最新交易日）会直接 failed。这里在 offline 开关之前，
-    # 对 benchmark + 指数 + 策略固定池逐只 dm.fetch(get_daily, start, end)：
-    # 缓存覆盖不足时 cache.get 会自动回源补齐并落盘（见 manager.fetch 的
-    # _covers 逻辑），随后离线回测用的就是完整数据。仅刷关键标的，不刷全市场
-    # 1600+ ETF（其余在回测中按需取、缺失则策略侧容忍/跳过）。
+    # 先全市场预载日线（ETF+股票），再对 benchmark + 指数 + 策略固定池逐只
+    # dm.fetch(get_daily, start, end)：预载后这些标的基本命中 _daily_mem，不再
+    # 逐只联网（T17 实测：原顺序 119 次单标的 daily 联网 ≈ 7.8s → 现在仅指数
+    # （预载排除 kline_index_daily）走网络）。
+    try:
+        dm.preload_daily()
+    except Exception:
+        pass
     try:
         _refresh_codes = list(dict.fromkeys(
             [benchmark, "511880.XSHG"] + list(_EXTRA_INDEX_CODES)
@@ -1305,11 +1309,6 @@ def run_jq_backtest(strategy_path: str, params: dict,
         if _refreshed:
             _log_progress(params.get("run_id"),
                           f"离线回测前补齐日线缓存: {_refreshed}/{len(_refresh_codes)} 只标的已覆盖 {start}~{end}")
-        # 刷新后重建内存日线缓存，确保 preload_daily 拿到补齐后的帧
-        try:
-            dm.preload_daily()
-        except Exception:
-            pass
         # 把回测窗口对齐到「数据实际可用的交易日区间」：rqalpha 的 benchmark
         # 校验要求基准日线必须完整覆盖回测区间，且需要回测首日之前至少一根 bar
         # （用于计算首日收益率，trading_dates 会比需求多一天）。若窗口超出可用

@@ -121,7 +121,11 @@ class StockDataClient:
             sub = g.drop(columns=[c for c in drop if c in g.columns]).copy()
             if has_date:
                 sub["trade_dt"] = pd.to_datetime(g.index.normalize()).values
-            out[_to_jq(sym)] = sub.sort_index()
+            # 服务端分区数据本就按 symbol+date 升序（T17 实测 per-symbol 恒单调），
+            # 已排序帧跳过 sort_index（7196 组 × 排序 ≈ 秒级）；非单调时仍兜底排。
+            if not sub.index.is_monotonic_increasing:
+                sub = sub.sort_index()
+            out[_to_jq(sym)] = sub
         return out
 
     # ---- 行情 ----
