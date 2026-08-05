@@ -168,3 +168,50 @@ def _safe_float(v) -> float | None:
         return float(v)
     except Exception:  # noqa: BLE001
         return None
+
+
+def load_state(path: Path = STATE_PATH) -> dict:
+    """读断点状态；不存在/损坏时返回默认空状态。"""
+    default = {
+        "start": None, "end": None,
+        "minute_done": [], "daily_done": [], "adj_done": [], "dividends_done": [],
+        "failed": {},
+    }
+    if not path.exists():
+        return default
+    try:
+        st = json.loads(path.read_text())
+        for k, v in default.items():
+            st.setdefault(k, v)
+        return st
+    except Exception:  # noqa: BLE001
+        logger.warning("断点状态损坏，重置: %s", path)
+        return default
+
+
+def save_state(state: dict, path: Path = STATE_PATH) -> None:
+    """原子写状态文件（tmp + rename）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1))
+    tmp.rename(path)
+
+
+def mark_done(state: dict, stage: str, sym: str) -> None:
+    state[f"{stage}_done"].append(sym)
+
+
+def mark_failed(state: dict, stage: str, sym: str, reason: str) -> None:
+    state["failed"].setdefault(stage, {})[sym] = str(reason)[:200]
+
+
+def append_failure(sym: str, reason: str) -> None:
+    """把回源失败标的追加到 failure csv（symbol, 原因, 时间）。"""
+    try:
+        from datetime import datetime as _dt
+        line = f"{sym},{reason},{_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        FAILURE_CSV.parent.mkdir(parents=True, exist_ok=True)
+        with open(FAILURE_CSV, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:  # noqa: BLE001
+        logger.warning("失败记录写入失败: %s", sym)

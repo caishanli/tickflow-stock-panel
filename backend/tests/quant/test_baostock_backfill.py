@@ -119,3 +119,30 @@ def test_safe_float():
     assert bb._safe_float("") is None
     assert bb._safe_float("-") is None
     assert bb._safe_float("abc") is None
+
+
+def test_state_roundtrip(tmp_path):
+    p = tmp_path / "state.json"
+    st = bb.load_state(p)
+    assert st["minute_done"] == []
+    bb.mark_done(st, "minute", "600036.SH")
+    bb.mark_failed(st, "minute", "000001.SZ", "timeout")
+    bb.save_state(st, p)
+    st2 = bb.load_state(p)
+    assert st2["minute_done"] == ["600036.SH"]
+    assert st2["failed"]["minute"]["000001.SZ"] == "timeout"
+    assert bb.load_state(tmp_path / "missing.json")["daily_done"] == []
+
+
+def test_state_atomic_no_tmp_left(tmp_path):
+    p = tmp_path / "state.json"
+    bb.save_state({"a": 1}, p)
+    assert not (tmp_path / "state.json.tmp").exists()
+
+
+def test_mark_done_and_failed_mutate_inplace(tmp_path):
+    st = bb.load_state(tmp_path / "missing.json")
+    bb.mark_done(st, "daily", "000001.SH")
+    bb.mark_failed(st, "daily", "510300.SH", "empty")
+    assert st["daily_done"] == ["000001.SH"]
+    assert st["failed"]["daily"] == {"510300.SH": "empty"}
