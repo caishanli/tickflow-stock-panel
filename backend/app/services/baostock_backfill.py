@@ -215,3 +215,51 @@ def append_failure(sym: str, reason: str) -> None:
             f.write(line)
     except Exception:  # noqa: BLE001
         logger.warning("失败记录写入失败: %s", sym)
+
+
+def write_minute_partition(df: pl.DataFrame, root: Path, day: _date) -> None:
+    """按 date 分区原子写 5min（读旧→concat→unique keep=last→tmp→rename），幂等。"""
+    pdir = root / f"date={day}"
+    pdir.mkdir(parents=True, exist_ok=True)
+    part = pdir / "part.parquet"
+    tmp = pdir / "part.tmp"
+    if part.exists():
+        old = pl.read_parquet(part)
+        df = pl.concat([old, df]).unique(
+            subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
+    df = df.sort(["symbol", "datetime"])
+    df.write_parquet(tmp)
+    tmp.rename(part)
+
+
+def flush_minute_batch(frames: list[pl.DataFrame], root: Path) -> None:
+    """一批股票的 5min 按交易日分组一次性写分区（降 IO 一个量级）。"""
+    if not frames:
+        return
+    all_df = pl.concat(frames).unique(
+        subset=["symbol", "datetime"], keep="last")
+    all_df = all_df.with_columns(pl.col("datetime").dt.date().alias("_day"))
+    for d, g in all_df.group_by("_day"):
+        write_minute_partition(g.drop("_day"), root, d[0])
+
+
+def write_daily_partition(df: pl.DataFrame, root: Path) -> None:
+    """按 date 分区原子写日线（兼容有无 date 列的既有分区）。"""
+    ds = str(df["date"][0])[:10]
+    pdir = root / f"date={ds}"
+    pdir.mkdir(parents=True, exist_ok=True)
+    part = pdir / "part.parquet"
+    tmp = pdir / "part.tmp"
+    if part.exists():
+        old = pl.read_parquet(part)
+        if "date" not in old.columns:
+            df = df.drop("date")
+            merged = pl.concat([old, df]).unique(
+                subset=["symbol"], keep="last").sort(["symbol"])
+        else:
+            merged = pl.concat([old, df]).unique(
+                subset=["symbol", "date"], keep="last").sort(["symbol", "date"])
+    else:
+        merged = df.sort(["symbol", "date"])
+    merged.write_parquet(tmp)
+    tmp.rename(part)

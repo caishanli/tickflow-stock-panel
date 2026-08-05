@@ -1,5 +1,7 @@
 """baostock_backfill 单元测试（不打真实网络，monkeypatch 假 baostock 模块）。"""
 import time
+from datetime import date as _date
+from datetime import datetime as _datetime
 
 import polars as pl
 import pytest
@@ -146,3 +148,44 @@ def test_mark_done_and_failed_mutate_inplace(tmp_path):
     bb.mark_failed(st, "daily", "510300.SH", "empty")
     assert st["daily_done"] == ["000001.SH"]
     assert st["failed"]["daily"] == {"510300.SH": "empty"}
+
+
+def _m5(sym, day, hour=10):
+    return pl.DataFrame({
+        "symbol": [sym, sym],
+        "datetime": [_datetime(2025, 7, day, hour, 0), _datetime(2025, 7, day, hour, 5)],
+        "open": [1.0, 1.1], "high": [1.2, 1.3], "low": [0.9, 1.0],
+        "close": [1.1, 1.2], "volume": [100.0, 200.0], "amount": [110.0, 240.0],
+    })
+
+
+def test_write_minute_partition_idempotent(tmp_path):
+    root = tmp_path / "k5"
+    bb.write_minute_partition(_m5("600036.SH", 1), root, _date(2025, 7, 1))
+    bb.write_minute_partition(_m5("600036.SH", 1), root, _date(2025, 7, 1))
+    df = pl.read_parquet(root / "date=2025-07-01" / "part.parquet")
+    assert df.height == 2
+    assert not (root / "date=2025-07-01" / "part.tmp").exists()
+
+
+def test_flush_minute_batch_two_days(tmp_path):
+    root = tmp_path / "k5"
+    bb.flush_minute_batch([_m5("600036.SH", 1), _m5("000001.SZ", 2)], root)
+    d1 = pl.read_parquet(root / "date=2025-07-01" / "part.parquet")
+    d2 = pl.read_parquet(root / "date=2025-07-02" / "part.parquet")
+    assert set(d1["symbol"].to_list()) == {"600036.SH"}
+    assert set(d2["symbol"].to_list()) == {"000001.SZ"}
+
+
+def test_write_daily_partition_merge_with_date_col(tmp_path):
+    root = tmp_path / "kd"
+    df = pl.DataFrame({
+        "symbol": ["000001.SH"], "date": [_date(2025, 7, 1)],
+        "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+        "volume": [100.0], "amount": [100.0],
+    })
+    bb.write_daily_partition(df, root)
+    bb.write_daily_partition(df, root)
+    out = pl.read_parquet(root / "date=2025-07-01" / "part.parquet")
+    assert out.height == 1
+    assert "date" in out.columns
