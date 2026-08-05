@@ -4,7 +4,7 @@
 
 **Goal:** 把 mootdx intraday 实时分钟服务进化为独立网络 stock data 服务，量化回测/模拟盘全部通过网络获取行情数据（零本地 parquet 读取、零 mootdx/astock 直连），服务自治完成全部回源落盘。
 
-**Architecture:** 单进程 TCP 服务（ThreadingTCPServer + msgpack 帧），服务端多源聚合（本地分区 / mootdx / astock）+ 标的级 single-flight 去重回源 + 短 TTL 缓存 + 自治调度（启动 backfill / intraday / 15:35 cron）。量化侧经 jqdata 风格客户端 SDK 取数，DataManager / QuantDataProvider / live_feed 换成网络取数对象。FastAPI 主后端只做守护。
+**Architecture:** 单进程 TCP 服务（ThreadingTCPServer + msgpack 帧），服务端多源聚合（本地分区 / mootdx / astock）+ 当日分钟内存库（纯 lazy，网络数据才驻留，00:00 清空）+ 共享网络拉取线程池 + 标的级 single-flight 去重回源 + 自治调度（启动 backfill / 15:35 收盘同步 / 00:00 清空）。量化侧经 jqdata 风格客户端 SDK 取数，DataManager / QuantDataProvider / live_feed 换成网络取数对象。FastAPI 主后端只做守护。
 
 **Tech Stack:** Python 3.11+ / socketserver / threading / msgpack / polars / pandas / mootdx。前端、DuckDB、kline_sync、quote_service 不动。
 
@@ -32,7 +32,7 @@
 | `backend/app/services/stockdata/sources.py` | 分区读取 / mootdx / astock 聚合，带 single-flight、墙钟守护、失败统计 |
 | `backend/app/services/stockdata/handlers.py` | method → handler 分发（json / parquet 响应） |
 | `backend/app/services/stockdata/server.py` | ThreadingTCPServer + 帧循环 + 调度器装配 |
-| `backend/app/services/stockdata/scheduler.py` | 启动 backfill + intraday 循环 + 15:35 cron（线程） |
+| `backend/app/services/stockdata/scheduler.py` | 启动 backfill + 15:35 收盘同步 + 00:00 清空当日分钟内存（线程） |
 | `backend/scripts/run_stockdata_service.py` | 服务进程入口 |
 | `backend/app/services/stockdata_guardian.py` | 泛化自 intraday_guardian 的进程守护（PID 锁 + 3s 自愈） |
 | `backend/app/quant/datasource/network_client.py` | jqdata 风格客户端 SDK（重连/超时/请求 id） |
@@ -49,11 +49,11 @@
 **Files:** 仓库级操作
 
 **Interfaces:**
-- Produces: `feature/stockdata-service` 分支，含 spec 提交 + 移植代码（`mootdx_intraday.py`、`run_mootdx_intraday.py`、`intraday_guardian.py`、`mootdx_service` 扩展、`main.py` 守护托管）。
+- Produces: `feature/stockdata-service` 分支，含 spec 提交 + 移植的 `mootdx_service.py` 回源覆盖提交（`sync_index_daily` 及 staleness/告警检查）。**不移植** `mootdx_intraday.py`/`run_mootdx_intraday.py`/`intraday_guardian.py`（主动盘中轮询已取消，实时改按需回源）。
 
-- [ ] **Step 1: 记录当前 spec 提交**
+- [ ] **Step 1: 记录 spec 提交**
 
-Run: `git log --oneline -1` → 记下 spec 提交（当前 `9657252`）。
+Run: `git log --oneline --all -- docs/superpowers/specs/2026-08-05-stockdata-service-design.md | head` → 记下全部 spec 提交（`243a7c9` `7e49b9e` `9657252` `1c8838f` `2947afe`）。
 
 - [ ] **Step 2: 从 custom-main 建分支**
 
@@ -62,46 +62,43 @@ git checkout custom-main
 git switch -c feature/stockdata-service
 ```
 
-- [ ] **Step 3: 移植 spec 提交**
+- [ ] **Step 3: 移植 spec 提交（依赖序）**
 
 ```bash
-git cherry-pick 9657252
+git cherry-pick 243a7c9 7e49b9e 9657252 1c8838f 2947afe
 ```
-（若 spec 后续有增补提交，一并 cherry-pick。）
 
-- [ ] **Step 4: cherry-pick intraday 相关提交**
+- [ ] **Step 4: 移植 mootdx_service 回源覆盖提交**
+
+只移植 `mootdx_service.py` 相关（backfill 覆盖 + 指数日线 + staleness + 写0告警），**不移植** intraday 循环/守护/模拟盘实时回源提交：
 
 ```bash
-git log --oneline custom-main..feature/mootdx-intraday -- \
-  backend/app/services/mootdx_intraday.py \
-  backend/scripts/run_mootdx_intraday.py \
-  backend/app/services/intraday_guardian.py \
-  backend/app/main.py backend/app/jobs/daily_pipeline.py \
-  backend/app/services/mootdx_service.py
+git log --oneline custom-main..feature/mootdx-intraday -- backend/app/services/mootdx_service.py backend/app/jobs/daily_pipeline.py | cat
 ```
-输出应为：`a4dd7a6` `7c2d82b` `5ef4e4d` `2a133a3` `decb3c9` `d98a2ec` `067b4f9` `1dfaf9f` `8226d79` `e5f2ee0` `97ad919` `20f84a4`（顺序即依赖序）。
+输出应含：`d98a2ec` `067b4f9` `1dfaf9f` `8226d79` `e5f2ee0` `97ad919` `20f84a4`（依赖序）。
 
-按依赖序 cherry-pick：`git cherry-pick a4dd7a6 7c2d82b 5ef4e4d 2a133a3 decb3c9 d98a2ec 067b4f9 1dfaf9f 8226d79 e5f2ee0 97ad919 20f84a4`
-（冲突时解决后 `git cherry-pick --continue`；`20f84a4` 涉及 `daily_pipeline.py`/`mootdx_service.py` 告警逻辑，保留。）
+按依赖序 cherry-pick：`git cherry-pick d98a2ec 067b4f9 1dfaf9f 8226d79 e5f2ee0 97ad919 20f84a4`
+（冲突时解决后 `git cherry-pick --continue`。注意 `20f84a4` 也改了 `daily_pipeline.py` 的告警——该 cron 随后在 Task 9 整体删除，先保留。）
 
-- [ ] **Step 5: 不移植 minute_realtime_backfill**
+- [ ] **Step 5: 确认未误移植 intraday/模拟盘回源**
 
-Run: `git diff custom-main..HEAD --stat | grep -i "sim_accounts\|live_feed"` — 预期 live_feed 无 minute_realtime_backfill 改动（该功能不移植，后续 Task 14 直接改为网络取数）。若 `97bbc72`/`70c1935`/`af5fb14`/`a1ed56f` 误入，`git revert` 掉。
+Run: `git diff custom-main..HEAD --stat | grep -iE "mootdx_intraday|intraday_guardian|minute_realtime|sim_accounts|live_feed"`
+Expected: 无输出（这些文件都不应在本次移植中出现；若出现，`git revert` 掉）。
 
 - [ ] **Step 6: 验证移植后代码可导入**
 
 ```bash
 cd backend
-uv run --extra dev python -c "from app.services import mootdx_intraday, mootdx_service; from app.services.intraday_guardian import IntradayGuardian; print('ok')"
+uv run --extra dev python -c "from app.services import mootdx_service; print('ok')"
 ```
 Expected: `ok`
 
 - [ ] **Step 7: 运行既有测试确认移植无回归**
 
 ```bash
-uv run --extra dev pytest tests/quant/test_mootdx_intraday.py tests/quant/test_sync_adj_factor.py -q
+uv run --extra dev pytest tests/quant/test_sync_adj_factor.py -q
 ```
-Expected: PASS（与移植前一致）。
+Expected: PASS（与移植前一致；`test_mootdx_intraday.py` 不存在于本分支，跳过）。
 
 - [ ] **Step 8: Commit（若 cherry-pick 已产生提交则跳过）**
 
@@ -489,13 +486,19 @@ import datetime as _dt
 import polars as pl
 import pytest
 
-from app.services.stockdata.sources import DataSources
+from app.services.stockdata.sources import DataSources, MinuteMemoryStore
 
 
 def _write_daily(root, day, rows):
     import os
-    import polars as pl
     d = os.path.join(root, "kline_daily", f"date={day}")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame(rows).write_parquet(os.path.join(d, "part.parquet"))
+
+
+def _write_minute(root, sub, day, rows):
+    import os
+    d = os.path.join(root, sub, f"date={day}")
     os.makedirs(d, exist_ok=True)
     pl.DataFrame(rows).write_parquet(os.path.join(d, "part.parquet"))
 
@@ -509,7 +512,7 @@ def src(tmp_path):
         {"symbol": "600000.SH", "date": day, "open": 10.0, "high": 11.0,
          "low": 9.0, "close": 10.5, "volume": 1000, "amount": 105000.0},
     ])
-    s = DataSources(data_root=str(tmp_path), mootdx_factory=None)
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
     yield s
     os.environ.pop("PARTITION_DATA_ROOT", None)
 
@@ -523,10 +526,34 @@ def test_preload_daily_reads_partitions(src):
     assert df["volume"].to_list() == [100000]
 
 
-def test_realtime_snapshot_without_mootdx(src):
-    # 无 mootdx 源时：读当日分区，无补齐
-    df = src.get_realtime_snapshot(["600000.SH"])
+def test_minute_memory_store_lazy_and_clear():
+    ms = MinuteMemoryStore()
+    day = _dt.date.today()
+    assert ms.day() is None  # 未请求标的：无日期、无内存
+    df = pl.DataFrame({"symbol": ["600000.SH"], "datetime": [f"{day} 10:00:00"],
+                       "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+                       "volume": [100], "amount": [100.0]})
+    ms.update(f"{day} 00:00:00", df)
+    assert ms.day() == day
+    got = ms.get_slice({"600000.SH"}, "2000-01-01 00:00:00", f"{day} 15:00:00")
+    assert not got.is_empty()
+    # 换日 lazy 清空
+    ms.ensure_day(_dt.date.today() + _dt.timedelta(days=1))
+    assert ms.day() is None
+    assert ms.get_slice({"600000.SH"}, "2000-01-01 00:00:00", f"{day} 15:00:00").is_empty()
+
+
+def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
+    day = _dt.date.today().isoformat()
+    _write_minute(str(src.data_root), "kline_etf_minute", day, [
+        {"symbol": "512670.SH", "datetime": f"{day} 09:31:00", "open": 1.0,
+         "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1000, "amount": 1000.0},
+    ])
+    # 非交易时段：只读内存库，不触网
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
+    df = src.get_realtime_snapshot(["512670.XSHG"])
     assert not df.is_empty()
+    assert df["close"].to_list() == [1.0]
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -538,14 +565,18 @@ Expected: FAIL
 
 ```python
 # backend/app/services/stockdata/sources.py
-"""数据源聚合：本地分区 / mootdx / astock，带标的级去重与墙钟守护。
+"""数据源聚合：本地分区 / mootdx / astock + 当日分钟内存库 + 共享网络拉取线程池。
 
-股票日线分区 volume 为「手」（×100→股）、ETF 日线个别标的存在「手」
-（按 amount/(volume*close)>50 检测换算）；amount 恒为元。
+内存策略（重要）：
+- 本地分区已有的历史数据 → 每次按需读盘，**不常驻内存**（短 TTL 仅突发去重）；
+- 本地没有、需网络拿的数据（当日实时分钟）→ 拿到后进**当日分钟内存库**，
+  当日驻留，次日 00:00 清空，避免重复回源。
+- 当日分钟内存库是纯 lazy dict：服务启动不预载、不预分配，未请求标的零内存。
 """
 from __future__ import annotations
 
 import datetime as _dt
+import itertools
 import logging
 import os
 import threading
@@ -554,12 +585,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import polars as pl
 
-from .single_flight import DedupCache
+from .single_flight import DedupCache, SingleFlight
 
 logger = logging.getLogger("app.services.stockdata.sources")
 
-_REALTIME_TTL = 10.0     # 实时分钟短 TTL（秒）
-_HIST_TTL = 60.0         # 历史日线/分钟 TTL（秒）
+_HIST_TTL = 60.0  # 历史日线/分钟短 TTL（仅突发去重，不驻留）
 
 
 def _tf_symbol(code: str) -> str:
@@ -583,6 +613,15 @@ def _is_index(code: str) -> bool:
                                       and not pure.startswith("0000"))
 
 
+def _in_trading(now: _dt.datetime | None = None) -> bool:
+    """交易时段判定（口径同 quant.simulate.runner.in_trading）。"""
+    now = now or _dt.datetime.now()
+    t = now.time()
+    return (now.weekday() < 5
+            and (_dt.time(9, 30) <= t <= _dt.time(11, 30)
+                 or _dt.time(13, 0) <= t <= _dt.time(15, 0)))
+
+
 def _normalize_etf_volume_unit(df: pl.DataFrame) -> pl.DataFrame:
     """ETF 日线 volume 归一为「股」（同 DataManager._normalize_etf_volume_unit）。"""
     if df is None or df.is_empty() or "volume" not in df.columns:
@@ -601,18 +640,166 @@ def _normalize_etf_volume_unit(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-class DataSources:
-    """聚合源：本地分区读取为主，mootdx 补实时/缺口；失败按标的计数不中断整批。"""
+_MINUTE_COLS = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
 
-    def __init__(self, data_root: str | None = None, mootdx_factory: Callable | None = None):
+
+class MinuteMemoryStore:
+    """当日分钟内存库：纯 lazy dict，只存「客户端请求过、经网络拉到」的当日实时分钟。
+
+    不预载、不预分配；换日 lazy 清空（scheduler 在 00:00 主动清一次）。
+    """
+
+    def __init__(self) -> None:
+        self._frames: dict[str, pl.DataFrame] = {}
+        self._day: _dt.date | None = None
+        self._lock = threading.Lock()
+
+    def day(self) -> _dt.date | None:
+        with self._lock:
+            return self._day
+
+    def ensure_day(self, day: _dt.date) -> None:
+        """换日 lazy 清空：内存库只保留 `day` 当天的数据。"""
+        with self._lock:
+            if self._day != day:
+                self._frames.clear()
+                self._day = day
+
+    def clear(self) -> None:
+        with self._lock:
+            self._frames.clear()
+            self._day = None
+
+    def update(self, day: str, frames: list[pl.DataFrame]) -> None:
+        """把网络拉到/当日分区的分钟帧并入内存库（same-day）。"""
+        if not frames:
+            return
+        with self._lock:
+            self._day = _dt.date.fromisoformat(day)
+            for df in frames:
+                if df.is_empty():
+                    continue
+                syms = set(df["symbol"].to_list())
+                for sym in syms:
+                    sub = df.filter(pl.col("symbol") == sym)
+                    old = self._frames.get(sym)
+                    merged = pl.concat([old, sub]).unique(
+                        subset=["datetime"], keep="last").sort("datetime") if old is not None \
+                        else sub
+                    self._frames[sym] = merged
+
+    def get_slice(self, symbols: set[str], lo_ts: str, hi_ts: str) -> pl.DataFrame:
+        """取内存库中指定标的在 [lo_ts, hi_ts] 的当日分钟（空帧当无数据）。"""
+        with self._lock:
+            parts = [self._frames[s] for s in symbols if s in self._frames]
+            if not parts:
+                return pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
+            df = pl.concat(parts).filter(
+                (pl.col("datetime") >= pd_to_ts(lo_ts)) & (pl.col("datetime") <= pd_to_ts(hi_ts)))
+            return df
+
+
+class NetworkPuller:
+    """服务端共享网络拉取线程池：有界并发 + 每线程独立数据源 + 标的级 single-flight。
+
+    所有 handler 线程的实时回源都提交到此池：并发客户端请求的重叠标的内在
+    ``rt:{code}`` 键上只拉一次，对 mootdx 的并发 socket 数被池上限约束。
+    """
+
+    def __init__(self, factory: Callable | None = None, workers: int = 16):
+        self._factory = factory
+        self._workers = max(1, workers)
+        self._single = SingleFlight()
+        self._local = threading.local()
+        self._pool = ThreadPoolExecutor(
+            max_workers=self._workers, thread_name_prefix="stockdata-pull")
+
+    def _source(self):
+        src = getattr(self._local, "src", None)
+        if src is None:
+            if self._factory is not None:
+                src = self._factory()
+            else:
+                from app.quant.jqengine.datasource.mootdx_src import MootdxSource
+                src = MootdxSource()
+            self._local.src = src
+        return src
+
+    def _fetch_one(self, code: str) -> pl.DataFrame:
+        df = _pull_recent_guarded(self._source(), code)
+        if df is None or df.empty:
+            return pl.DataFrame()
+        pdf = df.reset_index()
+        pdf["symbol"] = _tf_symbol(code)
+        for c in _MINUTE_COLS:
+            if c not in pdf.columns:
+                pdf[c] = None
+        return pl.from_pandas(pdf[_MINUTE_COLS])
+
+    def fetch_minute(self, code: str) -> pl.DataFrame:
+        """单只标的实时分钟（per-symbol 去重：同一分钟多请求只回源一次）。"""
+        return self._single.run(f"rt:{code}", lambda: self._fetch_one(code))
+
+    def fetch_many(self, codes: list[str]) -> list[pl.DataFrame]:
+        futures = {self._pool.submit(self.fetch_minute, c): c for c in codes}
+        out = []
+        for f in futures:
+            try:
+                df = f.result()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[sources] 实时回源异常 %s: %s", f, e)
+                continue
+            if df is not None and not df.is_empty():
+                out.append(df)
+        return out
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=False)
+
+
+def _pull_recent_guarded(src, code: str, timeout: float = 30.0):
+    """墙钟守护的单只 mootdx 实时分钟拉取；超时/异常返回空帧。"""
+    import threading as _th
+    box: dict = {}
+
+    def _run():
+        try:
+            box["df"] = src.get_minute_recent(code, pages=1)
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+
+    t = _th.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        logger.warning("[sources] %s 实时回源超时(%ss)", code, timeout)
+        return None
+    if "err" in box:
+        logger.warning("[sources] %s 实时回源失败: %s", code, box["err"])
+        return None
+    df = box.get("df")
+    if df is None or df.empty:
+        return None
+    return df
+
+
+class DataSources:
+    """聚合源：本地分区读取为主 + 当日分钟内存库 + 共享网络拉取池。"""
+
+    def __init__(self, data_root: str | None = None, mootdx_factory: Callable | None = None,
+                 fetch_workers: int | None = None):
         self.data_root = data_root or os.getenv(
             "PARTITION_DATA_ROOT",
             os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data"),
         )
-        self.mootdx_factory = mootdx_factory  # 测试注入；None 时默认 MootdxSource
+        if fetch_workers is None:
+            try:
+                fetch_workers = int(os.getenv("STOCKDATA_FETCH_WORKERS", "") or 16)
+            except (TypeError, ValueError):
+                fetch_workers = 16
         self.dedup = DedupCache()
-        self._mootdx_sources: list = []
-        self._src_lock = threading.Lock()
+        self.minute_store = MinuteMemoryStore()
+        self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
         self.fail_counts: dict[str, int] = {}
         self._fail_lock = threading.Lock()
 
@@ -691,109 +878,77 @@ class DataSources:
         return _normalize_etf_volume_unit(pl.concat(parts))
 
     def get_minute(self, codes: list[str], lo_ts, hi_ts) -> pl.DataFrame:
+        """历史分钟读分区；若请求范围包含今日，叠加当日分钟内存库（网络数据）。"""
         lo_d = str(pd_to_date(lo_ts)) if lo_ts is not None else None
         hi_d = str(pd_to_date(hi_ts)) if hi_ts is not None else None
         syms = {_tf_symbol(c) for c in codes}
-        cols = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
         parts = []
         for subdir in ("kline_etf_minute", "kline_minute"):
-            df = self._scan_partitions(subdir, lo_d, hi_d, syms, cols)
+            df = self._scan_partitions(subdir, lo_d, hi_d, syms, _MINUTE_COLS)
             if not df.is_empty():
                 parts.append(df)
+        today = _dt.date.today()
+        if (lo_d is None or lo_d <= today.isoformat()) and (hi_d is None or hi_d >= today.isoformat()):
+            mem = self.minute_store.get_slice(syms, str(lo_ts or today), str(hi_ts or f"{today} 15:00:00"))
+            if not mem.is_empty():
+                parts.append(mem)
         if not parts:
             return pl.DataFrame()
-        out = pl.concat(parts)
+        out = pl.concat(parts).unique(subset=["symbol", "datetime"], keep="last")
         if lo_ts is not None:
             out = out.filter(pl.col("datetime") >= pd_to_ts(lo_ts))
         if hi_ts is not None:
             out = out.filter(pl.col("datetime") <= pd_to_ts(hi_ts))
         return out
 
-    # ---- mootdx 实时 ----
-    def _new_mootdx(self):
-        if self.mootdx_factory is not None:
-            return self.mootdx_factory()
-        from app.quant.jqengine.datasource.mootdx_src import MootdxSource
-        return MootdxSource()
-
-    def _pull_recent_guarded(self, src, code: str, timeout: float = 30.0):
-        """墙钟守护的单只 mootdx 实时分钟拉取；超时/异常返回空帧。"""
-        import threading as _th
-        import pandas as pd
-        box: dict = {}
-
-        def _run():
-            try:
-                box["df"] = src.get_minute_recent(code, pages=1)
-            except Exception as e:  # noqa: BLE001
-                box["err"] = e
-
-        t = _th.Thread(target=_run, daemon=True)
-        t.start()
-        t.join(timeout)
-        if t.is_alive():
-            logger.warning("[sources] %s 实时回源超时(%ss)", code, timeout)
-            return None
-        if "err" in box:
-            logger.warning("[sources] %s 实时回源失败: %s", code, box["err"])
-            return None
-        df = box.get("df")
-        if df is None or df.empty:
-            return None
-        return df
-
-    def _fetch_realtime_one(self, code: str) -> pl.DataFrame:
-        """单只标的实时分钟（per-symbol 去重）。指数不参与（仅用日线）。"""
-        if _is_index(code):
-            return pl.DataFrame()
-        src = self._new_mootdx()
-        df = self._pull_recent_guarded(src, code)
-        if df is None:
-            self._bump_fail(code)
-            return pl.DataFrame()
-        pdf = df.reset_index()
-        pdf["symbol"] = _tf_symbol(code)
-        keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-        for c in keep:
-            if c not in pdf.columns:
-                pdf[c] = None
-        return pl.from_pandas(pdf[keep])
-
     def _bump_fail(self, code: str) -> None:
         with self._fail_lock:
             self.fail_counts[code] = self.fail_counts.get(code, 0) + 1
 
     def get_realtime_snapshot(self, codes: list[str], as_of=None) -> pl.DataFrame:
-        """当日分区 + 未覆盖当前分钟/缺失的标的 mootdx 并发补实时（per-symbol 去重）。"""
-        today = (_dt.datetime.now() if as_of is None else pd_to_ts(as_of)).date()
-        tf_syms = {_tf_symbol(c) for c in codes}
-        base = self._scan_partitions(
-            "kline_etf_minute", today.isoformat(), today.isoformat(), tf_syms,
-            ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"])
-        have = set(base["symbol"].to_list())
-        asof_ts = pd_to_ts(as_of) if as_of is not None else _dt.datetime.now()
-        # 未覆盖：分区缺失，或最新 bar < 当前时刻
-        latest_by_sym = {}
-        for sym in base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows():
-            latest_by_sym[sym[0]] = sym[1]
+        """当日分钟内存库 + 未覆盖标的共享拉取池按需补实时（per-symbol 去重）。
 
+        实时回源只在交易时段执行；非交易时段只读内存库 + 当日分区（不触网）。
+        指数标的（仅用日线）不参与实时回源。
+        """
+        asof_ts = pd_to_ts(as_of) if as_of is not None else _dt.datetime.now()
+        today = asof_ts.date()
+        tf_syms = {_tf_symbol(c) for c in codes}
+        self.minute_store.ensure_day(today)
+
+        # 基础帧：当日分区（收盘同步/重启场景）+ 内存库（网络实时）
+        base_parts = []
+        part = self._scan_partitions("kline_etf_minute", today.isoformat(),
+                                     today.isoformat(), tf_syms, _MINUTE_COLS)
+        if not part.is_empty():
+            base_parts.append(part)
+        mem = self.minute_store.get_slice(tf_syms, f"{today} 00:00:00", str(asof_ts))
+        if not mem.is_empty():
+            base_parts.append(mem)
+        base = pl.concat(base_parts).unique(subset=["symbol", "datetime"], keep="last") \
+            if base_parts else pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
+
+        # 未覆盖：内存缺失，或内存最新 bar < asof（过期）。指数跳过。非交易时段不拉。
+        latest_by_sym = {}
+        for sym, mx in base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows():
+            latest_by_sym[sym] = mx
         todo = [c for c in codes
-                if _tf_symbol(c) not in have
-                or latest_by_sym.get(_tf_symbol(c)) is None
-                or latest_by_sym[_tf_symbol(c)] < asof_ts - _dt.timedelta(minutes=3)]
+                if _in_trading(asof_ts) and not _is_index(c)
+                and (_tf_symbol(c) not in latest_by_sym
+                     or latest_by_sym[_tf_symbol(c)] < asof_ts - _dt.timedelta(minutes=3))]
         fills: list[pl.DataFrame] = []
         if todo:
-            workers = min(16, len(todo))
-            with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-                futures = {ex.submit(self._fetch_realtime_one, c): c for c in todo}
-                for f in futures:
-                    df = f.result()
-                    if df is not None and not df.is_empty():
-                        fills.append(df)
-        out = pl.concat([base] + fills).unique(subset=["symbol", "datetime"], keep="last") \
-            if (fills or not base.is_empty()) else base
-        if as_of is not None:
-            out = out.filter(pl.col("datetime") <= asof_ts)
+            pulls = self.puller.fetch_many(todo)
+            for df in pulls:
+                if not df.is_empty():
+                    fills.append(df)
+            # 更新当日分钟内存库（网络数据才驻留）
+            if fills:
+                self.minute_store.update(today.isoformat(), fills)
+
+        out = pl.concat(base_parts + fills).unique(subset=["symbol", "datetime"], keep="last") \
+            if (fills or base_parts) else base
+        out = out.filter(pl.col("datetime") <= asof_ts)
         return out.sort(["symbol", "datetime"])
 
     # ---- 元数据 ----
@@ -876,10 +1031,6 @@ def pd_to_ts(x):
 def pd_to_date(x):
     import pandas as pd
     return pd.Timestamp(x).date()
-
-
-def _module_ready():
-    return True
 ```
 
 - [ ] **Step 4: 运行确认通过**
@@ -891,7 +1042,7 @@ Expected: PASS
 
 ```bash
 git add backend/app/services/stockdata/sources.py backend/tests/quant/test_stockdata_sources.py
-git commit -m "feat(stockdata): 数据源聚合（分区读 + mootdx 实时 + 标的级去重）"
+git commit -m "feat(stockdata): 数据源聚合 + 当日分钟内存库 + 共享网络拉取线程池"
 ```
 
 ---
@@ -1111,14 +1262,16 @@ git commit -m "feat(stockdata): method 分发 handlers（json/parquet 响应）"
 - Create: `backend/app/services/stockdata/scheduler.py`
 
 **Interfaces:**
-- Consumes: `mootdx_service.backfill_to_now`、`mootdx_service.sync_etf_minute`、`sync_adj_factor`、`sync_stock_minute`、`STOCK_MINUTE_BATCH_LIMIT`、`mootdx_intraday.run_intraday_loop`。
+- Consumes: `mootdx_service.backfill_to_now`、`mootdx_service.sync_etf_minute`、`sync_adj_factor`、`sync_stock_minute`、`STOCK_MINUTE_BATCH_LIMIT`；`DataSources.minute_store`（00:00 清空）。
 - Produces: `start_scheduler()`（启动 backfill 线程 + intraday 线程 + 15:35 cron 线程）；`stop_scheduler()`；`trigger_sync(kind)`（进程级单例，供 handler 手动触发）；`_scheduler_state: dict`（回源进度，供 status）。
 
 - [ ] **Step 1: 实现 scheduler.py（无测试，随 Task 8 集成验证）**
 
 ```python
 # backend/app/services/stockdata/scheduler.py
-"""自治调度：启动 backfill + 盘中 intraday 循环 + 15:35 定时同步（线程）。"""
+"""自治调度：启动 backfill + 15:35 收盘批量同步 + 00:00 清空当日分钟内存（线程）。
+
+无主动盘中全市场轮询——实时分钟只在客户端请求时按需回源（见 sources.get_realtime_snapshot）。"""
 from __future__ import annotations
 
 import datetime as _dt
@@ -1179,12 +1332,17 @@ def _sync_cron_loop():
         time.sleep(30)
 
 
-def _intraday_loop():
-    try:
-        from app.services.mootdx_intraday import run_intraday_loop
-        run_intraday_loop(stop_event=_stop)
-    except Exception:  # noqa: BLE001
-        logger.exception("intraday loop exited")
+def _midnight_clear_loop(data_sources) -> None:
+    """次日 00:00 清空当日分钟内存库（前一日网络实时数据不跨日驻留）。"""
+    last_date = _dt.date.today()
+    while not _stop.is_set():
+        time.sleep(30)
+        today = _dt.date.today()
+        if today != last_date:
+            if today > last_date:  # 日期前跳（改系统时钟）时也兜底
+                data_sources.minute_store.clear()
+                logger.info("stockdata minute store cleared at midnight (new day %s)", today)
+            last_date = today
 
 
 def trigger_sync(kind: str) -> dict:
@@ -1196,11 +1354,14 @@ def trigger_sync(kind: str) -> dict:
     return {"ok": True}
 
 
-def start_scheduler() -> None:
+def start_scheduler(data_sources=None) -> None:
     if _threads:
         return
     _stop.clear()
-    for target in (_backfill_loop, _sync_cron_loop, _intraday_loop):
+    targets = [_backfill_loop, _sync_cron_loop]
+    if data_sources is not None:
+        targets.append(lambda: _midnight_clear_loop(data_sources))
+    for target in targets:
         t = threading.Thread(target=target, name=f"stockdata-{target.__name__}", daemon=True)
         t.start()
         _threads.append(t)
@@ -1210,13 +1371,13 @@ def start_scheduler() -> None:
 def stop_scheduler() -> None:
     _stop.set()
 ```
-（`mootdx_intraday.run_intraday_loop` 已接受 `stop_event` 参数——Task 1 移植代码自带。）
+（说明：无主动 intraday 全市场轮询——实时分钟只在客户端请求时按需回源，见 Task 4 `get_realtime_snapshot`。）
 
 - [ ] **Step 2: Commit**
 
 ```bash
 git add backend/app/services/stockdata/scheduler.py
-git commit -m "feat(stockdata): 自治调度（启动 backfill + intraday + 15:35 同步）"
+git commit -m "feat(stockdata): 自治调度（启动 backfill + 15:35 收盘同步 + 00:00 内存清空）"
 ```
 
 ---
@@ -1319,7 +1480,7 @@ def main() -> None:
 
     src = DataSources()
     server = StockDataServer((HOST, _port()), src)
-    scheduler.start_scheduler()
+    scheduler.start_scheduler(data_sources=src)  # backfill + 15:35 + 00:00 内存清空
     logger = logging.getLogger("stockdata")
     logger.info("stockdata service listening on %s:%s", HOST, _port())
     try:
@@ -1844,7 +2005,7 @@ Expected: `main ok`（应用对象可导入；guardian 由 lifespan 才启动，
 - [ ] **Step 8: 跑主后端既有测试**
 
 ```bash
-uv run --extra dev pytest tests/test_sync_adj_factor.py tests/quant/test_mootdx_intraday.py -q
+uv run --extra dev pytest tests/test_sync_adj_factor.py -q
 ```
 Expected: PASS
 
@@ -2328,13 +2489,13 @@ class _FakeClient:
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `uv run --extra dev pytest tests/quant/test_live_feed.py tests/quant/test_runner_strategy.py tests/quant/test_minute_realtime_backfill.py -q`
-Expected: PASS（test_minute_realtime_backfill 若测 mootdx 直连路径则改为断言「不再直连」或删除）。
+Run: `uv run --extra dev pytest tests/quant/test_live_feed.py tests/quant/test_runner_strategy.py -q`
+Expected: PASS（`test_minute_realtime_backfill.py` 不存在于本分支——该功能未移植，跳过）。
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/app/quant/simulate/live_feed.py backend/app/quant/simulate/runner.py backend/tests/quant/test_live_feed.py backend/tests/quant/test_runner_strategy.py backend/tests/quant/test_minute_realtime_backfill.py
+git add backend/app/quant/simulate/live_feed.py backend/app/quant/simulate/runner.py backend/tests/quant/test_live_feed.py backend/tests/quant/test_runner_strategy.py
 git commit -m "feat(quant): live_feed/runner 换网络客户端，删除 mootdx 直连路径"
 ```
 
@@ -2499,11 +2660,12 @@ git commit -m "docs: AGENTS.md 记录 stock data 服务架构与验收命令"
 **Spec 覆盖核对**
 - 网络服务 + 多源聚合：Task 2-7 ✓
 - 全部走网络（DataManager/QuantDataProvider/live_feed）：Task 10-13 ✓
-- 服务自治回源（backfill/intraday/15:35）：Task 6、9 ✓
+- 服务自治回源（启动 backfill / 15:35 收盘同步 / 00:00 清空，无主动盘中轮询）：Task 6、9 ✓
 - 主后端只做守护 + 删回源：Task 9 ✓
 - jqdata 风格 API：Task 8 ✓
 - 客户端算 fq（get_adj_factors）：Task 10（_adj_factor_map）✓
-- 标的级去重 + 短 TTL：Task 3、4（get_realtime_snapshot per-symbol）✓
+- 标的级去重 + 当日分钟内存库（纯 lazy、按需回源、00:00 清空）+ 共享拉取线程池：Task 3、4 ✓
+- 历史数据不驻留（仅短 TTL 突发去重）：Task 4（_HIST_TTL）+ Task 3 ✓
 - 前端/DuckDB/主后端其余不动：Global Constraints + Task 9 只删回源 ✓
 - wufu_v52 回测/模拟盘对齐：Task 15、16 ✓
 - 测试/回归/ruff/mypy：Task 14 ✓
