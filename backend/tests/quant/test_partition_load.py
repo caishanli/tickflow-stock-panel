@@ -8,10 +8,20 @@
 - _load_minute_from_partitions 返回 DatetimeIndex 索引的分钟帧
 """
 
+import os
+
 import pandas as pd
 import pytest
 
-from app.quant.jqengine.datasource.manager import get_data_manager
+from app.quant.datasource.network_client import StockDataClient
+from app.quant.jqengine.datasource.manager import DataManager, get_data_manager
+
+_DATA_ROOT = DataManager._partition_root()
+
+
+def _partitions_present(*subdirs: str) -> bool:
+    """真实 data/ 按日分区是否齐备（缺失则相关测试 skip，不 spurious fail）。"""
+    return all(os.path.isdir(os.path.join(_DATA_ROOT, sub)) for sub in subdirs)
 
 
 @pytest.fixture
@@ -21,12 +31,20 @@ def dm():
     return d
 
 
+@pytest.mark.skipif(
+    not _partitions_present("kline_daily", "kline_etf_daily"),
+    reason="真实 data/kline_daily 与 data/kline_etf_daily 分区缺失",
+)
 def test_load_daily_from_partitions_has_etf_and_stock(dm):
     daily = dm._load_daily_from_partitions(asof=None)
     assert "515700.XSHG" in daily
     assert "000001.XSHE" in daily
 
 
+@pytest.mark.skipif(
+    not _partitions_present("kline_daily"),
+    reason="真实 data/kline_daily 分区缺失",
+)
 def test_load_daily_from_partitions_a_stock_volume_in_shares(dm):
     # A股日线分区 volume 存盘为「手」，读取后应归一到「股」（×100）
     daily = dm._load_daily_from_partitions(asof=None)
@@ -34,6 +52,10 @@ def test_load_daily_from_partitions_a_stock_volume_in_shares(dm):
     assert (df["volume"] > 1e6).all()  # 000001 日成交量百万股级
 
 
+@pytest.mark.skipif(
+    not _partitions_present("kline_etf_daily"),
+    reason="真实 data/kline_etf_daily 分区缺失",
+)
 def test_load_daily_from_partitions_etf_volume_not_scaled(dm):
     # ETF 日线分区 volume 存盘即为「股」，读取时不应被 ×100
     daily = dm._load_daily_from_partitions(asof=None)
@@ -42,6 +64,13 @@ def test_load_daily_from_partitions_etf_volume_not_scaled(dm):
 
 
 def test_load_minute_from_partitions(dm):
+    cli = StockDataClient()
+    try:
+        cli.ping()
+    except Exception:
+        pytest.skip("stockdata 服务不可达")
+    finally:
+        cli.close()
     df = dm._load_minute_from_partitions(
         "515700.XSHG",
         pd.Timestamp("2026-04-01"),
