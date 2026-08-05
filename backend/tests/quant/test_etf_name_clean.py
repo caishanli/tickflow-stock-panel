@@ -7,7 +7,7 @@
 - 不删除数字（30/50/100/300...）：避免 创业板50ETF 等被误除导致本地/聚宽
   exclude 与分组不一致。
 - 幂等：清洗结果再清洗不变。
-- _load_etf_universe 两个名称加载分支（快照 / mootdx 推导）都应用清洗。
+- _load_etf_universe 两个名称加载分支（快照 / network 推导）都应用清洗。
 """
 import datetime as _dt
 import json
@@ -59,12 +59,12 @@ def test_clean_empty_unchanged():
 class _UniverseDM:
     """_load_etf_universe 需要的最小 DataManager 鸭子类型。"""
 
-    def __init__(self, mootdx=None, cache_codes=()):
+    def __init__(self, network=None, cache_codes=()):
         self._daily_mem = {"get_daily_" + c: object() for c in cache_codes}
-        self.sources = {"mootdx": mootdx}
+        self.sources = {"network": network}
 
 
-class _FakeMootdxSrc:
+class _FakeNetworkSrc:
     def __init__(self, names):
         self._names = names
 
@@ -98,7 +98,7 @@ def test_load_etf_universe_cleans_snapshot_names(tmp_path, monkeypatch):
 def test_load_etf_universe_cleans_derived_names(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT",
                         str(tmp_path / "nonexistent.json"))
-    dm = _UniverseDM(mootdx=_FakeMootdxSrc(
+    dm = _UniverseDM(network=_FakeNetworkSrc(
         {"517900": "银行AH价格优选ETF"}), cache_codes=["517900.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert "517900" in names
