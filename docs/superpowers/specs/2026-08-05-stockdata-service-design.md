@@ -98,6 +98,16 @@ FastAPI 主进程（前端 + 守护）
 - `current_snapshot` 服务端并发回源口径沿用现有 `_guarded_get_minute`（墙钟 30s/只，超时重建 `MootdxSource`，指数标的排除）。
 - 服务端单只失败只标记该标的，不拖垮整批。
 
+## 并发去重回源（single-flight + 短 TTL 缓存）
+
+多个客户端可能同时请求同一标的的相同数据（如多个模拟盘账户同时 `current_snapshot` 同一 watch 集合、回测与模拟盘同时 `preload_daily`）。规则：
+
+- 服务端数据层对**每个数据键**做 single-flight 去重：同一键的并发请求只触发一次网络回源，其余请求等待同一 in-flight 结果并共享返回值，不重复回源。
+- 数据键粒度：实时分钟按 `rt:{code}`、日线按 `daily:{code}:{start}:{end}`、分钟按 `min:{code}:{lo}:{hi}`、全市场日线按 `preload_daily:{lookback_days}`。
+- 配合**短 TTL 内存缓存**（实时分钟 ~10s、日线/分钟 ~60s）：并发突发内先请求完成后，后续请求直接命中缓存，避免紧邻窗口内的重复回源。
+- 实现为通用 `single_flight(key, loader)` helper（线程安全，锁 + future 共享），网络回源失败时释放并允许下一次重试（失败结果不入缓存）。
+- 落盘仍走现有原子 `tmp→rename` 写分区；single-flight 只防重复网络拉取，不改变落盘语义。
+
 ## 数据流
 
 **模拟盘策略模式一轮 tick**
