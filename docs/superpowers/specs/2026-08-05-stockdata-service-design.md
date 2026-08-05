@@ -103,9 +103,10 @@ FastAPI 主进程（前端 + 守护）
 多个客户端可能同时请求同一标的的相同数据（如多个模拟盘账户同时 `current_snapshot` 同一 watch 集合、回测与模拟盘同时 `preload_daily`）。规则：
 
 - 服务端数据层对**每个数据键**做 single-flight 去重：同一键的并发请求只触发一次网络回源，其余请求等待同一 in-flight 结果并共享返回值，不重复回源。
-- 数据键粒度：实时分钟按 `rt:{code}`、日线按 `daily:{code}:{start}:{end}`、分钟按 `min:{code}:{lo}:{hi}`、全市场日线按 `preload_daily:{lookback_days}`。
-- 配合**短 TTL 内存缓存**（实时分钟 ~10s、日线/分钟 ~60s）：并发突发内先请求完成后，后续请求直接命中缓存，避免紧邻窗口内的重复回源。
-- 实现为通用 `single_flight(key, loader)` helper（线程安全，锁 + future 共享），网络回源失败时释放并允许下一次重试（失败结果不入缓存）。
+- **去重粒度是标的级（per-symbol），不是整批请求级**：两个交叉的批量请求（如 `current_snapshot([A,B,C])` 与 `current_snapshot([B,C,D])`）在 `rt:{B}`、`rt:{C}` 键上共享 in-flight/缓存结果，重叠部分 B、C 只回源一次，各自新标的 A、D 各自回源。
+- **实时键不含时间分量**：实时分钟键为 `rt:{code}`（不带 as_of），配合短 TTL 内存缓存（~10s），同一窗口内先后到达的交叉请求直接命中缓存，不回源——目标就是「实时数据不重复回源」。
+- 数据键粒度：实时分钟 `rt:{code}`、日线 `daily:{code}:{start}:{end}`、分钟 `min:{code}:{lo}:{hi}`、全市场日线 `preload_daily:{lookback_days}`。
+- 网络回源失败时释放该键并允许下一次重试（失败结果不入缓存）；请求方按各自 as_of 在返回帧上切片，不共享「时间」只共享「数据」。
 - 落盘仍走现有原子 `tmp→rename` 写分区；single-flight 只防重复网络拉取，不改变落盘语义。
 
 ## 数据流
