@@ -51,9 +51,9 @@
 **Interfaces:**
 - Produces: `feature/stockdata-service` 分支，含 spec 提交 + 移植的 `mootdx_service.py` 回源覆盖提交（`sync_index_daily` 及 staleness/告警检查）。**不移植** `mootdx_intraday.py`/`run_mootdx_intraday.py`/`intraday_guardian.py`（主动盘中轮询已取消，实时改按需回源）。
 
-- [ ] **Step 1: 记录 spec 提交**
+- [ ] **Step 1: 记录 spec/计划提交**
 
-Run: `git log --oneline --all -- docs/superpowers/specs/2026-08-05-stockdata-service-design.md | head` → 记下全部 spec 提交（`243a7c9` `7e49b9e` `9657252` `1c8838f` `2947afe`）。
+Run: `git log --oneline --all -- docs/superpowers/specs/2026-08-05-stockdata-service-design.md docs/superpowers/plans/2026-08-05-stockdata-service.md | head` → 记下全部提交（spec：`243a7c9` `7e49b9e` `9657252` `1c8838f` `2947afe`；计划：`a7fa283` `1f96363`）。
 
 - [ ] **Step 2: 从 custom-main 建分支**
 
@@ -62,10 +62,10 @@ git checkout custom-main
 git switch -c feature/stockdata-service
 ```
 
-- [ ] **Step 3: 移植 spec 提交（依赖序）**
+- [ ] **Step 3: 移植 spec/计划提交（依赖序）**
 
 ```bash
-git cherry-pick 243a7c9 7e49b9e 9657252 1c8838f 2947afe
+git cherry-pick 243a7c9 7e49b9e 9657252 1c8838f 2947afe a7fa283 1f96363
 ```
 
 - [ ] **Step 4: 移植 mootdx_service 回源覆盖提交**
