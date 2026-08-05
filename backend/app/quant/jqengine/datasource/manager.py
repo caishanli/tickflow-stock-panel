@@ -222,6 +222,7 @@ class DataManager:
         import glob as _glob
         roots = [
             os.path.join(self._partition_root(), "adj_factor_etf"),
+            os.path.join(self._partition_root(), "adj_factor_baostock"),
         ]
         paths = []
         for r in roots:

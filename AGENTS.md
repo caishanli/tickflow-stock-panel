@@ -58,8 +58,9 @@ uv run --extra dev mypy app               # 类型检查
   回源全市场近 3 年 **股票 5min 真实数据** → `data/kline_5min/date=YYYY-MM-DD/part.parquet`
   （baostock 无 1min/ETF分钟/指数分钟，实测 `frequency="1"` 返回错误）；
   ETF/指数**日线** → `kline_etf_daily` / `kline_index_daily`（指数 volume 股÷100 转手，
-  ETF 不换算；baostock ETF 日线仅 2026-01-05 起）；复权因子（分红/送转/配股/缩股净效果）
-  → `data/adj_factor/all.parquet`（与 `adj_factor_etf` 同构，DataManager 自动加载）；
+  ETF 不换算；baostock ETF 日线仅 2026-01-05 起）；复权因子（分红/送转/配股/缩股净效果，
+  累计锚定最新=1.0 的事件行）→ `data/adj_factor_baostock/all.parquet`
+  （DataManager 已接线读取，供回测前复权；不写 TickFlow 实时资产 `data/adj_factor/`）；
   分红送转明细 → `data/dividends/all.parquet`。
 - 断点续传：`data/baostock_backfill_state.json`；`--retry-failed` 重试失败，
   `--reset-state` 清空重跑；失败记录 `data/baostock_backfill_failures.csv`。

@@ -198,7 +198,7 @@ def tmp_data(tmp_path, monkeypatch):
     monkeypatch.setattr(bb, "KLINE_5MIN_ROOT", tmp_path / "kline_5min")
     monkeypatch.setattr(bb, "KLINE_INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
     monkeypatch.setattr(bb, "KLINE_ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
-    monkeypatch.setattr(bb, "ADJ_FACTOR_PATH", tmp_path / "adj_factor" / "all.parquet")
+    monkeypatch.setattr(bb, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_baostock" / "all.parquet")
     monkeypatch.setattr(bb, "DIVIDENDS_PATH", tmp_path / "dividends" / "all.parquet")
     monkeypatch.setattr(bb, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(bb, "FAILURE_CSV", tmp_path / "failures.csv")
@@ -417,7 +417,7 @@ def test_sync_corporate_writes_adj_and_dividends(tmp_data, monkeypatch):
     st = bb.load_state()
     out = bb.sync_corporate(_date(2025, 1, 1), _date(2025, 12, 31), st, timeout=5)
     assert out["adj"] == 1 and out["dividends"] == 1
-    adj = pl.read_parquet(tmp_data / "adj_factor" / "all.parquet")
+    adj = pl.read_parquet(tmp_data / "adj_factor_baostock" / "all.parquet")
     assert adj["symbol"].to_list() == ["600036.SH"]
     assert adj["trade_date"][0] == _date(2025, 7, 16)
     assert adj["ex_factor"][0] == pytest.approx(1.0)  # 唯一事件=最新 → 1.0
@@ -425,3 +425,33 @@ def test_sync_corporate_writes_adj_and_dividends(tmp_data, monkeypatch):
     assert div["cash_ps_before_tax"][0] == 2.0
     assert set(st["adj_done"]) == {"600036.SH"}
     assert set(st["dividends_done"]) == {"600036.SH"}
+
+
+def test_sync_corporate_incremental_flush_no_loss(tmp_data, monkeypatch):
+    syms = ["600036.SH", "000001.SZ", "600519.SH"]
+    monkeypatch.setattr(bb, "stock_universe", lambda: syms)
+    n = {"calls": 0}
+
+    def failing_adj(*a, **k):
+        n["calls"] += 1
+        if n["calls"] == 3:
+            raise RuntimeError("boom")
+        return [["sh.600036", "2025-07-16", "0.95", "12.76", "12.76"]]
+
+    monkeypatch.setattr(bb, "query_adjust_factor_rows", failing_adj)
+    monkeypatch.setattr(bb, "query_dividend_rows", lambda *a, **k: [])
+    st = bb.load_state()
+    bb.sync_corporate(_date(2025, 1, 1), _date(2025, 12, 31), st,
+                      timeout=5, flush_batch=2)
+    adj = pl.read_parquet(tmp_data / "adj_factor_baostock" / "all.parquet")
+    assert adj["symbol"].n_unique() == 2
+    assert set(st["adj_done"]) == {"600036.SH", "000001.SZ"}
+    assert "600519.SH" in st["failed"]["adj"]
+    monkeypatch.setattr(bb, "query_adjust_factor_rows", lambda *a, **k: [
+        ["sh.600519", "2025-07-16", "0.95", "12.76", "12.76"]])
+    st2 = bb.load_state()
+    bb.sync_corporate(_date(2025, 1, 1), _date(2025, 12, 31), st2,
+                      timeout=5, flush_batch=2, retry_failed=True)
+    adj2 = pl.read_parquet(tmp_data / "adj_factor_baostock" / "all.parquet")
+    assert adj2["symbol"].n_unique() == 3
+    assert set(st2["adj_done"]) == set(syms)

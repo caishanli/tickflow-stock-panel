@@ -32,7 +32,7 @@ DATA_ROOT = Path(_env_root) if _env_root else Path(__file__).resolve().parents[3
 KLINE_5MIN_ROOT = DATA_ROOT / "kline_5min"
 KLINE_INDEX_DAILY_ROOT = DATA_ROOT / "kline_index_daily"
 KLINE_ETF_DAILY_ROOT = DATA_ROOT / "kline_etf_daily"
-ADJ_FACTOR_PATH = DATA_ROOT / "adj_factor" / "all.parquet"
+ADJ_FACTOR_PATH = DATA_ROOT / "adj_factor_baostock" / "all.parquet"
 DIVIDENDS_PATH = DATA_ROOT / "dividends" / "all.parquet"
 STATE_PATH = DATA_ROOT / "baostock_backfill_state.json"
 FAILURE_CSV = DATA_ROOT / "baostock_backfill_failures.csv"
@@ -171,8 +171,9 @@ def _safe_float(v) -> float | None:
         return None
 
 
-def load_state(path: Path = STATE_PATH) -> dict:
+def load_state(path: Path | None = None) -> dict:
     """读断点状态；不存在/损坏时返回默认空状态。"""
+    path = path or STATE_PATH
     default: dict[str, Any] = {
         "start": None, "end": None,
         "minute_done": [], "daily_done": [], "adj_done": [], "dividends_done": [],
@@ -190,8 +191,9 @@ def load_state(path: Path = STATE_PATH) -> dict:
         return default
 
 
-def save_state(state: dict, path: Path = STATE_PATH) -> None:
+def save_state(state: dict, path: Path | None = None) -> None:
     """原子写状态文件（tmp + rename）。"""
+    path = path or STATE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1))
@@ -584,15 +586,35 @@ def _write_append_table(df: pl.DataFrame, path: Path, keys: list[str]) -> None:
     tmp.rename(path)
 
 
+def _flush_adj_batch(events: dict[str, list[tuple[_date, float]]]) -> int:
+    """批量写复权因子表（增量 flush，幂等）。返回本次写入的事件行数。"""
+    if not events:
+        return 0
+    df = build_ex_factor_table(events)
+    _write_append_table(df, ADJ_FACTOR_PATH, ["symbol", "trade_date"])
+    return df.height
+
+
+def _flush_dividend_batch(frames: list[pl.DataFrame]) -> int:
+    """批量写分红明细表（增量 flush，幂等）。返回本次写入的行数。"""
+    if not frames:
+        return 0
+    df = pl.concat(frames).unique(
+        subset=["symbol", "ex_date"], keep="last").sort(["symbol", "ex_date"])
+    _write_append_table(df, DIVIDENDS_PATH, ["symbol", "ex_date"])
+    return df.height
+
+
 def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
-                   retry_failed: bool = False, limit: int | None = None,
-                   progress=None) -> dict:
+                   flush_batch: int = 100, retry_failed: bool = False,
+                   limit: int | None = None, progress=None) -> dict:
     """复权因子 + 分红送转明细回源（全市场股票）。
 
-    - adj：逐只 query_adjust_factor → 事件行 ex_factor 表 → data/adj_factor/all.parquet
+    - adj：逐只 query_adjust_factor → 事件行 ex_factor 表 → data/adj_factor_baostock/all.parquet
     - dividends：逐只 × 逐年（start.year..end.year）query_dividend_data →
       data/dividends/all.parquet；只保留 start<=ex_date<=end 且 ex_date 非空的行
     - 断点：state['adj_done'] / state['dividends_done']（按 symbol 粒度）
+    - 增量 flush：每 flush_batch 只先写表再标记 done 并存状态（kill 后 resume 不丢数据）
     """
     stats = {"adj": 0, "dividends": 0}
     syms = stock_universe()
@@ -606,6 +628,7 @@ def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
         todo_adj = todo_adj[:limit]
     logger.info("[adj] 回源 %d 只（已覆盖 %d）", len(todo_adj), len(done_adj))
     events: dict[str, list[tuple[_date, float]]] = {}
+    batch_syms: list[str] = []
     for i, sym in enumerate(todo_adj, 1):
         code = to_baostock_code(sym)
         try:
@@ -628,17 +651,23 @@ def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
             append_failure(sym, f"adj:{str(e)[:120]}")
             save_state(state)
             continue
-        mark_done(state, "adj", sym)
-        if i % 100 == 0:
+        batch_syms.append(sym)
+        if len(batch_syms) >= flush_batch:
+            stats["adj"] += _flush_adj_batch(events)
+            for s in batch_syms:
+                mark_done(state, "adj", s)
             save_state(state)
+            batch_syms, events = [], {}
             if progress:
-                progress("adj", i, len(todo_adj), len(events))
-    save_state(state)
-    if events:
-        df = build_ex_factor_table(events)
-        _write_append_table(df, ADJ_FACTOR_PATH, ["symbol", "trade_date"])
-        stats["adj"] = df.height
-        logger.info("[adj] 因子表 %d 行 → %s", df.height, ADJ_FACTOR_PATH)
+                progress("adj", i, len(todo_adj), stats["adj"])
+    if batch_syms:
+        stats["adj"] += _flush_adj_batch(events)
+        for s in batch_syms:
+            mark_done(state, "adj", s)
+        save_state(state)
+        if progress:
+            progress("adj", i, len(todo_adj), stats["adj"])
+    logger.info("[adj] 因子表累计 %d 行 → %s", stats["adj"], ADJ_FACTOR_PATH)
     # ---- 分红送转明细 ----
     years = list(range(start.year, end.year + 1))
     done_div = set(state["dividends_done"])
@@ -651,6 +680,7 @@ def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
     logger.info("[dividends] 回源 %d 只 × %d 年（已覆盖 %d）",
                 len(todo_div), len(years), len(done_div))
     div_frames: list[pl.DataFrame] = []
+    batch_syms = []
     for i, sym in enumerate(todo_div, 1):
         code = to_baostock_code(sym)
         all_ok = True
@@ -680,17 +710,23 @@ def sync_corporate(start: _date, end: _date, state: dict, timeout: float = 120,
                     "stocks_ps": [_safe_float(rec.get("dividStocksPs"))],
                     "reserve_to_stock_ps": [_safe_float(rec.get("dividReserveToStockPs"))],
                 }))
-        if all_ok:
-            mark_done(state, "dividends", sym)
-        if i % 100 == 0:
+        if not all_ok:
+            continue
+        batch_syms.append(sym)
+        if len(batch_syms) >= flush_batch:
+            stats["dividends"] += _flush_dividend_batch(div_frames)
+            for s in batch_syms:
+                mark_done(state, "dividends", s)
             save_state(state)
+            batch_syms, div_frames = [], []
             if progress:
-                progress("dividends", i, len(todo_div), len(div_frames))
-    save_state(state)
-    if div_frames:
-        df = pl.concat(div_frames).unique(
-            subset=["symbol", "ex_date"], keep="last").sort(["symbol", "ex_date"])
-        _write_append_table(df, DIVIDENDS_PATH, ["symbol", "ex_date"])
-        stats["dividends"] = df.height
-        logger.info("[dividends] 明细 %d 行 → %s", df.height, DIVIDENDS_PATH)
+                progress("dividends", i, len(todo_div), stats["dividends"])
+    if batch_syms:
+        stats["dividends"] += _flush_dividend_batch(div_frames)
+        for s in batch_syms:
+            mark_done(state, "dividends", s)
+        save_state(state)
+        if progress:
+            progress("dividends", i, len(todo_div), stats["dividends"])
+    logger.info("[dividends] 明细累计 %d 行 → %s", stats["dividends"], DIVIDENDS_PATH)
     return stats
