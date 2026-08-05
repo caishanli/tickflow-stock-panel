@@ -39,8 +39,26 @@ def _mootdx_df():
     return df
 
 
-def _make_dm(tmp_path):
-    dm = DataManager(token="", cache=DataCache(root=str(tmp_path)))
+class _FakeClient:
+    """网络客户端替身：preload_daily 返回合成日线帧（离线，不联网）。
+
+    DataManager.preload_daily 已改走 network client，不再从本地分区/cache
+    直接读日线；用替身把合成帧从 client 喂入，断言 money 单位归一口径不变。
+    """
+
+    def __init__(self, daily):
+        self._daily = daily  # {jq_code: DatetimeIndex 日线帧}
+
+    def preload_daily(self, lookback_days=400, asof=None):
+        return self._daily
+
+    def get_adj_factors(self):
+        return pd.DataFrame()
+
+
+def _make_dm(tmp_path, daily=None):
+    dm = DataManager(token="", cache=DataCache(root=str(tmp_path)),
+                     client=_FakeClient(daily or {}))
     dm._offline = True
     return dm
 
@@ -65,9 +83,8 @@ def test_ensure_money_yuan_keeps_existing_money():
 
 
 def test_preload_daily_normalizes_money_units(tmp_path):
-    dm = _make_dm(tmp_path)
-    dm.cache.put("daily", "astock_510300.XSHG", _astock_df())
-    dm.cache.put("daily", "mootdx_512800.XSHG", _mootdx_df())
+    dm = _make_dm(tmp_path, daily={"510300.XSHG": _astock_df(),
+                                   "512800.XSHG": _mootdx_df()})
     dm.preload_daily()
     ts = dm._daily_mem["get_daily_510300.XSHG"]
     assert ts["money"].iloc[-1] == 4039507.185
@@ -77,8 +94,7 @@ def test_preload_daily_normalizes_money_units(tmp_path):
 
 def test_money_aggregate_excludes_unit_error(tmp_path):
     """策略口径全市场合计：amount 单位统一为元，直接可用。"""
-    dm = _make_dm(tmp_path)
-    dm.cache.put("daily", "astock_510300.XSHG", _astock_df())
+    dm = _make_dm(tmp_path, daily={"510300.XSHG": _astock_df()})
     dm.preload_daily()
     m = dm.get_daily_money_cached(["510300.XSHG"], DATES[-1], count=1)
     assert m["money"].iloc[0] == 4039507.185

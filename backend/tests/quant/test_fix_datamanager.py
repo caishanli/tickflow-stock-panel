@@ -8,6 +8,10 @@
 - H6c _minute_mem 命中校验覆盖区间（同参数结果与访问顺序无关）
 - 重复定义 preload_minute_for_pool 合并为一个
 - M11 _minute_mem 有界 LRU（容量上限 + 驱逐释放 + 覆盖元数据联动清理）
+
+分钟读取已改走 network client（不再直读本地 real_ 分区），测试用
+``_FakeClient`` 替身把合成 real_ 1m 帧从 client 喂入，断言仍覆盖
+DataManager 的窗口裁剪/覆盖校验/滑窗/预热逻辑。
 """
 
 import inspect
@@ -35,14 +39,56 @@ def _make_dm(tmp_path, set_window=True, **kw):
     return dm
 
 
-def _seed_minute_caches(dm, code=CODE):
-    """写入合成 real_ 1m 缓存。"""
+class _FakeClient:
+    """网络客户端替身：get_price/get_minute_pool 从内存帧返回合成 real_ 1m 数据。
+
+    DataManager 分钟读取已改走 network client（不再直读本地 real_ 分区），
+    用替身把合成数据从 client 喂入，离线不联网。与 stockdata 服务语义对齐：
+    end_date 为纯日期时按全天闭合（含当日 15:00 bar），裁剪由 DataManager
+    侧完成（H6b）。
+    """
+
+    def __init__(self, frames):
+        self.frames = frames  # {code: DatetimeIndex 分钟帧}
+
+    def get_price(self, security, start_date=None, end_date=None,
+                  frequency="daily", fields=None):
+        codes = [security] if isinstance(security, str) else list(security)
+        lo = pd.Timestamp(start_date) if start_date else None
+        hi = pd.Timestamp(end_date) if end_date else None
+        if hi is not None and hi == hi.normalize():
+            hi = hi + pd.Timedelta(hours=15)
+        out = {}
+        for c in codes:
+            df = self.frames.get(c)
+            if df is None:
+                continue
+            if lo is not None:
+                df = df[df.index >= lo]
+            if hi is not None:
+                df = df[df.index <= hi]
+            out[c] = df
+        return out
+
+    def get_minute_pool(self, codes, lo_ts, hi_ts):
+        return self.get_price(
+            codes,
+            start_date=str(lo_ts) if lo_ts is not None else None,
+            end_date=str(hi_ts) if hi_ts is not None else None,
+            frequency="1m")
+
+
+def _real_minute_frame(code=CODE):
     idx1 = pd.date_range(REAL_START, REAL_END, freq="1min")
-    real = pd.DataFrame(
+    return pd.DataFrame(
         {"open": REAL_CLOSE, "high": REAL_CLOSE, "low": REAL_CLOSE,
          "close": REAL_CLOSE, "volume": 1.0, "money": 1.0},
         index=idx1)
-    dm.cache.put("minute", f"real_{code}", real)
+
+
+def _seed_minute_caches(dm, code=CODE):
+    """注入网络客户端替身：client 返回合成 real_ 1m 帧（替代旧本地分区直读）。"""
+    dm.client = _FakeClient({code: _real_minute_frame(code)})
 
 
 def _daily_df(dates, money_base=1e6):
@@ -160,6 +206,7 @@ def test_feed_result_independent_of_access_order(tmp_path):
     feed1 = dm1.get_minute_feed(CODE, WIN_START, WIN_END)
 
     dm2 = _make_dm(tmp_path)
+    _seed_minute_caches(dm2)
     feed2 = dm2.get_minute_feed(CODE, WIN_START, WIN_END)  # 直接 feed
     pdt.assert_frame_equal(feed1, feed2)
 
