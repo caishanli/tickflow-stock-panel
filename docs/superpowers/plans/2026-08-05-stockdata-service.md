@@ -1054,6 +1054,8 @@ Expected: PASS
 ```bash
 git add backend/app/services/stockdata/sources.py backend/tests/quant/test_stockdata_sources.py
 git commit -m "feat(stockdata): 数据源聚合 + 当日分钟内存库 + 共享网络拉取线程池"
+
+> **Task 4 review 修复（已并入实现，本代码块为设计底稿、已过时）**：commit `5d35d5f` 修复——(1) 空 base 帧 Utf8 vs datetime 过滤崩溃（返回空帧短路）；(2) `_is_index` 加后缀判断（仅沪市 000xxx 是指数，深市 000001.XSHE 是股票）；(3) `get_all_securities`/`get_security_info`/`get_stock_names` 只 select 分区实际有的 `symbol` 列（name/list_date 置空）；(4) `_pull_recent_guarded` 超时抛 `TimeoutError`，`_fetch_one` 重建线程局部源；(5) `get_daily`/`get_minute` 包 `get_or_fetch`（`daily:`/`min:` 键，minute 短 TTL 10s）；(6) 删未用 `itertools` 与死代码 `fail_counts`（`h_status` 不再引用）。Task 5 `h_status` 代码块已按此更新。
 ```
 
 ---
@@ -1156,7 +1158,8 @@ def h_ping(p, s: DataSources):
 
 
 def h_status(p, s: DataSources):
-    return "json", {"fails": dict(s.fail_counts)}
+    # 注：DataSources 不再维护 fail_counts（Task4 review 已移除），状态仅回显基础信息
+    return "json", {"ok": True, "ts": _dt.datetime.now().isoformat()}
 
 
 def h_get_price(p, s: DataSources):
