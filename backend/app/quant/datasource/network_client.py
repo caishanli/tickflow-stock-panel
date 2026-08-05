@@ -73,6 +73,7 @@ class StockDataClient:
             use_bin_type=True)
         frame = len(payload).to_bytes(_HEADER, "big") + payload
         last: Exception | None = None
+        resp: dict | None = None
         for attempt in range(retry):
             with self._sock_lock:
                 try:
@@ -81,10 +82,7 @@ class StockDataClient:
                     self._sock.sendall(frame)
                     n = int.from_bytes(self._recv_exact(_HEADER), "big")
                     resp = msgpack.unpackb(self._recv_exact(n), raw=False)
-                    if not resp.get("ok"):
-                        d = resp.get("d") or {}
-                        raise RuntimeError(f"{method} 失败: {d.get('msg')} ({d.get('code')})")
-                    return resp
+                    break
                 except Exception as e:  # noqa: BLE001
                     last = e
                     try:
@@ -95,7 +93,12 @@ class StockDataClient:
                     self._sock = None
             if attempt < retry - 1:
                 time.sleep(min(0.5 * (2 ** attempt), 5.0))
-        raise ConnectionError(f"stock data 服务不可达 ({self.host}:{self.port}): {last}")
+        if resp is None:
+            raise ConnectionError(f"stock data 服务不可达 ({self.host}:{self.port}): {last}")
+        if not resp.get("ok"):
+            d = resp.get("d") or {}
+            raise RuntimeError(f"{method} 失败: {d.get('msg')} ({d.get('code')})")
+        return resp
 
     def _parquet_to_dict(self, resp: dict) -> dict[str, pd.DataFrame]:
         """parquet 响应 → {jq_code: DatetimeIndex df}。"""

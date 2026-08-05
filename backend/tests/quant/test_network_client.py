@@ -58,3 +58,24 @@ def test_current_snapshot(server_and_client):
     snap = cli.current_snapshot(["512670.XSHG", "159919.XSHE"])
     assert "512670.XSHG" in snap
     assert snap["512670.XSHG"]["close"].iloc[-1] == 1.05
+
+
+def test_business_error_raises_runtime_error_and_keeps_connection(server_and_client):
+    cli, _ = server_and_client
+    connects = []
+    orig_connect = StockDataClient._connect
+
+    def counting_connect(self):
+        connects.append(1)
+        return orig_connect(self)
+
+    StockDataClient._connect = counting_connect
+    try:
+        with pytest.raises(RuntimeError) as ei:
+            cli._request("no_such_method", {})
+        assert "未知 method" in str(ei.value)
+        assert cli._sock is not None
+        assert cli.ping()["pong"] is True
+        assert len(connects) == 1
+    finally:
+        StockDataClient._connect = orig_connect
