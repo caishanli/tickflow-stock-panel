@@ -236,3 +236,28 @@ def test_sync_daily_writes_etf_not_filtered_by_stock_listing(monkeypatch, tmp_pa
 
     assert res["etf"] == 2, f"ETF 应写入 2 只，实际 {res}"
     assert written.get("kline_etf_daily") == ["159518.SZ", "510300.SH"]
+
+
+def test_sync_daily_warns_when_etf_zero(caplog, monkeypatch, tmp_path):
+    """ETF 全部拉取失败时 sync_daily 应打 warning（防静默写 0）。"""
+    import logging
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+
+    class _EmptySrc:
+        def get_daily(self, code, start, end):
+            return None
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _EmptySrc())
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ"])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
+    monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: None)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.mootdx_service"):
+        res = ms.sync_daily(_dt.date(2026, 8, 4))
+
+    assert res["etf"] == 0
+    assert any("ETF" in r.message and "0" in r.message for r in caplog.records), \
+        f"应告警 ETF 写 0，实际日志: {[r.message for r in caplog.records]}"

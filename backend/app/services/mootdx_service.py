@@ -641,6 +641,13 @@ def sync_daily(day: _date) -> dict:
     if edf is not None:
         frames_etf.append(edf)
         written["etf"] = edf.height
+    # 防御：回源结果为空不能静默——否则分区缺口无声累积（曾因过滤 bug 让
+    # ETF 日线数月未落盘而不自知）。全市场全失败通常意味着数据源/过滤异常。
+    if frames_stock and not frames_etf:
+        logger.warning("mootdx_service: 日线回源 %s 股票 %d 只但 ETF 全部失败，"
+                       "请检查 ETF 宇宙/过滤逻辑", day, written["stock"])
+    if not frames_stock and not frames_etf:
+        logger.warning("mootdx_service: 日线回源 %s 股票与 ETF 全部失败", day)
 
     if frames_stock:
         _write_daily_partition(pl.concat(frames_stock), STOCK_DAILY_ROOT)
@@ -737,6 +744,8 @@ def sync_index_daily(day: _date) -> dict:
             except Exception:  # noqa: BLE001
                 pass
     if not frames:
+        logger.warning("mootdx_service: 指数日线回源 %s 全部失败（%d 只尝试）",
+                       day, len(indices))
         return {"written": 0, "symbols": len(indices)}
     _write_daily_partition(pl.concat(frames), INDEX_DAILY_ROOT)
     logger.info("mootdx_service: 指数日线回源 %s 完成: %d 只", day, len(frames))
