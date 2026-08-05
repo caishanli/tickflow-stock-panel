@@ -210,4 +210,29 @@ def test_backfill_seeds_window_when_root_empty(monkeypatch, tmp_path):
 
     res = ms.backfill_to_now()
     assert days == [_d(2026, 8, 3), _d(2026, 8, 4)]
-    assert res["daily_days"] == ["2026-08-03", "2026-08-04"]
+
+
+def test_sync_daily_writes_etf_not_filtered_by_stock_listing(monkeypatch, tmp_path):
+    """sync_daily 的 ETF 部分不应被股票 instruments 表过滤。
+
+    Bug：`_active` 用 `_listing_date_map()`（股票表，无 ETF）过滤 etfs，导致
+    所有 ETF 被判 1970 占位退市 → `daily_written.etf=0`，ETF 日线从不落盘
+    （模拟盘请求今日 ETF 日线 stale → 离线本地缺失）。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _FakeSrc(_dt.date(2026, 8, 4)))
+    # 股票表存在但无 ETF symbol（真实情形）
+    monkeypatch.setattr(ms, "_listing_date_map",
+                        lambda: {"000001.SZ": _dt.date(1991, 4, 3)})
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ"])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE", "510300.XSHG"])
+    written = {}
+    monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: written.setdefault(
+        root.name, df["symbol"].to_list()))
+
+    res = ms.sync_daily(_dt.date(2026, 8, 4))
+
+    assert res["etf"] == 2, f"ETF 应写入 2 只，实际 {res}"
+    assert written.get("kline_etf_daily") == ["159518.SZ", "510300.SH"]

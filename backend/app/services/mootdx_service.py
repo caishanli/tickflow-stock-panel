@@ -584,13 +584,15 @@ def sync_daily(day: _date) -> dict:
     day_str = day.strftime("%Y%m%d")
     # 跳过上市日晚于目标日的标的（新股在该日前无数据）；上市日期占位
     # （1970-01-01 = 退市/异常）的标的 4/1 前已无交易，一并跳过免超时。
+    # 注意：只对股票做该过滤。ETF 宇宙来自 etf_universe_snapshot（无退市占位），
+    # 且 _listing_date_map 读的是股票 instruments 表，对 ETF 过滤会把全部 ETF
+    # 判为 1970 占位退市 → daily_written.etf 恒 0，ETF 日线永不落盘。
     listing = _listing_date_map()
     if listing:
         def _active(sym: str) -> bool:
             ld = listing.get(sym, _date(1970, 1, 1))
             return ld > _date(1970, 1, 1) and ld <= day
         stocks = [s for s in stocks if _active(s)]
-        etfs = [s for s in etfs if _active(s)]
     written = {"stock": 0, "etf": 0}
     frames_stock: list[pl.DataFrame] = []
     frames_etf: list[pl.DataFrame] = []
