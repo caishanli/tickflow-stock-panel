@@ -37,18 +37,31 @@ uv run --extra dev mypy app               # 类型检查
 - 插件/数据源：`backend/app/plugins/`（内置 `stocksdk`）。第三方数据接入走 YAML，见 `docs/custom-data-source.md` 与 `docs/plugin-development.md`。
 - 多数 `/api/*` 需鉴权（未登录返回 401）。
 
-## mootdx 数据服务（quant/回测侧）
+## stock data 服务（网络行情数据服务，quant/回测侧唯一取数入口）
 
-- `backend/app/services/mootdx_service.py`：独立于模拟盘的 mootdx 数据服务。
+- 独立进程：`backend/scripts/run_stockdata_service.py`（TCP server + 4 字节大端长度前缀 + msgpack 帧，代码在 `backend/app/services/stockdata/`）。手动启动：`cd backend && uv run --extra dev python scripts/run_stockdata_service.py`。
+- 配置（env）：`STOCKDATA_HOST`（默认 127.0.0.1）/ `STOCKDATA_PORT`（默认 3322）/ `STOCKDATA_FETCH_WORKERS`（默认 16，服务端共享网络拉取线程池，mootdx socket 不线程安全、每 worker 独立源）。
+- 主后端守护：`app/main.py` lifespan 由 `stockdata_guardian`（`backend/app/services/stockdata_guardian.py`）托管子进程——单实例 PID 锁 + 3s 自愈，`STOCKDATA_ENABLED=0` 关闭。回源落盘全在服务内自治，主后端只做守护。
+- **量化侧唯一取数入口** = `StockDataClient`（`backend/app/quant/datasource/network_client.py`，jqdata 风格：`get_price`/`current_snapshot`/`preload_daily`/`get_minute_pool`/`get_adj_factors`/`get_trade_days`/`get_all_securities`/`get_index_stocks`/...）。`DataManager`（`quant/jqengine/datasource/manager.py`）/ `QuantDataProvider` / `live_feed` 全走网络客户端——**零本地 parquet 读取、零 mootdx/astock 直连**。前复权（fq='pre'）在客户端用 `get_adj_factors` 本地折算。主后端前端展示（kline/screener 等）仍 DuckDB 直读共享 `data/`，不受影响。
+- 服务自治回源（`stockdata/scheduler.py`，不再由主后端执行）：启动 backfill（`backfill_to_now`）、工作日 15:35 收盘批量同步（ETF 分钟 + 前复权因子表 + 股票分钟增量）、00:00 清空前一日分钟内存库。**无主动盘中全市场轮询**——实时分钟只在客户端 `current_snapshot` 请求时按需回源：`rt:{code}` 标的级 single-flight 去重 + 共享拉取线程池，当日分钟内存库纯 lazy（未请求标的零内存），非交易时段不触网。
+- 验收命令（backend/ 下，详情见 `docs/superpowers/specs/2026-08-05-stockdata-service-design.md`）：
+  - wufu_v52 回测对齐 `260401-260716`：跑 `run_quant_backtest.py`（区间 2026-04-01~2026-07-16）后用 `scripts/diff_jq_vs_local.py` 对比 fixture `tests/fixtures/wufu_v52/backtest_260401-260716/`（收益逐日差 ≤0.05%、交易组对齐口径同现状）。
+  - 模拟盘对齐 `sim_260710`：`run_quant_sim.py --account wufu_v52_sim --strategy tests/fixtures/wufu_v52/wufu-v5.2.py --date 2026-07-10`，成交对比 `tests/fixtures/wufu_v52/sim_260710/live_transaction_list.csv`。
+  - 回测性能门禁：wufu-v5.2 `260401-260716` 全程 ≤120s——`uv run --extra dev pytest -m integration tests/quant/test_wufu_backtest_perf.py -q`。
+
+## mootdx 数据服务（stock data 服务的数据源/回源实现）
+
+- `backend/app/services/mootdx_service.py`：stock data 服务内部多源之一（mootdx 回源），被 `stockdata/scheduler.py` 与 `stockdata/sources.py` 消费。
   - `sync_etf_minute(day)`：拉当日全部 ETF 真实 1m → `data/kline_etf_minute/date=YYYY-MM-DD/part.parquet`。
   - `sync_adj_factor()`：mootdx xdxr 事件重建逐日前复权因子 → 增量合并 `data/adj_factor_etf/all.parquet`。
   - `sync_daily(day)`：mootdx 回源全市场日线 → `data/kline_daily`（股票，volume 手）+ `data/kline_etf_daily`（ETF，volume 股）。**北交所（920xxx.BJ）mootdx 无数据，跳过**。
   - `sync_stock_minute(limit=None)`：回源 **4/1 起全市场 A 股分钟** → `data/kline_minute/date=*/`。每只拉一次全量（~3 个月 22560 bar），按交易日分组后**每攒满 100 只批量写分区**（避免逐只逐分区 IO）；北交所跳过。全市场 ~5200 只约 2.2 小时。`limit=N` 只处理前 N 只缺口（增量慢跑：resume 按**最新分区**跳过已覆盖，多轮后自动补齐）；调度场景传 `STOCK_MINUTE_BATCH_LIMIT`（20 只/批）。
   - `backfill_to_now()`：补齐到当前时间缺失的 ETF 分钟 + 全市场日线 + **一批股票分钟**（幂等，只补最新分区之后的交易日）。
 - 触发：
-  - **系统启动**：`app/main.py` lifespan 后台线程调 `backfill_to_now()`（~13 分钟，不阻塞启动）。
-  - **收盘后**：`daily_pipeline.start_scheduler` 注册 `mootdx_sync` cron（工作日 15:35）——ETF 分钟 + 因子表 + 一批股票分钟增量回源。
-- 回测/模拟盘只读落盘分区（`DataManager._adj_factor_map` / `_load_minute_from_partitions`），不联网。
+  - **系统启动**：stock data 服务内 `scheduler` 后台线程调 `backfill_to_now()`（~13 分钟，不阻塞启动）——不再由主后端 lifespan 调用。
+  - **收盘后**：stock data 服务内 `scheduler` 注册 15:35 cron（工作日）——ETF 分钟 + 因子表 + 一批股票分钟增量回源；主后端 `daily_pipeline` 不再注册 `mootdx_sync` cron。
+  - **盘中实时**：无主动轮询（`mootdx_intraday` 已取消）——实时分钟只由客户端 `current_snapshot` 按需回源（见上节）。
+- 量化侧不再直接读落盘分区（`DataManager`/`QuantDataProvider`/`live_feed` 已改走 `StockDataClient`，见上节）；模拟盘 `minute_realtime_backfill` 联网开关已删除。
 - 失败标的（超时/异常/空）追加写入 `data/mootdx_sync_failures.csv`（symbol, 原因, 时间）；`get_minute`/`get_daily` 均有墙钟守护（30s/20s）防 socket 挂起卡死整批，超时重建 `MootdxSource`。
 - `mootdx_src._is_index` 注意：**深市 000xxx 是股票**（000001 平安银行），仅沪市 000xxx 是指数。误判会把 SZ 000xxx 走 index_bars 返回空，触发全服务器轮换（每只 ~8.5s）。
 
