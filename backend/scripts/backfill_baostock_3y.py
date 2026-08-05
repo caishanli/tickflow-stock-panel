@@ -62,6 +62,7 @@ def main() -> None:
     res = bs.login()
     if res is None or getattr(res, "error_code", "0") != "0":
         print(f"[baostock-backfill] login 失败: {getattr(res, 'error_msg', '')}", flush=True)
+        sys.exit(1)
     progress = bb.make_progress_printer()
     print(f"[baostock-backfill] {start} ~ {end} stage={args.stage} ...", flush=True)
 
