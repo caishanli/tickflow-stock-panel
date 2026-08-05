@@ -202,10 +202,12 @@ def _is_trading_day(dm, today) -> bool:
     try:
         start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
         df = None
-        mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
-        if mootdx_src is not None:
+        dm_client = getattr(dm, "client", None)
+        if dm_client is not None:
             try:
-                df = mootdx_src.get_daily("000300.XSHG", start, str(today))
+                out = dm_client.get_price("000300.XSHG", start_date=start,
+                                          end_date=str(today), frequency="daily")
+                df = out.get("000300.XSHG")
             except Exception:
                 df = None
         if df is None:
@@ -261,7 +263,9 @@ def _seed_universe(ctx) -> None:
     g = getattr(ctx, "g", None)
     if g is None:
         return
-    pools = []
+    # 保留策略已声明的 universe（init 里 context.universe = [...]），只做追加，
+    # 避免把策略自身股票池覆盖掉导致行情馈送取不到价（order 拿 price 0 拒单）。
+    pools = list(getattr(ctx, "universe", None) or [])
     for attr in ("fixed_etf_pool", "global_etf_pool", "merged_etf_pool",
                  "domestic_etf_pool", "overseas_etf_pool", "sector_etf_pool",
                  "etf_pool", "universe", "pool"):
@@ -689,6 +693,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     jq_api, jq_loader = _load_engine()
     dm = dm if dm is not None else _make_dm()
     feed = feed or live_feed.refresh
+    # 实时由 stock data 服务保证，feed 恒走网络客户端（无 mootdx 直连路径）。
     st = read_state(account_id)
     has_saved = bool(st.get("start_cash"))
     start_cash = float(st.get("start_cash") or acct.get("capital", 0.0) or 0.0)

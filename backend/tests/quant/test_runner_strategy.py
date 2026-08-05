@@ -34,6 +34,20 @@ def api_client(tmp_quant):
     return TestClient(app)
 
 
+class _FakeClient:
+    """最小网络客户端 stub：盘中 feed 与交易日判定可安全命中。"""
+
+    def current_snapshot(self, codes, as_of=None):
+        idx = pd.DatetimeIndex([pd.Timestamp(as_of)])
+        return {c: pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0],
+                                 "close": [1.0], "volume": [100], "amount": [100.0]},
+                                index=idx) for c in codes}
+
+    def get_price(self, security, start_date=None, end_date=None, frequency="daily",
+                  fields=None):
+        return {}
+
+
 class _StubDM:
     """最小 DataManager stub：策略下单价由 feed 的 minute_prices 快照提供。"""
     sources = {}
@@ -41,6 +55,9 @@ class _StubDM:
     _minute_mem = {}
     _minute_cov = {}
     _offline = False
+
+    def __init__(self):
+        self.client = _FakeClient()
 
     def fetch(self, method, *a, **k):
         raise RuntimeError("stub: no data")
@@ -310,7 +327,7 @@ def test_strategy_loop_saved_state_skips_replay(tmp_quant, monkeypatch):
     aid = service.account_create("acct_rp2", 100000.0, 0.03, "s_rp2", str(days[0]))
     protocol.save_state(aid, {
         "cash": 100000.0, "start_cash": 100000.0, "net_value": 100000.0, "pnl": 0.0,
-        "positions": {}, "stop_loss_log": [], "dt": "2026-07-17 09:31",
+        "positions": {}, "stop_loss_log": [], "dt": str(today + datetime.timedelta(days=1)) + " 09:31",
     })
     _patch_one_loop(monkeypatch)
     runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
