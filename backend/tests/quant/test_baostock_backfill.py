@@ -308,3 +308,68 @@ def test_make_progress_printer_prints(capsys):
     p("minute", 10, 100, 1234)
     out = capsys.readouterr().out
     assert "minute" in out and "10/100" in out
+
+
+def test_to_daily_df_volume_div():
+    rows = [["2025-07-01", "3513.25", "3532.11", "3513.25", "3519.65",
+             "57208470500", "623102482278"]]
+    df = bb._to_daily_df("sh.000001", rows, volume_div=100.0)
+    assert df["symbol"].to_list() == ["000001.SH"]
+    assert df["volume"][0] == 572084705.0  # 股 ÷100 → 手
+    assert str(df["date"][0]) == "2025-07-01"
+
+
+def test_sync_daily_writes_both_universes(tmp_data, monkeypatch):
+    monkeypatch.setattr(bb, "index_universe", lambda: ["000001.SH"])
+    monkeypatch.setattr(bb, "etf_universe", lambda: ["510300.SH"])
+    monkeypatch.setattr(bb, "query_kline", lambda *a, **k: [
+        ["2025-07-01", "1", "2", "1.5", "1.8", "100000000", "200000000"],
+    ])
+    st = bb.load_state()
+    out = bb.sync_daily(_date(2025, 7, 1), _date(2025, 7, 2), st, timeout=5)
+    assert out["index"]["rows"] == 1 and out["etf"]["rows"] == 1
+    idx = pl.read_parquet(tmp_data / "kline_index_daily" / "date=2025-07-01" / "part.parquet")
+    etf = pl.read_parquet(tmp_data / "kline_etf_daily" / "date=2025-07-01" / "part.parquet")
+    assert idx["symbol"].to_list() == ["000001.SH"]
+    assert etf["symbol"].to_list() == ["510300.SH"]
+    assert idx["volume"][0] == 1000000.0  # 指数 ÷100
+    assert etf["volume"][0] == 100000000.0  # ETF 不换算
+    assert set(st["daily_done"]) == {"000001.SH", "510300.SH"}
+
+
+def test_write_daily_partition_legacy_no_date_col(tmp_path):
+    root = tmp_path / "kd"
+    legacy = pl.DataFrame({
+        "symbol": ["000001.SH"], "open": [1.0], "high": [1.0], "low": [1.0],
+        "close": [1.0], "volume": [100.0], "amount": [100.0],
+    })
+    (root / "date=2025-07-01").mkdir(parents=True)
+    legacy.write_parquet(root / "date=2025-07-01" / "part.parquet")
+    new = pl.DataFrame({
+        "symbol": ["000001.SH"], "date": [_date(2025, 7, 1)],
+        "open": [2.0], "high": [2.0], "low": [2.0], "close": [2.0],
+        "volume": [200.0], "amount": [200.0],
+    })
+    bb.write_daily_partition(new, root)
+    out = pl.read_parquet(root / "date=2025-07-01" / "part.parquet")
+    assert out.height == 1
+    assert out["close"][0] == 2.0
+    assert "date" not in out.columns
+
+
+def test_etf_universe_from_snapshot(tmp_data):
+    qk = tmp_data / "quant_kline"
+    qk.mkdir(parents=True)
+    (qk / "etf_universe_snapshot.json").write_text(
+        '{"codes": ["510300.XSHG", "159919.XSHE"]}')
+    assert bb.etf_universe() == ["159919.SZ", "510300.SH"]
+
+
+def test_etf_universe_fallback_partitions(tmp_data):
+    bb.write_daily_partition(pl.DataFrame({
+        "symbol": ["510300.SH", "159919.SZ"],
+        "date": [_date(2025, 7, 1), _date(2025, 7, 1)],
+        "open": [1.0, 1.0], "high": [1.0, 1.0], "low": [1.0, 1.0],
+        "close": [1.0, 1.0], "volume": [1.0, 1.0], "amount": [1.0, 1.0],
+    }), tmp_data / "kline_etf_daily")
+    assert bb.etf_universe() == ["159919.SZ", "510300.SH"]

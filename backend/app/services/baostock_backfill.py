@@ -321,8 +321,8 @@ def etf_universe() -> list[str]:
             lf = pl.scan_parquet(
                 str(KLINE_ETF_DAILY_ROOT / "**" / "*.parquet"), hive_partitioning=True)
             return sorted(lf.select("symbol").unique().collect()["symbol"].to_list())
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("kline_etf_daily 扫描失败: %s", e)
     return []
 
 
@@ -453,3 +453,91 @@ def sync_minute(start: _date, end: _date, state: dict, timeout: float = 300,
         save_state(state)
     logger.info("[minute] 完成 %d 只, 累计 %d 行", len(todo), total)
     return {"symbols": len(todo), "rows": total}
+
+
+_DAILY_SCHEMA = {
+    "symbol": pl.Utf8, "date": pl.Date,
+    "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
+    "close": pl.Float64, "volume": pl.Float64, "amount": pl.Float64,
+}
+
+
+def _to_daily_df(code: str, rows: list[list[str]], volume_div: float = 1.0) -> pl.DataFrame:
+    """baostock 日线行 → polars 帧。volume_div=100 时 baostock 股→手（指数口径）。"""
+    if not rows:
+        return pl.DataFrame(schema=_DAILY_SCHEMA)
+    return pl.DataFrame({
+        "symbol": [from_baostock_code(code)] * len(rows),
+        "date": [_date.fromisoformat(r[0]) for r in rows],
+        "open": [float(r[1]) for r in rows],
+        "high": [float(r[2]) for r in rows],
+        "low": [float(r[3]) for r in rows],
+        "close": [float(r[4]) for r in rows],
+        "volume": [float(r[5]) / volume_div for r in rows],
+        "amount": [float(r[6]) for r in rows],
+    })
+
+
+def _flush_daily_batch(frames: list[pl.DataFrame], root: Path) -> None:
+    if not frames:
+        return
+    all_df = pl.concat(frames).unique(subset=["symbol", "date"], keep="last")
+    for d, g in all_df.group_by("date"):
+        write_daily_partition(g, root)
+
+
+def sync_daily(start: _date, end: _date, state: dict, timeout: float = 300,
+               retry_failed: bool = False, limit: int | None = None,
+               progress=None) -> dict:
+    """ETF + 指数日线回源：逐只拉 3 年日线 → 按 date 批量写分区。
+
+    指数 volume 股÷100 转手（对齐现有 kline_index_daily）；ETF 不换算。
+    baostock ETF 日线仅 2026-01-05 起（更早返回空），空帧记失败但不阻塞。
+    """
+    groups = [
+        ("index", index_universe(), KLINE_INDEX_DAILY_ROOT, 100.0),
+        ("etf", etf_universe(), KLINE_ETF_DAILY_ROOT, 1.0),
+    ]
+    stats = {}
+    for name, syms, root, vol_div in groups:
+        done = set(state["daily_done"])
+        failed = state["failed"].get("daily", {})
+        todo = [s for s in syms if s not in done]
+        if not retry_failed:
+            todo = [s for s in todo if s not in failed]
+        if limit is not None:
+            todo = todo[:limit]
+        logger.info("[daily:%s] 回源 %d 只（已覆盖 %d）", name, len(todo), len(done))
+        batch: list[tuple[str, pl.DataFrame]] = []
+        total = 0
+        for i, sym in enumerate(todo, 1):
+            code = to_baostock_code(sym)
+            try:
+                rows = query_kline(code, DAILY_FIELDS,
+                                   start.isoformat(), end.isoformat(),
+                                   "d", "3", timeout)
+                df = _to_daily_df(code, rows, vol_div)
+                if df.is_empty():
+                    raise RuntimeError("empty")
+            except Exception as e:  # noqa: BLE001
+                mark_failed(state, "daily", sym, str(e)[:120])
+                append_failure(sym, f"daily:{str(e)[:120]}")
+                save_state(state)
+                continue
+            batch.append((sym, df))
+            total += df.height
+            if len(batch) >= 100:
+                _flush_daily_batch([d for _, d in batch], root)
+                for s, _ in batch:
+                    mark_done(state, "daily", s)
+                save_state(state)
+                batch = []
+                if progress:
+                    progress(f"daily:{name}", i, len(todo), total)
+        if batch:
+            _flush_daily_batch([d for _, d in batch], root)
+            for s, _ in batch:
+                mark_done(state, "daily", s)
+            save_state(state)
+        stats[name] = {"symbols": len(todo), "rows": total}
+    return stats
