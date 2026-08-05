@@ -263,3 +263,88 @@ def write_daily_partition(df: pl.DataFrame, root: Path) -> None:
         merged = df.sort(["symbol", "date"])
     merged.write_parquet(tmp)
     tmp.rename(part)
+
+
+def stock_universe() -> list[str]:
+    """全市场 A 股 symbol 列表（.SH/.SZ，排除北交所；优先 instruments parquet）。"""
+    inst = DATA_ROOT / "instruments" / "instruments.parquet"
+    if inst.exists():
+        try:
+            df = pl.read_parquet(inst, columns=["symbol"])
+            syms = [s for s in df["symbol"].to_list() if not s.endswith(".BJ")]
+            if syms:
+                return sorted(syms)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("instruments 读取失败: %s", e)
+    # 兜底：baostock query_all_stock（沪深 A 股）
+    out = []
+    for r in query_all_stock():
+        code = r[0]
+        if code.startswith(("sh.6", "sz.0", "sz.3")):
+            out.append(from_baostock_code(code))
+    return sorted(set(out))
+
+
+def index_universe() -> list[str]:
+    """指数 universe（优先 instruments_index parquet）。"""
+    inst_dir = DATA_ROOT / "instruments_index"
+    fs = sorted(inst_dir.glob("*.parquet")) if inst_dir.is_dir() else []
+    if fs:
+        try:
+            df = pl.read_parquet(fs[-1], columns=["symbol"])
+            return sorted(df["symbol"].to_list())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("instruments_index 读取失败: %s", e)
+    # 兜底：query_all_stock 指数码
+    out = []
+    for r in query_all_stock():
+        code = r[0]
+        if code.startswith(("sh.000", "sz.399")):
+            out.append(from_baostock_code(code))
+    return sorted(set(out))
+
+
+def etf_universe() -> list[str]:
+    """ETF universe（优先 etf_universe_snapshot.json，JQ 码转 .SH/.SZ）。"""
+    snap = DATA_ROOT / "quant_kline" / "etf_universe_snapshot.json"
+    if snap.exists():
+        try:
+            codes = json.loads(snap.read_text()).get("codes", [])
+            if codes:
+                return sorted(
+                    c.replace(".XSHG", ".SH").replace(".XSHE", ".SZ") for c in codes)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ETF 快照读取失败: %s", e)
+    # 兜底：已有 kline_etf_daily 分区里的标的
+    if KLINE_ETF_DAILY_ROOT.is_dir():
+        try:
+            lf = pl.scan_parquet(
+                str(KLINE_ETF_DAILY_ROOT / "**" / "*.parquet"), hive_partitioning=True)
+            return sorted(lf.select("symbol").unique().collect()["symbol"].to_list())
+        except Exception:  # noqa: BLE001
+            pass
+    return []
+
+
+def listing_date_map() -> dict[str, _date]:
+    """{symbol: 上市日期}（instruments parquet；缺失返回空 dict）。"""
+    inst = DATA_ROOT / "instruments" / "instruments.parquet"
+    out: dict[str, _date] = {}
+    if not inst.exists():
+        return out
+    try:
+        df = pl.read_parquet(inst, columns=["symbol", "listing_date"])
+        for sym, ld in df.iter_rows():
+            if not sym or not ld:
+                continue
+            s = str(ld).strip()
+            try:
+                if "-" in s:
+                    out[sym] = _date.fromisoformat(s[:10])
+                else:
+                    out[sym] = _date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception as e:  # noqa: BLE001
+        logger.warning("上市日期读取失败: %s", e)
+    return out

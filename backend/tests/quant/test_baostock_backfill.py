@@ -41,7 +41,7 @@ class _FakeBS:
 
     def query_all_stock(self, day=None):
         self.calls.append(("all_stock", day))
-        return _FakeRS([["sh.600036", "1", "招商银行"], ["sh.000001", "1", "上证指数"]])
+        return _FakeRS([["sh.600036", "1", "招商银行"], ["sz.000001", "1", "平安银行"]])
 
     def query_adjust_factor(self, code, start_date, end_date):
         self.calls.append(("adj", code))
@@ -189,3 +189,53 @@ def test_write_daily_partition_merge_with_date_col(tmp_path):
     out = pl.read_parquet(root / "date=2025-07-01" / "part.parquet")
     assert out.height == 1
     assert "date" in out.columns
+
+
+@pytest.fixture
+def tmp_data(tmp_path, monkeypatch):
+    """把模块全部路径常量重定向到 tmp 目录。"""
+    monkeypatch.setattr(bb, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(bb, "KLINE_5MIN_ROOT", tmp_path / "kline_5min")
+    monkeypatch.setattr(bb, "KLINE_INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(bb, "KLINE_ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(bb, "ADJ_FACTOR_PATH", tmp_path / "adj_factor" / "all.parquet")
+    monkeypatch.setattr(bb, "DIVIDENDS_PATH", tmp_path / "dividends" / "all.parquet")
+    monkeypatch.setattr(bb, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(bb, "FAILURE_CSV", tmp_path / "failures.csv")
+    return tmp_path
+
+
+def test_stock_universe_from_instruments(tmp_data, fake_bs):
+    inst = tmp_data / "instruments"
+    inst.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["600036.SH", "000001.SZ", "920001.BJ"],
+        "listing_date": ["2020-01-01", "1991-04-03", "2023-01-01"],
+    }).write_parquet(inst / "instruments.parquet")
+    assert bb.stock_universe() == ["000001.SZ", "600036.SH"]  # 排除北交所
+
+
+def test_stock_universe_fallback_all_stock(tmp_data, fake_bs):
+    # 无 instruments 文件 → 回退 query_all_stock
+    assert bb.stock_universe() == ["000001.SZ", "600036.SH"]
+
+
+def test_index_universe_from_parquet(tmp_data):
+    inst = tmp_data / "instruments_index"
+    inst.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["000001.SH", "399001.SZ"],
+        "name": ["上证指数", "深证成指"],
+    }).write_parquet(inst / "instruments_index.parquet")
+    assert bb.index_universe() == ["000001.SH", "399001.SZ"]
+
+
+def test_listing_date_map(tmp_data):
+    inst = tmp_data / "instruments"
+    inst.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["600036.SH", "000001.SZ"],
+        "listing_date": ["2002-04-09", "1991-04-03"],
+    }).write_parquet(inst / "instruments.parquet")
+    m = bb.listing_date_map()
+    assert m["600036.SH"] == _date(2002, 4, 9)
