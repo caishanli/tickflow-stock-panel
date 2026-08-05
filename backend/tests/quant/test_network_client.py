@@ -25,6 +25,15 @@ def server_and_client(tmp_path, monkeypatch):
             "symbol": [sym], "datetime": [ts], "open": [close], "high": [close],
             "low": [close], "close": [close], "volume": [1000], "amount": [close * 1000.0],
         }).write_parquet(os.path.join(d, f"part-{i}.parquet"))
+    # 股票日线分区：volume 存「手」(1000)，服务端 _load_daily 对 kline_daily
+    # ×100 归一为「股」(100000)，验证该链路能到达客户端
+    d = os.path.join(str(root), "kline_daily", f"date={day}")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["600000.SH"], "date": [day], "open": [10.0], "high": [10.5],
+        "low": [9.9], "close": [10.2], "volume": [1000],
+        "amount": [10.2 * 1000 * 100.0],
+    }).write_parquet(os.path.join(d, "part-daily.parquet"))
     # 非交易时段门控：current_snapshot 不触网（fixture 无 mootdx，测试只验读路径）
     monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
     srv = StockDataServer(("127.0.0.1", 0), DataSources(data_root=str(root), mootdx_factory=None))
@@ -58,6 +67,16 @@ def test_current_snapshot(server_and_client):
     snap = cli.current_snapshot(["512670.XSHG", "159919.XSHE"])
     assert "512670.XSHG" in snap
     assert snap["512670.XSHG"]["close"].iloc[-1] == 1.05
+
+
+def test_get_price_daily_stock_volume_hands_to_shares(server_and_client):
+    cli, _ = server_and_client
+    day = _dt.date.today().isoformat()
+    out = cli.get_price("600000.XSHG", frequency="daily",
+                        start_date=day, end_date=day)
+    df = out["600000.XSHG"]
+    assert df["volume"].iloc[0] == 100000
+    assert df["amount"].iloc[0] == 10.2 * 1000 * 100.0
 
 
 def test_business_error_raises_runtime_error_and_keeps_connection(server_and_client):

@@ -383,6 +383,8 @@ class DataManager:
                 asof=pd.Timestamp.now().normalize().date() - pd.Timedelta(days=1))
             if from_part:
                 for jq, df in from_part.items():
+                    df = _ensure_money_yuan(df, "network")
+                    df = _ensure_volume_shares(df, "network")
                     self._daily_mem[f"get_daily_{jq}"] = df
                 self._daily_ver += 1
                 self._daily_preloaded = True
@@ -534,6 +536,9 @@ class DataManager:
                     df = getattr(self.sources["network"], method)(*args, **kwargs)
                     if df is None or (hasattr(df, "empty") and df.empty):
                         raise DataSourceError(f"network 空数据")
+                    # 与旧分区路径同口径：网络帧补 money/volume 列（幂等，列在则跳过）
+                    df = _ensure_money_yuan(df, "network")
+                    df = _ensure_volume_shares(df, "network")
                     self._daily_mem[cache_key] = df
                     self._daily_ver += 1
                     self._src_fail["network"] = 0
