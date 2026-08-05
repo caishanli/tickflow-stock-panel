@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from app.services.stockdata.handlers import HANDLERS, handle
+from app.services.stockdata.handlers import HANDLERS, _norm_code, handle
 from app.services.stockdata.sources import DataSources
 
 
@@ -39,3 +39,16 @@ def test_get_price_minute(src):
 def test_ping(src):
     t, data = handle("ping", {}, src)
     assert t == "json" and data["pong"] is True
+
+
+def test_norm_code_bare_6_digit():
+    assert _norm_code("512670") == "512670.XSHG"   # 6 开头 → 沪市
+    assert _norm_code("600000") == "600000.XSHG"   # 6 开头 → 沪市
+    assert _norm_code("000001") == "000001.XSHE"   # 深市 000001 平安银行
+    assert _norm_code("300750") == "300750.XSHE"   # 3 开头 → 深市
+
+
+def test_norm_code_with_suffix():
+    assert _norm_code("512670.SH") == "512670.XSHG"
+    assert _norm_code("000300.XSHG") == "000300.XSHG"
+    assert _norm_code("000001.SZ") == "000001.XSHE"

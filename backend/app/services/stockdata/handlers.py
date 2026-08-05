@@ -12,8 +12,11 @@ logger = logging.getLogger("app.services.stockdata.handlers")
 
 def _norm_code(code: str) -> str:
     """客户端可能传 .XSHG/.XSHE/.SH/.SZ/裸 6 位，统一为 .XSHG/.XSHE。"""
-    pure = code.split(".", 1)[0]
-    return _to_jq(pure) if "." not in code else _to_jq(code)
+    if "." in code:
+        return _to_jq(code)
+    # 裸 6 位：按数字前缀推断市场（5/6/9 沪市：5 开头为沪 ETF，9 开头为沪 B 股；
+    # 其余 0/3/4/8 等深市），再归一
+    return _to_jq(code + (".XSHG" if code[:1] in ("5", "6", "9") else ".XSHE"))
 
 
 def _norm_codes(security) -> list[str]:
