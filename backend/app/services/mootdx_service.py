@@ -406,11 +406,11 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     symbol 只拉一次 ``get_minute`` 全量，再按 ``day_set`` 过滤出落在缺失日的
     bar，由 ``_flush_stock_minute_chunk`` 按各自交易日分组写入 ``date=`` 分区
     （读旧→concat→unique），避免 O(N_days × 全市场) 的重复回源。
-    跳过退市/异常（上市日期 1970 占位）与上市日晚于整个缺失窗口起点的标的。
+    跳过退市/异常（上市日期 1970 占位）与上市日晚于整个缺失窗口末端的标的。
     返回写入行数。
     """
     day_set = set(days)
-    min_day = min(days)
+    window_end = max(days)
     src = MootdxSource()
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
@@ -429,8 +429,8 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     chunk: list[pl.DataFrame] = []
     for sym in stocks:
         ld = listing.get(sym)
-        if ld is not None and ld > min_day:
-            continue  # 上市晚于缺失窗口起点，窗口内无数据
+        if ld is not None and ld > window_end:
+            continue  # 上市晚于整个缺失窗口，窗口内无数据
         try:
             df = _guarded_get_minute(src, sym, max_bars=40000)
         except TimeoutError:
