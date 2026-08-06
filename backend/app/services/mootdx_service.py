@@ -487,6 +487,29 @@ def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
     return days
 
 
+def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
+    """calendar 中不在 root 的 date= 分区里的日期（中间洞也检）。"""
+    existing = set(_partition_dates(root))
+    return [d for d in calendar if d.isoformat() not in existing]
+
+
+def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]]:
+    """分区级缺失扫描：4/1（或 start）至今，5 类数据按交易日历逐日比对。
+
+    检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
+    仅分区级（分区存在即视为该日已覆盖），不逐 symbol 校验。
+    """
+    today = _date.today()
+    calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
+    return {
+        "kline_daily":       _missing_days_in(calendar, STOCK_DAILY_ROOT),
+        "kline_etf_daily":   _missing_days_in(calendar, ETF_DAILY_ROOT),
+        "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
+        "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
+        "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
+    }
+
+
 MARKET_CLOSE_TIME = _dt.time(15, 0)  # 当日日线/分钟视为"可回源"的时间下限
 
 

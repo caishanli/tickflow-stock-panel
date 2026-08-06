@@ -381,3 +381,33 @@ def test_missing_minute_guards_intraday_today(tmp_path, monkeypatch):
     # 盘中但今日分区缺失 → 同样不回源（半日数据不落盘）
     (root / "date=2026-08-05").rmdir()
     assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == []
+
+
+def test_scan_missing_partitions_finds_middle_gap(tmp_path, monkeypatch):
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
+        _dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+
+    # 只有 8/3、8/5 有分区，8/4 缺失（中间洞）
+    for name in ["kline_daily", "kline_etf_daily", "kline_index_daily"]:
+        for d in ["2026-08-03", "2026-08-05"]:
+            (tmp_path / name / f"date={d}").mkdir(parents=True)
+    # 分钟类 8/3、8/5 也有，8/4 缺失
+    for name in ["kline_etf_minute", "kline_minute"]:
+        for d in ["2026-08-03", "2026-08-05"]:
+            (tmp_path / name / f"date={d}").mkdir(parents=True)
+
+    missing = ms.scan_missing_partitions()
+    assert missing["kline_daily"] == [_dt.date(2026, 8, 4)]
+    assert missing["kline_etf_daily"] == [_dt.date(2026, 8, 4)]
+    assert missing["kline_index_daily"] == [_dt.date(2026, 8, 4)]
+    assert missing["kline_etf_minute"] == [_dt.date(2026, 8, 4)]
+    assert missing["kline_minute"] == [_dt.date(2026, 8, 4)]
