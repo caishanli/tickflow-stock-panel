@@ -392,6 +392,59 @@ def sync_stock_minute_day(day: _date) -> int:
     return total
 
 
+def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
+    """逐缺失日复用现有 sync 函数补全，单日失败记 errors 不阻断。
+
+    ``missing`` 键名与 ``scan_missing_partitions`` 一致：
+    kline_daily / kline_etf_daily → sync_daily；kline_index_daily →
+    sync_index_daily；kline_etf_minute → sync_etf_minute；
+    kline_minute → sync_stock_minute_day。
+    """
+    result: dict = {
+        "daily_days": [], "index_daily_days": [],
+        "etf_minute_days": [], "stock_minute_days": [], "errors": [],
+    }
+
+    for day in missing.get("kline_daily", []) + missing.get("kline_etf_daily", []):
+        try:
+            sync_daily(day)
+            result["daily_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"daily {day}: {e}")
+    for day in missing.get("kline_index_daily", []):
+        try:
+            sync_index_daily(day)
+            result["index_daily_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"index_daily {day}: {e}")
+    for day in missing.get("kline_etf_minute", []):
+        try:
+            sync_etf_minute(day)
+            result["etf_minute_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"etf_minute {day}: {e}")
+    for day in missing.get("kline_minute", []):
+        try:
+            sync_stock_minute_day(day)
+            result["stock_minute_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"stock_minute {day}: {e}")
+
+    return result
+
+
+def scan_and_backfill_full() -> dict:
+    """00:00 全量巡检 + 补全入口：扫描缺失 → 逐日补全 → 汇总。"""
+    missing = scan_missing_partitions()
+    backfilled = backfill_missing_partitions(missing)
+    total = sum(len(v) for v in missing.values())
+    logger.info("mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s",
+                total, {k: len(v) for k, v in backfilled.items()},
+                len(backfilled["errors"]))
+    return {"missing": missing, "backfilled": backfilled,
+            "errors": backfilled["errors"]}
+
+
 def sync_adj_factor() -> dict:
     """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建）。
 

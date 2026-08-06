@@ -479,3 +479,49 @@ def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     assert part.exists()
     df = pl.read_parquet(part)
     assert len(df) == 2
+
+
+def test_backfill_missing_partitions_routes_to_sync(monkeypatch):
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    calls = {"daily": [], "index": [], "etf_min": [], "stock_min": []}
+    monkeypatch.setattr(ms, "sync_daily", lambda d: calls["daily"].append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls["index"].append(d) or {"written": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d: calls["etf_min"].append(d) or 5)
+    monkeypatch.setattr(ms, "sync_stock_minute_day", lambda d: calls["stock_min"].append(d) or 7)
+
+    missing = {
+        "kline_daily":       [_dt.date(2026, 6, 15)],
+        "kline_etf_daily":   [_dt.date(2026, 6, 16)],
+        "kline_index_daily": [_dt.date(2026, 6, 17)],
+        "kline_etf_minute":  [_dt.date(2026, 6, 18)],
+        "kline_minute":      [_dt.date(2026, 6, 19)],
+    }
+    res = ms.backfill_missing_partitions(missing)
+    assert calls["daily"] == [_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)]
+    assert calls["index"] == [_dt.date(2026, 6, 17)]
+    assert calls["etf_min"] == [_dt.date(2026, 6, 18)]
+    assert calls["stock_min"] == [_dt.date(2026, 6, 19)]
+    assert res["errors"] == []
+
+
+def test_backfill_missing_partitions_survives_per_day_error(monkeypatch):
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    def _boom(d):
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(ms, "sync_daily", _boom)
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_day", lambda d: 0)
+
+    missing = {
+        "kline_daily": [_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)],
+        "kline_index_daily": [_dt.date(2026, 6, 17)],
+    }
+    res = ms.backfill_missing_partitions(missing)
+    assert len(res["errors"]) == 2  # 两日都失败，但 index 仍补了
+    assert "2026-06-17" in res["index_daily_days"]
