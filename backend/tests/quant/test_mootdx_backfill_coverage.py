@@ -413,6 +413,43 @@ def test_scan_missing_partitions_finds_middle_gap(tmp_path, monkeypatch):
     assert missing["kline_minute"] == [_dt.date(2026, 8, 4)]
 
 
+def test_sync_stock_minute_day_filters_listing_and_writes(tmp_path, monkeypatch):
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [
+        "000001.SZ", "600000.SH", "999999.SZ"])
+    # 600000 上市晚于目标日 → 跳过不取数；000001 停牌（无该日 bar）；999999 有
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "000001.SZ": _dt.date(2020, 1, 1),
+        "600000.SH": _dt.date(2026, 8, 1),   # 上市晚于 6/15 → 跳过
+        "999999.SZ": _dt.date(2020, 1, 1),
+    })
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            if sym == "000001.SZ":  # 停牌：无该日 bar
+                idx = pd.DatetimeIndex([_dt.datetime(2026, 6, 16, 9, 31)])
+            else:  # 999999 有 6/15 的两根
+                idx = pd.DatetimeIndex([
+                    _dt.datetime(2026, 6, 15, 9, 31),
+                    _dt.datetime(2026, 6, 15, 9, 32)])
+            idx.name = "datetime"  # 与真实 MootdxSource.get_minute 一致
+            return pd.DataFrame({"open": [1.0] * len(idx), "close": [1.0] * len(idx),
+                                 "volume": [100.0] * len(idx), "amount": [100.0] * len(idx)},
+                                index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    n = ms.sync_stock_minute_day(_dt.date(2026, 6, 15))
+    # 只有 999999 写入 2 根（600000 上市过滤跳过，000001 停牌该日无 bar）
+    assert n == 2
+    part = tmp_path / "kline_minute" / "date=2026-06-15" / "part.parquet"
+    assert part.exists()
+
+
 def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     import datetime as _dt
     import pandas as pd

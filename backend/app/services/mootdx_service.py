@@ -333,6 +333,65 @@ def sync_stock_minute(limit: int | None = None) -> int:
     return total
 
 
+def sync_stock_minute_day(day: _date) -> int:
+    """按缺失日补全全市场股票分钟到 ``kline_minute/date={day}``。
+
+    「有数据才回」：上市日晚于目标日的 symbol 跳过（该日尚未上市）；
+    当日停牌/无 bar 自然跳过不落盘。逐 symbol 用 ``get_minute`` 全量拉，
+    过滤到 ``day`` 后批量写分区（复用 ``_flush_stock_minute_chunk``）。
+    返回写入行数。
+    """
+    src = MootdxSource()
+    stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
+    if not stocks:
+        logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
+        return 0
+    listing = _listing_date_map()
+    keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    total = 0
+    chunk: list[pl.DataFrame] = []
+    for i, sym in enumerate(stocks):
+        ld = listing.get(sym)
+        if ld is not None and ld > day:
+            continue  # 上市晚于目标日，该日无数据
+        try:
+            df = _guarded_get_minute(src, sym, max_bars=40000)
+        except TimeoutError:
+            src = MootdxSource()
+            _append_failure(sym, "timeout")
+            continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            _append_failure(sym, f"exception:{str(e)[:60]}")
+            continue
+        if df is None or df.empty:
+            _append_failure(sym, "empty")
+            continue
+        df = df.copy()
+        df["symbol"] = sym
+        df = df.reset_index()
+        for c in keep:
+            if c not in df.columns:
+                df[c] = None
+        df = df[keep]
+        df = df[pd.to_datetime(df["datetime"]).dt.date == day]
+        if df.empty:
+            continue  # 当日停牌/无 bar，跳过
+        sub = pl.from_pandas(df)
+        sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
+        sub = sub.unique(subset=["symbol", "datetime"], keep="last")
+        chunk.append(sub)
+        total += sub.height
+        if len(chunk) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(chunk)
+            chunk = []
+            src = MootdxSource()
+    if chunk:
+        _flush_stock_minute_chunk(chunk)
+    logger.info("mootdx_service: 股票分钟按日回源 %s 完成, %d 行", day, total)
+    return total
+
+
 def sync_adj_factor() -> dict:
     """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建）。
 
