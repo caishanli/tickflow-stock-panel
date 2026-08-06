@@ -464,6 +464,29 @@ def _trade_days_up_to(end: _date) -> list[_date]:
     return days
 
 
+def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
+    """返回 [start, end] 内 A 股交易日（从沪深300 日线推导，全区间不截断）。
+
+    与 ``_trade_days_up_to``（90 天窗口）不同，本函数支持 4/1 至今的全区间
+    扫描。取数失败回退工作日近似（不阻断检测）。
+    """
+    src = MootdxSource()
+    try:
+        df = src.get_daily("000300.XSHG", start.strftime("%Y%m%d"),
+                           end.strftime("%Y%m%d"))
+        if df is not None and not df.empty:
+            return sorted(d.date() for d in df.index if d.date() <= end)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mootdx_service: 交易日历获取失败: %s", e)
+    days = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:
+            days.append(d)
+        d += _dt.timedelta(days=1)
+    return days
+
+
 MARKET_CLOSE_TIME = _dt.time(15, 0)  # 当日日线/分钟视为"可回源"的时间下限
 
 

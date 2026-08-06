@@ -27,6 +27,30 @@ def _patch_index_universe(monkeypatch, syms):
     monkeypatch.setattr(ms, "_index_universe", lambda: syms)
 
 
+def test_trade_days_in_range(monkeypatch):
+    class _FakeSrc:
+        def get_daily(self, code, start, end):
+            idx = pd.DatetimeIndex([
+                _dt.datetime(2026, 8, 3), _dt.datetime(2026, 8, 4),
+                _dt.datetime(2026, 8, 5)])
+            return pd.DataFrame({"open": [1.0] * 3}, index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _FakeSrc())
+    days = ms._trade_days_in_range(_dt.date(2026, 8, 1), _dt.date(2026, 8, 6))
+    assert days == [_dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)]
+
+
+def test_trade_days_in_range_fallback_weekday(monkeypatch):
+    class _FailSrc:
+        def get_daily(self, code, start, end):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _FailSrc())
+    days = ms._trade_days_in_range(_dt.date(2026, 8, 3), _dt.date(2026, 8, 5))
+    # 周一(3)周二(4)周三(5)都是工作日
+    assert days == [_dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)]
+
+
 def test_sync_index_daily_writes_partition(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
