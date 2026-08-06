@@ -411,3 +411,34 @@ def test_scan_missing_partitions_finds_middle_gap(tmp_path, monkeypatch):
     assert missing["kline_index_daily"] == [_dt.date(2026, 8, 4)]
     assert missing["kline_etf_minute"] == [_dt.date(2026, 8, 4)]
     assert missing["kline_minute"] == [_dt.date(2026, 8, 4)]
+
+
+def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
+    import datetime as _dt
+    import pandas as pd
+    import polars as pl
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
+
+    class _Src:
+        def get_minute(self, code, max_bars=30000):
+            idx = pd.DatetimeIndex([
+                _dt.datetime(2026, 6, 15, 10, 30), _dt.datetime(2026, 6, 15, 10, 31)])
+            idx.name = "datetime"  # 与真实 MootdxSource.get_minute 一致（reset_index 得 datetime 列）
+            return pd.DataFrame({"open": [1.0, 1.0], "close": [1.0, 1.0],
+                                 "volume": [100.0, 100.0], "amount": [100.0, 100.0]},
+                                index=idx)
+
+    # 强制走历史日分支（day 距今天 > 5 天）
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _dt.date(2026, 8, 6))})())
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    n = ms.sync_etf_minute(_dt.date(2026, 6, 15))
+    assert n == 2
+    part = tmp_path / "kline_etf_minute" / "date=2026-06-15" / "part.parquet"
+    assert part.exists()
+    df = pl.read_parquet(part)
+    assert len(df) == 2

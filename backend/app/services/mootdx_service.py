@@ -81,9 +81,9 @@ def _etf_universe() -> list[str]:
 def sync_etf_minute(day: _date | None = None) -> int:
     """收盘后同步指定交易日（默认今天）全部 ETF 分钟到按日分区。
 
-    逐标的用 mootdx ``get_minute_recent`` 拉最近几页真实 1m（含当日），
-    过滤到 ``day`` 后以 ``date={day}/part.parquet`` 原子写盘
-    （读旧→concat→unique→原子替换）。返回写入行数。
+    逐标的拉真实 1m：近期日（≤5 天）用 ``get_minute_recent``（含当日盘中），
+    历史日（>5 天）用 ``get_minute`` 全量拉再过滤当日（支持 4/1 起缺失日回补）。
+    以 ``date={day}/part.parquet`` 原子写盘。返回写入行数。
     """
     day = day or _date.today()
     src = MootdxSource()
@@ -91,11 +91,15 @@ def sync_etf_minute(day: _date | None = None) -> int:
     if not codes:
         logger.warning("mootdx_service: ETF 宇宙为空，跳过分钟同步")
         return 0
+    historical = (day < _date.today() - _dt.timedelta(days=5))
     frames = []
     for i, jq in enumerate(codes):
         try:
-            df = src.get_minute_recent(jq, pages=2)
-        except Exception as e:
+            if historical:
+                df = src.get_minute(jq, max_bars=40000)
+            else:
+                df = src.get_minute_recent(jq, pages=2)
+        except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
             continue
         if df is None or df.empty:
@@ -108,7 +112,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
             if c not in df.columns:
                 df[c] = None
         df = df[keep]
-        df = df[df["datetime"].dt.date == day]
+        df = df[pd.to_datetime(df["datetime"]).dt.date == day]
         if df.empty:
             continue
         frames.append(pl.from_pandas(df))
@@ -116,7 +120,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
             try:
                 src._client = None
                 src._server_idx = -1
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
     if not frames:
         return 0
