@@ -548,13 +548,11 @@ class DataManager:
                     # 与旧分区路径同口径：网络帧补 money/volume 列（幂等，列在则跳过）
                     df = _ensure_money_yuan(df, "network")
                     df = _ensure_volume_shares(df, "network")
-                    self._daily_mem[cache_key] = df
-                    self._daily_ver += 1
+                    self._put_daily_mem_protected(cache_key, df)
                     self._src_fail["network"] = 0
                     return df
                 result = getattr(self.sources["network"], method)(*args, **kwargs)
-                self._daily_mem[cache_key] = result
-                self._daily_ver += 1
+                self._put_daily_mem_protected(cache_key, result)
                 return result
             except Exception as e:
                 last_err = f"{name}: {e}"
@@ -566,6 +564,47 @@ class DataManager:
                 self._maybe_demote(name)
                 continue
         raise DataSourceError(f"所有数据源失败: {last_err}")
+
+    @staticmethod
+    def _frame_coverage(df) -> tuple | None:
+        """返回日线帧的 (起点, 终点) 日期；无法判定时返回 None。"""
+        if df is None or getattr(df, "empty", False):
+            return None
+        try:
+            if isinstance(getattr(df, "index", None), pd.DatetimeIndex) and len(df.index):
+                return (df.index.min(), df.index.max())
+            for c in ("trade_date", "date", "datetime"):
+                if c in df.columns and len(df):
+                    s = pd.to_datetime(df[c], errors="coerce").dropna()
+                    if len(s):
+                        return (s.min(), s.max())
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _put_daily_mem_protected(self, cache_key: str, new_df) -> None:
+        """写 ``_daily_mem`` 时保护全量：若已有缓存的覆盖范围更广，不覆盖。
+
+        场景：``_trade_days_between`` 等用窄窗口（如 07-10~08-05）fetch 日线，
+        无条件 ``self._daily_mem[k] = df`` 会用一个十几行的窄帧盖掉原本预加载的
+        全量日线；后续 attribute_history 请求全量时 ``_covers`` 只看 end 未来
+        哨兵误判覆盖 → 返回窄帧 → 走弱期判断「数据不足」。
+
+        规则：新帧与已有缓存都有效时，若已有缓存覆盖范围 ⊇ 新帧（起点更早
+        或终点更晚），保留已有缓存不覆盖；否则覆盖写入。任意一方无效则直接写。
+        """
+        if cache_key in self._daily_mem:
+            old = self._daily_mem.get(cache_key)
+            old_cov = self._frame_coverage(old)
+            new_cov = self._frame_coverage(new_df)
+            if old_cov is not None and new_cov is not None:
+                old_lo, old_hi = old_cov
+                new_lo, new_hi = new_cov
+                old_covers_new = old_lo <= new_lo and old_hi >= new_hi
+                if old_covers_new:
+                    return  # 已有更全缓存，保留，不覆盖
+        self._daily_mem[cache_key] = new_df
+        self._daily_ver += 1
 
     def _maybe_demote(self, name):
         """某数据源连续取数失败达阈值 -> 降到优先级末位并持久化到 .env。

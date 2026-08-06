@@ -642,3 +642,59 @@ def test_throttle_backfill_called_in_sync_daily_loop(tmp_path, monkeypatch):
 
     ms.sync_daily(_dt.date(2026, 8, 5))
     assert len(calls["throttle"]) >= 3  # 每只股票都调用
+
+
+# ---------------------------------------------------------------------------
+# _put_daily_mem_protected：窄窗口请求不污染日线全量缓存
+# ---------------------------------------------------------------------------
+
+def test_put_daily_mem_protected_keeps_wider_cache():
+    """已有缓存覆盖更广（起点更早）时，窄窗口新帧不覆盖。"""
+    import pandas as _pd
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+
+    full = _pd.DataFrame({"close": [1.0, 1.0]},
+                         index=_pd.DatetimeIndex(["2025-07-31", "2026-08-06"]))
+    narrow = _pd.DataFrame({"close": [1.0]},
+                           index=_pd.DatetimeIndex(["2026-07-10"]))
+
+    # 先写全量
+    dm._put_daily_mem_protected("get_daily_000300.XSHG", full)
+    assert len(dm._daily_mem["get_daily_000300.XSHG"]) == 2
+    v0 = dm._daily_ver
+
+    # 窄窗口请求 → 已有更全 → 不覆盖
+    dm._put_daily_mem_protected("get_daily_000300.XSHG", narrow)
+    assert len(dm._daily_mem["get_daily_000300.XSHG"]) == 2
+    assert dm._daily_ver == v0  # 未写，版本号不变
+
+
+def test_put_daily_mem_protected_writes_new_or_wider():
+    """无缓存 / 新帧更全时正常写入。"""
+    import pandas as _pd
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+
+    full = _pd.DataFrame({"close": [1.0, 1.0]},
+                         index=_pd.DatetimeIndex(["2025-07-31", "2026-08-06"]))
+
+    # 无缓存 → 写入
+    dm._put_daily_mem_protected("get_daily_000300.XSHG", full)
+    assert len(dm._daily_mem["get_daily_000300.XSHG"]) == 2
+    assert dm._daily_ver == 1
+
+    # 已有窄缓存，新帧更全 → 覆盖
+    narrow = _pd.DataFrame({"close": [1.0]}, index=_pd.DatetimeIndex(["2026-07-10"]))
+    dm2 = DataManager.__new__(DataManager)
+    dm2._daily_mem = {"get_daily_000300.XSHG": narrow}
+    dm2._daily_ver = 5
+    dm2._put_daily_mem_protected("get_daily_000300.XSHG", full)
+    assert len(dm2._daily_mem["get_daily_000300.XSHG"]) == 2
+    assert dm2._daily_ver == 6
