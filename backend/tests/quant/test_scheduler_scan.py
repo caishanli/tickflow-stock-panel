@@ -3,6 +3,7 @@
 
 def test_midnight_scan_loop_triggers_full_scan(monkeypatch):
     import threading
+
     from app.services.stockdata import scheduler as sched
 
     fired = {"n": 0}
