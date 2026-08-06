@@ -306,6 +306,52 @@ def sim_status(aid: str):
                      "stop_loss": db.get_sim_stoploss(aid)}}
 
 
+def _build_benchmark_map(first_day: str, last_day: str) -> dict:
+    """按日聚合沪深300 收盘，返回 {YYYYMMDD: 相对启动前一交易日涨跌%}。
+
+    基准日 = 模拟盘启动日前一个交易日（用前日收盘做基准，首日即反映当天涨跌）。
+    网络源日线日期列名为 trade_dt（非 trade_date/date/datetime），找不到日期列会
+    导致 day_close 恒空 → 基准收益恒 0 → 沪深300 基线平直。取数失败返回空 dict。
+    """
+    import pandas as _pd
+
+    if not first_day:
+        return {}
+    try:
+        from ..jqengine.datasource.manager import get_data_manager
+        dm = get_data_manager()
+        start_ts = _pd.Timestamp(first_day) - _pd.Timedelta(days=10)
+        df = dm.fetch("get_daily", "000300.XSHG", str(start_ts)[:10], last_day)
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return {}
+        df = df.copy()
+        dcol = next((c for c in ("trade_date", "date", "datetime", "trade_dt")
+                     if c in df.columns), None)
+        if dcol is None and isinstance(df.index, _pd.DatetimeIndex):
+            dcol = df.index
+        if dcol is None:
+            return {}
+        if isinstance(dcol, str):
+            df["_day"] = df[dcol].astype(str).str.replace("-", "").str[:8]
+        else:
+            df["_day"] = dcol.strftime("%Y-%m-%d").str.replace("-", "").str[:8]
+        close_col = "close" if "close" in df.columns else df.columns[-1]
+        day_close = df.groupby("_day")[close_col].last().to_dict()
+        if not day_close:
+            return {}
+        base_day = first_day.replace("-", "")
+        sorted_days = sorted(day_close.keys())
+        base_idx = sorted_days.index(base_day) if base_day in sorted_days else 0
+        if base_idx > 0:
+            base_day = sorted_days[base_idx - 1]  # 前一个交易日
+        base = day_close.get(base_day) or (sorted(day_close.values())[0] if day_close else 0)
+        if not base:
+            return {}
+        return {d: round((day_close[d] / base - 1) * 100, 2) for d in day_close}
+    except Exception:
+        return {}
+
+
 @router.get("/sim/accounts/{aid}/stream")
 def sim_stream(aid: str, since_id: int | None = None):
     """模拟盘实时增量推送（SSE）：status/log/trade/equity 事件。
@@ -324,7 +370,17 @@ def sim_stream(aid: str, since_id: int | None = None):
         off_log = db.get_max_sim_log_id(aid) if start is None else start
         off_trade = db.get_max_sim_trade_id(aid) if start is None else start
         off_eq = db.get_max_sim_snapshot_id(aid) if start is None else start
+        # 连接期取一次基准映射，增量 equity 行也附 benchmark_pct（否则当天末点掉回 0）
+        _bench = {}
+        try:
+            _snaps = db.get_sim_snapshots(aid)
+            if _snaps:
+                _bench = _build_benchmark_map(str(_snaps[0].get("dt", ""))[:10],
+                                              str(_snaps[-1].get("dt", ""))[:10])
+        except Exception:  # noqa: BLE001
+            _bench = {}
         last_status = None
+        last_state_sig = None
         while True:
             acct = db.get_sim_account(aid)
             status = acct.get("status") if acct else "unknown"
@@ -334,15 +390,25 @@ def sim_stream(aid: str, since_id: int | None = None):
             max_log = db.get_max_sim_log_id(aid)
             max_trade = db.get_max_sim_trade_id(aid)
             max_eq = db.get_max_sim_snapshot_id(aid)
+            # sim_state 是 upsert（rowid 不变），补跑期间 account.status 恒为 running，
+            # 只按 rowid/状态变化判断会漏推状态 → 卡片（净值/收益率/持仓）不更新。
+            # 每轮读一次 state 做签名比较，净额/现金/时间戳变了就推 status 事件。
+            state = db.read_sim_state(aid)
+            state_sig = (state.get("net_value"), state.get("cash"), state.get("pnl"),
+                         state.get("dt"))
+            state_changed = state_sig != last_state_sig
             has_new = (max_log > off_log or max_trade > off_trade
-                       or max_eq > off_eq or status != last_status)
+                       or max_eq > off_eq or status != last_status or state_changed)
             if has_new:
-                if status != last_status:
-                    yield f"event: status\ndata: {_json.dumps({'status': status, 'state': db.read_sim_state(aid)}, ensure_ascii=False)}\n\n"
+                if status != last_status or state_changed:
+                    yield f"event: status\ndata: {_json.dumps({'status': status, 'state': state}, ensure_ascii=False)}\n\n"
                     last_status = status
+                    last_state_sig = state_sig
                 for row in db.get_sim_snapshots_after(aid, off_eq):
                     off_eq = row["rowid"]
                     d = {k: row[k] for k in ("dt", "net_value", "cash", "positions_value", "pnl", "pnl_pct")}
+                    day = str(row["dt"]).replace("-", "")[:8]
+                    d["benchmark_pct"] = _bench.get(day, 0)
                     yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
                 for row in db.get_sim_trades_after(aid, off_trade):
                     off_trade = row["rowid"]
@@ -353,8 +419,9 @@ def sim_stream(aid: str, since_id: int | None = None):
                     yield f"event: log\ndata: {_json.dumps({'ts': row['ts'], 'level': row['level'], 'message': row['message']}, ensure_ascii=False)}\n\n"
             if terminal:
                 return
-            # 空闲（无增量）时拉长间隔，避免非交易时段空转烧 CPU
-            await asyncio.sleep(0.5 if has_new else 3)
+            # 空闲（无增量）时拉长间隔，避免非交易时段空转烧 CPU；
+            # 状态在变（补跑逐 bar 推进）时保持短轮询，卡片及时跟上
+            await asyncio.sleep(0.5 if (has_new or state_changed) else 3)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -365,39 +432,12 @@ def sim_equity(aid: str):
     snaps = db.get_sim_snapshots(aid)
     if not snaps:
         return {"data": []}
-    # 附带沪深300基准：按日聚合快照，取每日末净值对应的 000300 收益率
-    import datetime as _dt
-    import pandas as _pd
-    try:
-        from ..jqengine.datasource.manager import get_data_manager
-        dm = get_data_manager()
-        first_day = str(snaps[0].get("dt", ""))[:10]
-        last_day = str(snaps[-1].get("dt", ""))[:10]
-        if not first_day:
-            return {"data": snaps}
-        start_ts = _pd.Timestamp(first_day) - _pd.Timedelta(days=10)
-        df = dm.fetch("get_daily", "000300.XSHG", str(start_ts)[:10], last_day)
-        if df is not None and not df.empty:
-            dcol = next((c for c in ("trade_date", "date", "datetime") if c in df.columns), None)
-            if dcol:
-                df = df.copy()
-                df["_day"] = df[dcol].astype(str).str.replace("-", "").str[:8]
-                close_col = "close" if "close" in df.columns else df.columns[-1]
-                day_close = df.groupby("_day")[close_col].last().to_dict()
-                # 基准日 = 模拟盘启动日前一个交易日（用前日收盘做基准，首日即反映当天涨跌）
-                base_day = first_day.replace("-", "")
-                sorted_days = sorted(day_close.keys())
-                base_idx = sorted_days.index(base_day) if base_day in sorted_days else 0
-                if base_idx > 0:
-                    base_day = sorted_days[base_idx - 1]  # 前一个交易日
-                base = day_close.get(base_day) or (sorted(day_close.values())[0] if day_close else 0)
-                if base:
-                    bench_ret = {d: (day_close[d] / base - 1) * 100 for d in day_close}
-                    for s in snaps:
-                        day = str(s.get("dt", ""))[:10].replace("-", "")
-                        s["benchmark_pct"] = round(bench_ret.get(day, 0), 2)
-    except Exception:
-        pass
+    first_day = str(snaps[0].get("dt", ""))[:10]
+    last_day = str(snaps[-1].get("dt", ""))[:10]
+    bench = _build_benchmark_map(first_day, last_day)
+    for s in snaps:
+        day = str(s.get("dt", ""))[:10].replace("-", "")
+        s["benchmark_pct"] = bench.get(day, 0)
     return {"data": snaps}
 
 

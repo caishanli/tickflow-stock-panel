@@ -55,6 +55,7 @@ class _StubDM:
     _minute_mem = {}
     _minute_cov = {}
     _offline = False
+    _daily_ver = 0
 
     def __init__(self):
         self.client = _FakeClient()
@@ -318,6 +319,80 @@ def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
     logs = db.get_sim_logs(aid)
     assert any("开始历史补跑" in l["message"] for l in logs)
     assert any("历史补跑完成" in l["message"] for l in logs)
+    # 补跑日志时间戳用引擎推进到的时间（bar 时刻/当日），而非真实当前时间
+    reb = [l for l in logs if "rebalanced" in l["message"]]
+    assert reb and reb[0]["ts"].startswith(str(days[0]))
+    start_log = [l for l in logs if "开始历史补跑" in l["message"]]
+    done_log = [l for l in logs if "历史补跑完成" in l["message"]]
+    assert start_log[0]["ts"].startswith(str(days[0]))
+    assert done_log[0]["ts"].startswith(str(days[-1]))
+
+
+def test_strategy_loop_replays_today_intraday_bars(tmp_quant, monkeypatch):
+    """启动/重置当天（含今日交易日）也要回补开盘到当前时刻，而非只补到昨日。
+
+    回归：_replay_history 原先只补 [start_date, 昨日]，当日盘中/收盘后启动时
+    今天日内 bar 全丢（只有 EOD 一条快照）。现在 today 也进补跑范围，只回放到
+    bar <= now 的时刻，剩余由实时主循环接管。
+    """
+    class _FixedNow(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 8, 6, 10, 30, 0)
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+    today = datetime.date(2026, 8, 6)
+    days = [datetime.date(2026, 8, 3), datetime.date(2026, 8, 4),
+            datetime.date(2026, 8, 5), today]
+    save_strategy("s_rpt", "s", STRATEGY_BUY)
+    aid = service.account_create("acct_rpt", 100000.0, 0.03, "s_rpt", str(days[0]))
+    # 补跑 4 天（含今天）逐日检查 is_paused，之后实时段只跑 1 个 tick
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+
+    snaps = db.get_sim_snapshots(aid)
+    today_snaps = [s for s in snaps if s["dt"].startswith(str(today))]
+    # 今日回补到 10:30（09:31~10:30 共 60 根 bar）；实时 tick 因 last_bar 已推进被去重跳过
+    assert len(today_snaps) == 60, len(today_snaps)
+    times = sorted(s["dt"][11:16] for s in today_snaps)
+    assert "09:31" in times and "10:30" in times
+    assert snaps[-1]["dt"].startswith(str(today))
+    logs = db.get_sim_logs(aid)
+    assert any("今日" in l["message"] and "回补" in l["message"] for l in logs)
+
+
+STRATEGY_REPLAY_LOG = '''
+def init(context):
+    context.universe = ["510300.XSHG"]
+    g.logged_days = []
+
+def before_trading_start(context):
+    log.info("pre-market")
+
+def on_open(context):
+    log.info("opened")
+
+run_daily(on_open, "open")
+'''
+
+
+def test_replay_logs_use_engine_forward_time(tmp_quant, monkeypatch):
+    """补跑日志时间戳用引擎推进到的时间（bar/当日），而非真实当前时间。"""
+    today = datetime.date.today()
+    days = [today - datetime.timedelta(days=n) for n in (4, 3, 2, 1)]
+    save_strategy("s_rlog", "s", STRATEGY_REPLAY_LOG)
+    aid = service.account_create("acct_rlog", 100000.0, 0.03, "s_rlog", str(days[0]))
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+    logs = db.get_sim_logs(aid)
+    opened = [l for l in logs if l["message"] == "opened"]
+    pre = [l for l in logs if l["message"] == "pre-market"]
+    # 每个补跑日各触发一次，时间戳落在该交易日（引擎推进的时间），而非真实当前时间
+    for day in days:
+        assert any(l["ts"].startswith(str(day)) for l in opened), (day, opened)
+        assert any(l["ts"].startswith(str(day)) for l in pre), (day, pre)
 
 
 def test_strategy_loop_saved_state_skips_replay(tmp_quant, monkeypatch):

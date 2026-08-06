@@ -127,13 +127,15 @@ def _run_watcher_loop(account_id: str, acct: dict, provider, matcher: Matcher,
 # 策略驱动模式
 # ---------------------------------------------------------------------------
 
-def _emit_log(account_id: str, level: str, message: str) -> None:
+def _emit_log(account_id: str, level: str, message: str,
+              ts: str | None = None) -> None:
     """模拟盘日志落 sim_logs（供 /sim/accounts/{aid}/logs 读取），失败仅告警。
 
     level=="notify" 且账户开启钉钉推送且非补跑时，异步发送到钉钉。
+    ts 默认用真实当前时间；补跑场景显式传引擎推进到的时间（见 _replay_*）。
     """
     try:
-        db.insert_sim_log(account_id, str(datetime.datetime.now()), level, message)
+        db.insert_sim_log(account_id, ts or str(datetime.datetime.now()), level, message)
     except Exception:  # noqa: BLE001
         log.warning("[runner] 日志落库失败(%s): %s", level, message)
     if level == "notify" and account_id not in _replay_active_ids:
@@ -389,6 +391,9 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
     """盘前（每交易日一次）：调度器重置 + T+1 清零 + before_open/before_trading_start。"""
     fired.clear()
     if aux is not None:
+        # 记录引擎当前推进到的时间（补跑时 = 当日 09:25；实时 = 真实当前时间），
+        # 供 _replay_log_sink 给补跑日志打历史时间戳，而非真实 wall-clock。
+        aux["replay_dt"] = pd.Timestamp(now)
         aux["prev_close_cache"] = {}
         # 每日清空无分钟数据缓存：新交易日可能有标的开始有数据（如新ETF上市）
         dm = aux.get("dm")
@@ -472,7 +477,8 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
         _safe_call(account_id, bundle.after_trading_end, ctx, "after_trading_end")
     live_feed.persist_real(dm, aux["fresh_frames"])
     _persist(account_id, ctx, state, now, aux["jq_api"], aux)
-    _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘")
+    # now 在补跑时是引擎推进到的当日收市时刻（15:05），日志时间戳随引擎而非真实时钟
+    _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘", ts=str(now))
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +573,8 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     datetime.datetime.combine(today, datetime.time(9, 25)), aux)
         now = datetime.datetime.now()
         _emit_log(account_id, "info",
-                  f"补跑今日 {from_ts.strftime('%H:%M')} ~ {now.strftime('%H:%M')}")
+                  f"补跑今日 {from_ts.strftime('%H:%M')} ~ {now.strftime('%H:%M')}",
+                  ts=str(aux.get("replay_dt") or now))
         for bar in _session_minutes(today):
             if bar <= from_ts:
                 continue
@@ -577,7 +584,8 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
                 continue
             _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
         _emit_log(account_id, "info",
-                  f"日内补跑完成，净值 {state.get('net_value', 0):.2f}")
+                  f"日内补跑完成，净值 {state.get('net_value', 0):.2f}",
+                  ts=str(aux.get("replay_dt") or state.get("dt") or now))
     finally:
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
@@ -586,18 +594,27 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
 
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
-    """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
+    """从 start_date 起按历史分钟补跑至今日（今天仅补跑到当前已走完的 bar），
+    随后由主循环无缝接入实时，避免当天收盘后才启动/重置账户时日内行情丢失。"""
     _replay_active_ids.add(account_id)
     try:
         aux["replay_mode"] = True
         aux["batch_snapshots"] = []
         aux["batch_trades"] = []
         aux["batch_logs"] = []
-        yesterday = datetime.date.today() - datetime.timedelta(days=1)
-        days = _trade_days_between(dm, start_date, yesterday)
+        now = datetime.datetime.now()
+        today = now.date()
+        yesterday = today - datetime.timedelta(days=1)
+        # 含今天：完整交易日回放到昨日；今天既已开市（盘前/盘中/收盘）则也回放到当前时刻
+        days = _trade_days_between(dm, start_date, today)
+        full_days = [d for d in days if d != today]
+        first_ts = (datetime.datetime.combine(days[0], datetime.time(9, 25))
+                    if days else now)
         _emit_log(account_id, "info",
-                  f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日")
-        for day in days:
+                  f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日"
+                  + (f"，今日 {now.strftime('%H:%M')} 前已回放" if today in days else ""),
+                  ts=str(first_ts))
+        for day in full_days:
             if is_paused(account_id):
                 break
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
@@ -608,8 +625,25 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                 _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
             _eod(account_id, bundle, ctx, dm, state, aux,
                  datetime.datetime.combine(day, datetime.time(15, 5)))
-            _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
-        _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
+            _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}",
+                      ts=str(datetime.datetime.combine(day, datetime.time(15, 5))))
+        # 今天若已是交易日，把已走过（<= 当前时间）的 bar 也回补进来；
+        # 今天不跑 _eod，剩余 bar / 收盘由主循环实时接管（last_bar 已推进避免重复触发）
+        if today in days and not is_paused(account_id):
+            _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
+                        datetime.datetime.combine(today, datetime.time(9, 25)), aux)
+            for bar in _session_minutes(today):
+                if bar > now:
+                    break
+                if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
+                    continue
+                _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+            _emit_log(account_id, "info",
+                      f"今日 {now.strftime('%H:%M')} 前已回补，净值 {state.get('net_value', 0):.2f}",
+                      ts=str(aux.get("replay_dt") or state.get("dt") or now))
+        _emit_log(account_id, "info", "历史补跑完成，进入实时模式",
+                  ts=str(datetime.datetime.combine(days[-1], datetime.time(15, 5)))
+                  if days else str(now))
     finally:
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
@@ -644,6 +678,7 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         return None  # 同一 bar 已处理
     aux["last_bar"] = bar_ts
     ctx.current_dt = bar_ts
+    aux["replay_dt"] = bar_ts
     jq_api._state["minute_prices"] = prices
     jq_api._state["minute_mode"] = True
     # 涨跌停禁买卖（昨收缺失的标的不判定）
@@ -725,8 +760,15 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     }
     def _replay_log_sink(level, msg):
         if aux.get("replay_mode"):
+            # 补跑日志打引擎当时推进到的时间（bar 内 = bar 时刻；盘前 = 当日 09:25），
+            # 否则全部堆在真实当前时间，历史补跑逐日日志无法区分。
+            ts = aux.get("replay_dt")
+            if ts is None:
+                ts = getattr(ctx, "current_dt", None)
+            if ts is None:
+                ts = datetime.datetime.now()
             aux.setdefault("batch_logs", []).append(
-                (account_id, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, msg))
+                (account_id, str(ts)[:19], level, msg))
         else:
             _emit_log(account_id, level, msg)
     jq_api._state["log_sink"] = _replay_log_sink
