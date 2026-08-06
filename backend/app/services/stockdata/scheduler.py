@@ -62,6 +62,34 @@ def _sync_cron_loop():
         time.sleep(30)
 
 
+def _run_full_scan_once() -> None:
+    """00:00 全量缺失巡检 + 补全（单次执行体，与 15:35 用 _sync_lock 串行）。"""
+    with _sync_lock:
+        try:
+            from app.services import mootdx_service
+            res = mootdx_service.scan_and_backfill_full()
+            with _lock:
+                _scheduler_state["last_full_scan"] = str(_dt.datetime.now())
+                _scheduler_state["full_scan_result"] = res
+            logger.info("stockdata midnight full scan done: %s",
+                        {k: len(v) for k, v in (res.get("missing") or {}).items()}
+                        if isinstance(res.get("missing"), dict) else res)
+        except Exception:  # noqa: BLE001
+            logger.exception("stockdata midnight full scan failed")
+
+
+def _midnight_scan_loop():
+    """00:00 触发全量缺失巡检；每日一次，跨日重置。"""
+    last_date = None
+    while not _stop.is_set():
+        now = _dt.datetime.now()
+        if (now.time() >= _dt.time(0, 0) and now.time() < _dt.time(0, 1)
+                and now.date() != last_date):
+            last_date = now.date()
+            threading.Thread(target=_run_full_scan_once, daemon=True).start()
+        time.sleep(20)
+
+
 def _midnight_clear_loop(data_sources) -> None:
     """次日 00:00 清空当日分钟内存库（前一日网络实时数据不跨日驻留）。"""
     last_date = _dt.date.today()
@@ -88,7 +116,7 @@ def start_scheduler(data_sources=None) -> None:
     if _threads:
         return
     _stop.clear()
-    targets = [_backfill_loop, _sync_cron_loop]
+    targets = [_backfill_loop, _sync_cron_loop, _midnight_scan_loop]
     if data_sources is not None:
         targets.append(lambda: _midnight_clear_loop(data_sources))
     for target in targets:
