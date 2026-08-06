@@ -78,6 +78,34 @@ def test_preload_daily_excludes_index_but_get_daily_serves(tmp_path):
         os.environ.pop("PARTITION_DATA_ROOT", None)
 
 
+def test_get_daily_accepts_compact_date_format(tmp_path):
+    """get_daily 必须兼容 %Y%m%d 无横线日期（模拟盘 jqcompat 传此格式）。
+
+    回归：服务端 _scan_partitions 用字符串比较分区名（ISO 带横线），
+    '20260601' 与 '2026-06-01' 比较恒 False → 全部分区被跳过返回空，
+    导致指数走弱期判断「数据不足」、全球池成交额过滤静默失效。
+    """
+    import os
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    day = "2026-07-10"
+    idx = {"symbol": "000300.SH", "date": day, "open": 3000.0, "high": 3000.0,
+           "low": 3000.0, "close": 3000.0, "volume": 100.0, "amount": 300000.0}
+    d = os.path.join(str(tmp_path), "kline_index_daily", f"date={day}")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame([idx]).write_parquet(os.path.join(d, "part.parquet"))
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
+    try:
+        # 无横线 %Y%m%d 格式（jqcompat _DayBarStore.get_bars 传入）
+        got = s.get_daily(["000300.XSHG"], "20260601", "20260710")
+        assert not got.is_empty()
+        assert got["symbol"].to_list() == ["000300.SH"]
+        # 带横线 ISO 格式（rqalpha_bridge 传入）不受影响
+        got2 = s.get_daily(["000300.XSHG"], "2026-06-01", "2026-07-10")
+        assert not got2.is_empty()
+    finally:
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
 def test_minute_memory_store_lazy_and_clear():
     ms = MinuteMemoryStore()
     day = _dt.date.today()

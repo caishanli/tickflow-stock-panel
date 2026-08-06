@@ -63,7 +63,12 @@ def run_minute(func, minute="every"):
 
 
 def _filter_up_to(df, dt):
-    """把 DataFrame 截到 <= current_dt，避免回测未来函数。"""
+    """把 DataFrame 截到 <= current_dt，避免回测未来函数。
+
+    日线（索引时间为 00:00）的当日 bar 代表 15:00 收盘——盘中（<15:00）
+    取日线时不应包含当日（聚宽 attribute_history 恒不含当前 bar 语义）。
+    比较基准 = 日线索引 + 15h（当日生效于收盘）；分钟线索引含具体时刻，原样比。
+    """
     if df is None or df.empty:
         return df
     idx = None
@@ -77,7 +82,12 @@ def _filter_up_to(df, dt):
     if idx is None:
         return df
     try:
-        return df[idx <= pd.Timestamp(dt)]
+        dt_ts = pd.Timestamp(dt)
+        # 日线索引恒为 00:00：当日 bar 生效于 15:00，盘中不纳入当日
+        cmp = idx
+        if len(idx) and (idx.normalize() == idx).all():
+            cmp = idx + pd.Timedelta(hours=15)
+        return df[cmp <= dt_ts]
     except Exception:
         return df
 

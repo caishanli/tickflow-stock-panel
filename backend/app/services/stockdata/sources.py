@@ -325,6 +325,14 @@ class DataSources:
                                  lambda: self._load_daily(lookback_days, asof))
 
     def get_daily(self, codes: list[str], start_date: str, end_date: str) -> pl.DataFrame:
+        # 日期规范化：兼容 %Y%m%d（模拟盘 jqcompat _DayBarStore 传入）与 ISO
+        # （rqalpha_bridge 传入）两种格式。分区名恒为 ISO（date=YYYY-MM-DD），
+        # _scan_partitions 用字符串比较；'20260601' 与 '2026-06-01' 比较恒 False
+        # 会把全部分区跳过 → 指数走弱期判断「数据不足」/全球池成交额过滤静默失效。
+        # 统一转 ISO 再比较。
+        start_date = str(pd_to_date(start_date)) if start_date else None
+        end_date = str(pd_to_date(end_date)) if end_date else None
+
         def _load():
             syms = {_tf_symbol(c) for c in codes}
             cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]

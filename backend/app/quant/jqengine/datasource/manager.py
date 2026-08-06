@@ -1,5 +1,6 @@
 """数据源优先级调度 + 自动降级 + 缓存管理器。"""
 
+import datetime as _dt
 import logging
 import os
 from collections import OrderedDict
@@ -533,7 +534,15 @@ class DataManager:
             try:
                 if method in ("get_daily",):
                     code = args[0]
-                    df = getattr(self.sources["network"], method)(*args, **kwargs)
+                    # fetch("get_daily", code) 单参（_build_money_full 等）缺
+                    # start/end → 补全量窗口，避免 NetworkSource.get_daily 缺参抛
+                    # 错导致全球池成交额过滤静默失效（模拟盘补跑 _daily_mem 空时
+                    # 触发）。显式传了日期则原样透传。
+                    _fetch_args = list(args)
+                    if len(_fetch_args) < 3:
+                        _fetch_args += ["2000-01-01", _dt.datetime.now().strftime("%Y-%m-%d")]
+                        _fetch_args = _fetch_args[:3]
+                    df = getattr(self.sources["network"], method)(*_fetch_args, **kwargs)
                     if df is None or (hasattr(df, "empty") and df.empty):
                         raise DataSourceError(f"network 空数据")
                     # 与旧分区路径同口径：网络帧补 money/volume 列（幂等，列在则跳过）
