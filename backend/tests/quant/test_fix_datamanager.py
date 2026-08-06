@@ -278,3 +278,22 @@ def test_minute_mem_default_cap(tmp_path):
     """容量默认 800（与 scripts/run_jq_rqalpha.py --minute_cache_cap 一致）。"""
     dm = _make_dm(tmp_path)
     assert dm._minute_mem.cap == 800
+
+
+# ---------------- 分钟数据覆盖告警：回测起点早于分钟数据首日 ----------------
+
+def test_minute_coverage_start(tmp_path, monkeypatch):
+    """最早分钟分区日期：无分区返回 None；以 ETF 分钟覆盖为准（回测宇宙为
+    ETF），股票分钟（kline_minute，2018 起）仅作无 ETF 目录时的兜底——
+    避免股票分钟的历史覆盖掩盖 ETF 分钟缺口导致告警漏报。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    dm = _make_dm(tmp_path)
+    assert dm.minute_coverage_start() is None
+    (tmp_path / "kline_etf_minute" / "date=2026-04-01").mkdir(parents=True)
+    assert dm.minute_coverage_start() == pd.Timestamp("2026-04-01").date()
+    (tmp_path / "kline_minute" / "date=2018-02-09").mkdir(parents=True)
+    assert dm.minute_coverage_start() == pd.Timestamp("2026-04-01").date()
+    # 无 ETF 分钟目录时兜底到股票分钟
+    import shutil
+    shutil.rmtree(tmp_path / "kline_etf_minute")
+    assert dm.minute_coverage_start() == pd.Timestamp("2018-02-09").date()

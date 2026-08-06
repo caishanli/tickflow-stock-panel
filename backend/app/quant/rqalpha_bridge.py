@@ -127,7 +127,7 @@ def _now():
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _log_progress(run_id: str | None, msg: str) -> None:
+def _log_progress(run_id: str | None, msg: str, level: str = "INFO") -> None:
     """运行期阶段进度实时落库（SSE 即刻推送到前端日志页签）。
 
     预加载/数据源构建阶段没有 quantlive 事件钩子，不写进度日志的话，前端在
@@ -136,9 +136,26 @@ def _log_progress(run_id: str | None, msg: str) -> None:
     if not run_id:
         return
     try:
-        db.insert_log(run_id, _now(), "INFO", msg)
+        db.insert_log(run_id, _now(), level, msg)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _minute_coverage_warning(start, coverage_start):
+    """回测起点早于本地分钟数据覆盖首日 → 返回告警文案（可安全回测时 None）。
+
+    ``coverage_start`` 为 datetime.date 或 None（无任何分钟分区）。分钟数据
+    缺失时段无分钟成交，策略的动量/停牌判定会全部按「盘中临时停牌」跳过，
+    结果与聚宽不可比——提前显式提示，避免静默产出不可信结果。
+    """
+    if coverage_start is None:
+        return ("⚠️ 本地无分钟线数据分区：动量/停牌判定将全部按「盘中临时停牌」"
+                "跳过，回测结果不可信。请先同步分钟数据（mootdx_sync）。")
+    if pd.Timestamp(start).date() >= coverage_start:
+        return None
+    return (f"⚠️ 回测起点 {start} 早于本地分钟线数据覆盖首日 {coverage_start}："
+            f"覆盖前时段无分钟成交，动量/停牌判定将全部按「盘中临时停牌」跳过，"
+            "该时段结果与聚宽不可比。请先补齐分钟数据或调整回测区间。")
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1396,12 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     _log_progress(params.get("run_id"), "预加载日线缓存…")
     dm.preload_daily()
     dm.set_minute_window(start, end)
+
+    # 分钟数据覆盖告警：回测起点早于本地分钟数据首日时，覆盖前时段动量/停牌
+    # 判定全部按「盘中临时停牌」跳过，结果不可信——显式提示而非静默产出。
+    _cov_warn = _minute_coverage_warning(start, dm.minute_coverage_start())
+    if _cov_warn:
+        _log_progress(params.get("run_id"), _cov_warn, level="WARNING")
 
     # 全量 ETF 宇宙（与聚宽 get_all_securities(['etf']) 对齐）：
     # 优先读 ETF 名录快照（≤7 天，保证结果可复现）；快照过期或缺失时

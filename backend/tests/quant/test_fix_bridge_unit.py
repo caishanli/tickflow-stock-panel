@@ -19,6 +19,19 @@ from app.quant import rqalpha_bridge as bridge
 
 
 # ---------------------------------------------------------------------------
+# 分钟数据覆盖告警：回测起点早于本地分钟数据首日时提示结果不可信
+# ---------------------------------------------------------------------------
+
+def test_minute_coverage_warning():
+    import datetime as _dt
+    warn = bridge._minute_coverage_warning
+    assert warn("2026-04-01", None) is not None            # 无分钟数据 → 告警
+    assert warn("2026-04-01", _dt.date(2026, 4, 1)) is None   # 等于覆盖首日 → 不告警
+    assert warn("2026-06-01", _dt.date(2026, 4, 1)) is None   # 完全在覆盖内 → 不告警
+    assert warn("2026-04-01", _dt.date(2026, 4, 2)) is not None  # 早于覆盖 → 告警
+
+
+# ---------------------------------------------------------------------------
 # 合成数据与 fake provider/DataManager
 # ---------------------------------------------------------------------------
 def _daily_df(closes=(10.0, 11.0, 12.0)):

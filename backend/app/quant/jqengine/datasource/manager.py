@@ -4,6 +4,7 @@ import datetime as _dt
 import logging
 import os
 from collections import OrderedDict
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -351,6 +352,23 @@ class DataManager:
             if name.startswith("date="):
                 out.append(name)
         return sorted(out)
+
+    @classmethod
+    def minute_coverage_start(cls) -> date | None:
+        """本地分钟线数据最早覆盖日期。
+
+        以 ETF 分钟分区（kline_etf_minute）为准——jqcompat 回测宇宙为 ETF；
+        股票分钟（kline_minute）历史更早（2018 起），若混用会掩盖 ETF 分钟
+        缺口导致告警漏报。无 ETF 分钟目录时兜底到股票分钟，两者皆无返回 None。
+
+        用于回测起点早于分钟数据覆盖的告警：覆盖前时段无分钟成交，动量/停牌
+        判定会全部按「盘中临时停牌」跳过，结果与聚宽不可比。
+        """
+        for subdir in ("kline_etf_minute", "kline_minute"):
+            dates = cls._partition_dates(subdir)
+            if dates:
+                return pd.Timestamp(dates[0][len("date="):]).date()
+        return None
 
     def preload_minute(self, codes):
         """预加载指定标的的分钟线到 _minute_mem（整段窗口，供时钟 feed 使用）。
