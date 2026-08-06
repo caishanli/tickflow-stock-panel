@@ -347,10 +347,17 @@ def sync_stock_minute_day(day: _date) -> int:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
         return 0
     listing = _listing_date_map()
+    # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
+    # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过（与 sync_stock_minute 一致）。
+    pre_delisted = [s for s in stocks if listing.get(s) == _date(1970, 1, 1)]
+    if pre_delisted:
+        logger.info("mootdx_service: 跳过 %d 只退市/异常标的（上市日期占位）: %s",
+                    len(pre_delisted), pre_delisted[:10])
+        stocks = [s for s in stocks if s not in set(pre_delisted)]
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     total = 0
     chunk: list[pl.DataFrame] = []
-    for i, sym in enumerate(stocks):
+    for sym in stocks:
         ld = listing.get(sym)
         if ld is not None and ld > day:
             continue  # 上市晚于目标日，该日无数据
@@ -392,13 +399,83 @@ def sync_stock_minute_day(day: _date) -> int:
     return total
 
 
+def sync_stock_minute_range(days: list[_date]) -> int:
+    """批量回补多个缺失交易日：每只拉一次全量历史，一次写入所有缺失日分区。
+
+    与 ``sync_stock_minute_day``（逐缺失日全市场重拉）不同，多日缺口时每个
+    symbol 只拉一次 ``get_minute`` 全量，再按 ``day_set`` 过滤出落在缺失日的
+    bar，由 ``_flush_stock_minute_chunk`` 按各自交易日分组写入 ``date=`` 分区
+    （读旧→concat→unique），避免 O(N_days × 全市场) 的重复回源。
+    跳过退市/异常（上市日期 1970 占位）与上市日晚于整个缺失窗口起点的标的。
+    返回写入行数。
+    """
+    day_set = set(days)
+    min_day = min(days)
+    src = MootdxSource()
+    stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
+    if not stocks:
+        logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
+        return 0
+    listing = _listing_date_map()
+    # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
+    # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过。
+    pre_delisted = [s for s in stocks if listing.get(s) == _date(1970, 1, 1)]
+    if pre_delisted:
+        logger.info("mootdx_service: 跳过 %d 只退市/异常标的（上市日期占位）: %s",
+                    len(pre_delisted), pre_delisted[:10])
+        stocks = [s for s in stocks if s not in set(pre_delisted)]
+    keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    total = 0
+    chunk: list[pl.DataFrame] = []
+    for sym in stocks:
+        ld = listing.get(sym)
+        if ld is not None and ld > min_day:
+            continue  # 上市晚于缺失窗口起点，窗口内无数据
+        try:
+            df = _guarded_get_minute(src, sym, max_bars=40000)
+        except TimeoutError:
+            src = MootdxSource()
+            _append_failure(sym, "timeout")
+            continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            _append_failure(sym, f"exception:{str(e)[:60]}")
+            continue
+        if df is None or df.empty:
+            _append_failure(sym, "empty")
+            continue
+        df = df.copy()
+        df["symbol"] = sym
+        df = df.reset_index()
+        for c in keep:
+            if c not in df.columns:
+                df[c] = None
+        df = df[keep]
+        df = df[pd.to_datetime(df["datetime"]).dt.date.isin(day_set)]
+        if df.empty:
+            continue  # 缺失窗口内无 bar，跳过
+        sub = pl.from_pandas(df)
+        sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
+        sub = sub.unique(subset=["symbol", "datetime"], keep="last")
+        chunk.append(sub)
+        total += sub.height
+        if len(chunk) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(chunk)
+            chunk = []
+            src = MootdxSource()
+    if chunk:
+        _flush_stock_minute_chunk(chunk)
+    logger.info("mootdx_service: 股票分钟批量回源 %d 个缺失日, %d 行", len(days), total)
+    return total
+
+
 def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
     """逐缺失日复用现有 sync 函数补全，单日失败记 errors 不阻断。
 
     ``missing`` 键名与 ``scan_missing_partitions`` 一致：
     kline_daily / kline_etf_daily → sync_daily；kline_index_daily →
     sync_index_daily；kline_etf_minute → sync_etf_minute；
-    kline_minute → sync_stock_minute_day。
+    kline_minute → sync_stock_minute_range（批量一次补全全部缺失日）。
     """
     result: dict = {
         "daily_days": [], "index_daily_days": [],
@@ -423,12 +500,13 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
             result["etf_minute_days"].append(str(day))
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"etf_minute {day}: {e}")
-    for day in missing.get("kline_minute", []):
+    min_days = missing.get("kline_minute", [])
+    if min_days:
         try:
-            sync_stock_minute_day(day)
-            result["stock_minute_days"].append(str(day))
+            sync_stock_minute_range(min_days)
+            result["stock_minute_days"].extend(str(d) for d in min_days)
         except Exception as e:  # noqa: BLE001
-            result["errors"].append(f"stock_minute {day}: {e}")
+            result["errors"].append(f"stock_minute {min_days}: {e}")
 
     return result
 
@@ -438,9 +516,14 @@ def scan_and_backfill_full() -> dict:
     missing = scan_missing_partitions()
     backfilled = backfill_missing_partitions(missing)
     total = sum(len(v) for v in missing.values())
-    logger.info("mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s",
-                total, {k: len(v) for k, v in backfilled.items()},
-                len(backfilled["errors"]))
+    msg = "mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s"
+    args = (total, {k: len(v) for k, v in backfilled.items()},
+            len(backfilled["errors"]))
+    if backfilled["errors"]:
+        # 补全后有残留错误 → WARNING（供钉钉通知等消费）
+        logger.warning(msg, *args)
+    else:
+        logger.info(msg, *args)
     return {"missing": missing, "backfilled": backfilled,
             "errors": backfilled["errors"]}
 

@@ -421,16 +421,22 @@ def test_sync_stock_minute_day_filters_listing_and_writes(tmp_path, monkeypatch)
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
     monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
     monkeypatch.setattr(ms, "_stock_universe", lambda: [
-        "000001.SZ", "600000.SH", "999999.SZ"])
-    # 600000 上市晚于目标日 → 跳过不取数；000001 停牌（无该日 bar）；999999 有
+        "000001.SZ", "600000.SH", "999999.SZ", "888888.SZ"])
+    # 600000 上市晚于目标日 → 跳过不取数；000001 停牌（无该日 bar）；
+    # 999999 有 6/15 数据；888888 上市日期占位（1970）= 退市 → 跳过不取数
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {
         "000001.SZ": _dt.date(2020, 1, 1),
         "600000.SH": _dt.date(2026, 8, 1),   # 上市晚于 6/15 → 跳过
         "999999.SZ": _dt.date(2020, 1, 1),
+        "888888.SZ": _dt.date(1970, 1, 1),   # 退市/异常占位 → 跳过
     })
+
+    fetched: list[str] = []
+    failures: list[str] = []
 
     class _Src:
         def get_minute(self, sym, max_bars=40000):
+            fetched.append(sym)
             if sym == "000001.SZ":  # 停牌：无该日 bar
                 idx = pd.DatetimeIndex([_dt.datetime(2026, 6, 16, 9, 31)])
             else:  # 999999 有 6/15 的两根
@@ -443,11 +449,58 @@ def test_sync_stock_minute_day_filters_listing_and_writes(tmp_path, monkeypatch)
                                 index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    monkeypatch.setattr(ms, "_append_failure",
+                        lambda sym, reason: failures.append(sym))
     n = ms.sync_stock_minute_day(_dt.date(2026, 6, 15))
-    # 只有 999999 写入 2 根（600000 上市过滤跳过，000001 停牌该日无 bar）
+    # 只有 999999 写入 2 根（600000 上市过滤跳过，000001 停牌该日无 bar，
+    # 888888 退市占位跳过）
     assert n == 2
+    assert "888888.SZ" not in fetched, "退市占位标的不应被取数"
+    assert "888888.SZ" not in failures, "退市占位标的不应记失败"
     part = tmp_path / "kline_minute" / "date=2026-06-15" / "part.parquet"
     assert part.exists()
+
+
+def test_sync_stock_minute_range_writes_all_missing_days(tmp_path, monkeypatch):
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [
+        "000001.SZ", "600000.SH", "999999.SZ"])
+    # 600000 上市晚于缺失窗口起点（6/15）→ 跳过；000001/999999 窗口内两日都有 bar
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "000001.SZ": _dt.date(2020, 1, 1),
+        "600000.SH": _dt.date(2026, 8, 1),   # 上市晚于 min_day → 跳过
+        "999999.SZ": _dt.date(2020, 1, 1),
+    })
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            idx = pd.DatetimeIndex([
+                _dt.datetime(2026, 6, 15, 9, 31),
+                _dt.datetime(2026, 6, 15, 9, 32),
+                _dt.datetime(2026, 6, 16, 9, 31)])
+            idx.name = "datetime"  # 与真实 MootdxSource.get_minute 一致
+            return pd.DataFrame({"open": [1.0] * len(idx), "close": [1.0] * len(idx),
+                                 "volume": [100.0] * len(idx), "amount": [100.0] * len(idx)},
+                                index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    n = ms.sync_stock_minute_range([_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)])
+    # 2 只 × 3 根（两日）= 6 行；600000 上市过滤跳过
+    assert n == 6
+    for d in ["2026-06-15", "2026-06-16"]:
+        part = tmp_path / "kline_minute" / f"date={d}" / "part.parquet"
+        assert part.exists(), f"缺失日 {d} 应有分区"
+    df15 = pl.read_parquet(tmp_path / "kline_minute" / "date=2026-06-15" / "part.parquet")
+    df16 = pl.read_parquet(tmp_path / "kline_minute" / "date=2026-06-16" / "part.parquet")
+    assert sorted(set(df15["symbol"].to_list())) == ["000001.SZ", "999999.SZ"]
+    assert df15.height == 4  # 2 只 × 各 2 根
+    assert sorted(set(df16["symbol"].to_list())) == ["000001.SZ", "999999.SZ"]
+    assert df16.height == 2  # 2 只 × 各 1 根
 
 
 def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
@@ -489,7 +542,8 @@ def test_backfill_missing_partitions_routes_to_sync(monkeypatch):
     monkeypatch.setattr(ms, "sync_daily", lambda d: calls["daily"].append(d) or {"stock": 1, "etf": 1})
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls["index"].append(d) or {"written": 1})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d: calls["etf_min"].append(d) or 5)
-    monkeypatch.setattr(ms, "sync_stock_minute_day", lambda d: calls["stock_min"].append(d) or 7)
+    monkeypatch.setattr(ms, "sync_stock_minute_range",
+                        lambda days: calls["stock_min"].append(list(days)) or 7)
 
     missing = {
         "kline_daily":       [_dt.date(2026, 6, 15)],
@@ -502,7 +556,8 @@ def test_backfill_missing_partitions_routes_to_sync(monkeypatch):
     assert calls["daily"] == [_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)]
     assert calls["index"] == [_dt.date(2026, 6, 17)]
     assert calls["etf_min"] == [_dt.date(2026, 6, 18)]
-    assert calls["stock_min"] == [_dt.date(2026, 6, 19)]
+    # 批量一次调用拿全缺失日列表
+    assert calls["stock_min"] == [[_dt.date(2026, 6, 19)]]
     assert res["errors"] == []
 
 
@@ -516,7 +571,7 @@ def test_backfill_missing_partitions_survives_per_day_error(monkeypatch):
     monkeypatch.setattr(ms, "sync_daily", _boom)
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 1})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute_day", lambda d: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
 
     missing = {
         "kline_daily": [_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)],
