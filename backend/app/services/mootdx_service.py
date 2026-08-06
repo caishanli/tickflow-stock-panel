@@ -12,6 +12,7 @@ _load_minute_from_partitions），本服务不参与策略执行。
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
 from datetime import date as _date
@@ -463,28 +464,56 @@ def _trade_days_up_to(end: _date) -> list[_date]:
     return days
 
 
-def _missing_minute_days() -> list[_date]:
-    """找出分区缺失的 ETF 分钟交易日（最新分区日期 → 今天）。"""
+MARKET_CLOSE_TIME = _dt.time(15, 0)  # 当日日线/分钟视为"可回源"的时间下限
+
+
+def _market_closed(now: _dt.datetime | None = None) -> bool:
+    """当前是否已收盘（≥15:00，含盘后）。盘中视为未收盘。"""
+    now = now or _dt.datetime.now()
+    return now.time() >= MARKET_CLOSE_TIME
+
+
+def _missing_minute_days(now: _dt.datetime | None = None) -> list[_date]:
+    """找出分区缺失的 ETF 分钟交易日（最新分区日期 → 今天）。
+
+    盘中（<15:00）不把"今天"当作缺失日：当日分钟尚未走完，回源只会拿到
+    半日数据，写入会污染当天分区（与日线同一问题）。收盘后才把今天算缺失。
+    """
     existing = _partition_dates(ETF_MINUTE_ROOT)
     if not existing:
         return []
     latest = _date.fromisoformat(existing[-1])
-    today = _date.today()
-    if latest >= today:
+    now = now or _dt.datetime.now()
+    today = now.date()
+    if latest >= today and not _market_closed(now):
         return []
     return [d for d in _trade_days_up_to(today) if latest < d <= today]
 
 
-def _missing_daily_days(root: Path) -> list[_date]:
-    """找出某日线分区缺失的交易日。"""
+def _missing_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_date]:
+    """找出某日线分区缺失的交易日。
+
+    盘中（<15:00）不把"今天"当作缺失日：当日日线尚未收全，回源只能拿到
+    盘中半日快照（如 08-05 10:36 写入的坏分区），且写入后 ``latest==today``
+    会让后续回源永久跳过修正。收盘后才把今天算缺失（若今日分区为盘中快照
+    则一并重写，见 ``_stale_today_daily_days``），由 backfill 补全。
+    """
     existing = _partition_dates(root)
     if not existing:
         return []
     latest = _date.fromisoformat(existing[-1])
     today = _date.today()
-    if latest >= today:
+    now = now or _dt.datetime.now()
+    if latest >= today and not _market_closed(now):
         return []
-    return [d for d in _trade_days_up_to(today) if latest < d <= today]
+    days = [d for d in _trade_days_up_to(today) if latest < d <= today]
+    # 收盘后：今日分区若为盘中快照（mtime < 15:00），即使 latest==today
+    # 也要强制重写为收盘完整数据（否则盘中坏分区会永久残留）。
+    if _market_closed(now):
+        stale = _stale_today_daily_days(root, now)
+        if stale:
+            return sorted(set(days) | set(stale))
+    return days
 
 
 def _stock_universe() -> list[str]:
@@ -755,6 +784,29 @@ def sync_index_daily(day: _date) -> dict:
 def _missing_index_daily_days() -> list[_date]:
     """找出 ``kline_index_daily`` 分区缺失的交易日。"""
     return _missing_daily_days(INDEX_DAILY_ROOT)
+
+
+def _stale_today_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_date]:
+    """收盘后发现「今天」分区存在但写入时间早于收盘（盘中快照）→ 需重写。
+
+    场景：盘中某次 backfill 把今日半日数据当完整日线写入（mtime < 15:00），
+    之后 ``_missing_daily_days`` 因 latest==today 永远跳过修正。此处通过
+    分区 part.parquet 的 mtime 判定是否盘中写入，返回需要强制重写的今日列表。
+    """
+    now = now or _dt.datetime.now()
+    today = now.date()
+    pdir = root / f"date={today.isoformat()}"
+    part = pdir / "part.parquet"
+    if not part.exists():
+        return []
+    try:
+        mt = _dt.datetime.fromtimestamp(part.stat().st_mtime)
+    except OSError:
+        return []
+    if mt.time() >= MARKET_CLOSE_TIME:
+        return []  # 收盘后写入过，视为完整
+    # 盘中写入（mtime < 15:00）且当前已收盘 → 标记需重写
+    return [today]
 
 
 def _adj_factor_stale() -> bool:

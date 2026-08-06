@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 
 import pandas as pd
 import polars as pl
@@ -261,3 +262,98 @@ def test_sync_daily_warns_when_etf_zero(caplog, monkeypatch, tmp_path):
     assert res["etf"] == 0
     assert any("ETF" in r.message and "0" in r.message for r in caplog.records), \
         f"应告警 ETF 写 0，实际日志: {[r.message for r in caplog.records]}"
+
+
+# ---------------------------------------------------------------------------
+# 盘中守卫 + 收盘自愈（08-05 盘中写入坏分区的回归）
+# ---------------------------------------------------------------------------
+
+def _mk_daily_part(root, day, mtime_hour):
+    pdir = root / f"date={day}"
+    pdir.mkdir(parents=True, exist_ok=True)
+    part = pdir / "part.parquet"
+    pl.DataFrame({
+        "symbol": ["000300.SH"], "open": [4550.0], "high": [4620.0],
+        "low": [4550.0], "close": [4619.7], "volume": [1.0], "amount": [1.0],
+    }).write_parquet(part)
+    os.utime(part, (_dt.datetime(2026, 8, 5, mtime_hour, 0).timestamp(),) * 2)
+    return part
+
+
+def test_market_closed_threshold(monkeypatch):
+    assert ms._market_closed(_dt.datetime(2026, 8, 5, 14, 59)) is False
+    assert ms._market_closed(_dt.datetime(2026, 8, 5, 15, 0)) is True
+    assert ms._market_closed(_dt.datetime(2026, 8, 5, 18, 0)) is True
+
+
+def test_missing_daily_guards_intraday_today(tmp_path, monkeypatch):
+    """盘中（<15:00）：今日分区已存在 → 不把今天当缺失日，不回源。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_daily"
+    _mk_daily_part(root, "2026-08-05", mtime_hour=10)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_dt.date(2026, 8, 5)])
+
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 5, 10, 55))
+    assert days == []
+
+
+def test_missing_daily_selfheals_stale_today_after_close(tmp_path, monkeypatch):
+    """收盘后：今日分区为盘中快照（mtime<15:00）→ 强制重写今天。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_daily"
+    _mk_daily_part(root, "2026-08-05", mtime_hour=10)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_dt.date(2026, 8, 5)])
+
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 5, 18, 0))
+    assert days == [_dt.date(2026, 8, 5)]
+
+
+def test_missing_daily_skips_clean_today_after_close(tmp_path, monkeypatch):
+    """收盘后：今日分区为收盘后写入（mtime>=15:00）→ 不重写。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_daily"
+    _mk_daily_part(root, "2026-08-05", mtime_hour=16)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_dt.date(2026, 8, 5)])
+
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 5, 18, 0))
+    assert days == []
+
+
+def test_missing_daily_includes_today_when_partition_absent_after_close(tmp_path, monkeypatch):
+    """收盘后：今日分区缺失 → 今天算缺失日，回源补全。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_daily"
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 5, 18, 0))
+    assert _dt.date(2026, 8, 5) in days
+
+
+def test_stale_today_daily_days_detects_intraday_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_index_daily"
+    _mk_daily_part(root, "2026-08-05", mtime_hour=10)
+    assert ms._stale_today_daily_days(root, _dt.datetime(2026, 8, 5, 18, 0)) \
+        == [_dt.date(2026, 8, 5)]
+    # 收盘后写入 → 不 stale
+    _mk_daily_part(root, "2026-08-05", mtime_hour=16)
+    assert ms._stale_today_daily_days(root, _dt.datetime(2026, 8, 5, 18, 0)) == []
+    # 盘中判断（未收盘）不报 stale（只有收盘后触发重写）
+    _mk_daily_part(root, "2026-08-05", mtime_hour=10)
+    assert ms._stale_today_daily_days(root, _dt.datetime(2026, 8, 5, 10, 55)) \
+        == [_dt.date(2026, 8, 5)]  # 仍返回（调用方只在收盘后使用）
+
+
+def test_missing_minute_guards_intraday_today(tmp_path, monkeypatch):
+    """盘中：ETF 分钟今日分区已存在 → 不回源今日。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_etf_minute"
+    (root / "date=2026-08-05").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_dt.date(2026, 8, 5)])
+
+    # 盘中（10:55）：今日分区已存在 → 不回源今日
+    assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == []
+    # 盘中但今日分区缺失 → 同样不回源（半日数据不落盘）
+    (root / "date=2026-08-05").rmdir()
+    assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == []
