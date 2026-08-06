@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import time
 from datetime import date as _date
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,25 @@ def _append_failure(sym: str, reason: str) -> None:
             f.write(line)
     except Exception:  # noqa: BLE001
         logger.warning("mootdx_service: 失败记录写入失败: %s", sym)
+
+
+# 后台回源节流：客户端请求优先占用 mootdx socket/CPU，backfill 每取 N 个 symbol
+# 主动 sleep 一小段让出资源。默认开启（每 5 个 symbol 睡 0.2s），环境变量可调。
+_BACKFILL_THROTTLE_EVERY = int(os.getenv("BACKFILL_THROTTLE_EVERY", "5"))
+_BACKFILL_THROTTLE_SLEEP = float(os.getenv("BACKFILL_THROTTLE_SLEEP", "0.2"))
+
+
+def _throttle_backfill(i: int) -> None:
+    """后台回源节流：每 ``_BACKFILL_THROTTLE_EVERY`` 个 symbol 后 sleep 一小段。
+
+    ``i`` 为当前循环序号（0-based）。``sleep`` 主动释放 GIL 与 mootdx socket
+    占用，给客户端实时请求让路（客户端走共享线程池，不受本函数影响）。
+    仅在后台回源路径调用（sync_daily/sync_index_daily/sync_stock_minute/…）。
+    """
+    if _BACKFILL_THROTTLE_EVERY <= 0:
+        return
+    if (i + 1) % _BACKFILL_THROTTLE_EVERY == 0:
+        time.sleep(_BACKFILL_THROTTLE_SLEEP)
 
 
 def _to_tf_symbol(code: str) -> str:
@@ -94,6 +114,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
     historical = (day < _date.today() - _dt.timedelta(days=5))
     frames = []
     for i, jq in enumerate(codes):
+        _throttle_backfill(i)
         try:
             if historical:
                 df = src.get_minute(jq, max_bars=40000)
@@ -285,6 +306,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     total = 0
     chunk: list[pl.DataFrame] = []
     for i, sym in enumerate(todo):
+        _throttle_backfill(i)
         # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
         sym_start = STOCK_MINUTE_START
         ld = listing.get(sym)
@@ -357,7 +379,8 @@ def sync_stock_minute_day(day: _date) -> int:
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     total = 0
     chunk: list[pl.DataFrame] = []
-    for sym in stocks:
+    for i, sym in enumerate(stocks):
+        _throttle_backfill(i)
         ld = listing.get(sym)
         if ld is not None and ld > day:
             continue  # 上市晚于目标日，该日无数据
@@ -427,7 +450,8 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     total = 0
     chunk: list[pl.DataFrame] = []
-    for sym in stocks:
+    for i, sym in enumerate(stocks):
+        _throttle_backfill(i)
         ld = listing.get(sym)
         if ld is not None and ld > window_end:
             continue  # 上市晚于整个缺失窗口，窗口内无数据
@@ -874,6 +898,7 @@ def sync_daily(day: _date) -> dict:
     def _fetch(syms: list[str]) -> pl.DataFrame | None:
         out_frames = []
         for i, sym in enumerate(syms):
+            _throttle_backfill(i)
             try:
                 df = _guarded_get_daily(src, sym, day_str, day_str)
             except Exception:
@@ -991,6 +1016,7 @@ def sync_index_daily(day: _date) -> dict:
     day_str = day.strftime("%Y%m%d")
     frames: list[pl.DataFrame] = []
     for i, sym in enumerate(indices):
+        _throttle_backfill(i)
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
             if df is None or df.empty:

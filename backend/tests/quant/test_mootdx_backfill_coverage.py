@@ -580,3 +580,65 @@ def test_backfill_missing_partitions_survives_per_day_error(monkeypatch):
     res = ms.backfill_missing_partitions(missing)
     assert len(res["errors"]) == 2  # 两日都失败，但 index 仍补了
     assert "2026-06-17" in res["index_daily_days"]
+
+
+# ---------------------------------------------------------------------------
+# 后台回源节流（客户端请求优先）
+# ---------------------------------------------------------------------------
+
+def test_throttle_backfill_sleeps_every_n(monkeypatch):
+    """每 _BACKFILL_THROTTLE_EVERY 个 symbol 后 sleep _BACKFILL_THROTTLE_SLEEP。"""
+    sleeps = []
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 3)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.05)
+    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
+    for i in range(6):
+        ms._throttle_backfill(i)
+    assert sleeps == [0.05, 0.05]  # i=2(第3个) 和 i=5(第6个) 触发
+
+
+def test_throttle_backfill_disabled_when_every_zero(monkeypatch):
+    """_BACKFILL_THROTTLE_EVERY<=0 时完全不禁流。"""
+    sleeps = []
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 0)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.05)
+    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
+    for i in range(10):
+        ms._throttle_backfill(i)
+    assert sleeps == []
+
+
+def test_throttle_backfill_called_in_sync_daily_loop(tmp_path, monkeypatch):
+    """sync_daily 循环逐 symbol 调用节流（证明接入点存在且生效）。"""
+    calls = {"throttle": []}
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 2)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.0)
+    monkeypatch.setattr(ms.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ", "600000.SH", "000002.SZ"])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: None)
+
+    class _Src:
+        def get_daily(self, code, start, end):
+            import pandas as pd
+            ts = pd.Timestamp("2026-08-05 15:00:00")
+            return pd.DataFrame(
+                {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+                 "volume": [1000.0], "amount": [10000.0]},
+                index=pd.DatetimeIndex([ts]))
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    # 统计 throttle 调用次数：monkeypatch 包装
+    orig = ms._throttle_backfill
+    def _spy(i):
+        calls["throttle"].append(i)
+        orig(i)
+    monkeypatch.setattr(ms, "_throttle_backfill", _spy)
+
+    ms.sync_daily(_dt.date(2026, 8, 5))
+    assert len(calls["throttle"]) >= 3  # 每只股票都调用
