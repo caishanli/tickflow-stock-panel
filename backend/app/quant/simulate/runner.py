@@ -486,6 +486,13 @@ def _trade_days_between(dm, start, end) -> list:
     """
     try:
         df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+        # 只取交易日索引，不缓存窄窗口帧到 _daily_mem：否则后续 attribute_history
+        # 请求全量（20000101~20300101）会命中这个补跑区间帧（_covers 只看 end 未来
+        # 哨兵判覆盖），导致 000300 只有补跑区间的十几行 → 走弱期判断「数据不足」。
+        _mem = getattr(dm, "_daily_mem", None)
+        if _mem is not None:
+            _mem.pop("get_daily_000300.XSHG", None)
+            dm._daily_ver += 1
     except Exception:
         df = None
     if df is None or df.empty:
