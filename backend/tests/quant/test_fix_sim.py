@@ -324,6 +324,77 @@ def test_m5_terminate_missing_run_404(tmp_quant, api_client):
     assert api_client.post("/api/quant/backtest/nope/terminate").status_code == 404
 
 
+# ---- sim_equity：沪深300 基准需识别 trade_dt 日期列（否则基线平直为 0）----
+def test_sim_equity_benchmark_uses_trade_dt_column(tmp_quant, api_client, monkeypatch):
+    from app.quant.jqengine.datasource import manager as dm_mgr
+
+    class _BenchDM:
+        def fetch(self, method, *a, **k):
+            return pd.DataFrame({
+                "close": [100.0, 101.0, 103.0],
+                "trade_dt": ["2026-07-09", "2026-07-10", "2026-07-13"],
+            })
+
+    monkeypatch.setattr(dm_mgr, "get_data_manager", lambda *a, **k: _BenchDM())
+    db.insert_sim_account("a_bm", "a", 100000.0, 0.03, "created")
+    db.insert_sim_snapshot("a_bm", "2026-07-10 09:31:00", 100000.0, 100000.0, 0.0, 0.0, 0.0)
+    db.insert_sim_snapshot("a_bm", "2026-07-13 09:31:00", 101000.0, 100000.0, 1000.0, 1000.0, 0.01)
+    r = api_client.get("/api/quant/sim/accounts/a_bm/equity")
+    assert r.status_code == 200
+    bm = {s["dt"][:10]: s.get("benchmark_pct") for s in r.json()["data"]}
+    # 基准日 = 启动日前一交易日（07-09 收盘 100）→ 07-10 = +1.0%，07-13 = +3.0%
+    assert bm["2026-07-10"] == pytest.approx(1.0)
+    assert bm["2026-07-13"] == pytest.approx(3.0)
+
+
+def test_sim_equity_benchmark_falls_back_to_datetime_index(tmp_quant, api_client, monkeypatch):
+    from app.quant.jqengine.datasource import manager as dm_mgr
+
+    class _IndexDM:
+        def fetch(self, method, *a, **k):
+            return pd.DataFrame({"close": [100.0, 101.0]},
+                                index=pd.DatetimeIndex(["2026-07-09", "2026-07-10"]))
+
+    monkeypatch.setattr(dm_mgr, "get_data_manager", lambda *a, **k: _IndexDM())
+    db.insert_sim_account("a_bmi", "a", 100000.0, 0.03, "created")
+    db.insert_sim_snapshot("a_bmi", "2026-07-10 09:31:00", 100000.0, 100000.0, 0.0, 0.0, 0.0)
+    r = api_client.get("/api/quant/sim/accounts/a_bmi/equity")
+    bm = {s["dt"][:10]: s.get("benchmark_pct") for s in r.json()["data"]}
+    assert bm["2026-07-10"] == pytest.approx(1.0)
+
+
+# ---- 补跑期间状态卡片不更新：status 事件只在状态切换时推送 ----
+async def test_sim_stream_emits_status_when_state_changes(tmp_quant, monkeypatch):
+    """补跑时 account.status 恒为 running，但 sim_state 每 bar 更新。
+
+    回归：卡片（净值/收益率/持仓）只消费 status 事件里的 state，而 status 事件
+    仅在状态切换时推送 → 补跑期间卡片不更新。修复后 state 变化也要推 status 事件。
+    """
+    from app.quant.api import quant as quant_api
+    import asyncio
+
+    async def _no_sleep(*a, **k):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    db.insert_sim_account("a_stchg", "s", 100000.0, 0.03, "running")
+    db.upsert_sim_state("a_stchg", 100000.0, "{}", 100000.0, 0.0, 100000.0, "[]",
+                        "2026-07-10 09:31:00")
+    resp = quant_api.sim_stream("a_stchg")
+    agen = resp.body_iterator  # type: ignore[attr-defined]
+    # 第一轮：状态切换（None → running）推一条 status
+    first = await anext(agen)
+    assert "event: status" in first
+    assert '"status": "running"' in first
+    # 状态不变（仍 running），但 sim_state 更新（净额变化）→ 必须再推一条 status
+    db.upsert_sim_state("a_stchg", 99000.0, "{}", 101000.0, 1000.0, 100000.0, "[]",
+                        "2026-07-10 09:32:00")
+    second = await anext(agen)
+    assert "event: status" in second
+    assert "101000.0" in second
+    await agen.aclose()
+
+
 # ---- M12 + #8：SSE 断点续推与终态关流 ----
 def test_m12_sse_since_id_resumes_from_snapshot(tmp_quant, api_client):
     db.insert_run("run_s", "s", "", "{}", "done")
