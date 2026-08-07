@@ -48,5 +48,7 @@ def test_get_name_map_empty_on_error(monkeypatch):
         names._NAMES = None
 
 
-def test_resolve_name_none_map_fallback():
+def test_resolve_name_none_map_fallback(monkeypatch):
+    """名称映射为空时回退代码本身（不依赖真实服务）。"""
+    monkeypatch.setattr(names, "get_name_map", lambda: {})
     assert names.resolve_name("159985.XSHE") == "159985.XSHE"
