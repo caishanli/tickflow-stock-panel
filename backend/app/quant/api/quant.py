@@ -412,7 +412,8 @@ def sim_stream(aid: str, since_id: int | None = None):
                     yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
                 for row in db.get_sim_trades_after(aid, off_trade):
                     off_trade = row["rowid"]
-                    d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
+                    d = {k: row[k] for k in ("ts", "code", "name", "action", "price",
+                                             "amount", "pnl", "pnl_pct", "commission")}
                     yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
                 for row in db.get_sim_logs_after(aid, off_log):
                     off_log = row["rowid"]
