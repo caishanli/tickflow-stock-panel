@@ -265,6 +265,25 @@ def test_preload_minute_for_pool_single_definition():
     assert sig.parameters["as_of"].default is None
 
 
+def test_unset_minute_window_restores_sliding(tmp_path):
+    """补跑结束后必须复位分钟窗口：钉窗泄漏到实时模式会让
+    preload_minute_for_pool 永远用补跑区间的 full 窗口（as_of 前移也不滑动），
+    逐日重新加载丢失批量预取。unset 后回到滑窗语义。"""
+    dm = _make_dm(tmp_path)
+    _seed_minute_caches(dm)
+    dm.set_minute_window("2026-03-02", "2026-03-31")
+    assert dm._minute_win is not None
+    dm.unset_minute_window()
+    assert dm._minute_win is None
+    # unset 后 preload 走滑窗（full=False）：as_of 前移，上界跟随 as_of
+    _seed_minute_caches(dm)
+    dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
+    df = dm._minute_mem.get(CODE)
+    assert df is not None and not df.empty
+    assert df.index.max() == pd.Timestamp("2026-03-25 15:00")
+    assert dm._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
+
+
 def test_preload_minute_for_pool_functional(tmp_path):
     """合并后的实现：as_of 可缺省语义保留；回测（已 set_minute_window）加载整段
     回测窗口并记录覆盖（T17：整窗帧供 get_minute_feed 命中，免逐标的全窗口联网）；

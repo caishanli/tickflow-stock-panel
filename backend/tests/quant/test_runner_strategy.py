@@ -288,9 +288,13 @@ def _replay_dm_cls(days):
             super().__init__()
             self.window_seen = None
             self.pool_seen = None
+            self.unset_seen = False
 
         def set_minute_window(self, start, end):
             self.window_seen = (str(start)[:10], str(end)[:10])
+
+        def unset_minute_window(self):
+            self.unset_seen = True
 
         def preload_minute_for_pool(self, codes, as_of=None):
             self.pool_seen = list(codes) if codes else []
@@ -359,6 +363,8 @@ def test_replay_pins_minute_window_and_preloads_pool(tmp_quant, monkeypatch):
     assert dm.window_seen[1] == str(today)
     assert dm.pool_seen is not None
     assert "510300.XSHG" in dm.pool_seen           # 策略 universe 标的被批量预取
+    # 补跑结束进入实时：钉住的窗口必须复位，否则 preload 永远走 full 窗口不滑动
+    assert dm.unset_seen is True
 
 
 def test_strategy_loop_replays_today_intraday_bars(tmp_quant, monkeypatch):

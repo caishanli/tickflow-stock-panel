@@ -592,6 +592,10 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
         _replay_active_ids.discard(account_id)
+        # 补跑结束进入实时：复位钉住的分钟窗口，避免 preload_minute_for_pool
+        # 永远用补跑区间 full 窗口、as_of 前移也不滑动（逐日重载丢失批量预取）。
+        # 已缓存的分钟帧不清空，覆盖检查与 live_feed 保持帧新鲜。
+        _unset_replay_minute_window(dm)
 
 
 def _pin_replay_minute_window(dm, ctx, start, end) -> None:
@@ -606,8 +610,8 @@ def _pin_replay_minute_window(dm, ctx, start, end) -> None:
     if set_win is not None:
         try:
             set_win(str(start)[:10], str(end)[:10])
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:
+            log.warning("[replay] set_minute_window 失败（回退滑窗）: %s", e)
     codes = []
     if ctx is not None:
         pf = getattr(ctx, "portfolio", None)
@@ -618,8 +622,20 @@ def _pin_replay_minute_window(dm, ctx, start, end) -> None:
     if preload is not None and codes:
         try:
             preload(codes, pd.Timestamp(end))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:
+            log.warning("[replay] 分钟池批量预取失败（补跑将逐日回源）: %s", e)
+
+
+def _unset_replay_minute_window(dm) -> None:
+    """补跑结束后复位分钟窗口（unset_minute_window 的 stub-DM 兜底版本）。"""
+    if dm is None:
+        return
+    unset_win = getattr(dm, "unset_minute_window", None)
+    if unset_win is not None:
+        try:
+            unset_win()
+        except Exception as e:
+            log.warning("[replay] unset_minute_window 失败（实时模式沿用钉窗）: %s", e)
 
 
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
@@ -680,6 +696,10 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
         _replay_active_ids.discard(account_id)
+        # 补跑结束进入实时：复位钉住的分钟窗口，避免 preload_minute_for_pool
+        # 永远用补跑区间 full 窗口、as_of 前移也不滑动（逐日重载丢失批量预取）。
+        # 已缓存的分钟帧不清空，覆盖检查与 live_feed 保持帧新鲜。
+        _unset_replay_minute_window(dm)
 
 
 def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,

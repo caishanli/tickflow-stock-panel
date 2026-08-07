@@ -314,6 +314,17 @@ class DataManager:
         self._minute_mem.clear()
         self._minute_cov.clear()
 
+    def unset_minute_window(self) -> None:
+        """复位分钟线窗口（补跑结束后调用）：回到实时/模拟盘的滑窗语义。
+
+        补跑前 _pin_replay_minute_window 钉住整个区间；补跑完成进入实时后必须
+        复位，否则 preload_minute_for_pool 的 ``full = bool(_minute_win)`` 永远
+        按钉死的补跑窗口展开，as_of 前移也不滑动——覆盖检查恒不命中、逐日重载
+        丢失批量预取优化。不清空已缓存的分钟帧（_minute_cov 仍有效，覆盖检查
+        与 live_feed 会继续保持帧新鲜）。
+        """
+        self._minute_win = None
+
     @staticmethod
     def _to_jq_code(code):
         """代码(.SZ/.SH) -> JQ代码(.XSHE/.XSHG)。"""
