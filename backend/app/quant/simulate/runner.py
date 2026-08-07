@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from . import live_feed
+from . import names
 from .protocol import read_state, save_state, is_paused
 from .matcher import Matcher
 from .. import db
@@ -309,6 +310,7 @@ def _state_from_portfolio(ctx, state: dict) -> dict:
             "amount": float(p.amount), "avg_cost": float(p.avg_cost),
             "price": float(p.price),
             "today_amount": float(getattr(p, "today_amount", 0.0) or 0.0),
+            "name": names.resolve_name(code),
         }
         for code, p in ctx.portfolio.positions.items()
     }
@@ -442,7 +444,7 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
         trade_row = (account_id, str(t["dt"]),
                      t["code"], "BUY" if t["amount"] > 0 else "SELL",
                      t["price"], amount, round(pnl, 4), round(pnl_pct, 4),
-                     t.get("fee", 0.0))
+                     t.get("fee", 0.0), names.resolve_name(t["code"]))
         if batch_trades is not None:
             batch_trades.append(trade_row)
         else:
