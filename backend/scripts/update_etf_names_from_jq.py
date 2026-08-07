@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-SNAPSHOT = Path("/home/caisl/tickflow-stock-panel/data/quant_kline/etf_universe_snapshot.json")
-PROBE = Path("/home/caisl/tickflow-stock-panel/backend/scripts/result.txt")
+_REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+SNAPSHOT = Path(os.getenv("PARTITION_DATA_ROOT", _REPO_ROOT / "data")) / "quant_kline" / "etf_universe_snapshot.json"
+PROBE = Path(os.path.dirname(os.path.abspath(__file__))) / "result.txt"
 
 
 def parse_jq_names(path: Path) -> dict[str, str]:

@@ -138,7 +138,7 @@ export const listBacktests = (strategyId?: string) =>
 - [ ] **Step 2: 类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错。
 
@@ -562,7 +562,7 @@ function TradeTable({ trades }: { trades: any[] }) {
 - [ ] **Step 2: 类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错（确认已包含 `logTab` 状态声明）。
 
@@ -584,14 +584,14 @@ git commit -m "feat(quant): 策略列表 + 标签页编辑器(编辑/详情/列�
 - [ ] **Step 1: 后端语法校验**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/backend && python3 -c "import ast; ast.parse(open('app/quant/db.py').read()); ast.parse(open('app/quant/api/quant.py').read()); print('syntax ok')"
+cd /home/ubuntu/tickflow-stock-panel/backend && python3 -c "import ast; ast.parse(open('app/quant/db.py').read()); ast.parse(open('app/quant/api/quant.py').read()); print('syntax ok')"
 ```
 Expected: 打印 `syntax ok`。
 
 - [ ] **Step 2: 前端全量类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错。
 

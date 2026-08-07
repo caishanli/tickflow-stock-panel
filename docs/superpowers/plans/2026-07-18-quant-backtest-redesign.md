@@ -302,7 +302,7 @@ export function tone(v: number | null): string {
 - [ ] **Step 2: 类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错。
 
@@ -387,7 +387,7 @@ export function EquityChart({ equity }: { equity: any[] }) {
 - [ ] **Step 2: 类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错。
 
@@ -762,7 +762,7 @@ function TradeTable({ trades }: { trades: any[] }) {
 - [ ] **Step 2: 类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错。
 
@@ -784,14 +784,14 @@ git commit -m "feat(quant): 量化回测页面重构为列表+编辑器(指标/�
 - [ ] **Step 1: 后端类型/导入 sanity**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/backend && python -c "import app.quant.api.quant as q; print('api ok')"
+cd /home/ubuntu/tickflow-stock-panel/backend && python -c "import app.quant.api.quant as q; print('api ok')"
 ```
 Expected: 打印 `api ok`，无 ImportError。
 
 - [ ] **Step 2: 前端全量类型检查**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel/frontend && npx tsc -b
+cd /home/ubuntu/tickflow-stock-panel/frontend && npx tsc -b
 ```
 Expected: 无报错。
 

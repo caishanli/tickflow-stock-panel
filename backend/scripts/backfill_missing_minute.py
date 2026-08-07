@@ -17,7 +17,9 @@ from pathlib import Path
 import pandas as pd
 import polars as pl
 
-ROOT = Path("/home/caisl/tickflow-stock-panel/data/kline_etf_minute")
+_REPO_ROOT = Path(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+ROOT = Path(os.getenv("PARTITION_DATA_ROOT", _REPO_ROOT / "data")) / "kline_etf_minute"
 CUTOFF = "2026-04-24"   # 只补齐这之后缺失的日期
 END = "2026-07-31"      # 拉取上界
 

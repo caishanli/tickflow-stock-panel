@@ -223,11 +223,11 @@ class DataManager:
         self._adj_events_cache = None  # 惰性：从因子表重建的除权事件
 
     def _adj_factor_map(self) -> dict[str, dict]:
-        """加载前复权因子表：{jq_code: {trade_date(date): ex_factor}}。
+        """加载前复权因子表: {jq_code: {trade_date(date): ex_factor}}。
 
-        合并两处来源：本地 parquet（``adj_factor_etf`` ETF 因子 +
-        ``adj_factor_baostock`` 股票因子，baostock 回源脚本产出）与
-        stockdata 网络服务因子表（服务端读同一 ``adj_factor_etf`` 目录）；
+        合并两处来源: 本地 parquet (adj_factor_etf ETF 因子 +
+        adj_factor_baostock 股票因子, baostock 回源脚本产出) 与
+        stockdata 网络服务因子表 (服务端读同一 adj_factor_etf 目录);
         任一来源不可用/离线时另一来源兜底。
         """
         if self._adj_factor is not None:

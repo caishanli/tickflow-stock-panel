@@ -21,7 +21,12 @@ load_dotenv()
 from app.quant.jqengine.datasource.manager import DataManager  # noqa: E402
 from app.quant.jqengine.datasource.base import DataSourceError  # noqa: E402
 
-STRATEGY = "/home/caisl/五福闹新春-v5.2/wufu-v5.2.py"
+_BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STRATEGY = os.environ.get(
+    "WUFU_REPO",
+    os.path.join(_BACKEND, "tests", "fixtures", "wufu_v52"),
+)
+STRATEGY = os.path.join(STRATEGY, "wufu-v5.2.py")
 AUX = [
     "510300.XSHG",  # 基准
     "000300.XSHG", "399101.XSHE", "399006.XSHE", "000510.XSHG",  # 走弱期判定指数

@@ -317,7 +317,7 @@ Expected: 3 PASS
 
 ```bash
 cd backend && uv run --extra dev pytest tests/quant/test_runner_strategy.py tests/quant/test_runner_mark.py -q
-cd /home/caisl/tickflow-stock-panel && git add backend/app/quant/simulate/runner.py backend/tests/quant/test_runner_mark.py
+cd /home/ubuntu/tickflow-stock-panel && git add backend/app/quant/simulate/runner.py backend/tests/quant/test_runner_mark.py
 git commit -m "feat(sim): 收盘重估 + 收盘后补跑按真实收盘价打标"
 ```
 
@@ -565,6 +565,6 @@ cd backend && uv run --extra dev mypy app/quant/simulate/runner.py
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /home/caisl/tickflow-stock-panel && git add backend/app/quant/simulate/runner.py backend/tests/quant/test_runner_mark.py
+cd /home/ubuntu/tickflow-stock-panel && git add backend/app/quant/simulate/runner.py backend/tests/quant/test_runner_mark.py
 git commit -m "feat(sim): 盘中实时打标，价格跳变按阈值节流落快照"
 ```

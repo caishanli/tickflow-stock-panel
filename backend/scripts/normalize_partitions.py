@@ -8,12 +8,19 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import polars as pl
 
-DATA_ROOT = Path("/home/caisl/tickflow-stock-panel/data")
+DATA_ROOT = Path(os.environ.get(
+    "PARTITION_DATA_ROOT",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data",
+    ),
+))
 
 
 def _normalize_partition_files(partition_dir: Path) -> int:

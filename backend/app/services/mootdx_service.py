@@ -29,8 +29,12 @@ from app.quant.jqengine.datasource.mootdx_src import MootdxSource
 logger = logging.getLogger("app.services.mootdx_service")
 
 _env_root = os.getenv("PARTITION_DATA_ROOT", "").strip()
-DATA_ROOT = Path(_env_root) if _env_root else Path(
-    "/home/caisl/tickflow-stock-panel/data")
+if _env_root:
+    DATA_ROOT = Path(_env_root)
+else:
+    _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    DATA_ROOT = Path(_repo_root) / "data"
 ETF_MINUTE_ROOT = DATA_ROOT / "kline_etf_minute"
 ADJ_FACTOR_PATH = DATA_ROOT / "adj_factor_etf" / "all.parquet"
 INDEX_DAILY_ROOT = DATA_ROOT / "kline_index_daily"

@@ -4,7 +4,7 @@
 用法:
   uv run python scripts/compare_wufu.py \
       --ours data/quant_sim/jqwufu \
-      --jq /home/caisl/五福闹新春-v5.2 \
+      --jq backend/tests/fixtures/wufu_v52 \
       [--start 2026-06-08] [--end 2026-07-08]
 """
 import argparse
@@ -13,7 +13,11 @@ import re
 
 import pandas as pd
 
-JQ_DIR = "/home/caisl/五福闹新春-v5.2"
+JQ_DIR = os.environ.get(
+    "WUFU_REPO",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "tests", "fixtures", "wufu_v52"),
+)
 JQ_TRADES = "20260101-20260708交易记录.csv"
 JQ_EQUITY = "20260101-20260708收益.csv"
 INIT_CASH = 100000.0

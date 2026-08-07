@@ -24,7 +24,11 @@ load_dotenv()
 from app.quant.rqalpha_bridge import run_jq_backtest
 from app.quant import jqcompat as _jqcompat
 
-REPO = os.environ.get("WUFU_REPO", "/home/caisl/五福闹新春-v5.2")
+_BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.environ.get(
+    "WUFU_REPO",
+    os.path.join(_BACKEND, "tests", "fixtures", "wufu_v52"),
+)
 
 
 def main():
