@@ -63,7 +63,12 @@ def run_minute(func, minute="every"):
 
 
 def _filter_up_to(df, dt):
-    """把 DataFrame 截到 <= current_dt，避免回测未来函数。"""
+    """把 DataFrame 截到 <= current_dt，避免回测未来函数。
+
+    日线（索引时间为 00:00）的当日 bar 代表 15:00 收盘——盘中（<15:00）
+    取日线时不应包含当日（聚宽 attribute_history 恒不含当前 bar 语义）。
+    比较基准 = 日线索引 + 15h（当日生效于收盘）；分钟线索引含具体时刻，原样比。
+    """
     if df is None or df.empty:
         return df
     idx = None
@@ -77,7 +82,12 @@ def _filter_up_to(df, dt):
     if idx is None:
         return df
     try:
-        return df[idx <= pd.Timestamp(dt)]
+        dt_ts = pd.Timestamp(dt)
+        # 日线索引恒为 00:00：当日 bar 生效于 15:00，盘中不纳入当日
+        cmp = idx
+        if len(idx) and (idx.normalize() == idx).all():
+            cmp = idx + pd.Timedelta(hours=15)
+        return df[cmp <= dt_ts]
     except Exception:
         return df
 
@@ -812,10 +822,10 @@ def get_security_name(code):
         return names[code]
     mgr = _state.get("manager")
     if mgr:
-        # 先尝试 mootdx 通达信简称
-        if "mootdx" in mgr.sources:
+        # 先尝试网络源通达信简称
+        if "network" in mgr.sources:
             try:
-                mootdx_names = mgr.sources["mootdx"].get_stock_names()
+                mootdx_names = mgr.sources["network"].get_stock_names()
                 pure = code.split(".")[0]
                 if pure in mootdx_names:
                     if names is None:
@@ -857,11 +867,11 @@ def get_all_securities(types=None, date=None):
     if mgr is None:
         return pd.DataFrame()
     types = types or ["etf"]
-    # 从 mootdx 获取通达信简称（与聚宽 display_name 一致）
+    # 从网络源获取通达信简称（与聚宽 display_name 一致）
     mootdx_names = {}
-    if "mootdx" in mgr.sources:
+    if "network" in mgr.sources:
         try:
-            mootdx_names = mgr.sources["mootdx"].get_stock_names()
+            mootdx_names = mgr.sources["network"].get_stock_names()
         except Exception:
             pass
     records = []

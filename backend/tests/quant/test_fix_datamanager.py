@@ -8,6 +8,10 @@
 - H6c _minute_mem 命中校验覆盖区间（同参数结果与访问顺序无关）
 - 重复定义 preload_minute_for_pool 合并为一个
 - M11 _minute_mem 有界 LRU（容量上限 + 驱逐释放 + 覆盖元数据联动清理）
+
+分钟读取已改走 network client（不再直读本地 real_ 分区），测试用
+``_FakeClient`` 替身把合成 real_ 1m 帧从 client 喂入，断言仍覆盖
+DataManager 的窗口裁剪/覆盖校验/滑窗/预热逻辑。
 """
 
 import inspect
@@ -35,14 +39,81 @@ def _make_dm(tmp_path, set_window=True, **kw):
     return dm
 
 
-def _seed_minute_caches(dm, code=CODE):
-    """写入合成 real_ 1m 缓存。"""
+class _FakeClient:
+    """网络客户端替身：get_price/get_minute_pool 从内存帧返回合成 real_ 1m 数据。
+
+    DataManager 分钟读取已改走 network client（不再直读本地 real_ 分区），
+    用替身把合成数据从 client 喂入，离线不联网。与 stockdata 服务语义对齐：
+    end_date 为纯日期时按全天闭合（含当日 15:00 bar），裁剪由 DataManager
+    侧完成（H6b）。
+    """
+
+    def __init__(self, frames):
+        self.frames = frames  # {code: DatetimeIndex 分钟帧}
+
+    def get_price(self, security, start_date=None, end_date=None,
+                  frequency="daily", fields=None):
+        codes = [security] if isinstance(security, str) else list(security)
+        lo = pd.Timestamp(start_date) if start_date else None
+        hi = pd.Timestamp(end_date) if end_date else None
+        if hi is not None and hi == hi.normalize():
+            hi = hi + pd.Timedelta(hours=15)
+        out = {}
+        for c in codes:
+            df = self.frames.get(c)
+            if df is None:
+                continue
+            if lo is not None:
+                df = df[df.index >= lo]
+            if hi is not None:
+                df = df[df.index <= hi]
+            out[c] = df
+        return out
+
+    def get_minute_pool(self, codes, lo_ts, hi_ts):
+        return self.get_price(
+            codes,
+            start_date=str(lo_ts) if lo_ts is not None else None,
+            end_date=str(hi_ts) if hi_ts is not None else None,
+            frequency="1m")
+
+
+class _StrictMinuteClient(_FakeClient):
+    """忠实模拟 stockdata 服务端 ``h_get_minute``：纯日期上界**不**自动补 15:00，
+    精确按 ``datetime <= hi_ts`` 过滤（与 ``h_get_price`` 分钟路径补 15:00 不同）。
+
+    用于复现 DataManager ``preload_minute_for_pool`` 把窗口上界（纯日期午夜）
+    原样传给网络端时，当天分钟被整段排除、而 ``_minute_cov`` 却记为覆盖到
+    当日 15:00 的覆盖区间假阳性。
+    """
+
+    def get_minute_pool(self, codes, lo_ts, hi_ts):
+        lo = pd.Timestamp(lo_ts) if lo_ts is not None else None
+        hi = pd.Timestamp(hi_ts) if hi_ts is not None else None
+        out = {}
+        for c in codes:
+            df = self.frames.get(c)
+            if df is None:
+                continue
+            if lo is not None:
+                df = df[df.index >= lo]
+            if hi is not None:
+                df = df[df.index <= hi]
+            out[c] = df
+        return out
+
+
+def _real_minute_frame(code=CODE):
     idx1 = pd.date_range(REAL_START, REAL_END, freq="1min")
-    real = pd.DataFrame(
+    return pd.DataFrame(
         {"open": REAL_CLOSE, "high": REAL_CLOSE, "low": REAL_CLOSE,
          "close": REAL_CLOSE, "volume": 1.0, "money": 1.0},
         index=idx1)
-    dm.cache.put("minute", f"real_{code}", real)
+
+
+def _seed_minute_caches(dm, code=CODE):
+    """注入网络客户端替身：client 返回合成 real_ 1m 帧（替代旧本地分区直读）。"""
+    dm.client = _FakeClient({code: _real_minute_frame(code)})
 
 
 def _daily_df(dates, money_base=1e6):
@@ -104,6 +175,38 @@ def test_money_memo_full_frame_and_version(tmp_path):
     assert (res3["money"] >= 9e8).all()
 
 
+# ---------------- 占位成交额（停牌/退市 sentinel）不应计入"有成交" ----------------
+
+def test_money_filter_excludes_placeholder_amount(tmp_path):
+    """停牌/退市标的分区里 amount=2**-127（≈0 sentinel）不得算"有成交"。
+
+    回归：560650.SH 停牌后 07-02~07-30 amount 恒为 5.877e-39（占位值），
+    _build_money_full 的 ``money > 0`` 会把它计入 → 策略"全市场ETF总成交额"
+    出现 "0.00亿元 (1只ETF有成交)" 的误导日志。占位 amount 应整体剔除。"""
+    dm = _make_dm(tmp_path, set_window=False)
+    today = pd.Timestamp.today().normalize()
+    dates = pd.bdate_range("2026-07-01", min(pd.Timestamp("2026-08-06"), today))
+    # 正常 ETF：真实成交额
+    dm._daily_mem["get_daily_510300.XSHG"] = _daily_df(dates, 1e6)
+    # 占位 ETF：07-02 起 amount 为 sentinel（≈0）
+    n = len(dates)
+    stub = pd.DataFrame({
+        "trade_date": [d.strftime("%Y-%m-%d") for d in dates],
+        "open": [1.068] * n,
+        "close": [1.068] * n,
+        "volume": [2 ** -125] * n,
+        "money": [2 ** -127] * n,
+    })
+    dm._daily_mem["get_daily_560650.XSHG"] = stub
+
+    res = dm.get_daily_money_cached(["510300.XSHG", "560650.XSHG"],
+                                    str(dates[-1].date()), count=3)
+    assert "560650.XSHG" not in set(res["code"]), \
+        "占位 amount 标的不应出现在成交额明细中"
+    # 正常 ETF 仍完整返回
+    assert "510300.XSHG" in set(res["code"])
+
+
 # ---------------- H6b：merged 结果裁剪到请求窗口 [lo, hi] ----------------
 
 def test_merged_clipped_to_window_and_real_only(tmp_path):
@@ -160,6 +263,7 @@ def test_feed_result_independent_of_access_order(tmp_path):
     feed1 = dm1.get_minute_feed(CODE, WIN_START, WIN_END)
 
     dm2 = _make_dm(tmp_path)
+    _seed_minute_caches(dm2)
     feed2 = dm2.get_minute_feed(CODE, WIN_START, WIN_END)  # 直接 feed
     pdt.assert_frame_equal(feed1, feed2)
 
@@ -186,62 +290,74 @@ def test_preload_minute_for_pool_single_definition():
     assert sig.parameters["as_of"].default is None
 
 
+def test_preload_pool_upper_bound_includes_close_bar(tmp_path):
+    """补跑钉窗时 preload_minute_for_pool 的批量取数必须把窗口上界扩到当日
+    15:00（而非纯日期午夜），否则服务端 get_minute 会把当天分钟整段排除、
+    _minute_cov 却记为覆盖到 15:00 → 收盘重估取到昨日价。
+
+    回归：模拟盘 517520.XSHG 8-07 收盘后补跑，_revalue_at_close 经
+    get_minute_price_at 取到 8-06 收盘 2.031（真实 8-07 收盘 2.112），
+    净值低估 ~3904。
+    """
+    dm = _make_dm(tmp_path)
+    # 钉窗结束于"今天"（纯日期），复现补跑 today 场景
+    dm.set_minute_window("2026-08-03", "2026-08-07")
+    # 真实分钟帧：8-06 收 2.031，8-07 收 2.112（最后 15:00 bar）
+    idx1 = pd.date_range("2026-08-03 09:31", "2026-08-06 15:00", freq="1min")
+    idx2 = pd.date_range("2026-08-07 09:31", "2026-08-07 15:00", freq="1min")
+    df = pd.concat([
+        pd.DataFrame({"close": 2.031, "volume": 1.0, "money": 1.0}, index=idx1),
+        pd.DataFrame({"close": 2.112, "volume": 1.0, "money": 1.0}, index=idx2),
+    ])
+    dm.client = _StrictMinuteClient({CODE: df})
+    dm.preload_minute_for_pool([CODE], as_of="2026-08-07")
+    cached = dm._minute_mem.get(CODE)
+    assert cached is not None and not cached.empty
+    # 覆盖区间与帧必须一致：缓存帧含 8-07 收盘 bar
+    assert cached.index.max() == pd.Timestamp("2026-08-07 15:00")
+    # 收盘重估/取价必须命中 8-07 收盘价，而非昨日 2.031
+    assert dm.get_minute_price_at(CODE, "2026-08-07 15:00") == 2.112
+
+
+def test_unset_minute_window_restores_sliding(tmp_path):
+    """补跑结束后必须复位分钟窗口：钉窗泄漏到实时模式会让
+    preload_minute_for_pool 永远用补跑区间的 full 窗口（as_of 前移也不滑动），
+    逐日重新加载丢失批量预取。unset 后回到滑窗语义。"""
+    dm = _make_dm(tmp_path)
+    _seed_minute_caches(dm)
+    dm.set_minute_window("2026-03-02", "2026-03-31")
+    assert dm._minute_win is not None
+    dm.unset_minute_window()
+    assert dm._minute_win is None
+    # unset 后 preload 走滑窗（full=False）：as_of 前移，上界跟随 as_of
+    _seed_minute_caches(dm)
+    dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
+    df = dm._minute_mem.get(CODE)
+    assert df is not None and not df.empty
+    assert df.index.max() == pd.Timestamp("2026-03-25 15:00")
+    assert dm._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
+
+
 def test_preload_minute_for_pool_functional(tmp_path):
-    """合并后的实现：as_of 可缺省语义保留；预热帧按 _minute_win 全窗口加载并记录覆盖。"""
+    """合并后的实现：as_of 可缺省语义保留；回测（已 set_minute_window）加载整段
+    回测窗口并记录覆盖（T17：整窗帧供 get_minute_feed 命中，免逐标的全窗口联网）；
+    未设窗口（实时/模拟盘）保持滑窗裁剪。"""
     dm = _make_dm(tmp_path)
     _seed_minute_caches(dm)
     dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
     df = dm._minute_mem.get(CODE)
     assert df is not None and not df.empty
-    assert df.index.min() >= pd.Timestamp(WIN_START)
-    assert df.index.max() <= pd.Timestamp(WIN_END + " 15:00")
-    assert dm._minute_cov[CODE][0] == pd.Timestamp(WIN_START)
+    # 已 set_minute_window → 整段回测窗口（superset of 滑窗）
+    assert df.index.max() == pd.Timestamp(WIN_END + " 15:00")
     assert dm._minute_cov[CODE][1] == pd.Timestamp(WIN_END + " 15:00")
-
-
-def test_preload_minute_for_pool_covers_full_window(tmp_path, monkeypatch):
-    """预热按 _minute_win 全窗口覆盖后，整段 feed 命中缓存、不触发逐标的合并。
-
-    回归：原预热只覆盖 as_of 前 15 天滑窗，动量循环里每次 get_price(1m)
-    都走 get_minute_feed 请求整段回测区间，覆盖不足 → 每标的串行
-    _load_minute_merged 全量回载（~0.2s/只 × 195 ≈ 39s）。
-    """
-    dm = _make_dm(tmp_path)
-    _seed_minute_caches(dm)
-    calls = []
-    orig = DataManager._load_minute_merged
-
-    def spy(self, code, lo_hi=None, **kw):
-        calls.append(code)
-        return orig(self, code, lo_hi=lo_hi, **kw)
-
-    monkeypatch.setattr(DataManager, "_load_minute_merged", spy)
-    dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
-    # 覆盖区间 = 全窗口（_minute_win），而非 as_of 前 15 天滑窗
-    assert dm._minute_cov[CODE][0] == pd.Timestamp(WIN_START)
-    assert dm._minute_cov[CODE][1] == pd.Timestamp(WIN_END + " 15:00")
-    calls.clear()  # 预热阶段回退加载（测试环境无分区）不计入
-    feed = dm.get_minute_feed(CODE, WIN_START, WIN_END)
-    assert not feed.empty
-    assert calls == []  # 全窗口预热 → feed 零重载
-    assert feed.loc[pd.Timestamp("2026-03-17 10:00"), "close"] == REAL_CLOSE
-
-
-def test_preload_minute_for_pool_skips_scan_when_covered(tmp_path, monkeypatch):
-    """池内标的已全窗口覆盖时，再次预热不触发批量扫描（逐日 ~2s 开销回归）。"""
-    dm = _make_dm(tmp_path)
-    _seed_minute_caches(dm)
-    dm.preload_minute_for_pool([CODE], as_of="2026-03-25")
-    calls = []
-    orig = DataManager._load_minute_pool_from_partitions
-
-    def spy(self, codes, lo_ts, hi_ts):
-        calls.append(list(codes))
-        return orig(self, codes, lo_ts, hi_ts)
-
-    monkeypatch.setattr(DataManager, "_load_minute_pool_from_partitions", spy)
-    dm.preload_minute_for_pool([CODE], as_of="2026-03-26")
-    assert calls == []  # 全部已覆盖 → 零扫描
+    # 无窗口（实时/模拟盘）→ 滑窗截至 as_of
+    dm2 = _make_dm(tmp_path, set_window=False)
+    _seed_minute_caches(dm2)
+    dm2.preload_minute_for_pool([CODE], as_of="2026-03-25")
+    df2 = dm2._minute_mem.get(CODE)
+    assert df2 is not None and not df2.empty
+    assert df2.index.max() == pd.Timestamp("2026-03-25 15:00")
+    assert dm2._minute_cov[CODE][1] == pd.Timestamp("2026-03-25 15:00")
 
 
 # ---------------- M11：_minute_mem 有界 LRU ----------------

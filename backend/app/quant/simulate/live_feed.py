@@ -1,81 +1,51 @@
-"""实时分钟数据馈送：mootdx 实时 bar 增量合并进 DataManager 内存帧。
+"""实时分钟数据馈送：经 stock data 服务网络客户端取当日真实 1m 并合并进内存帧。
 
-盘中只写内存（``_minute_mem`` / ``_minute_cov``），当日真实 1m 于收盘后统一
-落盘本地分钟缓存（``minute/real_<code>.parquet``）——mootdx 取得的是真实 1m，
-按 C1 允许且应当落盘，但避免
-每分钟全帧重写；内存帧可能含 baostock 插值段，绝不整帧落盘（C2），落盘只
-用本模块累积的 mootdx 原始帧。
-
-多模拟盘进程收盘后几乎同时落盘：读-改-写整段由跨进程文件锁串行化
-（见 :func:`persist_real`），避免 parquet 整键替换下互相覆盖丢 bar。
+盘中只写内存（``_minute_mem`` / ``_minute_cov``）。落盘已移交 stock data 服务，
+本模块不再直连 mootdx 或写本地分区（``persist_real`` 保留为空操作兼容调用方）。
 """
 from __future__ import annotations
 
-import contextlib
 import datetime
 import logging
-import os
 
 import pandas as pd
 
-from ..jqengine.config import CONFIG as _JQ_CONFIG
-
 log = logging.getLogger("app.quant.simulate.live_feed")
 
-try:  # POSIX
-    import fcntl
 
-    def _lock_fd(f):
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-
-    def _unlock_fd(f):
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-except ImportError:  # Windows
-    import msvcrt
-
-    def _lock_fd(f):
-        f.seek(0)
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-
-    def _unlock_fd(f):
-        f.seek(0)
-        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+def _load_recent_via_client(dm, codes, now):
+    client = getattr(dm, "client", None)
+    if client is None:
+        return {}
+    return client.current_snapshot(codes, as_of=now)
 
 
-@contextlib.contextmanager
-def _file_lock(path):
-    """跨进程排他文件锁（POSIX flock / Windows msvcrt）。"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a+b") as f:
-        try:
-            _lock_fd(f)
-            yield
-        finally:
-            _unlock_fd(f)
-
-
-def _fetch_recent(dm, code):
-    src = dm.sources.get("mootdx")
-    if src is None:
-        raise RuntimeError("mootdx 源不可用")
-    return src.get_minute_recent(code)
-
-
-def refresh(dm, codes, now=None, fresh_acc=None):
+def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
     """刷新 watch 集合的实时分钟帧，返回 ``(prices, bar_dt)``。
 
     - prices: ``{code: 截至 now 最新 bar 收盘价}``；
     - bar_dt: 全场最新 bar 时刻（``pd.Timestamp``；全部无数据时为 None）；
-    - fresh_acc: 可选 dict，收集本轮 mootdx 原始帧（供收盘后 :func:`persist_real`
-      落盘；每轮覆盖同 code 旧帧，最新一页已含当日全部 bar）。
+    - loader: 取数函数 ``(dm, codes, now) -> {code: df}``，默认走网络客户端
+      ``dm.client.current_snapshot``（见 :func:`_load_recent_via_client`）；
+    - fresh_acc: 可选 dict，收集本轮原始帧（``persist_real`` 现为空操作，
+      仅供兼容调用方传参）；
+    - enabled: 向后兼容保留，不再启用任何 mootdx 直连路径。
 
-    单 code 失败保留内存旧帧并告警，不中断本轮。
+    loader 整体抛异常时本轮全量回退旧帧（单条告警）；单个 code 帧为 None/空
+    时仅该 code 保留内存旧帧并告警，不中断本轮。
     """
     now = pd.Timestamp(now or datetime.datetime.now())
+    if loader is None:
+        loader = _load_recent_via_client
+    try:
+        fresh_frames = loader(dm, list(dict.fromkeys(codes)), now) or {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("[live_feed] 实时帧拉取失败，本轮无更新: %s", e)
+        fresh_frames = {}
     prices, latest = {}, None
     for code in dict.fromkeys(codes):
         try:
-            fresh = _fetch_recent(dm, code)
+            fresh = fresh_frames.get(code)
             if fresh is None or fresh.empty:
                 raise RuntimeError("实时分钟为空")
             old = dm._minute_mem.get(code)
@@ -104,30 +74,5 @@ def refresh(dm, codes, now=None, fresh_acc=None):
 
 
 def persist_real(dm, fresh_frames):
-    """收盘后落盘：把当日 mootdx 真实 1m 合并进本地分钟缓存的 ``real_<code>``（C1）。
-
-    只写 mootdx 原始帧；内存合并帧可能含 baostock 插值段，绝不整帧落盘（C2）。
-    与本地已有 real_ 段按索引去重（keep=last）后整键重写。
-
-    多模拟盘进程收盘后几乎同时触发本函数：整个读-改-写用跨进程文件锁
-    （``{DATA_DIR}/minute/.persist.lock``）串行化，后到者基于先到者的落盘
-    结果再合并，避免 parquet 整键替换下互相覆盖丢 bar（旧 SQLite 按行序列化
-    无此问题，整文件替换后必须显式加锁）。
-    """
-    cache = getattr(dm, "cache", None)
-    root = getattr(cache, "root", None) or _JQ_CONFIG["DATA_DIR"]
-    with _file_lock(os.path.join(root, "minute", ".persist.lock")):
-        for code, fresh in (fresh_frames or {}).items():
-            if fresh is None or fresh.empty:
-                continue
-            key = f"real_{code}"
-            try:
-                local = dm.cache.peek("minute", key)
-                if local is not None and not local.empty:
-                    combined = pd.concat([local, fresh]).sort_index()
-                    combined = combined[~combined.index.duplicated(keep="last")]
-                else:
-                    combined = fresh
-                dm.cache.put("minute", key, combined)
-            except Exception as e:  # noqa: BLE001
-                log.warning("[live_feed] %s 真实分钟落盘失败: %s", code, e)
+    """落盘已移交 stock data 服务，本函数保留为空操作（兼容调用方）。"""
+    return

@@ -32,6 +32,8 @@ LIMIT_DOWN_PCT = -0.098  # 跌停判定阈值（主板 10% 留容差；科创/�
 LIMIT_UP_PCT = 0.098     # 涨停判定阈值（禁买，与跌停同口径）
 TICK_OFFSET = 8          # 交易时段每分钟第 N 秒后触发，等刚收的 bar 可读
 SESSION_END_GRACE = datetime.time(15, 2)  # 15:00 收市 bar 的处理宽限（之后进收盘钩子）
+MARK_INTERVAL = 10          # 盘中实时打标间隔（秒）
+MARK_SNAPSHOT_TICK = 0.0005 # 打标价格相对上次跳变超过该比例才落快照
 
 
 def in_trading(now=None):
@@ -127,13 +129,15 @@ def _run_watcher_loop(account_id: str, acct: dict, provider, matcher: Matcher,
 # 策略驱动模式
 # ---------------------------------------------------------------------------
 
-def _emit_log(account_id: str, level: str, message: str) -> None:
+def _emit_log(account_id: str, level: str, message: str,
+              ts: str | None = None) -> None:
     """模拟盘日志落 sim_logs（供 /sim/accounts/{aid}/logs 读取），失败仅告警。
 
     level=="notify" 且账户开启钉钉推送且非补跑时，异步发送到钉钉。
+    ts 默认用真实当前时间；补跑场景显式传引擎推进到的时间（见 _replay_*）。
     """
     try:
-        db.insert_sim_log(account_id, str(datetime.datetime.now()), level, message)
+        db.insert_sim_log(account_id, ts or str(datetime.datetime.now()), level, message)
     except Exception:  # noqa: BLE001
         log.warning("[runner] 日志落库失败(%s): %s", level, message)
     if level == "notify" and account_id not in _replay_active_ids:
@@ -202,10 +206,12 @@ def _is_trading_day(dm, today) -> bool:
     try:
         start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
         df = None
-        mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
-        if mootdx_src is not None:
+        dm_client = getattr(dm, "client", None)
+        if dm_client is not None:
             try:
-                df = mootdx_src.get_daily("000300.XSHG", start, str(today))
+                out = dm_client.get_price("000300.XSHG", start_date=start,
+                                          end_date=str(today), frequency="daily")
+                df = out.get("000300.XSHG")
             except Exception:
                 df = None
         if df is None:
@@ -261,7 +267,9 @@ def _seed_universe(ctx) -> None:
     g = getattr(ctx, "g", None)
     if g is None:
         return
-    pools = []
+    # 保留策略已声明的 universe（init 里 context.universe = [...]），只做追加，
+    # 避免把策略自身股票池覆盖掉导致行情馈送取不到价（order 拿 price 0 拒单）。
+    pools = list(getattr(ctx, "universe", None) or [])
     for attr in ("fixed_etf_pool", "global_etf_pool", "merged_etf_pool",
                  "domestic_etf_pool", "overseas_etf_pool", "sector_etf_pool",
                  "etf_pool", "universe", "pool"):
@@ -385,6 +393,9 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
     """盘前（每交易日一次）：调度器重置 + T+1 清零 + before_open/before_trading_start。"""
     fired.clear()
     if aux is not None:
+        # 记录引擎当前推进到的时间（补跑时 = 当日 09:25；实时 = 真实当前时间），
+        # 供 _replay_log_sink 给补跑日志打历史时间戳，而非真实 wall-clock。
+        aux["replay_dt"] = pd.Timestamp(now)
         aux["prev_close_cache"] = {}
         # 每日清空无分钟数据缓存：新交易日可能有标的开始有数据（如新ETF上市）
         dm = aux.get("dm")
@@ -417,7 +428,7 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
 
 def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
     """成交增量 / 状态 / 净值快照落库（每轮一次）。"""
-    trades = jq_api._state.get("trades") or []
+    trades = getattr(jq_api, "_state", {}).get("trades") or []
     drained = aux.get("trades_drained", 0)
     is_replay = aux.get("replay_mode", False)
     batch_trades = aux.get("batch_trades") if is_replay else None
@@ -440,7 +451,7 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
     pf = ctx.portfolio
     positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
     net = round(pf.cash + positions_value, 4)
-    start_cash = aux["start_cash"]
+    start_cash = aux.get("start_cash") or state.get("start_cash") or 0.0
     _state_from_portfolio(ctx, state)
     state["net_value"] = net
     state["pnl"] = round(net - start_cash, 4)
@@ -457,8 +468,45 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
         db.insert_sim_snapshot(*snapshot_row)
 
 
+def _revalue_at_close(dm, ctx, state: dict, bar_dt) -> None:
+    """收盘重估：把全部持仓按当日真实收盘价重打，并重算 state 净值。
+
+    价格源：优先 ``dm.get_minute_price_at(code, 当日 15:00)``（真实 1m 收盘），
+    无则回退日线当日 close（provider.get_daily 有进程内缓存）。只更新估值，
+    不触发策略回调 / matcher，不落库（落库由调用方 ``_persist`` 完成）。
+    """
+    if dm is None:
+        return
+    today = pd.Timestamp(bar_dt)
+    close_ts = today.replace(hour=15, minute=0, second=0, microsecond=0)
+    pf = ctx.portfolio
+    changed = False
+    for code, pos in list(pf.positions.items()):
+        price = dm.get_minute_price_at(code, close_ts)
+        if price is None:
+            try:
+                df = dm.fetch("get_daily", code, str(today.date()), str(today.date()))
+                if df is not None and not (hasattr(df, "empty") and df.empty):
+                    price = float(df["close"].iloc[-1])
+            except Exception as e:  # noqa: BLE001
+                log.warning("[runner] %s 收盘价重估失败: %s", code, e)
+        if price is None:
+            log.warning("[runner] %s 收盘重估无价，保留现价 %.4f", code, pos.price)
+            continue
+        pos.price = float(price)
+        changed = True
+    if changed:
+        _state_from_portfolio(ctx, state)
+        start_cash = state.get("start_cash", 0.0) or 0.0
+        positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
+        net = round(pf.cash + positions_value, 4)
+        state["net_value"] = net
+        state["pnl"] = round(net - start_cash, 4)
+        state["dt"] = str(bar_dt)
+
+
 def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
-    """收盘（每交易日一次）：after_close/after_trading_end + 真实分钟落盘 + 最终快照。"""
+    """收盘（每交易日一次）：after_close/after_trading_end + 真实分钟落盘 + 收盘重估 + 最终快照。"""
     if aux.get("replay_mode"):
         _flush_replay_batch(account_id, aux)
     for func, t in bundle.daily:
@@ -467,8 +515,10 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
     if bundle.after_trading_end is not None:
         _safe_call(account_id, bundle.after_trading_end, ctx, "after_trading_end")
     live_feed.persist_real(dm, aux["fresh_frames"])
+    _revalue_at_close(dm, ctx, state, pd.Timestamp(now))
     _persist(account_id, ctx, state, now, aux["jq_api"], aux)
-    _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘")
+    # now 在补跑时是引擎推进到的当日收市时刻（15:05），日志时间戳随引擎而非真实时钟
+    _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘", ts=str(now))
 
 
 # ---------------------------------------------------------------------------
@@ -478,20 +528,19 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
 def _trade_days_between(dm, start, end) -> list:
     """[start, end] 内的交易日列表（date 对象），按沪深300 指数日线。
 
-    优先用 dm 已有的 mootdx 源（避免重复建连），回退到 dm.fetch。
+    经 dm.fetch 走网络客户端取数，异常时回退为空列表。
     """
-    df = None
-    mootdx_src = dm.sources.get("mootdx") if hasattr(dm, "sources") else None
-    if mootdx_src is not None:
-        try:
-            df = mootdx_src.get_daily("000300.XSHG", str(start), str(end))
-        except Exception:
-            df = None
-    if df is None:
-        try:
-            df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
-        except Exception:
-            pass
+    try:
+        df = dm.fetch("get_daily", "000300.XSHG", str(start), str(end))
+        # 只取交易日索引，不缓存窄窗口帧到 _daily_mem：否则后续 attribute_history
+        # 请求全量（20000101~20300101）会命中这个补跑区间帧（_covers 只看 end 未来
+        # 哨兵判覆盖），导致 000300 只有补跑区间的十几行 → 走弱期判断「数据不足」。
+        _mem = getattr(dm, "_daily_mem", None)
+        if _mem is not None:
+            _mem.pop("get_daily_000300.XSHG", None)
+            dm._daily_ver += 1
+    except Exception:
+        df = None
     if df is None or df.empty:
         return []
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
@@ -560,11 +609,14 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         aux["batch_trades"] = []
         aux["batch_logs"] = []
         today = datetime.date.today()
+        # 钉住补跑区间分钟窗口并批量预取池（当日场景，窗口即为当天）
+        _pin_replay_minute_window(dm, ctx, from_ts, today)
         _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
                     datetime.datetime.combine(today, datetime.time(9, 25)), aux)
         now = datetime.datetime.now()
         _emit_log(account_id, "info",
-                  f"补跑今日 {from_ts.strftime('%H:%M')} ~ {now.strftime('%H:%M')}")
+                  f"补跑今日 {from_ts.strftime('%H:%M')} ~ {now.strftime('%H:%M')}",
+                  ts=str(aux.get("replay_dt") or now))
         for bar in _session_minutes(today):
             if bar <= from_ts:
                 continue
@@ -573,28 +625,90 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
             if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
                 continue
             _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+        # 收盘后启动/重置账户：补跑完今天后先按真实收盘价重估，再进实时
+        if now.time() > SESSION_END_GRACE:
+            _revalue_at_close(dm, ctx, state,
+                              pd.Timestamp(datetime.datetime.combine(today, datetime.time(15, 5))))
+            _persist(account_id, ctx, state,
+                     datetime.datetime.combine(today, datetime.time(15, 5)), aux["jq_api"], aux)
         _emit_log(account_id, "info",
-                  f"日内补跑完成，净值 {state.get('net_value', 0):.2f}")
+                  f"日内补跑完成，净值 {state.get('net_value', 0):.2f}",
+                  ts=str(aux.get("replay_dt") or state.get("dt") or now))
     finally:
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
         _replay_active_ids.discard(account_id)
+        # 补跑结束进入实时：复位钉住的分钟窗口，避免 preload_minute_for_pool
+        # 永远用补跑区间 full 窗口、as_of 前移也不滑动（逐日重载丢失批量预取）。
+        # 已缓存的分钟帧不清空，覆盖检查与 live_feed 保持帧新鲜。
+        _unset_replay_minute_window(dm)
+
+
+def _pin_replay_minute_window(dm, ctx, start, end) -> None:
+    """补跑前把整个补跑区间钉为分钟窗口并批量预取池，消除逐日滑动窗口的重复回源。
+
+    回测由 rqalpha_bridge 在启动前 set_minute_window；模拟盘补跑此处补上同口径。
+    用 hasattr 兜底：stub DM（既有测试）无此方法时静默跳过，不影响行为。
+    """
+    if dm is None:
+        return
+    set_win = getattr(dm, "set_minute_window", None)
+    if set_win is not None:
+        try:
+            set_win(str(start)[:10], str(end)[:10])
+        except Exception as e:
+            log.warning("[replay] set_minute_window 失败（回退滑窗）: %s", e)
+    codes = []
+    if ctx is not None:
+        pf = getattr(ctx, "portfolio", None)
+        codes = list(dict.fromkeys(
+            list(getattr(ctx, "universe", None) or [])
+            + (list(pf.positions.keys()) if pf is not None else [])))
+    preload = getattr(dm, "preload_minute_for_pool", None)
+    if preload is not None and codes:
+        try:
+            preload(codes, pd.Timestamp(end))
+        except Exception as e:
+            log.warning("[replay] 分钟池批量预取失败（补跑将逐日回源）: %s", e)
+
+
+def _unset_replay_minute_window(dm) -> None:
+    """补跑结束后复位分钟窗口（unset_minute_window 的 stub-DM 兜底版本）。"""
+    if dm is None:
+        return
+    unset_win = getattr(dm, "unset_minute_window", None)
+    if unset_win is not None:
+        try:
+            unset_win()
+        except Exception as e:
+            log.warning("[replay] unset_minute_window 失败（实时模式沿用钉窗）: %s", e)
 
 
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
-    """从 start_date 起按历史分钟补跑至昨日，随后由主循环无缝接入实时。"""
+    """从 start_date 起按历史分钟补跑至今日（今天仅补跑到当前已走完的 bar），
+    随后由主循环无缝接入实时，避免当天收盘后才启动/重置账户时日内行情丢失。"""
     _replay_active_ids.add(account_id)
     try:
         aux["replay_mode"] = True
         aux["batch_snapshots"] = []
         aux["batch_trades"] = []
         aux["batch_logs"] = []
-        yesterday = datetime.date.today() - datetime.timedelta(days=1)
-        days = _trade_days_between(dm, start_date, yesterday)
+        now = datetime.datetime.now()
+        today = now.date()
+        yesterday = today - datetime.timedelta(days=1)
+        # 含今天：完整交易日回放到昨日；今天既已开市（盘前/盘中/收盘）则也回放到当前时刻
+        days = _trade_days_between(dm, start_date, today)
+        full_days = [d for d in days if d != today]
+        # 钉住整个补跑区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源
+        _pin_replay_minute_window(dm, ctx, start_date, today)
+        first_ts = (datetime.datetime.combine(days[0], datetime.time(9, 25))
+                    if days else now)
         _emit_log(account_id, "info",
-                  f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日")
-        for day in days:
+                  f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日"
+                  + (f"，今日 {now.strftime('%H:%M')} 前已回放" if today in days else ""),
+                  ts=str(first_ts))
+        for day in full_days:
             if is_paused(account_id):
                 break
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
@@ -605,12 +719,79 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                 _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
             _eod(account_id, bundle, ctx, dm, state, aux,
                  datetime.datetime.combine(day, datetime.time(15, 5)))
-            _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}")
-        _emit_log(account_id, "info", "历史补跑完成，进入实时模式")
+            _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}",
+                      ts=str(datetime.datetime.combine(day, datetime.time(15, 5))))
+        # 今天若已是交易日，把已走过（<= 当前时间）的 bar 也回补进来；
+        # 今天不跑 _eod，剩余 bar / 收盘由主循环实时接管（last_bar 已推进避免重复触发）
+        if today in days and not is_paused(account_id):
+            _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
+                        datetime.datetime.combine(today, datetime.time(9, 25)), aux)
+            for bar in _session_minutes(today):
+                if bar > now:
+                    break
+                if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
+                    continue
+                _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+            # 收盘后启动/重置账户：补跑完今天后先按真实收盘价重估，再进实时
+            if now.time() > SESSION_END_GRACE:
+                _revalue_at_close(dm, ctx, state,
+                                  pd.Timestamp(datetime.datetime.combine(today, datetime.time(15, 5))))
+                _persist(account_id, ctx, state,
+                         datetime.datetime.combine(today, datetime.time(15, 5)), aux["jq_api"], aux)
+            _emit_log(account_id, "info",
+                      f"今日 {now.strftime('%H:%M')} 前已回补，净值 {state.get('net_value', 0):.2f}",
+                      ts=str(aux.get("replay_dt") or state.get("dt") or now))
+        _emit_log(account_id, "info", "历史补跑完成，进入实时模式",
+                  ts=str(datetime.datetime.combine(days[-1], datetime.time(15, 5)))
+                  if days else str(now))
     finally:
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
         _replay_active_ids.discard(account_id)
+        # 补跑结束进入实时：复位钉住的分钟窗口，避免 preload_minute_for_pool
+        # 永远用补跑区间 full 窗口、as_of 前移也不滑动（逐日重载丢失批量预取）。
+        # 已缓存的分钟帧不清空，覆盖检查与 live_feed 保持帧新鲜。
+        _unset_replay_minute_window(dm)
+
+
+def _mark_to_market(feed, dm, ctx, state: dict, last_mark: dict, now) -> bool:
+    """盘中实时打标：把持仓价刷新到最新并重算净值。
+
+    与策略 tick 共用同一 ``feed``（策略 tick 用 live_feed.refresh 实时，mark 也用
+    同一 feed，保证 live 与测试/回放口径一致）。返回 True 表示任一持仓价相对上次
+    打标跳变超过 MARK_SNAPSHOT_TICK（调用方据此决定是否落快照 + save_state）。
+    只改估值，不触发策略/matcher。
+    """
+    pf = ctx.portfolio
+    if not pf.positions:
+        return False
+    codes = list(pf.positions.keys())
+    prices, _bar = feed(dm, codes, now, None)
+    if not prices:
+        return False
+    dirty = False
+    for code, pos in list(pf.positions.items()):
+        px = prices.get(code)
+        if px is None:
+            continue
+        prev = last_mark.get(code)
+        # 首次 mark：以当前已持久化持仓价为基线（刚被策略 tick 打过，价格未变不落快照）
+        if prev is None or not prev:
+            if pos.price and abs(px / pos.price - 1) >= MARK_SNAPSHOT_TICK:
+                dirty = True
+        elif abs(px / prev - 1) >= MARK_SNAPSHOT_TICK:
+            dirty = True
+        pos.price = float(px)
+        last_mark[code] = float(px)
+    if dirty:
+        _state_from_portfolio(ctx, state)
+        start_cash = state.get("start_cash", 0.0) or 0.0
+        positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
+        net = round(pf.cash + positions_value, 4)
+        state["net_value"] = net
+        state["pnl"] = round(net - start_cash, 4)
+        state["dt"] = str(now)
+    return dirty
 
 
 def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
@@ -641,6 +822,7 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         return None  # 同一 bar 已处理
     aux["last_bar"] = bar_ts
     ctx.current_dt = bar_ts
+    aux["replay_dt"] = bar_ts
     jq_api._state["minute_prices"] = prices
     jq_api._state["minute_mode"] = True
     # 涨跌停禁买卖（昨收缺失的标的不判定）
@@ -689,6 +871,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     jq_api, jq_loader = _load_engine()
     dm = dm if dm is not None else _make_dm()
     feed = feed or live_feed.refresh
+    # 实时由 stock data 服务保证，feed 恒走网络客户端（无 mootdx 直连路径）。
     st = read_state(account_id)
     has_saved = bool(st.get("start_cash"))
     start_cash = float(st.get("start_cash") or acct.get("capital", 0.0) or 0.0)
@@ -721,8 +904,15 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     }
     def _replay_log_sink(level, msg):
         if aux.get("replay_mode"):
+            # 补跑日志打引擎当时推进到的时间（bar 内 = bar 时刻；盘前 = 当日 09:25），
+            # 否则全部堆在真实当前时间，历史补跑逐日日志无法区分。
+            ts = aux.get("replay_dt")
+            if ts is None:
+                ts = getattr(ctx, "current_dt", None)
+            if ts is None:
+                ts = datetime.datetime.now()
             aux.setdefault("batch_logs", []).append(
-                (account_id, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, msg))
+                (account_id, str(ts)[:19], level, msg))
         else:
             _emit_log(account_id, level, msg)
     jq_api._state["log_sink"] = _replay_log_sink
@@ -773,15 +963,44 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                 hooks_done["pre"] = today
             if in_trading(now) or (datetime.time(15, 0) < t <= SESSION_END_GRACE):
                 if aux["frequency"] == "daily" and aux["daily_done"] == today:
-                    # 日频账户：当日唯一 tick 已完成
-                    time.sleep(idle_interval)
+                    # 日频账户：当日唯一 tick 已完成，仍做实时打标
+                    dirty = _mark_to_market(feed, dm, ctx, state,
+                                            aux.setdefault("last_mark", {}), now)
+                    if dirty:
+                        save_state(account_id, state)
+                        positions_value = round(sum(
+                            p.amount * p.price for p in ctx.portfolio.positions.values()), 4)
+                        db.insert_sim_snapshot(account_id, state["dt"], state["net_value"],
+                                               state["cash"], positions_value,
+                                               state["pnl"],
+                                               round(state["net_value"] / state["start_cash"] - 1, 6)
+                                               if state["start_cash"] else 0.0)
+                    time.sleep(max(1, 60 - now.second + TICK_OFFSET))
                     continue
                 bar = _strategy_tick(account_id, bundle, ctx, dm, feed, matcher,
                                      state, aux, now)
                 if bar is not None and aux["frequency"] == "daily":
                     aux["daily_done"] = today
                 # 对齐分钟边界 + 偏移，等刚收的 bar 可读
-                time.sleep(max(1, 60 - now.second + TICK_OFFSET))
+                sleep_left = max(1, 60 - now.second + TICK_OFFSET)
+                while sleep_left > 0:
+                    step = min(MARK_INTERVAL, sleep_left)
+                    time.sleep(step)
+                    sleep_left -= step
+                    if not in_trading() or not ctx.portfolio.positions:
+                        continue
+                    mnow = datetime.datetime.now()
+                    dirty = _mark_to_market(feed, dm, ctx, state,
+                                            aux.setdefault("last_mark", {}), mnow)
+                    if dirty:
+                        save_state(account_id, state)
+                        positions_value = round(sum(
+                            p.amount * p.price for p in ctx.portfolio.positions.values()), 4)
+                        db.insert_sim_snapshot(account_id, state["dt"], state["net_value"],
+                                               state["cash"], positions_value,
+                                               state["pnl"],
+                                               round(state["net_value"] / state["start_cash"] - 1, 6)
+                                               if state["start_cash"] else 0.0)
             elif t > SESSION_END_GRACE and hooks_done["eod"] != today:
                 _eod(account_id, bundle, ctx, dm, state, aux, now)
                 hooks_done["eod"] = today

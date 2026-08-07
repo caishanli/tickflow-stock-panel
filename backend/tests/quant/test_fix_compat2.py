@@ -269,8 +269,8 @@ class _FakeTushareSrc:
         return self._rows
 
 
-class _FakeMootdxSrc:
-    def __init__(self, names=None, fail=True):
+class _FakeNamesSrc:
+    def __init__(self, names=None, fail=False):
         self._names = names or {}
         self._fail = fail
         self.calls = 0
@@ -285,11 +285,11 @@ class _FakeMootdxSrc:
 class _UniverseDM:
     """_load_etf_universe 需要的最小 DataManager 鸭子类型。"""
 
-    def __init__(self, mootdx=None, offline=False, cache_codes=()):
+    def __init__(self, names_src=None, offline=False, cache_codes=()):
         self._offline = offline
         self._daily_mem = {"get_daily_" + c: object() for c in cache_codes}
         self.sources = {
-            "mootdx": mootdx or _FakeMootdxSrc(),
+            "network": names_src or _FakeNamesSrc(),
         }
 
 
@@ -335,11 +335,11 @@ def test_snapshot_missing_falls_back_to_cache(tmp_path, monkeypatch):
 
 
 def test_snapshot_stale_cache_derivation_with_names(tmp_path, monkeypatch):
-    """快照过期 + 缓存有代码 + mootdx 有名称：从缓存推导并合并名称。"""
+    """快照过期 + 缓存有代码 + 网络源有名称：从缓存推导并合并名称。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap, codes=("OLD000.XSHG",), days_ago=30)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
-    dm = _UniverseDM(mootdx=_FakeMootdxSrc({"510300": "300ETF"}, fail=False),
+    dm = _UniverseDM(names_src=_FakeNamesSrc({"510300": "300ETF"}, fail=False),
                      cache_codes=["510300.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]

@@ -875,12 +875,21 @@ class _DayBarStore:
             if best_df is None or best_span == 0:
                 self._bars[code] = np.empty(0, dtype=_BAR_DTYPE)
                 continue
-            ddf = _normalize_daily(best_df)
-            ddf = ddf[(ddf["date"] >= ds) & (ddf["date"] <= de)]
-            if ddf.empty:
-                arr = np.empty(0, dtype=_BAR_DTYPE)
+            if isinstance(getattr(best_df, "index", None), pd.DatetimeIndex):
+                # _daily_mem 分区帧：DatetimeIndex 单调升序，直接按索引切片 + 快
+                # 速 recarray（T17：避免逐只 _normalize_daily 整帧重建 ≈ 8s）
+                ddf = best_df.loc[(best_df.index >= ds) & (best_df.index <= de)]
+                if ddf.empty:
+                    arr = np.empty(0, dtype=_BAR_DTYPE)
+                else:
+                    arr = _mem_daily_to_recarray(ddf, code=code)
             else:
-                arr = _daily_to_recarray(ddf, code=code)
+                ddf = _normalize_daily(best_df)
+                ddf = ddf[(ddf["date"] >= ds) & (ddf["date"] <= de)]
+                if ddf.empty:
+                    arr = np.empty(0, dtype=_BAR_DTYPE)
+                else:
+                    arr = _daily_to_recarray(ddf, code=code)
             self._bars[code] = arr
 
     def get_date_range(self, order_book_id):
@@ -974,6 +983,37 @@ def _limit_prices_from_prev_close(close: "pd.Series", rate: float = 0.10):
     limit_up = (prev_close * (1 + rate)).round(2)
     limit_down = (prev_close * (1 - rate)).round(2)
     return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+
+
+def _mem_daily_to_recarray(df, code=None):
+    """从 DataManager 内存日线帧（DatetimeIndex + open/high/low/close/volume/money）
+    直接构造 _BAR_DTYPE recarray，跳过 _normalize_daily 的整帧重建。
+
+    T17：_DayBarStore.preload 对 1667 只标的逐只 normalize×2 + recarray ≈ 8s，
+    该帧已是 DatetimeIndex 且单调升序（服务端分区保证），直接按列填充可省去
+    两次 DataFrame 重建。仅限 _daily_mem 来源帧；其它来源仍走 _daily_to_recarray。
+
+    total_turnover 复刻旧路径（normalize×2）行为：`_daily_to_recarray` 二次
+    normalize 时帧已无 money/amount 列，退化为 ``close × volume``——对齐必须
+    保持该口径（T15/16 对齐 fixture 即基于此），故此处同样用 close×volume，
+    不用 money。
+    """
+    n = len(df)
+    if n == 0:
+        return np.empty(0, dtype=_BAR_DTYPE)
+    arr = np.zeros(n, dtype=_BAR_DTYPE)
+    _idx = df.index
+    arr["datetime"] = (
+        _idx.year.astype("int64") * 10000
+        + _idx.month.astype("int64") * 100
+        + _idx.day.astype("int64")
+    ) * 1000000
+    for f in ("open", "high", "low", "close", "volume"):
+        arr[f] = df[f].to_numpy(dtype=np.float64)
+    arr["total_turnover"] = arr["close"] * arr["volume"]
+    arr["limit_up"], arr["limit_down"] = _limit_prices_from_prev_close(
+        df["close"], rate=_limit_rate(code) if code else 0.10)
+    return arr
 
 
 def _daily_to_recarray(df, code=None):
@@ -1140,8 +1180,12 @@ class JqDataSource:
                 "trade_date" if "trade_date" in _df.columns else None)
             if _col is None:
                 continue
-            for _d in _df[_col]:
-                all_dates.add(pd.Timestamp(_d).date())
+            # 批量转 datetime.date（T17：原逐行 pd.Timestamp(...).date() 对
+            # 全市场日线（1667 标的 × ~250 交易日 ≈ 40 万行索引）是纯 Python 逐
+            # 行开销，all_dates 仅用于日历并集，直接向量化 set 更新更快）
+            all_dates.update(
+                pd.DatetimeIndex(pd.to_datetime(_df[_col].to_numpy())).date
+            )
         # 分区优先后 cache.get_all 可能为空（数据已迁到按日分区 Parquet，
         # 旧 SQLite/文件缓存未再回填），此时以 preload_daily 灌入的
         # _daily_mem（全市场分区日线，DatetimeIndex）为日历来源，否则
@@ -1152,8 +1196,7 @@ class JqDataSource:
                 if _df is None or getattr(_df, "empty", True):
                     continue
                 if _df.index is not None and len(_df.index):
-                    for _d in _df.index:
-                        all_dates.add(pd.Timestamp(_d).date())
+                    all_dates.update(pd.DatetimeIndex(_df.index).date)
 
         # 日线预加载：把内存缓存直接铺进 _DayBarStore._bars，回测期间 get_price
         # / history 全部命中内存，零 SQLite、零重复 _normalize_daily。

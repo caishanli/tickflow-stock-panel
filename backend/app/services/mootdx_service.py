@@ -12,8 +12,10 @@ _load_minute_from_partitions），本服务不参与策略执行。
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
+import time
 from datetime import date as _date
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,7 @@ DATA_ROOT = Path(_env_root) if _env_root else Path(
     "/home/caisl/tickflow-stock-panel/data")
 ETF_MINUTE_ROOT = DATA_ROOT / "kline_etf_minute"
 ADJ_FACTOR_PATH = DATA_ROOT / "adj_factor_etf" / "all.parquet"
+INDEX_DAILY_ROOT = DATA_ROOT / "kline_index_daily"
 # 回源失败标的落盘（symbol, 原因, 时间），供用户手动核查
 FAILURE_LOG_PATH = DATA_ROOT / "mootdx_sync_failures.csv"
 
@@ -47,6 +50,25 @@ def _append_failure(sym: str, reason: str) -> None:
             f.write(line)
     except Exception:  # noqa: BLE001
         logger.warning("mootdx_service: 失败记录写入失败: %s", sym)
+
+
+# 后台回源节流：客户端请求优先占用 mootdx socket/CPU，backfill 每取 N 个 symbol
+# 主动 sleep 一小段让出资源。默认开启（每 5 个 symbol 睡 0.2s），环境变量可调。
+_BACKFILL_THROTTLE_EVERY = int(os.getenv("BACKFILL_THROTTLE_EVERY", "5"))
+_BACKFILL_THROTTLE_SLEEP = float(os.getenv("BACKFILL_THROTTLE_SLEEP", "0.2"))
+
+
+def _throttle_backfill(i: int) -> None:
+    """后台回源节流：每 ``_BACKFILL_THROTTLE_EVERY`` 个 symbol 后 sleep 一小段。
+
+    ``i`` 为当前循环序号（0-based）。``sleep`` 主动释放 GIL 与 mootdx socket
+    占用，给客户端实时请求让路（客户端走共享线程池，不受本函数影响）。
+    仅在后台回源路径调用（sync_daily/sync_index_daily/sync_stock_minute/…）。
+    """
+    if _BACKFILL_THROTTLE_EVERY <= 0:
+        return
+    if (i + 1) % _BACKFILL_THROTTLE_EVERY == 0:
+        time.sleep(_BACKFILL_THROTTLE_SLEEP)
 
 
 def _to_tf_symbol(code: str) -> str:
@@ -79,9 +101,9 @@ def _etf_universe() -> list[str]:
 def sync_etf_minute(day: _date | None = None) -> int:
     """收盘后同步指定交易日（默认今天）全部 ETF 分钟到按日分区。
 
-    逐标的用 mootdx ``get_minute_recent`` 拉最近几页真实 1m（含当日），
-    过滤到 ``day`` 后以 ``date={day}/part.parquet`` 原子写盘
-    （读旧→concat→unique→原子替换）。返回写入行数。
+    逐标的拉真实 1m：近期日（≤5 天）用 ``get_minute_recent``（含当日盘中），
+    历史日（>5 天）用 ``get_minute`` 全量拉再过滤当日（支持 4/1 起缺失日回补）。
+    以 ``date={day}/part.parquet`` 原子写盘。返回写入行数。
     """
     day = day or _date.today()
     src = MootdxSource()
@@ -89,11 +111,16 @@ def sync_etf_minute(day: _date | None = None) -> int:
     if not codes:
         logger.warning("mootdx_service: ETF 宇宙为空，跳过分钟同步")
         return 0
+    historical = (day < _date.today() - _dt.timedelta(days=5))
     frames = []
     for i, jq in enumerate(codes):
+        _throttle_backfill(i)
         try:
-            df = src.get_minute_recent(jq, pages=2)
-        except Exception as e:
+            if historical:
+                df = src.get_minute(jq, max_bars=40000)
+            else:
+                df = src.get_minute_recent(jq, pages=2)
+        except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
             continue
         if df is None or df.empty:
@@ -106,7 +133,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
             if c not in df.columns:
                 df[c] = None
         df = df[keep]
-        df = df[df["datetime"].dt.date == day]
+        df = df[pd.to_datetime(df["datetime"]).dt.date == day]
         if df.empty:
             continue
         frames.append(pl.from_pandas(df))
@@ -114,7 +141,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
             try:
                 src._client = None
                 src._server_idx = -1
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
     if not frames:
         return 0
@@ -279,6 +306,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     total = 0
     chunk: list[pl.DataFrame] = []
     for i, sym in enumerate(todo):
+        _throttle_backfill(i)
         # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
         sym_start = STOCK_MINUTE_START
         ld = listing.get(sym)
@@ -325,6 +353,203 @@ def sync_stock_minute(limit: int | None = None) -> int:
         _flush_stock_minute_chunk(chunk)
     logger.info("mootdx_service: 股票分钟回源完成, 累计 %d 行", total)
     return total
+
+
+def sync_stock_minute_day(day: _date) -> int:
+    """按缺失日补全全市场股票分钟到 ``kline_minute/date={day}``。
+
+    「有数据才回」：上市日晚于目标日的 symbol 跳过（该日尚未上市）；
+    当日停牌/无 bar 自然跳过不落盘。逐 symbol 用 ``get_minute`` 全量拉，
+    过滤到 ``day`` 后批量写分区（复用 ``_flush_stock_minute_chunk``）。
+    返回写入行数。
+    """
+    src = MootdxSource()
+    stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
+    if not stocks:
+        logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
+        return 0
+    listing = _listing_date_map()
+    # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
+    # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过（与 sync_stock_minute 一致）。
+    pre_delisted = [s for s in stocks if listing.get(s) == _date(1970, 1, 1)]
+    if pre_delisted:
+        logger.info("mootdx_service: 跳过 %d 只退市/异常标的（上市日期占位）: %s",
+                    len(pre_delisted), pre_delisted[:10])
+        stocks = [s for s in stocks if s not in set(pre_delisted)]
+    keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    total = 0
+    chunk: list[pl.DataFrame] = []
+    for i, sym in enumerate(stocks):
+        _throttle_backfill(i)
+        ld = listing.get(sym)
+        if ld is not None and ld > day:
+            continue  # 上市晚于目标日，该日无数据
+        try:
+            df = _guarded_get_minute(src, sym, max_bars=40000)
+        except TimeoutError:
+            src = MootdxSource()
+            _append_failure(sym, "timeout")
+            continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            _append_failure(sym, f"exception:{str(e)[:60]}")
+            continue
+        if df is None or df.empty:
+            _append_failure(sym, "empty")
+            continue
+        df = df.copy()
+        df["symbol"] = sym
+        df = df.reset_index()
+        for c in keep:
+            if c not in df.columns:
+                df[c] = None
+        df = df[keep]
+        df = df[pd.to_datetime(df["datetime"]).dt.date == day]
+        if df.empty:
+            continue  # 当日停牌/无 bar，跳过
+        sub = pl.from_pandas(df)
+        sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
+        sub = sub.unique(subset=["symbol", "datetime"], keep="last")
+        chunk.append(sub)
+        total += sub.height
+        if len(chunk) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(chunk)
+            chunk = []
+            src = MootdxSource()
+    if chunk:
+        _flush_stock_minute_chunk(chunk)
+    logger.info("mootdx_service: 股票分钟按日回源 %s 完成, %d 行", day, total)
+    return total
+
+
+def sync_stock_minute_range(days: list[_date]) -> int:
+    """批量回补多个缺失交易日：每只拉一次全量历史，一次写入所有缺失日分区。
+
+    与 ``sync_stock_minute_day``（逐缺失日全市场重拉）不同，多日缺口时每个
+    symbol 只拉一次 ``get_minute`` 全量，再按 ``day_set`` 过滤出落在缺失日的
+    bar，由 ``_flush_stock_minute_chunk`` 按各自交易日分组写入 ``date=`` 分区
+    （读旧→concat→unique），避免 O(N_days × 全市场) 的重复回源。
+    跳过退市/异常（上市日期 1970 占位）与上市日晚于整个缺失窗口末端的标的。
+    返回写入行数。
+    """
+    day_set = set(days)
+    window_end = max(days)
+    src = MootdxSource()
+    stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
+    if not stocks:
+        logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
+        return 0
+    listing = _listing_date_map()
+    # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
+    # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过。
+    pre_delisted = [s for s in stocks if listing.get(s) == _date(1970, 1, 1)]
+    if pre_delisted:
+        logger.info("mootdx_service: 跳过 %d 只退市/异常标的（上市日期占位）: %s",
+                    len(pre_delisted), pre_delisted[:10])
+        stocks = [s for s in stocks if s not in set(pre_delisted)]
+    keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    total = 0
+    chunk: list[pl.DataFrame] = []
+    for i, sym in enumerate(stocks):
+        _throttle_backfill(i)
+        ld = listing.get(sym)
+        if ld is not None and ld > window_end:
+            continue  # 上市晚于整个缺失窗口，窗口内无数据
+        try:
+            df = _guarded_get_minute(src, sym, max_bars=40000)
+        except TimeoutError:
+            src = MootdxSource()
+            _append_failure(sym, "timeout")
+            continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            _append_failure(sym, f"exception:{str(e)[:60]}")
+            continue
+        if df is None or df.empty:
+            _append_failure(sym, "empty")
+            continue
+        df = df.copy()
+        df["symbol"] = sym
+        df = df.reset_index()
+        for c in keep:
+            if c not in df.columns:
+                df[c] = None
+        df = df[keep]
+        df = df[pd.to_datetime(df["datetime"]).dt.date.isin(day_set)]
+        if df.empty:
+            continue  # 缺失窗口内无 bar，跳过
+        sub = pl.from_pandas(df)
+        sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
+        sub = sub.unique(subset=["symbol", "datetime"], keep="last")
+        chunk.append(sub)
+        total += sub.height
+        if len(chunk) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(chunk)
+            chunk = []
+            src = MootdxSource()
+    if chunk:
+        _flush_stock_minute_chunk(chunk)
+    logger.info("mootdx_service: 股票分钟批量回源 %d 个缺失日, %d 行", len(days), total)
+    return total
+
+
+def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
+    """逐缺失日复用现有 sync 函数补全，单日失败记 errors 不阻断。
+
+    ``missing`` 键名与 ``scan_missing_partitions`` 一致：
+    kline_daily / kline_etf_daily → sync_daily；kline_index_daily →
+    sync_index_daily；kline_etf_minute → sync_etf_minute；
+    kline_minute → sync_stock_minute_range（批量一次补全全部缺失日）。
+    """
+    result: dict = {
+        "daily_days": [], "index_daily_days": [],
+        "etf_minute_days": [], "stock_minute_days": [], "errors": [],
+    }
+
+    for day in missing.get("kline_daily", []) + missing.get("kline_etf_daily", []):
+        try:
+            sync_daily(day)
+            result["daily_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"daily {day}: {e}")
+    for day in missing.get("kline_index_daily", []):
+        try:
+            sync_index_daily(day)
+            result["index_daily_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"index_daily {day}: {e}")
+    for day in missing.get("kline_etf_minute", []):
+        try:
+            sync_etf_minute(day)
+            result["etf_minute_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"etf_minute {day}: {e}")
+    min_days = missing.get("kline_minute", [])
+    if min_days:
+        try:
+            sync_stock_minute_range(min_days)
+            result["stock_minute_days"].extend(str(d) for d in min_days)
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"stock_minute {min_days}: {e}")
+
+    return result
+
+
+def scan_and_backfill_full() -> dict:
+    """00:00 全量巡检 + 补全入口：扫描缺失 → 逐日补全 → 汇总。"""
+    missing = scan_missing_partitions()
+    backfilled = backfill_missing_partitions(missing)
+    total = sum(len(v) for v in missing.values())
+    msg = "mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s"
+    args = (total, {k: len(v) for k, v in backfilled.items()},
+            len(backfilled["errors"]))
+    if backfilled["errors"]:
+        # 补全后有残留错误 → WARNING（供钉钉通知等消费）
+        logger.warning(msg, *args)
+    else:
+        logger.info(msg, *args)
+    return {"missing": missing, "backfilled": backfilled,
+            "errors": backfilled["errors"]}
 
 
 def sync_adj_factor() -> dict:
@@ -462,28 +687,102 @@ def _trade_days_up_to(end: _date) -> list[_date]:
     return days
 
 
-def _missing_minute_days() -> list[_date]:
-    """找出分区缺失的 ETF 分钟交易日（最新分区日期 → 今天）。"""
+def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
+    """返回 [start, end] 内 A 股交易日（从沪深300 日线推导，全区间不截断）。
+
+    与 ``_trade_days_up_to``（90 天窗口）不同，本函数支持 4/1 至今的全区间
+    扫描。取数失败回退工作日近似（不阻断检测）。
+    """
+    src = MootdxSource()
+    try:
+        df = src.get_daily("000300.XSHG", start.strftime("%Y%m%d"),
+                           end.strftime("%Y%m%d"))
+        if df is not None and not df.empty:
+            return sorted(d.date() for d in df.index if d.date() <= end)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mootdx_service: 交易日历获取失败: %s", e)
+    days = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:
+            days.append(d)
+        d += _dt.timedelta(days=1)
+    return days
+
+
+def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
+    """calendar 中不在 root 的 date= 分区里的日期（中间洞也检）。"""
+    existing = set(_partition_dates(root))
+    return [d for d in calendar if d.isoformat() not in existing]
+
+
+def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]]:
+    """分区级缺失扫描：4/1（或 start）至今，5 类数据按交易日历逐日比对。
+
+    检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
+    仅分区级（分区存在即视为该日已覆盖），不逐 symbol 校验。
+    """
+    today = _date.today()
+    calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
+    return {
+        "kline_daily":       _missing_days_in(calendar, STOCK_DAILY_ROOT),
+        "kline_etf_daily":   _missing_days_in(calendar, ETF_DAILY_ROOT),
+        "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
+        "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
+        "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
+    }
+
+
+MARKET_CLOSE_TIME = _dt.time(15, 0)  # 当日日线/分钟视为"可回源"的时间下限
+
+
+def _market_closed(now: _dt.datetime | None = None) -> bool:
+    """当前是否已收盘（≥15:00，含盘后）。盘中视为未收盘。"""
+    now = now or _dt.datetime.now()
+    return now.time() >= MARKET_CLOSE_TIME
+
+
+def _missing_minute_days(now: _dt.datetime | None = None) -> list[_date]:
+    """找出分区缺失的 ETF 分钟交易日（最新分区日期 → 今天）。
+
+    盘中（<15:00）不把"今天"当作缺失日：当日分钟尚未走完，回源只会拿到
+    半日数据，写入会污染当天分区（与日线同一问题）。收盘后才把今天算缺失。
+    """
     existing = _partition_dates(ETF_MINUTE_ROOT)
     if not existing:
         return []
     latest = _date.fromisoformat(existing[-1])
-    today = _date.today()
-    if latest >= today:
+    now = now or _dt.datetime.now()
+    today = now.date()
+    if latest >= today and not _market_closed(now):
         return []
     return [d for d in _trade_days_up_to(today) if latest < d <= today]
 
 
-def _missing_daily_days(root: Path) -> list[_date]:
-    """找出某日线分区缺失的交易日。"""
+def _missing_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_date]:
+    """找出某日线分区缺失的交易日。
+
+    盘中（<15:00）不把"今天"当作缺失日：当日日线尚未收全，回源只能拿到
+    盘中半日快照（如 08-05 10:36 写入的坏分区），且写入后 ``latest==today``
+    会让后续回源永久跳过修正。收盘后才把今天算缺失（若今日分区为盘中快照
+    则一并重写，见 ``_stale_today_daily_days``），由 backfill 补全。
+    """
     existing = _partition_dates(root)
     if not existing:
         return []
     latest = _date.fromisoformat(existing[-1])
     today = _date.today()
-    if latest >= today:
+    now = now or _dt.datetime.now()
+    if latest >= today and not _market_closed(now):
         return []
-    return [d for d in _trade_days_up_to(today) if latest < d <= today]
+    days = [d for d in _trade_days_up_to(today) if latest < d <= today]
+    # 收盘后：今日分区若为盘中快照（mtime < 15:00），即使 latest==today
+    # 也要强制重写为收盘完整数据（否则盘中坏分区会永久残留）。
+    if _market_closed(now):
+        stale = _stale_today_daily_days(root, now)
+        if stale:
+            return sorted(set(days) | set(stale))
+    return days
 
 
 def _stock_universe() -> list[str]:
@@ -583,13 +882,15 @@ def sync_daily(day: _date) -> dict:
     day_str = day.strftime("%Y%m%d")
     # 跳过上市日晚于目标日的标的（新股在该日前无数据）；上市日期占位
     # （1970-01-01 = 退市/异常）的标的 4/1 前已无交易，一并跳过免超时。
+    # 注意：只对股票做该过滤。ETF 宇宙来自 etf_universe_snapshot（无退市占位），
+    # 且 _listing_date_map 读的是股票 instruments 表，对 ETF 过滤会把全部 ETF
+    # 判为 1970 占位退市 → daily_written.etf 恒 0，ETF 日线永不落盘。
     listing = _listing_date_map()
     if listing:
         def _active(sym: str) -> bool:
             ld = listing.get(sym, _date(1970, 1, 1))
             return ld > _date(1970, 1, 1) and ld <= day
         stocks = [s for s in stocks if _active(s)]
-        etfs = [s for s in etfs if _active(s)]
     written = {"stock": 0, "etf": 0}
     frames_stock: list[pl.DataFrame] = []
     frames_etf: list[pl.DataFrame] = []
@@ -597,6 +898,7 @@ def sync_daily(day: _date) -> dict:
     def _fetch(syms: list[str]) -> pl.DataFrame | None:
         out_frames = []
         for i, sym in enumerate(syms):
+            _throttle_backfill(i)
             try:
                 df = _guarded_get_daily(src, sym, day_str, day_str)
             except Exception:
@@ -638,6 +940,13 @@ def sync_daily(day: _date) -> dict:
     if edf is not None:
         frames_etf.append(edf)
         written["etf"] = edf.height
+    # 防御：回源结果为空不能静默——否则分区缺口无声累积（曾因过滤 bug 让
+    # ETF 日线数月未落盘而不自知）。全市场全失败通常意味着数据源/过滤异常。
+    if frames_stock and not frames_etf:
+        logger.warning("mootdx_service: 日线回源 %s 股票 %d 只但 ETF 全部失败，"
+                       "请检查 ETF 宇宙/过滤逻辑", day, written["stock"])
+    if not frames_stock and not frames_etf:
+        logger.warning("mootdx_service: 日线回源 %s 股票与 ETF 全部失败", day)
 
     if frames_stock:
         _write_daily_partition(pl.concat(frames_stock), STOCK_DAILY_ROOT)
@@ -676,15 +985,178 @@ def _write_daily_partition(df: pl.DataFrame, root: Path) -> None:
     tmp.rename(part)
 
 
-def backfill_to_now() -> dict[str, Any]:
-    """启动回源：补齐到当前时间缺失的 ETF 分钟 + 全市场日线 + 股票分钟一批。
+def _index_universe() -> list[str]:
+    """返回指数日线回源 symbol 列表（.SH/.SZ，优先 instruments_index 表）。
 
-    幂等：仅处理最新分区日期之后的交易日。失败标的跳过不阻断。
-    返回 {minute_days, minute_rows, daily_days, daily_written,
-          stock_minute_rows, errors}。
+    指数宇宙：``data/instruments_index/instruments_index.parquet`` 的 symbol 列。
+    缺失/读取失败时兜底模拟盘固定 4 只（000300/000510/399006/399101），确保
+    弱市判断/基准数据始终可用。
     """
-    result: dict[str, Any] = {"minute_days": [], "minute_rows": 0,
-                              "daily_days": [], "daily_written": {}, "errors": []}
+    inst_path = DATA_ROOT / "instruments_index" / "instruments_index.parquet"
+    if inst_path.exists():
+        try:
+            df = pl.read_parquet(inst_path, columns=["symbol"])
+            syms = df["symbol"].to_list()
+            if syms:
+                return sorted(syms)
+        except Exception:  # noqa: BLE001
+            logger.warning("mootdx_service: instruments_index 读取失败, 用兜底指数")
+    return ["000300.SH", "000510.SH", "399006.SZ", "399101.SZ"]
+
+
+def sync_index_daily(day: _date) -> dict:
+    """回源指定交易日全市场指数日线到 ``kline_index_daily`` 分区。
+
+    逐个指数用 mootdx ``get_daily``（指数自动走 index_bars）拉最近日线，
+    取 ``day`` 那根写按日分区。跳过北交所（899xxx.BJ mootdx 无数据）。
+    返回 {"written": 写入指数数, "symbols": 尝试数}。
+    """
+    indices = [s for s in _index_universe() if not s.endswith(".BJ")]
+    src = MootdxSource()
+    day_str = day.strftime("%Y%m%d")
+    frames: list[pl.DataFrame] = []
+    for i, sym in enumerate(indices):
+        _throttle_backfill(i)
+        try:
+            df = _guarded_get_daily(src, sym, day_str, day_str)
+            if df is None or df.empty:
+                continue
+            hit = df[[x.date() == day for x in df.index]]
+            if hit.empty:
+                continue
+            row = hit.iloc[-1]
+            frames.append(pl.DataFrame({
+                "symbol": [sym],
+                "date": [day],
+                "open": [float(row["open"])],
+                "high": [float(row["high"])],
+                "low": [float(row["low"])],
+                "close": [float(row["close"])],
+                "volume": [float(row["volume"])],
+                "amount": [float(row["amount"])],
+            }))
+        except Exception:  # noqa: BLE001
+            continue
+        if (i + 1) % 500 == 0:
+            try:
+                src._client = None
+                src._server_idx = -1
+            except Exception:  # noqa: BLE001
+                pass
+    if not frames:
+        logger.warning("mootdx_service: 指数日线回源 %s 全部失败（%d 只尝试）",
+                       day, len(indices))
+        return {"written": 0, "symbols": len(indices)}
+    _write_daily_partition(pl.concat(frames), INDEX_DAILY_ROOT)
+    logger.info("mootdx_service: 指数日线回源 %s 完成: %d 只", day, len(frames))
+    return {"written": len(frames), "symbols": len(indices)}
+
+
+def _missing_index_daily_days() -> list[_date]:
+    """找出 ``kline_index_daily`` 分区缺失的交易日。"""
+    return _missing_daily_days(INDEX_DAILY_ROOT)
+
+
+def _stale_today_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_date]:
+    """收盘后发现「今天」分区存在但写入时间早于收盘（盘中快照）→ 需重写。
+
+    场景：盘中某次 backfill 把今日半日数据当完整日线写入（mtime < 15:00），
+    之后 ``_missing_daily_days`` 因 latest==today 永远跳过修正。此处通过
+    分区 part.parquet 的 mtime 判定是否盘中写入，返回需要强制重写的今日列表。
+    """
+    now = now or _dt.datetime.now()
+    today = now.date()
+    pdir = root / f"date={today.isoformat()}"
+    part = pdir / "part.parquet"
+    if not part.exists():
+        return []
+    try:
+        mt = _dt.datetime.fromtimestamp(part.stat().st_mtime)
+    except OSError:
+        return []
+    if mt.time() >= MARKET_CLOSE_TIME:
+        return []  # 收盘后写入过，视为完整
+    # 盘中写入（mtime < 15:00）且当前已收盘 → 标记需重写
+    return [today]
+
+
+def _adj_factor_stale() -> bool:
+    """判断 ETF 前复权因子表是否落后于 ETF 日线最新交易日。
+
+    因子表 ``all.parquet`` 的 ``max(trade_date)`` 落后于 ``kline_etf_daily``
+    最新分区日期（或有新增交易日）即视为 stale，需重新 ``sync_adj_factor``。
+    文件不存在视为 stale（首次部署）。
+    """
+    if not ADJ_FACTOR_PATH.exists():
+        return True
+    try:
+        df = pl.read_parquet(ADJ_FACTOR_PATH, columns=["trade_date"])
+        if df.is_empty():
+            return True
+        factor_latest = df["trade_date"].max()
+        if not isinstance(factor_latest, _date):
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+    etf_days = _partition_dates(ETF_DAILY_ROOT)
+    if not etf_days:
+        # 无 ETF 日线分区：以因子表自身为基准，不误判（有分区时以下逻辑生效）
+        return factor_latest < _date.today()
+    etf_latest = _date.fromisoformat(etf_days[-1])
+    return factor_latest < etf_latest
+
+
+def _notify_missing(missing: dict) -> None:
+    """空分区/缺口时打 WARNING 日志并尝试钉钉站内信通知用户。fire-and-forget。"""
+    lines = []
+    for name, st in missing.items():
+        latest = st.get("latest") or "无"
+        lines.append(f"- {name}: 最新 {latest}（empty={st.get('empty')}, missing={st.get('missing')}）")
+    msg = "mootdx 启动回源发现以下数据集缺失/缺口:\n" + "\n".join(lines)
+    logger.warning("mootdx_service: %s", msg)
+    try:
+        from app.quant import db as qdb
+        webhook = qdb.get_quant_setting("dingtalk_webhook_url") or ""
+        secret = qdb.get_quant_setting("dingtalk_secret") or ""
+        if webhook:
+            from app.quant.notify import send_dingtalk
+            send_dingtalk(webhook, secret, "模拟盘数据回源缺口", msg)
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: 钉钉缺口通知失败（忽略）")
+
+
+def backfill_to_now() -> dict[str, Any]:
+    """启动回源：补齐到当前时间缺失的全部数据集（幂等）。
+
+    覆盖：ETF 分钟 + 全市场日线（股票/ETF）+ 指数日线 + 股票分钟一批 +
+    ETF 前复权因子表（stale 时）。缺日期分区回溯补窗口；完全空分区也补窗口
+    并标记 missing + 钉钉告警。失败标的跳过不阻断。
+    返回结果含 index_daily_days/index_daily_written/adj_factor/missing。
+    """
+    result: dict[str, Any] = {
+        "minute_days": [], "minute_rows": 0,
+        "daily_days": [], "daily_written": {},
+        "index_daily_days": [], "index_daily_written": {},
+        "adj_factor": None,
+        "stock_minute_rows": 0, "errors": [],
+    }
+
+    stocks_daily      = _partition_dates(STOCK_DAILY_ROOT)
+    etf_daily_days    = _partition_dates(ETF_DAILY_ROOT)
+    index_daily_days  = _partition_dates(INDEX_DAILY_ROOT)
+    etf_minute_days   = _partition_dates(ETF_MINUTE_ROOT)
+
+    result["missing"] = {
+        "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
+                               "empty": not etf_minute_days, "missing": bool(_missing_minute_days())},
+        "kline_daily":        {"latest": stocks_daily[-1] if stocks_daily else None,
+                               "empty": not stocks_daily, "missing": bool(_missing_daily_days(STOCK_DAILY_ROOT))},
+        "kline_etf_daily":    {"latest": etf_daily_days[-1] if etf_daily_days else None,
+                               "empty": not etf_daily_days, "missing": bool(_missing_daily_days(ETF_DAILY_ROOT))},
+        "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
+                               "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
+        "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
+    }
 
     # 1. ETF 分钟
     for day in _missing_minute_days():
@@ -692,30 +1164,59 @@ def backfill_to_now() -> dict[str, Any]:
             n = sync_etf_minute(day)
             result["minute_days"].append(str(day))
             result["minute_rows"] += n
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: 分钟回源 %s 失败: %s", day, e)
             result["errors"].append(f"minute {day}: {e}")
 
-    # 2. 日线（股票 + ETF）——统一用一个交易日历
+    # 2. 日线（股票 + ETF）——统一用一个交易日历；空时补最近窗口
+    today = _date.today()
     daily_days = sorted(set(_missing_daily_days(STOCK_DAILY_ROOT))
                         | set(_missing_daily_days(ETF_DAILY_ROOT)))
+    if _missing_daily_days(STOCK_DAILY_ROOT) == [] and not stocks_daily:
+        daily_days = sorted(set(_trade_days_up_to(today)) - set(_partition_dates(STOCK_DAILY_ROOT)))
     for day in daily_days:
         try:
             w = sync_daily(day)
             result["daily_days"].append(str(day))
             for k, v in w.items():
                 result["daily_written"][k] = result["daily_written"].get(k, 0) + v
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: 日线回源 %s 失败: %s", day, e)
             result["errors"].append(f"daily {day}: {e}")
+
+    # 2b. 指数日线（新增）——空时补最近窗口
+    idx_days = sorted(_missing_index_daily_days())
+    if not idx_days and not index_daily_days:
+        idx_days = sorted(set(_trade_days_up_to(today)) - set(_partition_dates(INDEX_DAILY_ROOT)))
+    for day in idx_days:
+        try:
+            w = sync_index_daily(day)
+            result["index_daily_days"].append(str(day))
+            for k, v in w.items():
+                result["index_daily_written"][k] = result["index_daily_written"].get(k, 0) + v
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 指数日线回源 %s 失败: %s", day, e)
+            result["errors"].append(f"index_daily {day}: {e}")
+
+    # 2c. ETF 因子表（新增）——stale 才跑
+    if result["missing"]["adj_factor_etf"]["missing"] or not ADJ_FACTOR_PATH.exists():
+        try:
+            result["adj_factor"] = sync_adj_factor()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 因子表回源失败: %s", e)
+            result["errors"].append(f"adj_factor: {e}")
 
     # 3. 股票分钟增量慢跑（每次一批，resume 跳过已覆盖，多轮自动补齐）
     try:
         n = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
         result["stock_minute_rows"] = n
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")
+
+    # 4. 缺口告警（日志 + 钉钉）
+    if any(st["missing"] or st["empty"] for st in result["missing"].values()):
+        _notify_missing(result["missing"])
 
     logger.info("mootdx_service: 启动回源完成 %s", result)
     return result

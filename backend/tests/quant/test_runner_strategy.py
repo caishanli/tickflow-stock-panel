@@ -34,6 +34,20 @@ def api_client(tmp_quant):
     return TestClient(app)
 
 
+class _FakeClient:
+    """最小网络客户端 stub：盘中 feed 与交易日判定可安全命中。"""
+
+    def current_snapshot(self, codes, as_of=None):
+        idx = pd.DatetimeIndex([pd.Timestamp(as_of)])
+        return {c: pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0],
+                                 "close": [1.0], "volume": [100], "amount": [100.0]},
+                                index=idx) for c in codes}
+
+    def get_price(self, security, start_date=None, end_date=None, frequency="daily",
+                  fields=None):
+        return {}
+
+
 class _StubDM:
     """最小 DataManager stub：策略下单价由 feed 的 minute_prices 快照提供。"""
     sources = {}
@@ -41,6 +55,10 @@ class _StubDM:
     _minute_mem = {}
     _minute_cov = {}
     _offline = False
+    _daily_ver = 0
+
+    def __init__(self):
+        self.client = _FakeClient()
 
     def fetch(self, method, *a, **k):
         raise RuntimeError("stub: no data")
@@ -208,7 +226,9 @@ def test_run_daily_fires_once_per_day(tmp_quant, monkeypatch):
     bars = iter([_today_bar(), _today_bar(minute=31)])
 
     def _feed(dm, codes, now, acc):
-        return {c: 10.0 for c in codes}, next(bars)
+        p = next(bars, None)
+        # 主循环盘中 mark 子循环会基于持仓反复取价，越界后钳制在最后一根 bar
+        return {c: 10.0 for c in codes}, (p or _today_bar(minute=31))
 
     runner.run_loop(aid, dm=_StubDM(), feed=_feed, matcher=Matcher(0.03))
     # 'open' 任务每日只触发一次：两个 bar 也只有一笔买入（第二根 bar 现金已不足再触发目标仓位）
@@ -257,10 +277,29 @@ def test_session_minutes_full_day():
 
 
 def _replay_dm_cls(days):
-    """带历史日线（交易日判定/取交易日表）与历史分钟价的 stub DM。"""
+    """带历史日线（交易日判定/取交易日表）与历史分钟价的 stub DM。
+
+    附 set_minute_window / preload_minute_for_pool 桩：记录补跑是否把整个区间钉窗
+    口并批量预取池（Task 1 提速的核心行为）。
+    """
 
     class _ReplayDM(_StubDM):
         DAYS = days
+
+        def __init__(self):
+            super().__init__()
+            self.window_seen = None
+            self.pool_seen = None
+            self.unset_seen = False
+
+        def set_minute_window(self, start, end):
+            self.window_seen = (str(start)[:10], str(end)[:10])
+
+        def unset_minute_window(self):
+            self.unset_seen = True
+
+        def preload_minute_for_pool(self, codes, as_of=None):
+            self.pool_seen = list(codes) if codes else []
 
         def fetch(self, method, *a, **k):
             if method == "get_daily" and a and a[0] == "000300.XSHG":
@@ -301,6 +340,100 @@ def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
     logs = db.get_sim_logs(aid)
     assert any("开始历史补跑" in l["message"] for l in logs)
     assert any("历史补跑完成" in l["message"] for l in logs)
+    # 补跑日志时间戳用引擎推进到的时间（bar 时刻/当日），而非真实当前时间
+    reb = [l for l in logs if "rebalanced" in l["message"]]
+    assert reb and reb[0]["ts"].startswith(str(days[0]))
+    start_log = [l for l in logs if "开始历史补跑" in l["message"]]
+    done_log = [l for l in logs if "历史补跑完成" in l["message"]]
+    assert start_log[0]["ts"].startswith(str(days[0]))
+    assert done_log[0]["ts"].startswith(str(days[-1]))
+
+
+def test_replay_pins_minute_window_and_preloads_pool(tmp_quant, monkeypatch):
+    """补跑前必须钉住整个区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源。"""
+    today = datetime.date.today()
+    days = [today - datetime.timedelta(days=n) for n in (4, 3, 2, 1)]
+    save_strategy("s_pin", "s", STRATEGY_BUY)
+    aid = service.account_create("acct_pin", 100000.0, 0.03, "s_pin", str(days[0]))
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    dm = _replay_dm_cls(days)()
+    runner.run_loop(aid, dm=dm, feed=_feed_factory(10.0), matcher=Matcher(0.03))
+
+    assert dm.window_seen is not None
+    assert dm.window_seen[0] == str(days[0])
+    # 窗口上界 = 今天（start_date 在今天内，整个补跑区间被钉住）
+    assert dm.window_seen[1] == str(today)
+    assert dm.pool_seen is not None
+    assert "510300.XSHG" in dm.pool_seen           # 策略 universe 标的被批量预取
+    # 补跑结束进入实时：钉住的窗口必须复位，否则 preload 永远走 full 窗口不滑动
+    assert dm.unset_seen is True
+
+
+def test_strategy_loop_replays_today_intraday_bars(tmp_quant, monkeypatch):
+    """启动/重置当天（含今日交易日）也要回补开盘到当前时刻，而非只补到昨日。
+
+    回归：_replay_history 原先只补 [start_date, 昨日]，当日盘中/收盘后启动时
+    今天日内 bar 全丢（只有 EOD 一条快照）。现在 today 也进补跑范围，只回放到
+    bar <= now 的时刻，剩余由实时主循环接管。
+    """
+    class _FixedNow(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 8, 6, 10, 30, 0)
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+    today = datetime.date(2026, 8, 6)
+    days = [datetime.date(2026, 8, 3), datetime.date(2026, 8, 4),
+            datetime.date(2026, 8, 5), today]
+    save_strategy("s_rpt", "s", STRATEGY_BUY)
+    aid = service.account_create("acct_rpt", 100000.0, 0.03, "s_rpt", str(days[0]))
+    # 补跑 4 天（含今天）逐日检查 is_paused，之后实时段只跑 1 个 tick
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+
+    snaps = db.get_sim_snapshots(aid)
+    today_snaps = [s for s in snaps if s["dt"].startswith(str(today))]
+    # 今日回补到 10:30（09:31~10:30 共 60 根 bar）；实时 tick 因 last_bar 已推进被去重跳过
+    assert len(today_snaps) == 60, len(today_snaps)
+    times = sorted(s["dt"][11:16] for s in today_snaps)
+    assert "09:31" in times and "10:30" in times
+    assert snaps[-1]["dt"].startswith(str(today))
+    logs = db.get_sim_logs(aid)
+    assert any("今日" in l["message"] and "回补" in l["message"] for l in logs)
+
+
+STRATEGY_REPLAY_LOG = '''
+def init(context):
+    context.universe = ["510300.XSHG"]
+    g.logged_days = []
+
+def before_trading_start(context):
+    log.info("pre-market")
+
+def on_open(context):
+    log.info("opened")
+
+run_daily(on_open, "open")
+'''
+
+
+def test_replay_logs_use_engine_forward_time(tmp_quant, monkeypatch):
+    """补跑日志时间戳用引擎推进到的时间（bar/当日），而非真实当前时间。"""
+    today = datetime.date.today()
+    days = [today - datetime.timedelta(days=n) for n in (4, 3, 2, 1)]
+    save_strategy("s_rlog", "s", STRATEGY_REPLAY_LOG)
+    aid = service.account_create("acct_rlog", 100000.0, 0.03, "s_rlog", str(days[0]))
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+    logs = db.get_sim_logs(aid)
+    opened = [l for l in logs if l["message"] == "opened"]
+    pre = [l for l in logs if l["message"] == "pre-market"]
+    # 每个补跑日各触发一次，时间戳落在该交易日（引擎推进的时间），而非真实当前时间
+    for day in days:
+        assert any(l["ts"].startswith(str(day)) for l in opened), (day, opened)
+        assert any(l["ts"].startswith(str(day)) for l in pre), (day, pre)
 
 
 def test_strategy_loop_saved_state_skips_replay(tmp_quant, monkeypatch):
@@ -310,7 +443,7 @@ def test_strategy_loop_saved_state_skips_replay(tmp_quant, monkeypatch):
     aid = service.account_create("acct_rp2", 100000.0, 0.03, "s_rp2", str(days[0]))
     protocol.save_state(aid, {
         "cash": 100000.0, "start_cash": 100000.0, "net_value": 100000.0, "pnl": 0.0,
-        "positions": {}, "stop_loss_log": [], "dt": "2026-07-17 09:31",
+        "positions": {}, "stop_loss_log": [], "dt": str(today + datetime.timedelta(days=1)) + " 09:31",
     })
     _patch_one_loop(monkeypatch)
     runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),

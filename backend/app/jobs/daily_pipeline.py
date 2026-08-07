@@ -891,32 +891,6 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         replace_existing=True,
     )
 
-    # 盘后: mootdx 数据服务 - ETF 分钟分区 + 前复权因子表 + 股票分钟增量回源
-    # (独立于模拟盘; mootdx 为分钟线/因子的唯一数据源, 随盘后管道同步更新,
-    #  回测与模拟盘只读落盘分区数据, 见 app.services.mootdx_service)
-    def _mootdx_sync():
-        try:
-            from app.services import mootdx_service
-            minutes = mootdx_service.sync_etf_minute()
-            adj = mootdx_service.sync_adj_factor()
-            # 股票分钟增量慢跑: 每次一批, resume 跳过已覆盖, 多轮补齐
-            stock = mootdx_service.sync_stock_minute(
-                limit=mootdx_service.STOCK_MINUTE_BATCH_LIMIT)
-            logger.info("scheduled mootdx sync done: minute=%d rows, adj=%s, "
-                        "stock_minute_rows=%d", minutes, adj, stock)
-        except Exception:
-            logger.exception("scheduled mootdx sync failed")
-
-    scheduler.add_job(
-        _mootdx_sync,
-        trigger=CronTrigger(day_of_week="mon-fri",
-                            hour=15, minute=35,
-                            timezone="Asia/Shanghai"),
-        id="mootdx_sync",
-        misfire_grace_time=3600,
-        replace_existing=True,
-    )
-
     # 盘后: 五档盘口 sealed 定版(时间由偏好决定, 默认15:02, 范围15:01~18:00)
     depth_sched = preferences.get_depth_finalize_time()
 

@@ -1,48 +1,26 @@
+import pandas as pd
+import pytest
+
 from app.quant.datasource.base import DataSourceError
 from app.quant.datasource.manager import QuantDataProvider
 
 
-class _FailSource:
-    name = "fail"
+class _EmptyClient:
+    def get_price(self, security, start_date=None, end_date=None, frequency="daily", fields=None):
+        return {}
 
-    def get_daily(self, *a, **k):
-        raise DataSourceError("boom")
-
-    def get_minute(self, *a, **k):
-        raise DataSourceError("boom")
+    def current_snapshot(self, codes, as_of=None):
+        return {}
 
 
-class _OkSource:
-    name = "ok"
-
-    def __init__(self, df):
-        self._df = df
-
-    def get_daily(self, *a, **k):
-        return self._df
-
-    def get_minute(self, *a, **k):
-        return self._df
+def test_get_daily_empty_raises():
+    prov = QuantDataProvider(client=_EmptyClient())
+    with pytest.raises(DataSourceError):
+        prov.get_daily("600000.XSHG", "2026-01-01", "2026-02-01")
 
 
-def test_fallback_to_second_source():
-    import pandas as pd
-    ok = _OkSource(pd.DataFrame({"close": [1.0]}))
-    prov = QuantDataProvider.__new__(QuantDataProvider)
-    prov.sources = {"fail": _FailSource(), "ok": ok}
-    prov.priority = ["fail", "ok"]
-    prov.cache = type("C", (), {"get": lambda *a, **k: None, "put": lambda *a, **k: None})()
-    df = prov.fetch("get_daily", "X")
-    assert list(df["close"]) == [1.0]
-
-
-def test_all_fail_raises():
-    prov = QuantDataProvider.__new__(QuantDataProvider)
-    prov.sources = {"fail": _FailSource()}
-    prov.priority = ["fail"]
-    prov.cache = type("C", (), {"get": lambda *a, **k: None, "put": lambda *a, **k: None})()
-    try:
-        prov.fetch("get_daily", "X")
-        assert False, "should raise"
-    except DataSourceError:
-        pass
+def test_get_minute_empty_returns_empty_df():
+    prov = QuantDataProvider(client=_EmptyClient())
+    df = prov.get_minute("600000.XSHG", "2026-01-01")
+    assert isinstance(df, pd.DataFrame)
+    assert df.empty
