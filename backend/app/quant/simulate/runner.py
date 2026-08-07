@@ -776,7 +776,7 @@ def _mark_to_market(feed, dm, ctx, state: dict, last_mark: dict, now) -> bool:
             continue
         prev = last_mark.get(code)
         # 首次 mark：以当前已持久化持仓价为基线（刚被策略 tick 打过，价格未变不落快照）
-        if prev is None:
+        if prev is None or not prev:
             if pos.price and abs(px / pos.price - 1) >= MARK_SNAPSHOT_TICK:
                 dirty = True
         elif abs(px / prev - 1) >= MARK_SNAPSHOT_TICK:
