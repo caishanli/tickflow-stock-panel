@@ -832,7 +832,11 @@ class DataManager:
             logger.info("[DataManager] 分钟线预热完成: 成功 %d/%d，已缓存 %d 只",
                         len(codes) - len(todo), len(codes), len(self._minute_mem))
             return
-        batch = self._load_minute_pool_from_partitions(todo, lo_ts, hi_ts)
+        # 批量取数上界用 hi_eff（纯日期窗口上界扩到当日 15:00），否则服务端
+        # get_minute 按 `datetime <= hi_ts` 精确过滤会整段排除窗口结束日当天的
+        # 分钟，而 _minute_cov 却记为覆盖到 15:00 → 缓存假阳性，收盘重估/补跑
+        # 取到昨日价（回归：517520 补跑 8-07 取到 8-06 收盘 2.031）。
+        batch = self._load_minute_pool_from_partitions(todo, lo_ts, hi_eff)
         for code in todo:
             try:
                 df = batch.get(code)

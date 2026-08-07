@@ -78,6 +78,31 @@ class _FakeClient:
             frequency="1m")
 
 
+class _StrictMinuteClient(_FakeClient):
+    """忠实模拟 stockdata 服务端 ``h_get_minute``：纯日期上界**不**自动补 15:00，
+    精确按 ``datetime <= hi_ts`` 过滤（与 ``h_get_price`` 分钟路径补 15:00 不同）。
+
+    用于复现 DataManager ``preload_minute_for_pool`` 把窗口上界（纯日期午夜）
+    原样传给网络端时，当天分钟被整段排除、而 ``_minute_cov`` 却记为覆盖到
+    当日 15:00 的覆盖区间假阳性。
+    """
+
+    def get_minute_pool(self, codes, lo_ts, hi_ts):
+        lo = pd.Timestamp(lo_ts) if lo_ts is not None else None
+        hi = pd.Timestamp(hi_ts) if hi_ts is not None else None
+        out = {}
+        for c in codes:
+            df = self.frames.get(c)
+            if df is None:
+                continue
+            if lo is not None:
+                df = df[df.index >= lo]
+            if hi is not None:
+                df = df[df.index <= hi]
+            out[c] = df
+        return out
+
+
 def _real_minute_frame(code=CODE):
     idx1 = pd.date_range(REAL_START, REAL_END, freq="1min")
     return pd.DataFrame(
@@ -263,6 +288,35 @@ def test_preload_minute_for_pool_single_definition():
     assert src.count("def preload_minute_for_pool") == 1
     sig = inspect.signature(DataManager.preload_minute_for_pool)
     assert sig.parameters["as_of"].default is None
+
+
+def test_preload_pool_upper_bound_includes_close_bar(tmp_path):
+    """补跑钉窗时 preload_minute_for_pool 的批量取数必须把窗口上界扩到当日
+    15:00（而非纯日期午夜），否则服务端 get_minute 会把当天分钟整段排除、
+    _minute_cov 却记为覆盖到 15:00 → 收盘重估取到昨日价。
+
+    回归：模拟盘 517520.XSHG 8-07 收盘后补跑，_revalue_at_close 经
+    get_minute_price_at 取到 8-06 收盘 2.031（真实 8-07 收盘 2.112），
+    净值低估 ~3904。
+    """
+    dm = _make_dm(tmp_path)
+    # 钉窗结束于"今天"（纯日期），复现补跑 today 场景
+    dm.set_minute_window("2026-08-03", "2026-08-07")
+    # 真实分钟帧：8-06 收 2.031，8-07 收 2.112（最后 15:00 bar）
+    idx1 = pd.date_range("2026-08-03 09:31", "2026-08-06 15:00", freq="1min")
+    idx2 = pd.date_range("2026-08-07 09:31", "2026-08-07 15:00", freq="1min")
+    df = pd.concat([
+        pd.DataFrame({"close": 2.031, "volume": 1.0, "money": 1.0}, index=idx1),
+        pd.DataFrame({"close": 2.112, "volume": 1.0, "money": 1.0}, index=idx2),
+    ])
+    dm.client = _StrictMinuteClient({CODE: df})
+    dm.preload_minute_for_pool([CODE], as_of="2026-08-07")
+    cached = dm._minute_mem.get(CODE)
+    assert cached is not None and not cached.empty
+    # 覆盖区间与帧必须一致：缓存帧含 8-07 收盘 bar
+    assert cached.index.max() == pd.Timestamp("2026-08-07 15:00")
+    # 收盘重估/取价必须命中 8-07 收盘价，而非昨日 2.031
+    assert dm.get_minute_price_at(CODE, "2026-08-07 15:00") == 2.112
 
 
 def test_unset_minute_window_restores_sliding(tmp_path):
