@@ -60,3 +60,60 @@ def test_sim_account_dingtalk_enabled():
     acct = db.get_sim_account("a1")
     assert acct["dingtalk_enabled"] == 1
     os.unlink(p)
+
+def test_sim_trade_name_column():
+    p = _fresh()
+    db.insert_sim_trade("a1", "2024-01-02 09:31", "159985.XSHE", "BUY",
+                        2.139, 100, 0.0, 0.0, 9.99, "豆粕ETF华夏")
+    trades = db.get_sim_trades("a1")
+    assert len(trades) == 1
+    assert trades[0]["code"] == "159985.XSHE"
+    assert trades[0]["name"] == "豆粕ETF华夏"
+    db.delete_sim_account("a1")
+    os.unlink(p)
+
+
+def test_sim_trade_name_optional_old_signature():
+    """不带 name 的旧调用仍可用（name 默认空串）。"""
+    p = _fresh()
+    db.insert_sim_trade("a1", "2024-01-02 09:31", "600000.XSHG", "BUY", 10.0, 100, 0.0, 0.0, 0.0)
+    trades = db.get_sim_trades("a1")
+    assert trades[0]["name"] == ""
+    db.delete_sim_account("a1")
+    os.unlink(p)
+
+
+def test_sim_trade_batch_with_name():
+    p = _fresh()
+    db.batch_insert_trades([
+        ("a1", "2024-01-02 09:31", "159985.XSHE", "BUY", 2.139, 100, 0.0, 0.0, 9.99, "豆粕ETF华夏"),
+        ("a1", "2024-01-02 09:32", "511880.XSHG", "SELL", 100.0, 1000, 0.0, 0.0, 1.0, "银华日利ETF"),
+    ])
+    trades = db.get_sim_trades("a1")
+    assert len(trades) == 2
+    assert {t["name"] for t in trades} == {"豆粕ETF华夏", "银华日利ETF"}
+    db.delete_sim_account("a1")
+    os.unlink(p)
+
+
+def test_sim_trade_name_column_migration_on_old_db():
+    """旧库（无 name 列）init_db 自动补列，历史行 name 为 NULL。"""
+    p = _fresh()
+    import sqlite3
+    # 手动建无 name 列的旧表结构（先删新表）
+    conn = sqlite3.connect(p)
+    conn.execute("DROP TABLE sim_trades")
+    conn.execute(
+        "CREATE TABLE sim_trades (account_id TEXT, ts TEXT, code TEXT, action TEXT, "
+        "price REAL, amount REAL, pnl REAL, pnl_pct REAL, commission REAL)")
+    conn.execute(
+        "INSERT INTO sim_trades VALUES('a1','2024-01-02 09:31','600000.XSHG','BUY',"
+        "10.0,100,0.0,0.0,0.0)")
+    conn.commit(); conn.close()
+    # init_db 补列
+    db.init_db(p)
+    trades = db.get_sim_trades("a1")
+    assert len(trades) == 1
+    assert "name" in trades[0]
+    assert trades[0]["name"] is None
+    os.unlink(p)
