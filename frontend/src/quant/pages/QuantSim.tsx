@@ -467,7 +467,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                   return (
                     <tr key={sym} className="border-t border-border/60">
-                      <td className="px-3 py-1.5">{sym}</td>
+                      <td className="px-3 py-1.5">
+                        {p.name ? `${p.name} ` : ''}{sym}
+                      </td>
                       <td className="px-3 py-1.5 text-right num">{p.amount}</td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
@@ -516,7 +518,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   {[...tradeList].reverse().map((t: any, i: number) => (
                     <tr key={i} className="border-t border-border/60">
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
-                      <td className="px-3 py-1.5">{t.code ?? ''}</td>
+                      <td className="px-3 py-1.5">
+                        {t.name ? `${t.name} ` : ''}{t.code ?? ''}
+                      </td>
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
                         {t.action === 'BUY' ? '买入' : '卖出'}
                       </td>
