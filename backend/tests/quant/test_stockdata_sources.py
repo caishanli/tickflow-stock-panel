@@ -233,8 +233,13 @@ def test_fetch_one_rebuilds_source_on_timeout(monkeypatch):
         p.shutdown()
 
 
-def test_metadata_methods_with_ohlcv_only_partitions(src):
+def test_metadata_methods_with_ohlcv_only_partitions(src, monkeypatch):
     """分区仅 symbol/OHLCV：元数据方法不再因缺 name/list_date 列而崩。"""
+    # 隔离：无 instruments parquet 时不应触发真实网络 API（保持离线确定性）
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
     df = src.get_all_securities(["stock"], None)
     assert not df.is_empty()
     assert list(df.columns) == ["symbol", "type", "name", "list_date"]
@@ -250,3 +255,85 @@ def test_metadata_methods_with_ohlcv_only_partitions(src):
     assert info["end_date"] is None
 
     assert src.get_stock_names() == {}
+
+
+def _write_instruments(root, rows):
+    """写 instruments parquet（股票名称本地来源）。"""
+    import os
+    import polars as pl
+    d = os.path.join(root, "instruments")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame(rows).write_parquet(os.path.join(d, "instruments.parquet"))
+
+
+def test_get_stock_names_returns_local_stock_names(tmp_path, monkeypatch):
+    """股票名称来自本地 instruments parquet；API 失败时仍有本地名称。"""
+    import os
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    _write_instruments(str(tmp_path), [
+        {"symbol": "600000.SH", "name": "浦发银行", "code": "600000"},
+        {"symbol": "600249.SH", "name": "两面针", "code": "600249"},
+    ])
+    # 免费 API 必失败（未 mock）→ 降级本地
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=1)
+    try:
+        names = s.get_stock_names()
+        assert names.get("600000") == "浦发银行"
+        assert names.get("600249") == "两面针"
+        # codes 子集过滤
+        sub = s.get_stock_names(codes=["600000"])
+        assert sub == {"600000": "浦发银行"}
+    finally:
+        s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_get_stock_names_etf_falls_back_to_api(tmp_path, monkeypatch):
+    """ETF 名称本地 parquet 为空时走免费 API；异常时返回已有股票名称。"""
+    import os
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    _write_instruments(str(tmp_path), [
+        {"symbol": "600000.SH", "name": "浦发银行", "code": "600000"},
+    ])
+    # mock ETF instruments 来源返回空 + 抛异常（模拟 API 失败降级）
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no net")),
+    )
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=1)
+    try:
+        names = s.get_stock_names()
+        assert names.get("600000") == "浦发银行"  # 本地名称仍在
+    finally:
+        s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_get_stock_names_etf_from_local_parquet(tmp_path, monkeypatch):
+    """ETF 名称若本地 instruments_etf parquet 已有则直接读，不触网。"""
+    import os
+    import polars as pl
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    _write_instruments(str(tmp_path), [
+        {"symbol": "600000.SH", "name": "浦发银行", "code": "600000"},
+    ])
+    d = os.path.join(str(tmp_path), "instruments_etf")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame([
+        {"symbol": "159985.SZ", "name": "豆粕ETF华夏", "code": "159985"},
+        {"symbol": "511880.SH", "name": "银华日利ETF", "code": "511880"},
+    ]).write_parquet(os.path.join(d, "instruments_etf.parquet"))
+    # API 调用若发生会抛异常 → 测试断言它没被调用
+    def _boom(*a, **k):
+        raise AssertionError("ETF 名称应从本地 parquet 读，不调 API")
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type", _boom)
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=1)
+    try:
+        names = s.get_stock_names()
+        assert names.get("159985") == "豆粕ETF华夏"
+        assert names.get("511880") == "银华日利ETF"
+        assert names.get("600000") == "浦发银行"
+    finally:
+        s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)
