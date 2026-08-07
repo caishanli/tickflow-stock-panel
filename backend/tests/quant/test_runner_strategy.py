@@ -339,6 +339,7 @@ def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
     assert reb and reb[0]["ts"].startswith(str(days[0]))
     start_log = [l for l in logs if "开始历史补跑" in l["message"]]
     done_log = [l for l in logs if "历史补跑完成" in l["message"]]
+    assert start_log[0]["ts"].startswith(str(days[0]))
     assert done_log[0]["ts"].startswith(str(days[-1]))
 
 
