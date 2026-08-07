@@ -164,3 +164,88 @@ def test_replay_today_after_close_revalues(tmp_quant, monkeypatch):
     today_snaps = [s for s in snaps if s["dt"].startswith(str(today))]
     assert today_snaps and today_snaps[-1]["positions_value"] == pytest.approx(5000 * 12.0)
     assert protocol.read_state(aid)["positions"]["510300.XSHG"]["price"] == 12.0
+
+
+def _feed(price):
+    def _fe(dm, codes, now, acc):
+        return {c: price for c in codes}, pd.Timestamp(now)
+    return _fe
+
+
+def test_mark_to_market_updates_state_and_returns_dirty(tmp_quant):
+    """盘中 mark：刷新持仓价到最新、重算净值，价格跳变返回 True。"""
+    aid = _revalue_at_close_setup(tmp_quant)
+    st = protocol.read_state(aid)
+    from app.quant.jqengine.engine.jq.context import Position
+    ctx = type("Ctx", (), {"portfolio": type("Pf", (), {
+        "positions": {"510300.XSHG": Position()}, "cash": 0.0})()})()
+    ctx.portfolio.positions["510300.XSHG"].amount = 5000.0
+    ctx.portfolio.positions["510300.XSHG"].avg_cost = 10.0
+    ctx.portfolio.positions["510300.XSHG"].price = 10.0
+    runner._state_from_portfolio(ctx, st)
+    last_mark = {"510300.XSHG": 10.0}
+
+    dirty = runner._mark_to_market(_feed(12.0), None, ctx, st, last_mark,
+                                   pd.Timestamp("2026-07-17 10:30"))
+
+    assert dirty is True
+    assert st["positions"]["510300.XSHG"]["price"] == 12.0
+    assert st["net_value"] == pytest.approx(5000 * 12.0)
+    assert last_mark["510300.XSHG"] == 12.0
+    assert ctx.portfolio.positions["510300.XSHG"].price == 12.0
+
+
+def test_mark_to_market_no_change_is_clean(tmp_quant):
+    """价格未越过阈值时不 dirty（不落快照）。"""
+    aid = _revalue_at_close_setup(tmp_quant)
+    st = protocol.read_state(aid)
+    from app.quant.jqengine.engine.jq.context import Position
+    ctx = type("Ctx", (), {"portfolio": type("Pf", (), {
+        "positions": {"510300.XSHG": Position()}, "cash": 0.0})()})()
+    ctx.portfolio.positions["510300.XSHG"].amount = 5000.0
+    ctx.portfolio.positions["510300.XSHG"].avg_cost = 10.0
+    ctx.portfolio.positions["510300.XSHG"].price = 10.0
+    runner._state_from_portfolio(ctx, st)
+    last_mark = {"510300.XSHG": 10.0}
+
+    dirty = runner._mark_to_market(_feed(10.0), None, ctx, st, last_mark,
+                                   pd.Timestamp("2026-07-17 10:30"))
+
+    assert dirty is False
+    assert st["positions"]["510300.XSHG"]["price"] == 10.0
+
+
+def test_strategy_loop_live_marks_positions(tmp_quant, monkeypatch):
+    """盘中实时：两次 tick 之间持仓价随最新行情打标，净值跟涨。"""
+    save_strategy("s_mk", "s", STRATEGY_NOOP)
+    aid = service.account_create("acct_mk", 100000.0, 0.03, "s_mk")
+    protocol.save_state(aid, _st())
+    pauses = iter([False] * 20 + [True])
+    monkeypatch.setattr(runner, "is_paused", lambda aid: next(pauses))
+    monkeypatch.setattr(runner, "in_trading", lambda now=None: True)
+    monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today: None)
+    sleep_log = []
+    monkeypatch.setattr(runner.time, "sleep", lambda s: sleep_log.append(s))
+
+    class _FixedNow(datetime.datetime):
+        current = datetime.datetime(2026, 7, 17, 10, 30, 0)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+
+    class _LiveDM(_StubDM):
+        def __init__(self):
+            super().__init__()
+            self.client = _FakeClient(price=12.0)
+
+    runner.run_loop(aid, dm=_LiveDM(), feed=None, matcher=Matcher(0.03))
+
+    st = protocol.read_state(aid)
+    assert st["positions"]["510300.XSHG"]["price"] == 12.0
+    assert st["net_value"] == pytest.approx(5000 * 12.0)
+    snaps = db.get_sim_snapshots(aid)
+    assert snaps and snaps[-1]["positions_value"] == pytest.approx(5000 * 12.0)

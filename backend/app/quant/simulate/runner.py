@@ -32,6 +32,8 @@ LIMIT_DOWN_PCT = -0.098  # 跌停判定阈值（主板 10% 留容差；科创/�
 LIMIT_UP_PCT = 0.098     # 涨停判定阈值（禁买，与跌停同口径）
 TICK_OFFSET = 8          # 交易时段每分钟第 N 秒后触发，等刚收的 bar 可读
 SESSION_END_GRACE = datetime.time(15, 2)  # 15:00 收市 bar 的处理宽限（之后进收盘钩子）
+MARK_INTERVAL = 10          # 盘中实时打标间隔（秒）
+MARK_SNAPSHOT_TICK = 0.0005 # 打标价格相对上次跳变超过该比例才落快照
 
 
 def in_trading(now=None):
@@ -752,6 +754,46 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
         _unset_replay_minute_window(dm)
 
 
+def _mark_to_market(feed, dm, ctx, state: dict, last_mark: dict, now) -> bool:
+    """盘中实时打标：把持仓价刷新到最新并重算净值。
+
+    与策略 tick 共用同一 ``feed``（策略 tick 用 live_feed.refresh 实时，mark 也用
+    同一 feed，保证 live 与测试/回放口径一致）。返回 True 表示任一持仓价相对上次
+    打标跳变超过 MARK_SNAPSHOT_TICK（调用方据此决定是否落快照 + save_state）。
+    只改估值，不触发策略/matcher。
+    """
+    pf = ctx.portfolio
+    if not pf.positions:
+        return False
+    codes = list(pf.positions.keys())
+    prices, _bar = feed(dm, codes, now, None)
+    if not prices:
+        return False
+    dirty = False
+    for code, pos in list(pf.positions.items()):
+        px = prices.get(code)
+        if px is None:
+            continue
+        prev = last_mark.get(code)
+        # 首次 mark：以当前已持久化持仓价为基线（刚被策略 tick 打过，价格未变不落快照）
+        if prev is None:
+            if pos.price and abs(px / pos.price - 1) >= MARK_SNAPSHOT_TICK:
+                dirty = True
+        elif abs(px / prev - 1) >= MARK_SNAPSHOT_TICK:
+            dirty = True
+        pos.price = float(px)
+        last_mark[code] = float(px)
+    if dirty:
+        _state_from_portfolio(ctx, state)
+        start_cash = state.get("start_cash", 0.0) or 0.0
+        positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
+        net = round(pf.cash + positions_value, 4)
+        state["net_value"] = net
+        state["pnl"] = round(net - start_cash, 4)
+        state["dt"] = str(now)
+    return dirty
+
+
 def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
                    state: dict, aux: dict, now=None):
     """单轮分钟驱动：喂数 -> 策略回调 -> 止损巡检 -> 落库。返回本轮 bar 时刻。
@@ -921,15 +963,44 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                 hooks_done["pre"] = today
             if in_trading(now) or (datetime.time(15, 0) < t <= SESSION_END_GRACE):
                 if aux["frequency"] == "daily" and aux["daily_done"] == today:
-                    # 日频账户：当日唯一 tick 已完成
-                    time.sleep(idle_interval)
+                    # 日频账户：当日唯一 tick 已完成，仍做实时打标
+                    dirty = _mark_to_market(feed, dm, ctx, state,
+                                            aux.setdefault("last_mark", {}), now)
+                    if dirty:
+                        save_state(account_id, state)
+                        positions_value = round(sum(
+                            p.amount * p.price for p in ctx.portfolio.positions.values()), 4)
+                        db.insert_sim_snapshot(account_id, state["dt"], state["net_value"],
+                                               state["cash"], positions_value,
+                                               state["pnl"],
+                                               round(state["net_value"] / state["start_cash"] - 1, 6)
+                                               if state["start_cash"] else 0.0)
+                    time.sleep(max(1, 60 - now.second + TICK_OFFSET))
                     continue
                 bar = _strategy_tick(account_id, bundle, ctx, dm, feed, matcher,
                                      state, aux, now)
                 if bar is not None and aux["frequency"] == "daily":
                     aux["daily_done"] = today
                 # 对齐分钟边界 + 偏移，等刚收的 bar 可读
-                time.sleep(max(1, 60 - now.second + TICK_OFFSET))
+                sleep_left = max(1, 60 - now.second + TICK_OFFSET)
+                while sleep_left > 0:
+                    step = min(MARK_INTERVAL, sleep_left)
+                    time.sleep(step)
+                    sleep_left -= step
+                    if not in_trading() or not ctx.portfolio.positions:
+                        continue
+                    mnow = datetime.datetime.now()
+                    dirty = _mark_to_market(feed, dm, ctx, state,
+                                            aux.setdefault("last_mark", {}), mnow)
+                    if dirty:
+                        save_state(account_id, state)
+                        positions_value = round(sum(
+                            p.amount * p.price for p in ctx.portfolio.positions.values()), 4)
+                        db.insert_sim_snapshot(account_id, state["dt"], state["net_value"],
+                                               state["cash"], positions_value,
+                                               state["pnl"],
+                                               round(state["net_value"] / state["start_cash"] - 1, 6)
+                                               if state["start_cash"] else 0.0)
             elif t > SESSION_END_GRACE and hooks_done["eod"] != today:
                 _eod(account_id, bundle, ctx, dm, state, aux, now)
                 hooks_done["eod"] = today
