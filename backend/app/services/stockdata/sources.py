@@ -87,10 +87,20 @@ _MINUTE_COLS = ["symbol", "datetime", "open", "high", "low", "close", "volume", 
 
 
 def _as_datetime(df: pl.DataFrame, col: str = "datetime") -> pl.DataFrame:
-    """分区/内存帧的 datetime 统一为 Datetime 类型（落盘为 Datetime("us")）。"""
-    if df.is_empty() or col not in df.columns or df.schema[col] != pl.Utf8:
+    """分区/内存帧的 datetime 统一为 Datetime("us")（与落盘分区口径一致）。
+
+    仅 Utf8 转换不够：实时回源经 pl.from_pandas 得到 Datetime("ns")，分区 parquet
+    为 Datetime("us")，两者 pl.concat 会因单位不一致抛 SchemaError。故对已存在的
+    Datetime 列也统一 cast 到 us。
+    """
+    if df.is_empty() or col not in df.columns:
         return df
-    return df.with_columns(pl.col(col).str.to_datetime())
+    dtype = df.schema[col]
+    if dtype == pl.Utf8:
+        return df.with_columns(pl.col(col).str.to_datetime())
+    if isinstance(dtype, pl.Datetime) and dtype.time_unit != "us":
+        return df.with_columns(pl.col(col).cast(pl.Datetime("us", dtype.time_zone)))
+    return df
 
 
 class MinuteMemoryStore:

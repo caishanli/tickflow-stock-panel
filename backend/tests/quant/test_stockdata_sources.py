@@ -140,6 +140,33 @@ def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
     assert df["close"].to_list() == [1.0]
 
 
+def test_realtime_snapshot_mixed_ns_us_datetime(src, monkeypatch):
+    """回归：分区帧 datetime 为 Datetime('us')（parquet 落盘口径），实时回源
+    pl.from_pandas 为 Datetime('ns')；两者经 _as_datetime 应统一单位，pl.concat
+    不再抛 Datetime('ns') vs Datetime('μs') SchemaError。"""
+    import pandas as pd
+
+    day = _dt.date.today().isoformat()
+    _write_minute(str(src.data_root), "kline_etf_minute", day, [
+        {"symbol": "512670.SH", "datetime": f"{day} 09:31:00", "open": 1.0,
+         "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1000, "amount": 1000.0},
+    ])
+    # 模拟实时回源帧：pandas 默认 Datetime('ns')
+    pdf = pd.DataFrame({
+        "symbol": ["512670.SH"], "datetime": pd.to_datetime([f"{day} 10:00:00"]),
+        "open": [1.1], "high": [1.1], "low": [1.1], "close": [1.1],
+        "volume": [2000], "amount": [2000.0],
+    })
+    ns_df = pl.from_pandas(pdf)
+    assert ns_df.schema["datetime"] == pl.Datetime("ns")
+    src.minute_store.update(day, ns_df)
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
+    df = src.get_realtime_snapshot(["512670.XSHG"])
+    assert not df.is_empty()
+    # 分区 09:31 与内存 10:00 两条都应在（unique keep="last" 只去同秒重复）
+    assert len(df) == 2
+
+
 def test_realtime_snapshot_empty_no_crash(src, monkeypatch):
     """标的当日无分区、非交易时段不触网：返回空帧而非 Utf8 与 datetime 比较崩溃。"""
     monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
