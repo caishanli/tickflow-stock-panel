@@ -274,7 +274,11 @@ def test_get_stock_names_returns_local_stock_names(tmp_path, monkeypatch):
         {"symbol": "600000.SH", "name": "浦发银行", "code": "600000"},
         {"symbol": "600249.SH", "name": "两面针", "code": "600249"},
     ])
-    # 免费 API 必失败（未 mock）→ 降级本地
+    # 隔离：免费 API 若被调用必抛异常（保持离线确定性）
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no net")),
+    )
     s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=1)
     try:
         names = s.get_stock_names()
@@ -304,6 +308,33 @@ def test_get_stock_names_etf_falls_back_to_api(tmp_path, monkeypatch):
     try:
         names = s.get_stock_names()
         assert names.get("600000") == "浦发银行"  # 本地名称仍在
+    finally:
+        s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_get_stock_names_etf_from_api(tmp_path, monkeypatch):
+    """ETF 名称本地缺失时走免费 API 成功路径。"""
+    import os
+    import polars as pl
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    _write_instruments(str(tmp_path), [
+        {"symbol": "600000.SH", "name": "浦发银行", "code": "600000"},
+    ])
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type",
+        lambda *a, **k: pl.DataFrame([
+            {"symbol": "159985.SZ", "name": "豆粕ETF华夏"},
+            {"symbol": "511880.SH", "name": "银华日利ETF"},
+        ]),
+    )
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=1)
+    try:
+        names = s.get_stock_names()
+        assert names.get("600000") == "浦发银行"
+        assert names.get("159985") == "豆粕ETF华夏"
+        assert names.get("511880") == "银华日利ETF"
+        assert s.get_stock_names(codes=["159985"]) == {"159985": "豆粕ETF华夏"}
     finally:
         s.puller.shutdown()
         os.environ.pop("PARTITION_DATA_ROOT", None)
