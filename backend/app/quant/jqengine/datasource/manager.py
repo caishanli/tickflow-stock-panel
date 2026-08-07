@@ -1099,7 +1099,10 @@ class DataManager:
                 else:
                     _td_arr = pd.to_datetime(_td).to_numpy()
                 money_arr = money_col.astype(float).to_numpy()
-                mask = money_arr > 0
+                # 停牌/退市标的分区里 amount 为 2**-127（≈0 sentinel）占位值，
+                # ``> 0`` 会把它计入"有成交"，导致全市场 ETF 总成交额出现
+                # "0.00亿元 (1只ETF有成交)" 的误导日志。低于 1 元视为无成交剔除。
+                mask = money_arr > 1.0
                 if not mask.any():
                     continue
                 # 用 numpy 数组直接拼，避免逐 code 建 DataFrame + concat（130万行）

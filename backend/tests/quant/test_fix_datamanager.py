@@ -150,6 +150,38 @@ def test_money_memo_full_frame_and_version(tmp_path):
     assert (res3["money"] >= 9e8).all()
 
 
+# ---------------- 占位成交额（停牌/退市 sentinel）不应计入"有成交" ----------------
+
+def test_money_filter_excludes_placeholder_amount(tmp_path):
+    """停牌/退市标的分区里 amount=2**-127（≈0 sentinel）不得算"有成交"。
+
+    回归：560650.SH 停牌后 07-02~07-30 amount 恒为 5.877e-39（占位值），
+    _build_money_full 的 ``money > 0`` 会把它计入 → 策略"全市场ETF总成交额"
+    出现 "0.00亿元 (1只ETF有成交)" 的误导日志。占位 amount 应整体剔除。"""
+    dm = _make_dm(tmp_path, set_window=False)
+    today = pd.Timestamp.today().normalize()
+    dates = pd.bdate_range("2026-07-01", min(pd.Timestamp("2026-08-06"), today))
+    # 正常 ETF：真实成交额
+    dm._daily_mem["get_daily_510300.XSHG"] = _daily_df(dates, 1e6)
+    # 占位 ETF：07-02 起 amount 为 sentinel（≈0）
+    n = len(dates)
+    stub = pd.DataFrame({
+        "trade_date": [d.strftime("%Y-%m-%d") for d in dates],
+        "open": [1.068] * n,
+        "close": [1.068] * n,
+        "volume": [2 ** -125] * n,
+        "money": [2 ** -127] * n,
+    })
+    dm._daily_mem["get_daily_560650.XSHG"] = stub
+
+    res = dm.get_daily_money_cached(["510300.XSHG", "560650.XSHG"],
+                                    str(dates[-1].date()), count=3)
+    assert "560650.XSHG" not in set(res["code"]), \
+        "占位 amount 标的不应出现在成交额明细中"
+    # 正常 ETF 仍完整返回
+    assert "510300.XSHG" in set(res["code"])
+
+
 # ---------------- H6b：merged 结果裁剪到请求窗口 [lo, hi] ----------------
 
 def test_merged_clipped_to_window_and_real_only(tmp_path):
