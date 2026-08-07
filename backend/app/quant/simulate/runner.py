@@ -426,7 +426,7 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
 
 def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
     """成交增量 / 状态 / 净值快照落库（每轮一次）。"""
-    trades = jq_api._state.get("trades") or []
+    trades = getattr(jq_api, "_state", {}).get("trades") or []
     drained = aux.get("trades_drained", 0)
     is_replay = aux.get("replay_mode", False)
     batch_trades = aux.get("batch_trades") if is_replay else None
@@ -449,7 +449,7 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
     pf = ctx.portfolio
     positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
     net = round(pf.cash + positions_value, 4)
-    start_cash = aux["start_cash"]
+    start_cash = aux.get("start_cash") or state.get("start_cash") or 0.0
     _state_from_portfolio(ctx, state)
     state["net_value"] = net
     state["pnl"] = round(net - start_cash, 4)
@@ -466,8 +466,45 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
         db.insert_sim_snapshot(*snapshot_row)
 
 
+def _revalue_at_close(dm, ctx, state: dict, bar_dt) -> None:
+    """收盘重估：把全部持仓按当日真实收盘价重打，并重算 state 净值。
+
+    价格源：优先 ``dm.get_minute_price_at(code, 当日 15:00)``（真实 1m 收盘），
+    无则回退日线当日 close（provider.get_daily 有进程内缓存）。只更新估值，
+    不触发策略回调 / matcher，不落库（落库由调用方 ``_persist`` 完成）。
+    """
+    if dm is None:
+        return
+    today = pd.Timestamp(bar_dt)
+    close_ts = today.replace(hour=15, minute=0, second=0, microsecond=0)
+    pf = ctx.portfolio
+    changed = False
+    for code, pos in list(pf.positions.items()):
+        price = dm.get_minute_price_at(code, close_ts)
+        if price is None:
+            try:
+                df = dm.fetch("get_daily", code, str(today.date()), str(today.date()))
+                if df is not None and not (hasattr(df, "empty") and df.empty):
+                    price = float(df["close"].iloc[-1])
+            except Exception as e:  # noqa: BLE001
+                log.warning("[runner] %s 收盘价重估失败: %s", code, e)
+        if price is None:
+            log.warning("[runner] %s 收盘重估无价，保留现价 %.4f", code, pos.price)
+            continue
+        pos.price = float(price)
+        changed = True
+    if changed:
+        _state_from_portfolio(ctx, state)
+        start_cash = state.get("start_cash", 0.0) or 0.0
+        positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
+        net = round(pf.cash + positions_value, 4)
+        state["net_value"] = net
+        state["pnl"] = round(net - start_cash, 4)
+        state["dt"] = str(bar_dt)
+
+
 def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
-    """收盘（每交易日一次）：after_close/after_trading_end + 真实分钟落盘 + 最终快照。"""
+    """收盘（每交易日一次）：after_close/after_trading_end + 真实分钟落盘 + 收盘重估 + 最终快照。"""
     if aux.get("replay_mode"):
         _flush_replay_batch(account_id, aux)
     for func, t in bundle.daily:
@@ -476,6 +513,7 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
     if bundle.after_trading_end is not None:
         _safe_call(account_id, bundle.after_trading_end, ctx, "after_trading_end")
     live_feed.persist_real(dm, aux["fresh_frames"])
+    _revalue_at_close(dm, ctx, state, pd.Timestamp(now))
     _persist(account_id, ctx, state, now, aux["jq_api"], aux)
     # now 在补跑时是引擎推进到的当日收市时刻（15:05），日志时间戳随引擎而非真实时钟
     _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘", ts=str(now))
@@ -585,6 +623,12 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
             if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
                 continue
             _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+        # 收盘后启动/重置账户：补跑完今天后先按真实收盘价重估，再进实时
+        if now.time() > SESSION_END_GRACE:
+            _revalue_at_close(dm, ctx, state,
+                              pd.Timestamp(datetime.datetime.combine(today, datetime.time(15, 5))))
+            _persist(account_id, ctx, state,
+                     datetime.datetime.combine(today, datetime.time(15, 5)), aux["jq_api"], aux)
         _emit_log(account_id, "info",
                   f"日内补跑完成，净值 {state.get('net_value', 0):.2f}",
                   ts=str(aux.get("replay_dt") or state.get("dt") or now))
@@ -686,6 +730,12 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                 if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
                     continue
                 _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+            # 收盘后启动/重置账户：补跑完今天后先按真实收盘价重估，再进实时
+            if now.time() > SESSION_END_GRACE:
+                _revalue_at_close(dm, ctx, state,
+                                  pd.Timestamp(datetime.datetime.combine(today, datetime.time(15, 5))))
+                _persist(account_id, ctx, state,
+                         datetime.datetime.combine(today, datetime.time(15, 5)), aux["jq_api"], aux)
             _emit_log(account_id, "info",
                       f"今日 {now.strftime('%H:%M')} 前已回补，净值 {state.get('net_value', 0):.2f}",
                       ts=str(aux.get("replay_dt") or state.get("dt") or now))
