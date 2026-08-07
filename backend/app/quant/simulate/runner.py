@@ -569,6 +569,8 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         aux["batch_trades"] = []
         aux["batch_logs"] = []
         today = datetime.date.today()
+        # 钉住补跑区间分钟窗口并批量预取池（当日场景，窗口即为当天）
+        _pin_replay_minute_window(dm, ctx, from_ts, today)
         _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
                     datetime.datetime.combine(today, datetime.time(9, 25)), aux)
         now = datetime.datetime.now()
@@ -592,6 +594,34 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         _replay_active_ids.discard(account_id)
 
 
+def _pin_replay_minute_window(dm, ctx, start, end) -> None:
+    """补跑前把整个补跑区间钉为分钟窗口并批量预取池，消除逐日滑动窗口的重复回源。
+
+    回测由 rqalpha_bridge 在启动前 set_minute_window；模拟盘补跑此处补上同口径。
+    用 hasattr 兜底：stub DM（既有测试）无此方法时静默跳过，不影响行为。
+    """
+    if dm is None:
+        return
+    set_win = getattr(dm, "set_minute_window", None)
+    if set_win is not None:
+        try:
+            set_win(str(start)[:10], str(end)[:10])
+        except Exception:  # noqa: BLE001
+            pass
+    codes = []
+    if ctx is not None:
+        pf = getattr(ctx, "portfolio", None)
+        codes = list(dict.fromkeys(
+            list(getattr(ctx, "universe", None) or [])
+            + (list(pf.positions.keys()) if pf is not None else [])))
+    preload = getattr(dm, "preload_minute_for_pool", None)
+    if preload is not None and codes:
+        try:
+            preload(codes, pd.Timestamp(end))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     state: dict, aux: dict, start_date: str) -> None:
     """从 start_date 起按历史分钟补跑至今日（今天仅补跑到当前已走完的 bar），
@@ -608,6 +638,8 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
         # 含今天：完整交易日回放到昨日；今天既已开市（盘前/盘中/收盘）则也回放到当前时刻
         days = _trade_days_between(dm, start_date, today)
         full_days = [d for d in days if d != today]
+        # 钉住整个补跑区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源
+        _pin_replay_minute_window(dm, ctx, start_date, today)
         first_ts = (datetime.datetime.combine(days[0], datetime.time(9, 25))
                     if days else now)
         _emit_log(account_id, "info",

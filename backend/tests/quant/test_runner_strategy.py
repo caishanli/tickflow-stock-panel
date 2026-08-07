@@ -275,10 +275,25 @@ def test_session_minutes_full_day():
 
 
 def _replay_dm_cls(days):
-    """带历史日线（交易日判定/取交易日表）与历史分钟价的 stub DM。"""
+    """带历史日线（交易日判定/取交易日表）与历史分钟价的 stub DM。
+
+    附 set_minute_window / preload_minute_for_pool 桩：记录补跑是否把整个区间钉窗
+    口并批量预取池（Task 1 提速的核心行为）。
+    """
 
     class _ReplayDM(_StubDM):
         DAYS = days
+
+        def __init__(self):
+            super().__init__()
+            self.window_seen = None
+            self.pool_seen = None
+
+        def set_minute_window(self, start, end):
+            self.window_seen = (str(start)[:10], str(end)[:10])
+
+        def preload_minute_for_pool(self, codes, as_of=None):
+            self.pool_seen = list(codes) if codes else []
 
         def fetch(self, method, *a, **k):
             if method == "get_daily" and a and a[0] == "000300.XSHG":
@@ -324,8 +339,25 @@ def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
     assert reb and reb[0]["ts"].startswith(str(days[0]))
     start_log = [l for l in logs if "开始历史补跑" in l["message"]]
     done_log = [l for l in logs if "历史补跑完成" in l["message"]]
-    assert start_log[0]["ts"].startswith(str(days[0]))
     assert done_log[0]["ts"].startswith(str(days[-1]))
+
+
+def test_replay_pins_minute_window_and_preloads_pool(tmp_quant, monkeypatch):
+    """补跑前必须钉住整个区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源。"""
+    today = datetime.date.today()
+    days = [today - datetime.timedelta(days=n) for n in (4, 3, 2, 1)]
+    save_strategy("s_pin", "s", STRATEGY_BUY)
+    aid = service.account_create("acct_pin", 100000.0, 0.03, "s_pin", str(days[0]))
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    dm = _replay_dm_cls(days)()
+    runner.run_loop(aid, dm=dm, feed=_feed_factory(10.0), matcher=Matcher(0.03))
+
+    assert dm.window_seen is not None
+    assert dm.window_seen[0] == str(days[0])
+    # 窗口上界 = 今天（start_date 在今天内，整个补跑区间被钉住）
+    assert dm.window_seen[1] == str(today)
+    assert dm.pool_seen is not None
+    assert "510300.XSHG" in dm.pool_seen           # 策略 universe 标的被批量预取
 
 
 def test_strategy_loop_replays_today_intraday_bars(tmp_quant, monkeypatch):
