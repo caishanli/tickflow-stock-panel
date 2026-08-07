@@ -496,10 +496,20 @@ class DataSources:
         return sorted(set(df["symbol"].to_list()))
 
     def _build_name_map(self) -> dict[str, str]:
-        """构建 {纯6位代码: 名称} 映射：本地 instruments（股票）+ ETF（本地或免费 API）。
+        """构建 {纯6位代码: 名称} 映射：优先读本地缓存命中，否则本地 instruments（股票）
+        + ETF（本地或免费 API），构建后写回缓存。
 
         名称属展示层：任何失败降级为空/部分映射，不影响行情路径。
         """
+        # 0) 缓存命中直接返回（免重复构建/免网络）
+        try:
+            if os.path.exists(self._names_cache_file):
+                with open(self._names_cache_file, encoding="utf-8") as f:
+                    cached = _json.load(f)
+                if isinstance(cached, dict) and cached:
+                    return {str(k): str(v) for k, v in cached.items()}
+        except Exception:
+            pass
         out: dict[str, str] = {}
         # 1) 股票：本地 instruments parquet（免费档已含全量股票名称）
         try:
