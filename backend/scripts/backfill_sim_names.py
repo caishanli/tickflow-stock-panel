@@ -15,6 +15,9 @@ from app.quant.simulate import names
 def main() -> None:
     db.init_db()
     name_map = names.get_name_map()
+    if not name_map:
+        print("名称映射为空（stockdata 服务不可达？），跳过回填")
+        return
     total_trades = 0
     total_pos = 0
     for acct in db.list_sim_accounts():
@@ -27,7 +30,7 @@ def main() -> None:
                 (aid,),
             ).fetchall()
             for r in rows:
-                n = name_map.get(r["code"].split(".")[0]) or r["code"]
+                n = name_map.get(r["code"].split(".")[0]) or ""
                 c.execute("UPDATE sim_trades SET name=? WHERE rowid=?",
                           (n, r["rowid"]))
             total_trades += len(rows)
@@ -37,7 +40,7 @@ def main() -> None:
         changed = False
         for code, p in pos.items():
             if not p.get("name"):
-                p["name"] = name_map.get(code.split(".")[0]) or code
+                p["name"] = name_map.get(code.split(".")[0]) or ""
                 changed = True
         if changed:
             st["positions_json"] = json.dumps(pos, ensure_ascii=False)

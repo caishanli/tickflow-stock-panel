@@ -99,7 +99,6 @@ def test_sim_trade_batch_with_name():
 def test_sim_trade_name_column_migration_on_old_db():
     """旧库（无 name 列）init_db 自动补列，历史行 name 为 NULL。"""
     p = _fresh()
-    import sqlite3
     # 手动建无 name 列的旧表结构（先删新表）
     conn = sqlite3.connect(p)
     conn.execute("DROP TABLE sim_trades")
