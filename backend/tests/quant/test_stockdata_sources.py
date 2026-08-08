@@ -368,3 +368,29 @@ def test_get_stock_names_etf_from_local_parquet(tmp_path, monkeypatch):
     finally:
         s.puller.shutdown()
         os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_get_stock_names_writes_cache_when_etf_ok(tmp_path, monkeypatch):
+    """ETF 段成功（含 517xxx 等非前缀列表内代码）时缓存应落盘。"""
+    import json
+    import os
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    _write_instruments(str(tmp_path), [
+        {"symbol": "600000.SH", "name": "浦发银行", "code": "600000"},
+    ])
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type",
+        lambda *a, **k: pl.DataFrame([
+            {"symbol": "517900.SH", "name": "银行AH价格优选ETF"},
+        ]),
+    )
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=1)
+    try:
+        s.get_stock_names()
+        assert os.path.exists(s._names_cache_file)
+        with open(s._names_cache_file, encoding="utf-8") as f:
+            cached = json.load(f)
+        assert cached.get("517900") == "银行AH价格优选ETF"
+    finally:
+        s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)

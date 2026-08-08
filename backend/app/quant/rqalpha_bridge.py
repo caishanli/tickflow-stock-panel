@@ -1256,10 +1256,14 @@ def _load_etf_universe(dm):
         names = dm.sources["network"].get_stock_names() or {}
     except Exception:
         pass
-    # 通达信名转 JQ 码键（与快照键格式一致），不再 _clean_etf_name
-    names = {_ts_to_jq(c + (".SH" if c.isdigit() and c[:1] in "569" else ".SZ")): n
-             for c, n in names.items()}
-    return etf_codes, names, {}
+    # 通达信名转 JQ 码键（与快照键格式一致），不再 _clean_etf_name；
+    # 仅接受 6 位纯数字代码，避免非标键拼后缀污染名称映射
+    jq_names = {}
+    for c, n in names.items():
+        c = str(c)
+        if len(c) == 6 and c.isdigit():
+            jq_names[_ts_to_jq(c + (".SH" if c[:1] in "569" else ".SZ"))] = n
+    return etf_codes, jq_names, {}
 
 
 def run_jq_backtest(strategy_path: str, params: dict,

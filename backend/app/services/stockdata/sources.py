@@ -523,6 +523,7 @@ class DataSources:
         except Exception:
             logger.warning("get_stock_names: instruments 读取失败", exc_info=True)
         # 2) ETF：本地 instruments_etf parquet 优先，缺失则免费 TickFlow API 补
+        etf_ok = False
         try:
             import glob as _glob
             etf_paths = _glob.glob(
@@ -542,13 +543,12 @@ class DataSources:
                 for sym, name in df_etf.select(["symbol", "name"]).iter_rows():
                     if sym and name:
                         out.setdefault(str(sym).split(".")[0], str(name))
+                        etf_ok = True
         except Exception:
             logger.warning("get_stock_names: ETF 名称获取失败，降级本地", exc_info=True)
-        # 3) 落盘缓存：仅当 ETF 段成功（out 非空且含 ETF 代码）时写，避免
-        #    ETF API 失败时钉住股票-only 映射
-        has_etf = any(k.startswith(("159", "511", "512", "513", "515", "516",
-                                    "518", "588", "510", "501")) for k in out)
-        if has_etf:
+        # 3) 落盘缓存：仅当 ETF 段成功（etf_ok）时写，避免 ETF API 失败时
+        #    钉住股票-only 映射
+        if etf_ok:
             try:
                 os.makedirs(os.path.dirname(self._names_cache_file), exist_ok=True)
                 with open(self._names_cache_file, "w", encoding="utf-8") as f:

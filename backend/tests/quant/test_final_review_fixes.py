@@ -4,9 +4,6 @@ from __future__ import annotations
 import json
 import datetime as _dt
 
-import pytest
-
-from app.quant import db
 from app.quant.jqengine.engine.jq import jq_names
 
 
