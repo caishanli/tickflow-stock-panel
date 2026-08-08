@@ -1225,9 +1225,12 @@ def _merge_cache_daily_codes(dm, codes, names, tdx_names=None):
 
 
 def _load_etf_universe(dm):
-    """加载全市场 ETF 名录（代码 + 清洗后名称 + 上市/退市日期），对齐聚宽
+    """加载全市场 ETF 名录（代码 + 原始聚宽名 + 上市/退市日期），对齐聚宽
     get_all_securities(['etf'])。返回 (codes, name_map, list_dates)，其中
     list_dates 为 {code: (list_date, delist_date)}（'YYYY-MM-DD'）。
+
+    名称直接用快照原始聚宽名（与模拟盘 jq 源、聚宽三方一致），不再叠加
+    _clean_etf_name 二次清洗。
 
     快照机制（保证同一策略结果可复现，不随每次启动的实时拉取漂移）：
     - 快照存在且 fetched_at 距今 ≤7 天：直接使用（离线/在线都优先）；
@@ -1239,8 +1242,7 @@ def _load_etf_universe(dm):
              and _dt.datetime.now() - snap[0] <= _ETF_SNAPSHOT_MAX_AGE)
     if fresh:
         codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
-        names = {c: _clean_etf_name(n) for c, n in names.items()}
-        return codes, names, snap[3]
+        return codes, dict(snap[2]), snap[3]
     # 快照过期或不存在 → 从本地缓存推导（_daily_mem 含全市场股票，
     # 必须用 _is_jq_etf_code 过滤，否则股票会混进 ETF 宇宙）
     from .jqcompat import _is_jq_etf_code
@@ -1254,7 +1256,9 @@ def _load_etf_universe(dm):
         names = dm.sources["network"].get_stock_names() or {}
     except Exception:
         pass
-    names = {c: _clean_etf_name(n) for c, n in names.items()}
+    # 通达信名转 JQ 码键（与快照键格式一致），不再 _clean_etf_name
+    names = {_ts_to_jq(c + (".SH" if c.isdigit() and c[:1] in "569" else ".SZ")): n
+             for c, n in names.items()}
     return etf_codes, names, {}
 
 

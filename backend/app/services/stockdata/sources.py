@@ -544,13 +544,17 @@ class DataSources:
                         out.setdefault(str(sym).split(".")[0], str(name))
         except Exception:
             logger.warning("get_stock_names: ETF 名称获取失败，降级本地", exc_info=True)
-        # 3) 落盘缓存（下次启动命中，免网络）
-        try:
-            os.makedirs(os.path.dirname(self._names_cache_file), exist_ok=True)
-            with open(self._names_cache_file, "w", encoding="utf-8") as f:
-                _json.dump(out, f, ensure_ascii=False)
-        except Exception:
-            pass
+        # 3) 落盘缓存：仅当 ETF 段成功（out 非空且含 ETF 代码）时写，避免
+        #    ETF API 失败时钉住股票-only 映射
+        has_etf = any(k.startswith(("159", "511", "512", "513", "515", "516",
+                                    "518", "588", "510", "501")) for k in out)
+        if has_etf:
+            try:
+                os.makedirs(os.path.dirname(self._names_cache_file), exist_ok=True)
+                with open(self._names_cache_file, "w", encoding="utf-8") as f:
+                    _json.dump(out, f, ensure_ascii=False)
+            except Exception:
+                pass
         return out
 
     def get_stock_names(self, codes: list[str] | None = None) -> dict[str, str]:

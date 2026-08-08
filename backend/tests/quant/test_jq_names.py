@@ -8,10 +8,11 @@ from app.quant.jqengine.engine.jq import jq_names
 
 def test_load_jq_names_reads_snapshot(tmp_path, monkeypatch):
     """jq_names.load_jq_names 读 etf_universe_snapshot.json。"""
+    import datetime as _dt
     import json
     snap = tmp_path / "etf_universe_snapshot.json"
     snap.write_text(json.dumps({
-        "fetched_at": "2026-07-27T08:00:00",
+        "fetched_at": (_dt.datetime.now() - _dt.timedelta(days=1)).isoformat(),
         "codes": ["511880.XSHG"],
         "names": {"511880.XSHG": "货币ETF-A"},
         "list_dates": {},

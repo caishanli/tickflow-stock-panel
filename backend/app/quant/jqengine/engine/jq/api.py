@@ -836,23 +836,25 @@ def get_security_name(code):
         return names[code]
     mgr = _state.get("manager")
     if mgr:
-        # 先尝试网络源通达信简称
+        # 先尝试网络源通达信简称（与 get_all_securities 同口径：网络异常时
+        # jq 名替换块仍执行，保证 jq 名生效）
+        mootdx_names = {}
         if "network" in mgr.sources:
             try:
                 mootdx_names = mgr.sources["network"].get_stock_names()
-                if _name_source() == "jq":
-                    jq = _jq_names()
-                    if jq:
-                        mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
-                pure = code.split(".")[0]
-                if pure in mootdx_names:
-                    if names is None:
-                        names = {}
-                    names[code] = mootdx_names[pure]
-                    _state["sec_names"] = names
-                    return mootdx_names[pure]
             except Exception:
                 pass
+        if _name_source() == "jq":
+            jq = _jq_names()
+            if jq:
+                mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
+        pure = code.split(".")[0]
+        if pure in mootdx_names:
+            if names is None:
+                names = {}
+            names[code] = mootdx_names[pure]
+            _state["sec_names"] = names
+            return mootdx_names[pure]
         try:
             etfs = mgr.fetch("get_etf_list")
             if etfs:
