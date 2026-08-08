@@ -89,11 +89,18 @@
 - **模拟盘策略侧**（Task 7，已实现）：jqengine `get_all_securities`/`get_security_name`
   默认读快照原始聚宽名（`jq` 源），可切回通达信名（`tdx` 源）。开关存
   `quant_settings.sim_strategy_name_source`。
-- **回测侧**（Task 8，待实现）：`rqalpha_bridge._load_etf_universe` **移除**
+- **回测侧**（Task 8，已实现）：`rqalpha_bridge._load_etf_universe` **移除**
   `:1242/:1257` 的 `_clean_etf_name` 二次清洗，让回测策略侧也用快照原始聚宽名
   ——与模拟盘 jq 源、聚宽三方一致。（实测二次清洗改变 1253/1787 名称，是偏离。）
-- **快照过期**：`jq_names` 需像回测一样做 30 天新鲜度检查，过期回退（见 Task 8）。
+- **快照过期**（Task 8，已实现）：`jq_names` 加 30 天新鲜度检查（`MAX_AGE`），
+  过期回退通达信名，与回测同口径。
 - 网页成交/持仓显示列仍用通达信全名（`names.py`），独立于策略侧开关。
+
+**实证说明（二次最终评审）**：移除回测二次清洗后，wufu 回测 260401-260716 结果与
+基线条**逐字节一致**（112614.1146 / 85 笔）——wufu 策略自身 `clean_name`
+（wufu-v5.2.py:584）会再清洗，桥接层预清洗对该策略无行为影响。代码修复仍正确
+（三方统一原始聚宽名，`get_all_securities` 名称源一致），但本分支**不**改变
+wufu 回测收益对齐（+12.61% vs 聚宽 +3.86% 的差异另有驱动，非名称清洗）。
 
 ### 2. 名称解析模块（新增 `backend/app/quant/simulate/names.py`）
 
