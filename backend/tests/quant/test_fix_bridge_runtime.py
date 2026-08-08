@@ -38,6 +38,9 @@ def _write_bundle(tmp_path, bars: dict) -> str:
 
 _DAYS = [("2024-01-02", 10.0), ("2024-01-03", 11.0), ("2024-01-04", 12.0)]
 
+# 基准校验需要起点前一交易日的数据（rqalpha analyser 的 returns 种子日）
+_PREV_DAY = ("2023-12-29", 10.0)
+
 # 首日买 100 股、次日全卖：验证费用与 pnl
 _TRADE_STRATEGY_TMPL = (
     "from rqalpha import api\n"
@@ -168,3 +171,57 @@ def test_status_terminal_not_overwritten_by_done(tmp_path):
     run = db.get_run("guard1")
     assert run["status"] == "failed", f"终态被覆盖: {run['status']}"
     assert run["error"] == "terminated"
+
+
+def test_benchmark_nav_live_hook_with_configured_benchmark(tmp_path):
+    """配置基准后 live 钩子写真实基准净值（回归：此前传 Instrument 对象给
+    data_proxy.get_bar 抛 TypeError → 基准恒 1.0，收益曲线无基线）。"""
+    # bundle 同时含策略标的与基准标的（close 10/11/12，另含起点前一交易日）
+    bundle = _write_bundle(tmp_path, {
+        "600000.XSHG": [_PREV_DAY] + _DAYS,
+        "510300.XSHG": [_PREV_DAY] + _DAYS,
+    })
+    db_path = str(tmp_path / "bench.db")
+    db.init_db(db_path)
+    res = run_backtest_on_bundle(
+        bundle_dir=bundle,
+        strategy_code=_TRADE_STRATEGY_TMPL.format(code="600000.XSHG"),
+        params={"run_id": "bench1", "symbols": ["600000.XSHG"], "start": "2024-01-02",
+                "end": "2024-01-04", "frequency": "1d", "capital": 100000.0,
+                "fee": 0.001, "min_commission": 0, "slippage": 0.0,
+                "benchmark": "510300.XSHG"},
+        db_path=db_path,
+    )
+    run = db.get_run("bench1")
+    assert run["status"] == "done", f"status={run['status']}, error={run.get('error')}"
+    equity = db.get_equity("bench1")
+    # 基准净值 = 当日收盘 / 首日收盘 → 1.0 / 1.1 / 1.2
+    assert [round(r["benchmark"], 6) for r in equity] == [1.0, 1.1, 1.2]
+
+
+def test_backtest_logs_use_engine_advancing_time(tmp_path):
+    """回测策略日志时间戳为引擎推进时刻（trading_dt），非真实墙钟。"""
+    import datetime as _dt
+
+    jq.install_jqcompat(["600000.XSHG"])  # 注册 jqdata.log（_Log → LIVE_SINK）
+    bundle = _write_bundle(tmp_path, {"600000.XSHG": _DAYS})
+    db_path = str(tmp_path / "logts.db")
+    db.init_db(db_path)
+    res = run_backtest_on_bundle(
+        bundle_dir=bundle,
+        strategy_code=_H4_STRATEGY,
+        params={"run_id": "logts1", "symbols": ["600000.XSHG"], "start": "2024-01-02",
+                "end": "2024-01-04", "frequency": "1d", "capital": 100000.0,
+                "fee": 0.0003, "slippage": 0.0},
+        db_path=db_path,
+    )
+    run = db.get_run("logts1")
+    assert run["status"] == "done", f"status={run['status']}, error={run.get('error')}"
+    logs = db.get_logs("logts1")
+    engine_msgs = [l for l in logs if l["message"].startswith("CB_")]
+    assert engine_msgs, "应捕获到策略日志"
+    for l in engine_msgs:
+        ts = _dt.datetime.strptime(l["ts"], "%Y-%m-%d %H:%M:%S")
+        # 引擎推进时间落在回测窗口内（2024-01-02~04），而非提交时刻的真实时钟
+        assert _dt.datetime(2024, 1, 2) <= ts <= _dt.datetime(2024, 1, 4, 23, 59, 59), (
+            f"策略日志应为引擎推进时间, got {l['ts']} msg={l['message']}")

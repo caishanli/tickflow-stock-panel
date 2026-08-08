@@ -737,7 +737,9 @@ function LogList({ logs }: { logs: any[] }) {
   return (
     <div className="space-y-0.5 text-[11px] text-muted font-mono">
       {logs.map((l, i) => (
-        <div key={i}>{typeof l === 'string' ? l : `${l.level ?? ''} ${l.message ?? JSON.stringify(l)}`}</div>
+        <div key={i}>
+          {typeof l === 'string' ? l : `${l.ts ?? ''} [${l.level ?? 'info'}] ${l.message ?? JSON.stringify(l)}`}
+        </div>
       ))}
     </div>
   )
