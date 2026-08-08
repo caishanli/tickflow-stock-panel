@@ -14,7 +14,10 @@ _NAMES: dict[str, str] | None = None  # {纯6位代码: 名称}
 
 
 def get_name_map() -> dict[str, str]:
-    """返回 {纯6位代码: 名称}，进程内缓存。失败返回空映射。"""
+    """返回 {纯6位代码: 名称}，进程内缓存。失败返回空映射。
+
+    通达信名优先；缺失的标的（如 LOF）回退聚宽快照名。
+    """
     global _NAMES
     if _NAMES is not None:
         return _NAMES
@@ -30,6 +33,15 @@ def get_name_map() -> dict[str, str]:
                 out[pure] = str(name)
     except Exception:
         log.warning("get_stock_names 失败，标的名称回退代码", exc_info=True)
+    # 通达信名缺失的标的（如 LOF）补聚宽快照名（JQ码 → 纯代码键）
+    try:
+        from ..jqengine.engine.jq.jq_names import load_jq_names
+        for jq_code, name in (load_jq_names() or {}).items():
+            if name:
+                pure = str(jq_code).split(".", 1)[0]
+                out.setdefault(pure, str(name))
+    except Exception:
+        log.warning("聚宽快照名补充失败，仅用通达信名", exc_info=True)
     _NAMES = out
     return out
 
