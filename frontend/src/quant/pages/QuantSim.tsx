@@ -224,6 +224,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const { data: logs } = useQuery({
     queryKey: ['quant', 'sim', aid, 'logs'], queryFn: () => api.getSimLogs(aid),
   })
+  const { data: nameSource } = useQuery({
+    queryKey: ['quant', 'sim', 'name-source'], queryFn: () => api.getSimNameSource(),
+  })
+  const toggleNameSource = useMutation({
+    mutationFn: (src: 'jq' | 'tdx') => api.setSimNameSource(src),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['quant', 'sim', 'name-source'] }) },
+  })
 
   const appendTo = (key: any[], row: any, sig?: (r: any) => string) => {
     qc.setQueryData(key, (prev: any[]) => {
@@ -376,6 +383,10 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           策略 {strategyName(acct.strategy_id)} · {FREQ_LABEL[acct.frequency] ?? '分钟级'}
           {acct.start_date ? ` · 自 ${acct.start_date}` : ''}
         </span>
+        <button onClick={() => toggleNameSource.mutate(nameSource?.source === 'jq' ? 'tdx' : 'jq')}
+          className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg bg-elevated text-foreground text-xs">
+          策略名称：{nameSource?.source === 'tdx' ? '通达信' : '聚宽'}
+        </button>
         <div className="ml-auto flex gap-2">
           <button onClick={() => setShowDingtalkCfg(true)}
             className={`inline-flex items-center gap-1 px-3 h-9 rounded-lg text-xs ${acct?.dingtalk_enabled ? 'bg-accent text-white' : 'bg-elevated text-foreground'}`}>
