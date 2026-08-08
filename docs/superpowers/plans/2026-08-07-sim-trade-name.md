@@ -207,8 +207,25 @@ import json as _json
 
 - [ ] **Step 4: 运行确认通过**
 
+先 patch 现有 `test_metadata_methods_with_ohlcv_only_partitions`（:236-252）——其末尾
+`assert src.get_stock_names() == {}` 断言在无 instruments parquet 时仍为真，但新实现
+会触发 `_fetch_instruments_by_type` 真实网络调用。给该测试加 monkeypatch 隔离：
+
+```python
+def test_metadata_methods_with_ohlcv_only_partitions(src, monkeypatch):
+    """分区仅 symbol/OHLCV：元数据方法不再因缺 name/list_date 列而崩。"""
+    # 隔离：无 instruments parquet 时不应触发真实网络 API（保持离线确定性）
+    monkeypatch.setattr(
+        "app.services.index_sync._fetch_instruments_by_type",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    df = src.get_all_securities(["stock"], None)
+    ...
+    assert src.get_stock_names() == {}
+```
+
 Run: `uv run --extra dev pytest tests/quant/test_stockdata_sources.py -v`
-Expected: 全绿（含新增 3 个 + 原有测试；`test_metadata_methods_with_ohlcv_only_partitions` 里 `assert src.get_stock_names() == {}` 需确认——该测试的 tmp_path 无 instruments parquet，名称映射为空，仍通过）
+Expected: 全绿（含新增 3 个 + 原有测试，均离线、不触网）
 
 - [ ] **Step 5: 提交**
 
@@ -257,9 +274,9 @@ def test_resolve_name_uses_client_map(monkeypatch):
     names._NAMES = None
     try:
         nm = names.get_name_map()
-        assert nm.get("159985.XSHE") == "豆粕ETF华夏"
-        assert nm.get("600000.XSHG") == "浦发银行"
-        # 解析：JQ 码命中
+        assert nm.get("159985") == "豆粕ETF华夏"
+        assert nm.get("600000") == "浦发银行"
+        # 解析：JQ 码命中（按纯代码查）
         assert names.resolve_name("159985.XSHE") == "豆粕ETF华夏"
         # 未命中回退代码
         assert names.resolve_name("999999.XSHG") == "999999.XSHG"
@@ -483,7 +500,7 @@ def insert_sim_trade(account_id, ts, code, action, price, amount, pnl, pnl_pct,
         )
 ```
 
-替换 `batch_insert_trades`（:467-476）为：
+替换 `batch_insert_trades`（:467-476）为（**name 列放最后**，与 docstring/测试/`insert_sim_trade` 签名/runner `trade_row` 的 name-最后约定一致，避免位置错位）：
 
 ```python
 def batch_insert_trades(rows):
@@ -493,7 +510,7 @@ def batch_insert_trades(rows):
         return
     with get_conn() as c:
         c.executemany(
-            "INSERT INTO sim_trades(account_id,ts,code,name,action,price,amount,pnl,pnl_pct,commission) "
+            "INSERT INTO sim_trades(account_id,ts,code,action,price,amount,pnl,pnl_pct,commission,name) "
             "VALUES(?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
@@ -689,27 +706,50 @@ git commit -m "feat(sim): runner 落库成交/持仓写入标的名字"
 
 - [ ] **Step 1: 写失败测试（SSE 事件含 name）**
 
-在 `backend/tests/quant/test_api_quant.py` 追加：
+在 `backend/tests/quant/test_fix_sim.py` 追加（复用其既有 `tmp_quant` fixture；模式与
+`test_sim_stream_emits_status_when_state_changes` 一致——直接驱动 `sim_stream` 的
+async body iterator，不依赖真实 SSE 连接）。
+
+**注意两个坑**（TDD 实践验证）：
+- 成交必须在 `sim_stream` gen 启动**之后**插入——`sim_stream` 用 `off_trade = get_max_sim_trade_id` 初始化偏移，事前插入会被偏移覆盖、trade 事件永不发射；
+- 不要 patch 掉 `asyncio.sleep`——patch 后 gen 在无增量时变 busy loop 且不让出事件循环，`wait_for` 定时器永不触发，测试无限挂起。用真实 sleep + 有限轮数收尾即可。
 
 ```python
-def test_sim_stream_trade_event_includes_name(tmp_quant, api_client):
+async def test_sim_stream_trade_event_includes_name(tmp_quant):
     """SSE trade 事件透传 sim_trades.name。"""
-    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "created")
-    db.insert_sim_trade("a1", "2024-01-02 09:31", "159985.XSHE", "BUY",
-                        2.139, 100, 0.0, 0.0, 9.99, "豆粕ETF华夏")
-    with api_client.stream("GET", "/sim/accounts/a1/stream", timeout=3) as r:
-        lines = [ln for ln in r.iter_lines() if ln]
-    text = "\n".join(lines)
-    assert "event: trade" in text
-    assert "豆粕ETF华夏" in text
-```
+    from app.quant.api import quant as quant_api
+    import asyncio
 
-若 `test_api_quant.py` 无 `tmp_quant`/`api_client` fixture，参考 `test_runner_strategy.py:18-34` 复制这两个 fixture（`tmp_quant` 用 `tmp_path` + monkeypatch `CONFIG.db_path`；`api_client` 用 `FastAPI` + `router` + `TestClient`）。
+    db.insert_sim_account("a_nm", "s", 100000.0, 0.03, "running")
+    db.upsert_sim_state("a_nm", 100000.0, "{}", 100000.0, 0.0, 100000.0, "[]",
+                        "2024-01-02 09:31:00")
+    resp = quant_api.sim_stream("a_nm")
+    agen = resp.body_iterator  # type: ignore[attr-defined]
+    text = ""
+    try:
+        # 首轮：status 事件（gen 启动，off_trade 定格为 0）
+        first = await asyncio.wait_for(anext(agen), timeout=0.5)
+        text += first
+        # gen 启动后再插入成交 → 下一轮即 trade 事件
+        db.insert_sim_trade("a_nm", "2024-01-02 09:31", "159985.XSHE", "BUY",
+                            2.139, 100, 0.0, 0.0, 9.99, "豆粕ETF华夏")
+        for _ in range(3):
+            chunk = await asyncio.wait_for(anext(agen), timeout=0.5)
+            text += chunk
+            if "event: trade" in text:
+                break
+    except (StopAsyncIteration, asyncio.TimeoutError):
+        pass
+    finally:
+        await agen.aclose()
+    assert "event: trade" in text
+    assert '"name": "豆粕ETF华夏"' in text
+```
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `uv run --extra dev pytest tests/quant/test_api_quant.py::test_sim_stream_trade_event_includes_name -v`
-Expected: FAIL（SSE trade 事件 data 无 `name` 键，`豆粕ETF华夏` 不在 text 中）
+Run: `uv run --extra dev pytest tests/quant/test_fix_sim.py::test_sim_stream_trade_event_includes_name -v`
+Expected: FAIL（SSE trade 事件 data 无 `name` 键，`"name": "豆粕ETF华夏"` 不在 text 中；注意 trade 事件本身会发射，只是缺 name）
 
 - [ ] **Step 3: 实现**
 
@@ -785,28 +825,22 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `uv run --extra dev pytest tests/quant/test_api_quant.py::test_sim_stream_trade_event_includes_name -v`
+Run: `uv run --extra dev pytest tests/quant/test_fix_sim.py::test_sim_stream_trade_event_includes_name -v`
 Expected: PASS
 
 迁移脚本手动验证（不连网）：
 
 ```bash
-cd backend && uv run --extra dev python -c "
-from app.quant import db
-db.init_db()
-from app.quant.simulate import names
-names._NAMES = {'600000': '浦发银行'}
-import importlib, app.quant.simulate.names as m
-import sys; sys.modules['app.quant.simulate.names'] = m
-"
+cd backend && uv run --extra dev python -m py_compile scripts/backfill_sim_names.py
 ```
+Expected: 退出码 0（语法正确）
 
-如环境无网，直接确认脚本可被 import 且语法正确即可（`python -m py_compile scripts/backfill_sim_names.py`）。
+如环境有网，可再跑真实回填（会拉免费 TickFlow API）：`uv run --extra dev python scripts/backfill_sim_names.py`
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add backend/app/quant/api/quant.py backend/scripts/backfill_sim_names.py backend/tests/quant/test_api_quant.py
+git add backend/app/quant/api/quant.py backend/scripts/backfill_sim_names.py backend/tests/quant/test_fix_sim.py
 git commit -m "feat(sim): API/SSE 透传 name + 历史数据回填脚本"
 ```
 
@@ -861,6 +895,243 @@ git commit -m "feat(sim): 前端成交记录与持仓显示标的名字"
 
 ---
 
+### Task 7: 模拟盘策略侧名称源可切换（聚宽名 / 通达信名）
+
+**Files:**
+- Create: `backend/app/quant/jqengine/engine/jq/jq_names.py`（聚宽名称加载：读 `etf_universe_snapshot.json`）
+- Modify: `backend/app/quant/jqengine/engine/jq/api.py:810`（`get_security_name`）与 `:865`（`get_all_securities`）——按开关选聚宽名/通达信名
+- Modify: `backend/app/quant/jqengine/engine/jq/loader.py`（可选：策略命名空间不变，走 api 函数）
+- Modify: `backend/app/quant/api/quant.py`（新增开关读写 API）
+- Modify: `frontend/src/quant/pages/QuantSim.tsx`（新增开关 UI）
+- Test: 新增 `backend/tests/quant/test_jq_names.py` + `test_jqengine_name_source.py`
+
+**背景（多轮实测结论，方向最终定稿）**：
+- 聚宽 `display_name` 与通达信全名是**两套名称体系**：聚宽名如 `561020 食品招商`、`561450 华泰红利`、`588530 AIBOCI`；通达信全名如 `食品ETF招商`、`红利低波50ETF华泰柏瑞`、`科创创业人工智能ETF中银证券`。`_clean_etf_name` 无法互相转换（实测 1500/1602 不匹配）。
+- 回测（rqalpha_bridge）用**聚宽名**（快照），与聚宽一致 ✓；模拟盘（jqengine）用**通达信名**，偏离聚宽 ✗。
+- 用户决策：模拟盘策略侧**改用聚宽名**（对齐回测/聚宽），但保留通达信名路径，网页加参数切换。
+
+**方案**：策略侧名称源可切换开关（存 `quant_settings` kv：`sim_strategy_name_source`，`jq`=聚宽名 / `tdx`=通达信名，默认 `jq`）。jqengine `get_all_securities`/`get_security_name` 按开关取值；聚宽名从 `etf_universe_snapshot.json` 加载（与回测同源）。网页成交/持仓显示列不受影响（仍通达信全名，走 `names.py`）。
+
+**Interfaces:**
+- Produces:
+  - `app/quant/jqengine/engine/jq/jq_names.py`：`load_jq_names() -> dict[str, str]`（`{JQ码: 聚宽名}`，读快照，进程内缓存）
+  - `app/quant/api/quant.py`：`GET /sim/settings/name-source` + `PUT /sim/settings/name-source`（body `{"source": "jq"|"tdx"}`）
+  - jqengine `get_all_securities`/`get_security_name` 按开关返回名称
+- Consumes: `quant_settings` kv（`sim_strategy_name_source`）；`etf_universe_snapshot.json`
+
+- [ ] **Step 1: 写失败测试（开关默认聚宽名 + jqengine 用聚宽名）**
+
+新建 `backend/tests/quant/test_jq_names.py`：
+
+```python
+"""模拟盘策略侧名称源：聚宽名/通达信名可切换。"""
+from __future__ import annotations
+
+from app.quant import db
+from app.quant.jqengine.engine.jq import jq_names
+
+
+def test_load_jq_names_reads_snapshot(tmp_path, monkeypatch):
+    """jq_names.load_jq_names 读 etf_universe_snapshot.json。"""
+    import json
+    snap = tmp_path / "etf_universe_snapshot.json"
+    snap.write_text(json.dumps({
+        "fetched_at": "2026-07-27T08:00:00",
+        "codes": ["511880.XSHG"],
+        "names": {"511880.XSHG": "货币ETF-A"},
+        "list_dates": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(jq_names, "SNAPSHOT_PATH", str(snap))
+    jq_names._CACHE = None
+    try:
+        names = jq_names.load_jq_names()
+        assert names.get("511880.XSHG") == "货币ETF-A"
+    finally:
+        jq_names._CACHE = None
+
+
+def test_get_all_securities_uses_jq_names_when_enabled(monkeypatch):
+    """开关为 jq 时 get_all_securities 返回聚宽名。"""
+    import pandas as pd
+    from app.quant.jqengine.engine.jq import api
+
+    monkeypatch.setattr(api, "_state", {"manager": _FakeMgr()})
+    monkeypatch.setattr(
+        "app.quant.jqengine.engine.jq.api._name_source",
+        lambda: "jq",
+    )
+    monkeypatch.setattr(
+        "app.quant.jqengine.engine.jq.api._jq_names",
+        lambda: {"511880.XSHG": "货币ETF-A"},
+    )
+    df = api.get_all_securities(["etf"])
+    row = df.loc["511880.XSHG"]
+    assert row["display_name"] == "货币ETF-A"
+
+
+class _FakeMgr:
+    sources = {"network": object()}
+
+    def fetch(self, method, *a, **k):
+        return ["511880.XSHG"]
+```
+
+`get_all_securities` 的具体 mock 按实现调整（当前它先 `mgr.sources["network"].get_stock_names()` 拿通达信名，再加 `mgr.fetch("get_etf_list")`）。
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `uv run --extra dev pytest tests/quant/test_jq_names.py -v`
+Expected: FAIL（`jq_names` 模块不存在；`get_all_securities` 仍返回通达信名）
+
+- [ ] **Step 3: 实现**
+
+创建 `backend/app/quant/jqengine/engine/jq/jq_names.py`：
+
+```python
+"""聚宽 ETF 名称加载（模拟盘策略侧用，与回测同源快照）。"""
+from __future__ import annotations
+
+import json
+import os
+
+# 与 rqalpha_bridge._ETF_UNIVERSE_SNAPSHOT 同文件
+SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(__file__))))),
+    "data", "quant_kline", "etf_universe_snapshot.json")
+
+_CACHE: dict[str, str] | None = None
+
+
+def load_jq_names() -> dict[str, str]:
+    """返回 {JQ码: 聚宽 display_name}，进程内缓存；失败返回空。"""
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE
+    out: dict[str, str] = {}
+    try:
+        with open(SNAPSHOT_PATH, encoding="utf-8") as f:
+            snap = json.load(f)
+        out = {str(k): str(v) for k, v in (snap.get("names") or {}).items()}
+    except Exception:
+        pass
+    _CACHE = out
+    return out
+```
+
+（`SNAPSHOT_PATH` 路径计算按实际目录层级修正——从 `jq_names.py` 上溯到项目根 `data/`。）
+
+修改 `backend/app/quant/jqengine/engine/jq/api.py`：
+
+- import 区加 `from . import jq_names` 和 `from ...datasource.manager import get_data_manager`（若需要）
+- 加名称源辅助函数：
+
+```python
+def _name_source() -> str:
+    """策略侧名称源：jq=聚宽名 / tdx=通达信名。默认 jq。"""
+    try:
+        from .... import db as _db
+        return (_db.get_quant_setting("sim_strategy_name_source") or "jq")
+    except Exception:
+        return "jq"
+
+
+def _jq_names() -> dict[str, str]:
+    return jq_names.load_jq_names()
+```
+
+- `get_all_securities`（:865）：`mootdx_names = mgr.sources["network"].get_stock_names()` 之后，若 `_name_source() == "jq"`，改用聚宽名：
+
+```python
+    mootdx_names = {}
+    if "network" in mgr.sources:
+        try:
+            mootdx_names = mgr.sources["network"].get_stock_names()
+        except Exception:
+            pass
+    if _name_source() == "jq":
+        jq = _jq_names()
+        if jq:
+            mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
+```
+
+（聚宽名键是 JQ 码，转纯代码键以匹配 `pure = code.split(".")[0]` 查找。）
+
+- `get_security_name`（:810）：`mootdx_names = mgr.sources["network"].get_stock_names()` 之后同样按开关替换：
+
+```python
+                mootdx_names = mgr.sources["network"].get_stock_names()
+                if _name_source() == "jq":
+                    jq = _jq_names()
+                    if jq:
+                        mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
+```
+
+修改 `backend/app/quant/api/quant.py` 加开关 API：
+
+```python
+@router.get("/sim/settings/name-source")
+def sim_name_source_get():
+    return {"data": {"source": db.get_quant_setting("sim_strategy_name_source") or "jq"}}
+
+@router.put("/sim/settings/name-source")
+def sim_name_source_put(body: dict):
+    src = body.get("source", "jq")
+    if src not in ("jq", "tdx"):
+        raise HTTPException(400, "source must be 'jq' or 'tdx'")
+    db.set_quant_setting("sim_strategy_name_source", src)
+    return {"data": {"source": src}}
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `uv run --extra dev pytest tests/quant/test_jq_names.py -v`
+Expected: 全绿
+
+Run: `uv run --extra dev pytest tests/quant/test_runner_strategy.py tests/quant/test_fix_sim.py -q`
+Expected: 全绿（默认 jq 源下策略仍正常；若聚宽名快照缺某些 code，回退通达信名——见 Step 5 补充）
+
+- [ ] **Step 5: 前端开关 UI**
+
+`frontend/src/quant/pages/QuantSim.tsx` 页面头部（策略信息行附近）加一个切换开关：
+
+```tsx
+const nameSource = useQuery({
+  queryKey: ['quant', 'sim', 'name-source'], queryFn: () => api.getSimNameSource(),
+})
+const toggleNameSource = useMutation({
+  mutationFn: (src: 'jq' | 'tdx') => api.setSimNameSource(src),
+  onSuccess: () => { qc.invalidateQueries({ queryKey: ['quant', 'sim', 'name-source'] }) },
+})
+```
+
+渲染一个按钮/开关：「策略名称：聚宽 / 通达信」，点击切换并调 API。重启模拟盘账户后生效（名称源在 jqengine 进程内读取）。
+
+`frontend/src/quant/api.ts` 加：
+
+```typescript
+export const getSimNameSource = () => j('/sim/settings/name-source')
+export const setSimNameSource = (source: string) =>
+  j('/sim/settings/name-source', { method: 'PUT', body: JSON.stringify({ source }) })
+```
+
+- [ ] **Step 6: 前端 lint + 构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 构建成功
+
+Run: `cd frontend && pnpm lint`
+Expected: 通过（注：lint 环境既有问题，见 Task 6 备注；build 通过即可）
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add backend/app/quant/jqengine/engine/jq/jq_names.py backend/app/quant/jqengine/engine/jq/api.py backend/app/quant/api/quant.py backend/tests/quant/test_jq_names.py frontend/src/quant/pages/QuantSim.tsx frontend/src/quant/api.ts
+git commit -m "feat(quant): 模拟盘策略侧名称源可切换（聚宽/通达信），默认聚宽对齐回测"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
@@ -870,6 +1141,7 @@ git commit -m "feat(sim): 前端成交记录与持仓显示标的名字"
 - Task 4 → spec §4（runner 写入侧）
 - Task 5 → spec §5（迁移脚本）+ §6（API 透传）
 - Task 6 → spec §7（前端）
+- Task 7 → spec「统一模拟盘/回测策略侧名称」补充节（策略侧名称源可切换：聚宽/通达信，默认聚宽对齐回测）
 - 影响面/验收 → 各任务测试覆盖
 
 **Placeholder scan:** 无 TBD/TODO；每步有完整代码与命令。

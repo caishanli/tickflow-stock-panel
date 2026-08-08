@@ -58,6 +58,29 @@
 - **副产物**：此实现使 `jqengine` 的 `get_all_securities`/`get_security_name`
   （`api.py:810,865`）自动拿到真名称，恢复五福 v5.2 等策略的标的名称分组
 
+## 统一模拟盘/回测策略侧名称（最终评审补充，方向已反转）
+
+**问题**：回测（`rqalpha_bridge._load_etf_universe`）策略侧名称经 `_clean_etf_name`
+清洗成缩写；模拟盘（`jqengine` `get_all_securities`）用 `get_stock_names` 全名，
+未清洗。两条路径不一致。
+
+**权威仲裁（聚宽）**：sim_260710 fixture 聚宽真实成交的标的名称为**全名**
+（`豆粕ETF华夏(159985.XSHE)`、`银华日利(511880.XSHG)`），且聚宽**交易了 511880
+货币基金**。wufu 策略自带 `clean_name`（wufu-v5.2.py:584）从全名清洗——
+证明**聚宽 display_name 返回全名，策略自己清洗**。
+
+**实测**：快照 1662 code 中 876 个被清洗成缩写；160 只 exclude 判定反转
+（如 `510050 上证50ETF华夏` 全名排除/`50ETF` 不排；`511880 银华日利ETF`
+全名不排/`货币ETF-A` 排）。26 个「全名排除但快照不排」的宽基/指数 ETF，
+回测清洗后纳入池，导致回测收益 +12.61% 远高于聚宽 +3.86%（基线 260401-260716）。
+
+**结论（方向反转）**：模拟盘全名行为**正确**（与聚宽一致）；**回测清洗缩写是偏离**。
+应改**回测侧**：
+- `_load_etf_universe`（rqalpha_bridge.py:1242,1257）移除 `_clean_etf_name` 预清洗
+- ETF 名录快照 `etf_universe_snapshot.json` 名称重建为**全名**（`get_stock_names`
+  返回 `{纯代码: 全名}`，转 JQ 码键）
+- 回测策略侧 `get_all_securities` 拿到全名，与聚宽/模拟盘一致
+
 ### 2. 名称解析模块（新增 `backend/app/quant/simulate/names.py`）
 
 - `get_name_map() -> dict[str, str]`：进程内缓存 `{JQ码: 名称}`；
