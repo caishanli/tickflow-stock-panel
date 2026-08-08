@@ -464,7 +464,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             <table className="w-full text-xs">
               <thead className="text-muted sticky top-0 bg-surface">
                 <tr className="text-left">
-                  <th className="px-3 py-1.5 font-normal">标的</th>
+                  <th className="px-3 py-1.5 font-normal">名称</th>
+                  <th className="px-3 py-1.5 font-normal">代码</th>
                   <th className="px-3 py-1.5 font-normal text-right">数量</th>
                   <th className="px-3 py-1.5 font-normal text-right">成本</th>
                   <th className="px-3 py-1.5 font-normal text-right">现价</th>
@@ -478,9 +479,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                   return (
                     <tr key={sym} className="border-t border-border/60">
-                      <td className="px-3 py-1.5">
-                        {p.name ? `${p.name} ` : ''}{sym}
-                      </td>
+                      <td className="px-3 py-1.5">{p.name ?? ''}</td>
+                      <td className="px-3 py-1.5 text-muted">{sym}</td>
                       <td className="px-3 py-1.5 text-right num">{p.amount}</td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
@@ -518,7 +518,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 <thead className="text-muted sticky top-0 bg-surface">
                   <tr className="text-left">
                     <th className="px-3 py-1.5 font-normal">时间</th>
-                    <th className="px-3 py-1.5 font-normal">标的</th>
+                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
                     <th className="px-3 py-1.5 font-normal text-right">价格</th>
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
@@ -529,9 +530,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   {[...tradeList].reverse().map((t: any, i: number) => (
                     <tr key={i} className="border-t border-border/60">
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
-                      <td className="px-3 py-1.5">
-                        {t.name ? `${t.name} ` : ''}{t.code ?? ''}
-                      </td>
+                      <td className="px-3 py-1.5">{t.name ?? ''}</td>
+                      <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
                         {t.action === 'BUY' ? '买入' : '卖出'}
                       </td>
