@@ -66,3 +66,7 @@ export const getDingtalkConfig = () => j('/settings/dingtalk')
 export const saveDingtalkConfig = (webhookUrl: string, secret: string) =>
   j('/settings/dingtalk', { method: 'PUT', body: JSON.stringify({ webhook_url: webhookUrl, secret }) })
 export const testDingtalk = (webhookUrl: string, secret: string) => j('/settings/dingtalk/test', { method: 'POST', body: JSON.stringify({ webhook_url: webhookUrl, secret }) })
+
+export const getSimNameSource = () => j('/sim/settings/name-source')
+export const setSimNameSource = (source: string) =>
+  j('/sim/settings/name-source', { method: 'PUT', body: JSON.stringify({ source }) })

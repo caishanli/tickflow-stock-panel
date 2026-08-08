@@ -7,7 +7,8 @@
 - 不删除数字（30/50/100/300...）：避免 创业板50ETF 等被误除导致本地/聚宽
   exclude 与分组不一致。
 - 幂等：清洗结果再清洗不变。
-- _load_etf_universe 两个名称加载分支（快照 / network 推导）都应用清洗。
+- _clean_etf_name 保留但不再被 _load_etf_universe 调用（最终评审 I1：回测侧
+  移除二次清洗，名称直接用快照/网络原始名对齐模拟盘 jq 源）。
 """
 import datetime as _dt
 import json
@@ -85,21 +86,23 @@ def _write_snapshot(path, codes=("517900.XSHG", "512800.XSHG"), days_ago=0,
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
-def test_load_etf_universe_cleans_snapshot_names(tmp_path, monkeypatch):
+def test_load_etf_universe_uses_raw_snapshot_names(tmp_path, monkeypatch):
+    """快照命中路径不再二次清洗：名称 = 快照原始聚宽名。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
     dm = _UniverseDM()
     codes, names, list_dates = bridge._load_etf_universe(dm)
-    assert "H" not in names["517900.XSHG"]
-    assert names["517900.XSHG"] == "银行价格优选"
+    assert names["517900.XSHG"] == "银行AH价格优选ETF"
+    assert "H" in names["517900.XSHG"]
 
 
-def test_load_etf_universe_cleans_derived_names(tmp_path, monkeypatch):
+def test_load_etf_universe_uses_raw_derived_names(tmp_path, monkeypatch):
+    """快照缺失：网络名转 JQ 码键原样返回（不经 _clean_etf_name）。"""
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT",
                         str(tmp_path / "nonexistent.json"))
     dm = _UniverseDM(network=_FakeNetworkSrc(
         {"517900": "银行AH价格优选ETF"}), cache_codes=["517900.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
-    assert "517900" in names
-    assert "H" not in names["517900"]
+    assert "517900.XSHG" in names
+    assert names["517900.XSHG"] == "银行AH价格优选ETF"

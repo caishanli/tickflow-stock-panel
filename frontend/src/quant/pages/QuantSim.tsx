@@ -224,6 +224,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const { data: logs } = useQuery({
     queryKey: ['quant', 'sim', aid, 'logs'], queryFn: () => api.getSimLogs(aid),
   })
+  const { data: nameSource } = useQuery({
+    queryKey: ['quant', 'sim', 'name-source'], queryFn: () => api.getSimNameSource(),
+  })
+  const toggleNameSource = useMutation({
+    mutationFn: (src: 'jq' | 'tdx') => api.setSimNameSource(src),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['quant', 'sim', 'name-source'] }) },
+  })
 
   const appendTo = (key: any[], row: any, sig?: (r: any) => string) => {
     qc.setQueryData(key, (prev: any[]) => {
@@ -376,6 +383,10 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           策略 {strategyName(acct.strategy_id)} · {FREQ_LABEL[acct.frequency] ?? '分钟级'}
           {acct.start_date ? ` · 自 ${acct.start_date}` : ''}
         </span>
+        <button onClick={() => toggleNameSource.mutate(nameSource?.source === 'jq' ? 'tdx' : 'jq')}
+          className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg bg-elevated text-foreground text-xs">
+          策略名称：{nameSource?.source === 'tdx' ? '通达信' : '聚宽'}
+        </button>
         <div className="ml-auto flex gap-2">
           <button onClick={() => setShowDingtalkCfg(true)}
             className={`inline-flex items-center gap-1 px-3 h-9 rounded-lg text-xs ${acct?.dingtalk_enabled ? 'bg-accent text-white' : 'bg-elevated text-foreground'}`}>
@@ -453,7 +464,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             <table className="w-full text-xs">
               <thead className="text-muted sticky top-0 bg-surface">
                 <tr className="text-left">
-                  <th className="px-3 py-1.5 font-normal">标的</th>
+                  <th className="px-3 py-1.5 font-normal">名称</th>
+                  <th className="px-3 py-1.5 font-normal">代码</th>
                   <th className="px-3 py-1.5 font-normal text-right">数量</th>
                   <th className="px-3 py-1.5 font-normal text-right">成本</th>
                   <th className="px-3 py-1.5 font-normal text-right">现价</th>
@@ -467,7 +479,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                   return (
                     <tr key={sym} className="border-t border-border/60">
-                      <td className="px-3 py-1.5">{sym}</td>
+                      <td className="px-3 py-1.5">{p.name ?? ''}</td>
+                      <td className="px-3 py-1.5 text-muted">{sym}</td>
                       <td className="px-3 py-1.5 text-right num">{p.amount}</td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
@@ -505,7 +518,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 <thead className="text-muted sticky top-0 bg-surface">
                   <tr className="text-left">
                     <th className="px-3 py-1.5 font-normal">时间</th>
-                    <th className="px-3 py-1.5 font-normal">标的</th>
+                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
                     <th className="px-3 py-1.5 font-normal text-right">价格</th>
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
@@ -516,7 +530,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   {[...tradeList].reverse().map((t: any, i: number) => (
                     <tr key={i} className="border-t border-border/60">
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
-                      <td className="px-3 py-1.5">{t.code ?? ''}</td>
+                      <td className="px-3 py-1.5">{t.name ?? ''}</td>
+                      <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
                         {t.action === 'BUY' ? '买入' : '卖出'}
                       </td>

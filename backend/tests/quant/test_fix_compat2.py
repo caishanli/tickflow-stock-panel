@@ -304,15 +304,25 @@ def _write_snapshot(path, codes=("510300.XSHG",), days_ago=0):
 
 
 def test_snapshot_fresh_used_without_network(tmp_path, monkeypatch):
-    """快照存在且 ≤7 天：直接用（在线也不联网），保证可复现。名称经清洗。"""
+    """快照存在且 ≤7 天：直接用（在线也不联网），保证可复现。名称用原始快照名。"""
     snap = tmp_path / "etf_universe_snapshot.json"
     _write_snapshot(snap)
     monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
     dm = _UniverseDM(offline=False)
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert codes == ["510300.XSHG"]
-    assert names["510300.XSHG"] == "-510300"
+    assert names["510300.XSHG"] == "ETF-510300"
     assert list_dates["510300.XSHG"] == ("2020-01-01", "2999-12-31")
+
+
+def test_load_etf_universe_returns_raw_snapshot_names(tmp_path, monkeypatch):
+    """快照命中路径不再二次清洗：返回快照原始聚宽名（与模拟盘 jq 源一致）。"""
+    snap = tmp_path / "etf_universe_snapshot.json"
+    _write_snapshot(snap)  # 默认名 "ETF-510300"，二次清洗会变 "-510300"
+    monkeypatch.setattr(bridge, "_ETF_UNIVERSE_SNAPSHOT", str(snap))
+    dm = _UniverseDM(offline=False)
+    codes, names, list_dates = bridge._load_etf_universe(dm)
+    assert names["510300.XSHG"] == "ETF-510300"
 
 
 def test_snapshot_stale_falls_back_to_cache(tmp_path, monkeypatch):
@@ -353,6 +363,7 @@ def test_snapshot_cache_union_merge(tmp_path, monkeypatch):
     dm = _UniverseDM(cache_codes=["589720.XSHG"])
     codes, names, list_dates = bridge._load_etf_universe(dm)
     assert set(codes) == {"510300.XSHG", "589720.XSHG"}
-    # 缓存并入的代码无 tdx 名称时兜底为代码本身，list_dates 不造数据
-    assert names["589720.XSHG"] == "589720.XSHG"
+    # names 只含快照原始名；缓存并入代码无快照名，缺失回退 code（install_jqcompat 兜底）
+    assert names["510300.XSHG"] == "ETF-510300"
+    assert "589720.XSHG" not in names
     assert "589720.XSHG" not in list_dates

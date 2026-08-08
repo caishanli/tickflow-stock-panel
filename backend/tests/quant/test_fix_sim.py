@@ -395,6 +395,28 @@ async def test_sim_stream_emits_status_when_state_changes(tmp_quant, monkeypatch
     await agen.aclose()
 
 
+async def test_sim_stream_trade_event_includes_name(tmp_quant):
+    """SSE trade 事件透传 sim_trades.name。"""
+    from app.quant.api import quant as quant_api
+    import asyncio
+
+    db.insert_sim_account("a_nm", "s", 100000.0, 0.03, "running")
+    db.upsert_sim_state("a_nm", 100000.0, "{}", 100000.0, 0.0, 100000.0, "[]",
+                        "2024-01-02 09:31:00")
+    resp = quant_api.sim_stream("a_nm")
+    agen = resp.body_iterator  # type: ignore[attr-defined]
+    # 首轮 status 事件已推（off_trade 定格为 0）后再插入成交 → 该行作为
+    # rowid 增量被 get_sim_trades_after 推成 SSE trade 事件
+    first = await asyncio.wait_for(anext(agen), timeout=1.0)
+    assert "event: status" in first
+    db.insert_sim_trade("a_nm", "2024-01-02 09:31", "159985.XSHE", "BUY",
+                        2.139, 100, 0.0, 0.0, 9.99, "豆粕ETF华夏")
+    second = await asyncio.wait_for(anext(agen), timeout=1.0)
+    assert "event: trade" in second
+    assert '"name": "豆粕ETF华夏"' in second
+    await agen.aclose()
+
+
 # ---- M12 + #8：SSE 断点续推与终态关流 ----
 def test_m12_sse_since_id_resumes_from_snapshot(tmp_quant, api_client):
     db.insert_run("run_s", "s", "", "{}", "done")

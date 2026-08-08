@@ -412,7 +412,8 @@ def sim_stream(aid: str, since_id: int | None = None):
                     yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
                 for row in db.get_sim_trades_after(aid, off_trade):
                     off_trade = row["rowid"]
-                    d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
+                    d = {k: row[k] for k in ("ts", "code", "name", "action", "price",
+                                             "amount", "pnl", "pnl_pct", "commission")}
                     yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
                 for row in db.get_sim_logs_after(aid, off_log):
                     off_log = row["rowid"]
@@ -473,6 +474,21 @@ def datasource_verify():
         return {"data": {"ok": ok, "error": msg if not ok else None}}
     except Exception as e:  # noqa: BLE001
         return {"data": {"ok": False, "error": str(e)}}
+
+
+# ---- 策略侧名称源 ----
+@router.get("/sim/settings/name-source")
+def sim_name_source_get():
+    return {"data": {"source": db.get_quant_setting("sim_strategy_name_source") or "jq"}}
+
+
+@router.put("/sim/settings/name-source")
+def sim_name_source_put(body: dict):
+    src = body.get("source", "jq")
+    if src not in ("jq", "tdx"):
+        raise HTTPException(400, "source must be 'jq' or 'tdx'")
+    db.set_quant_setting("sim_strategy_name_source", src)
+    return {"data": {"source": src}}
 
 
 # ---- 钉钉推送 ----

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json as _json
 import logging
 import os
 import threading
@@ -272,6 +273,8 @@ class DataSources:
         self.dedup = DedupCache()
         self.minute_store = MinuteMemoryStore()
         self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
+        self._names_map: dict[str, str] | None = None
+        self._names_cache_file = os.path.join(self.data_root, ".stock_names_cache.json")
 
     # ---- 去重透传 ----
     def get_or_fetch(self, key: str, ttl: float, loader: Callable[[], _T]) -> _T:
@@ -492,9 +495,79 @@ class DataSources:
         df = self._scan_partitions("kline_daily", None, None, None, ["symbol"])
         return sorted(set(df["symbol"].to_list()))
 
-    def get_stock_names(self, codes: list[str] | None = None) -> dict:
-        # 股票名称分区暂未落盘（partition 仅 symbol/OHLCV）；名称属展示层，空降级
-        return {}
+    def _build_name_map(self) -> dict[str, str]:
+        """构建 {纯6位代码: 名称} 映射：优先读本地缓存命中，否则本地 instruments（股票）
+        + ETF（本地或免费 API），构建后写回缓存。
+
+        名称属展示层：任何失败降级为空/部分映射，不影响行情路径。
+        """
+        # 0) 缓存命中直接返回（免重复构建/免网络）
+        try:
+            if os.path.exists(self._names_cache_file):
+                with open(self._names_cache_file, encoding="utf-8") as f:
+                    cached = _json.load(f)
+                if isinstance(cached, dict) and cached:
+                    return {str(k): str(v) for k, v in cached.items()}
+        except Exception:
+            pass
+        out: dict[str, str] = {}
+        # 1) 股票：本地 instruments parquet（免费档已含全量股票名称）
+        try:
+            inst = os.path.join(self.data_root, "instruments", "instruments.parquet")
+            if os.path.exists(inst):
+                df = pl.read_parquet(inst)
+                if "symbol" in df.columns and "name" in df.columns:
+                    for sym, name in df.select(["symbol", "name"]).iter_rows():
+                        if sym and name:
+                            out[str(sym).split(".")[0]] = str(name)
+        except Exception:
+            logger.warning("get_stock_names: instruments 读取失败", exc_info=True)
+        # 2) ETF：本地 instruments_etf parquet 优先，缺失则免费 TickFlow API 补
+        etf_ok = False
+        try:
+            import glob as _glob
+            etf_paths = _glob.glob(
+                os.path.join(self.data_root, "instruments_etf", "**", "*.parquet"),
+                recursive=True)
+            df_etf = None
+            if etf_paths:
+                try:
+                    df_etf = pl.scan_parquet(etf_paths).collect()
+                except Exception:
+                    df_etf = None
+            if df_etf is None or df_etf.is_empty() or "name" not in df_etf.columns:
+                from app.services.index_sync import _fetch_instruments_by_type
+                df_etf = _fetch_instruments_by_type("etf", "etf")
+            if df_etf is not None and not df_etf.is_empty() \
+                    and "symbol" in df_etf.columns and "name" in df_etf.columns:
+                for sym, name in df_etf.select(["symbol", "name"]).iter_rows():
+                    if sym and name:
+                        out.setdefault(str(sym).split(".")[0], str(name))
+                        etf_ok = True
+        except Exception:
+            logger.warning("get_stock_names: ETF 名称获取失败，降级本地", exc_info=True)
+        # 3) 落盘缓存：仅当 ETF 段成功（etf_ok）时写，避免 ETF API 失败时
+        #    钉住股票-only 映射
+        if etf_ok:
+            try:
+                os.makedirs(os.path.dirname(self._names_cache_file), exist_ok=True)
+                with open(self._names_cache_file, "w", encoding="utf-8") as f:
+                    _json.dump(out, f, ensure_ascii=False)
+            except Exception:
+                pass
+        return out
+
+    def get_stock_names(self, codes: list[str] | None = None) -> dict[str, str]:
+        """返回 {纯6位代码: 名称} 映射；codes 非空时只返回命中的子集。
+
+        恢复 jqengine get_all_securities/get_security_name 的名称解析，
+        同时为模拟盘落库提供名称。进程内缓存，首次构建后复用。
+        """
+        if self._names_map is None:
+            self._names_map = self._build_name_map()
+        if not codes:
+            return dict(self._names_map)
+        return {c: n for c, n in self._names_map.items() if c in set(codes)}
 
     def get_adj_factors(self) -> pl.DataFrame:
         root = os.path.join(self.data_root, "adj_factor_etf")

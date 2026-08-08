@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS sim_equity_snapshots (
     account_id TEXT, dt TEXT, net_value REAL, cash REAL, positions_value REAL,
     pnl REAL, pnl_pct REAL);
 CREATE TABLE IF NOT EXISTS sim_trades (
-    account_id TEXT, ts TEXT, code TEXT, action TEXT, price REAL, amount REAL,
+    account_id TEXT, ts TEXT, code TEXT, name TEXT, action TEXT, price REAL, amount REAL,
     pnl REAL, pnl_pct REAL, commission REAL);
 CREATE TABLE IF NOT EXISTS sim_stop_loss (
     account_id TEXT, ts TEXT, code TEXT, action TEXT, price REAL, pnl_pct REAL);
@@ -81,6 +81,10 @@ def init_db(path: str | None = None) -> None:
         if "dingtalk_enabled" not in cols:
             conn.execute(
                 "ALTER TABLE sim_accounts ADD COLUMN dingtalk_enabled INTEGER DEFAULT 0")
+        # 兼容旧库：sim_trades 补 name 列（标的名称落库）
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sim_trades)")}
+        if "name" not in cols:
+            conn.execute("ALTER TABLE sim_trades ADD COLUMN name TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -465,13 +469,14 @@ def batch_insert_snapshots(rows):
 
 
 def batch_insert_trades(rows):
-    """批量写入成交。rows: list of (account_id, ts, code, action, price, amount, pnl, pnl_pct, commission)"""
+    """批量写入成交。rows: list of (account_id, ts, code, action, price, amount,
+    pnl, pnl_pct, commission, name)"""
     if not rows:
         return
     with get_conn() as c:
         c.executemany(
-            "INSERT INTO sim_trades(account_id,ts,code,action,price,amount,pnl,pnl_pct,commission) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO sim_trades(account_id,ts,code,action,price,amount,pnl,pnl_pct,commission,name) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
 
@@ -496,19 +501,20 @@ def get_sim_snapshots(account_id):
     return [dict(r) for r in rows]
 
 
-def insert_sim_trade(account_id, ts, code, action, price, amount, pnl, pnl_pct, commission):
+def insert_sim_trade(account_id, ts, code, action, price, amount, pnl, pnl_pct,
+                     commission, name=""):
     with get_conn() as c:
         c.execute(
-            "INSERT INTO sim_trades(account_id,ts,code,action,price,amount,pnl,pnl_pct,commission) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (account_id, ts, code, action, price, amount, pnl, pnl_pct, commission),
+            "INSERT INTO sim_trades(account_id,ts,code,name,action,price,amount,pnl,pnl_pct,commission) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (account_id, ts, code, name, action, price, amount, pnl, pnl_pct, commission),
         )
 
 
 def get_sim_trades(account_id):
     with get_conn() as c:
         rows = c.execute(
-            "SELECT ts,code,action,price,amount,pnl,pnl_pct,commission FROM sim_trades "
+            "SELECT ts,code,name,action,price,amount,pnl,pnl_pct,commission FROM sim_trades "
             "WHERE account_id=? ORDER BY ts", (account_id,)
         ).fetchall()
     return [dict(r) for r in rows]
@@ -572,7 +578,7 @@ def get_sim_logs_after(account_id, offset=0):
 def get_sim_trades_after(account_id, offset=0):
     with get_conn() as c:
         rows = c.execute(
-            "SELECT rowid, ts, code, action, price, amount, pnl, pnl_pct, commission "
+            "SELECT rowid, ts, code, name, action, price, amount, pnl, pnl_pct, commission "
             "FROM sim_trades WHERE account_id=? AND rowid > ? ORDER BY rowid",
             (account_id, offset),
         ).fetchall()

@@ -22,6 +22,7 @@ from pandas.tseries.offsets import CustomBusinessDay
 
 from types import SimpleNamespace
 
+from . import jq_names
 from .context import Context, G, Position
 from .portfolio import Portfolio
 from ...datasource.base import DataSourceError
@@ -807,6 +808,19 @@ def get_trade_days(start_date=None, end_date=None, count=None):
     return pd.DatetimeIndex(cal)
 
 
+def _name_source() -> str:
+    """策略侧名称源：jq=聚宽名 / tdx=通达信名。默认 jq。"""
+    try:
+        from .... import db as _db
+        return (_db.get_quant_setting("sim_strategy_name_source") or "jq")
+    except Exception:
+        return "jq"
+
+
+def _jq_names() -> dict[str, str]:
+    return jq_names.load_jq_names()
+
+
 def get_security_name(code):
     if code == "159363.XSHE":
         ctx = _state.get("ctx")
@@ -822,19 +836,25 @@ def get_security_name(code):
         return names[code]
     mgr = _state.get("manager")
     if mgr:
-        # 先尝试网络源通达信简称
+        # 先尝试网络源通达信简称（与 get_all_securities 同口径：网络异常时
+        # jq 名替换块仍执行，保证 jq 名生效）
+        mootdx_names = {}
         if "network" in mgr.sources:
             try:
                 mootdx_names = mgr.sources["network"].get_stock_names()
-                pure = code.split(".")[0]
-                if pure in mootdx_names:
-                    if names is None:
-                        names = {}
-                    names[code] = mootdx_names[pure]
-                    _state["sec_names"] = names
-                    return mootdx_names[pure]
             except Exception:
                 pass
+        if _name_source() == "jq":
+            jq = _jq_names()
+            if jq:
+                mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
+        pure = code.split(".")[0]
+        if pure in mootdx_names:
+            if names is None:
+                names = {}
+            names[code] = mootdx_names[pure]
+            _state["sec_names"] = names
+            return mootdx_names[pure]
         try:
             etfs = mgr.fetch("get_etf_list")
             if etfs:
@@ -874,6 +894,10 @@ def get_all_securities(types=None, date=None):
             mootdx_names = mgr.sources["network"].get_stock_names()
         except Exception:
             pass
+    if _name_source() == "jq":
+        jq = _jq_names()
+        if jq:
+            mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
     records = []
     for t in types:
         try:
