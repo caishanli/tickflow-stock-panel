@@ -81,6 +81,20 @@
   返回 `{纯代码: 全名}`，转 JQ 码键）
 - 回测策略侧 `get_all_securities` 拿到全名，与聚宽/模拟盘一致
 
+**最终定稿（最终评审后修正）**：进一步调查发现快照 `etf_universe_snapshot.json`
+本身存的是**聚宽 display_name**（如 `511880 → 货币ETF-A`、`159985 → 豆粕ETF华夏`），
+是聚宽原始名，非通达信全名。两套名称体系（聚宽名 vs 通达信全名）`_clean_etf_name`
+无法互转。最终方案：
+
+- **模拟盘策略侧**（Task 7，已实现）：jqengine `get_all_securities`/`get_security_name`
+  默认读快照原始聚宽名（`jq` 源），可切回通达信名（`tdx` 源）。开关存
+  `quant_settings.sim_strategy_name_source`。
+- **回测侧**（Task 8，待实现）：`rqalpha_bridge._load_etf_universe` **移除**
+  `:1242/:1257` 的 `_clean_etf_name` 二次清洗，让回测策略侧也用快照原始聚宽名
+  ——与模拟盘 jq 源、聚宽三方一致。（实测二次清洗改变 1253/1787 名称，是偏离。）
+- **快照过期**：`jq_names` 需像回测一样做 30 天新鲜度检查，过期回退（见 Task 8）。
+- 网页成交/持仓显示列仍用通达信全名（`names.py`），独立于策略侧开关。
+
 ### 2. 名称解析模块（新增 `backend/app/quant/simulate/names.py`）
 
 - `get_name_map() -> dict[str, str]`：进程内缓存 `{JQ码: 名称}`；

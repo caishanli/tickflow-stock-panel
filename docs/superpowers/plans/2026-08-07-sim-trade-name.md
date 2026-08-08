@@ -1132,6 +1132,191 @@ git commit -m "feat(quant): 模拟盘策略侧名称源可切换（聚宽/通达
 
 ---
 
+### Task 8: 最终评审 fixes（回测移除二次清洗 + 快照过期 + 缓存钉住）
+
+**Files:**
+- Modify: `backend/app/quant/rqalpha_bridge.py:1240-1258`（移除 `_clean_etf_name` 二次清洗）
+- Modify: `backend/app/quant/jqengine/engine/jq/jq_names.py`（加 30 天新鲜度检查 + 过期回退）
+- Modify: `backend/app/quant/services/stockdata/sources.py`（缓存仅在 ETF 段非空时落盘）
+- Modify: `backend/app/quant/jqengine/engine/jq/api.py`（`get_security_name` 的 jq 替换移出 try）
+- Test: `backend/tests/quant/test_fix_compat2.py` / `test_etf_name_clean.py`（回测移除清洗后仍绿）+ 新增/扩展 `test_jq_names.py`
+
+**背景（最终评审 3 Important）**：
+- **I1**：回测 `_load_etf_universe` 在快照聚宽名之上又叠加 `_clean_etf_name`（:1242/:1257），
+  双重清洗改变 1253/1787 名称（`豆粕ETF华夏→豆粕`），与模拟盘 jq 源（原始快照名）、
+  聚宽三方不一致。移除回测侧二次清洗。
+- **I2**：`jq_names` 无 30 天新鲜度检查，快照过期后模拟盘 jq 源永远用旧名；回测有
+  `_ETF_SNAPSHOT_MAX_AGE`。`jq_names` 加同样的过期回退。
+- **I3**：服务端 `.stock_names_cache.json` 在 ETF 段为空时也落盘，一次 ETF API 失败
+  永久钉住股票-only 名称。仅当 ETF 段非空才写缓存。
+
+**Interfaces:**
+- Consumes: `rqalpha_bridge._clean_etf_name`（移除调用，保留函数）；`jq_names` 快照读取；
+  `sources._build_name_map` 缓存写。
+- Produces: 回测策略侧用原始聚宽名；`jq_names` 过期回退；服务端缓存防钉住。
+
+- [ ] **Step 1: 写失败测试**
+
+新建 `backend/tests/quant/test_final_review_fixes.py`：
+
+```python
+"""最终评审 fixes 测试：回测移除二次清洗、jq_names 快照过期、缓存钉住防护。"""
+from __future__ import annotations
+
+import json
+import datetime as _dt
+
+import pytest
+
+from app.quant import db
+from app.quant.jqengine.engine.jq import jq_names
+
+
+def test_jq_names_skips_stale_snapshot(tmp_path, monkeypatch):
+    """快照过期（>30天）时 jq_names 返回空（回退 tdx）。"""
+    old = (_dt.datetime.now() - _dt.timedelta(days=31)).isoformat()
+    snap = tmp_path / "etf_universe_snapshot.json"
+    snap.write_text(json.dumps({
+        "fetched_at": old,
+        "codes": ["511880.XSHG"],
+        "names": {"511880.XSHG": "货币ETF-A"},
+        "list_dates": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(jq_names, "SNAPSHOT_PATH", str(snap))
+    monkeypatch.setattr(jq_names, "MAX_AGE", _dt.timedelta(days=30))
+    jq_names._CACHE = None
+    try:
+        assert jq_names.load_jq_names() == {}
+    finally:
+        jq_names._CACHE = None
+
+
+def test_jq_names_uses_fresh_snapshot(tmp_path, monkeypatch):
+    """快照新鲜时返回聚宽名。"""
+    fresh = (_dt.datetime.now() - _dt.timedelta(days=1)).isoformat()
+    snap = tmp_path / "etf_universe_snapshot.json"
+    snap.write_text(json.dumps({
+        "fetched_at": fresh,
+        "codes": ["511880.XSHG"],
+        "names": {"511880.XSHG": "货币ETF-A"},
+        "list_dates": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(jq_names, "SNAPSHOT_PATH", str(snap))
+    monkeypatch.setattr(jq_names, "MAX_AGE", _dt.timedelta(days=30))
+    jq_names._CACHE = None
+    try:
+        assert jq_names.load_jq_names().get("511880.XSHG") == "货币ETF-A"
+    finally:
+        jq_names._CACHE = None
+```
+
+回测移除二次清洗的测试：检查 `_load_etf_universe` 返回的名称等于快照原始名（不经
+`_clean_etf_name`），在 `test_fix_compat2.py` 现有快照测试基础上扩展或新增
+`test_load_etf_universe_returns_raw_snapshot_names`。
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `uv run --extra dev pytest tests/quant/test_final_review_fixes.py -v`
+Expected: FAIL（`jq_names` 无 `MAX_AGE`，过期的快照仍被读取返回名称）
+
+- [ ] **Step 3: 实现**
+
+**I1 — 回测移除二次清洗**（`backend/app/quant/rqalpha_bridge.py:1240-1258`）：
+
+`:1240-1243`（快照命中路径）改为：
+
+```python
+    if fresh:
+        codes, names = _merge_cache_daily_codes(dm, list(snap[1]), dict(snap[2]))
+        return codes, dict(snap[2]), snap[3]
+```
+
+（不再 `_clean_etf_name`；`names` 直接用快照原始聚宽名。`_merge_cache_daily_codes` 返回的
+`names` 与 `snap[2]` 同源，直接返回 `dict(snap[2])` 保证含全部快照名。）
+
+`:1252-1258`（fallback 路径）改为：
+
+```python
+    names = {}
+    try:
+        names = dm.sources["network"].get_stock_names() or {}
+    except Exception:
+        pass
+    # 通达信名转 JQ 码键（与快照键格式一致），不再 _clean_etf_name
+    names = {_ts_to_jq(c + (".SH" if c.isdigit() and c[:1] in "569" else ".SZ")): n
+             for c, n in names.items()}
+    return etf_codes, names, {}
+```
+
+（fallback 用通达信名转 JQ 码键；若无法推断后缀，保留纯代码键——`install_jqcompat`
+对缺失回退 code，可接受。`_clean_etf_name` 函数保留但不再在 `_load_etf_universe` 调用。）
+
+**I2 — jq_names 快照过期检查**（`backend/app/quant/jqengine/engine/jq/jq_names.py`）：
+
+```python
+import datetime as _dt
+
+MAX_AGE = _dt.timedelta(days=30)
+
+
+def load_jq_names() -> dict[str, str]:
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE
+    out: dict[str, str] = {}
+    try:
+        with open(SNAPSHOT_PATH, encoding="utf-8") as f:
+            snap = json.load(f)
+        fetched_at = _dt.datetime.fromisoformat(str(snap.get("fetched_at")))
+        if _dt.datetime.now() - fetched_at <= MAX_AGE:
+            out = {str(k): str(v) for k, v in (snap.get("names") or {}).items()}
+    except Exception:
+        pass
+    _CACHE = out
+    return out
+```
+
+**I3 — 服务端缓存防钉住**（`backend/app/services/stockdata/sources.py`）：`_build_name_map`
+的 ETF 段完成后，仅当 `out` 包含 ETF 名称（即 ETF 段非空）才写缓存：
+
+```python
+        # 3) 落盘缓存：仅当 ETF 段成功（out 非空且含 ETF 代码）时写，避免
+        #    ETF API 失败时钉住股票-only 映射
+        has_etf = any(k.startswith(("159", "511", "512", "513", "515", "516",
+                                    "518", "588", "510", "501")) for k in out)
+        if has_etf:
+            try:
+                os.makedirs(os.path.dirname(self._names_cache_file), exist_ok=True)
+                with open(self._names_cache_file, "w", encoding="utf-8") as f:
+                    _json.dump(out, f, ensure_ascii=False)
+            except Exception:
+                pass
+```
+
+**Task7-b — get_security_name jq 替换移出 try**（`backend/app/quant/jqengine/engine/jq/api.py`）：
+把 `get_security_name` 里 `mootdx_names` 的 jq 替换块从 `try` 内移到 `try` 外（与
+`get_all_securities` 一致），使网络异常时 jq 名仍生效。
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `uv run --extra dev pytest tests/quant/test_final_review_fixes.py -v`
+Expected: 全绿
+
+Run: `uv run --extra dev pytest tests/quant/test_fix_compat2.py tests/quant/test_etf_name_clean.py tests/quant/test_rqalpha_bridge.py tests/quant/test_runner_strategy.py tests/quant/test_fix_sim.py tests/quant/test_jq_names.py -q`
+Expected: 全绿
+
+Run: `uv run --extra dev pytest tests/quant/test_stockdata_sources.py -q`
+Expected: 全绿（缓存写条件变化后现有测试仍过）
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add backend/app/quant/rqalpha_bridge.py backend/app/quant/jqengine/engine/jq/jq_names.py backend/app/quant/jqengine/engine/jq/api.py backend/app/services/stockdata/sources.py backend/tests/quant/test_final_review_fixes.py
+git commit -m "fix(quant): 回测移除 ETF 名称二次清洗 + jq_names 快照过期检查 + 服务端缓存防钉住"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
@@ -1142,6 +1327,7 @@ git commit -m "feat(quant): 模拟盘策略侧名称源可切换（聚宽/通达
 - Task 5 → spec §5（迁移脚本）+ §6（API 透传）
 - Task 6 → spec §7（前端）
 - Task 7 → spec「统一模拟盘/回测策略侧名称」补充节（策略侧名称源可切换：聚宽/通达信，默认聚宽对齐回测）
+- Task 8 → spec「最终定稿」补充节（回测移除二次清洗 + jq_names 快照过期 + 服务端缓存防钉住）
 - 影响面/验收 → 各任务测试覆盖
 
 **Placeholder scan:** 无 TBD/TODO；每步有完整代码与命令。
