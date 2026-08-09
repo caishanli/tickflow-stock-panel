@@ -132,11 +132,12 @@ def diff_trades(local_tr, fix_tr, out_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--local", default="data/quant_sim/jqwufu")
+    _runtime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "quant_sim")
+    ap.add_argument("--local", default=os.path.join(_runtime, "jqwufu"))
     ap.add_argument("--fixture", default="tests/fixtures/wufu_v52")
     ap.add_argument("--ret", default=None, help="收益CSV文件名(覆盖默认)")
     ap.add_argument("--trd", default=None, help="交易记录CSV文件名(覆盖默认)")
-    ap.add_argument("--out", default="data/quant_sim/jqwufu/diff")
+    ap.add_argument("--out", default=os.path.join(_runtime, "jqwufu", "diff"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 

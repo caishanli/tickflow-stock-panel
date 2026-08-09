@@ -103,8 +103,9 @@ def build_trade_csv(tr):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--local", default="data/quant_sim/jqwufu")
-    ap.add_argument("--out", default="data/quant_sim/jqwufu/aligned")
+    _runtime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "quant_sim")
+    ap.add_argument("--local", default=os.path.join(_runtime, "jqwufu"))
+    ap.add_argument("--out", default=os.path.join(_runtime, "jqwufu", "aligned"))
     ap.add_argument("--benchmark", default="tushare_510300.XSHG")
     ap.add_argument("--log", default=None, help="策略日志文件(可选)")
     args = ap.parse_args()

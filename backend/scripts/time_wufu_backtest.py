@@ -8,9 +8,10 @@ import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 STRATEGY = "tests/fixtures/wufu_v52/wufu-v5.2.py"
+from app.quant.config import CONFIG
 PARAMS = {"start": "2026-04-01", "end": "2026-07-16",
           "benchmark": "510300.XSHG", "minute_cache_cap": 800,
-          "out_dir": "data/quant_sim/jqwufu_network"}
+          "out_dir": os.path.join(CONFIG.runtime_dir, "jqwufu_network")}
 
 _t0 = time.monotonic()
 from app.quant.rqalpha_bridge import run_jq_backtest
@@ -109,8 +110,9 @@ def _timed_jq_init(self, *a, **kw):
         _eng["JqDataSource.__init__"] = _eng.get("JqDataSource.__init__", 0.0) + (time.monotonic() - t0)
 JqDataSource.__init__ = _timed_jq_init
 
+from app.quant.config import CONFIG
 t0 = time.monotonic()
-result = run_jq_backtest(STRATEGY, PARAMS, db_path="data/quant.db")
+result = run_jq_backtest(STRATEGY, PARAMS, db_path=CONFIG.db_path)
 elapsed = time.monotonic() - t0
 print(f"\n===== 回测总耗时: {elapsed:.1f}s =====")
 print("[timing] 网络请求明细（method: 次数 / 总耗时）")
