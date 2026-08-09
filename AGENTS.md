@@ -31,6 +31,7 @@ uv run --extra dev mypy app               # 类型检查
 
 - 入口：`backend/app/main.py`（`app.main:app`，uvicorn `--reload`）。路由在 `backend/app/api/`，按功能拆分（screener/backtest/monitor 等）。
 - 数据层：`backend/app/tickflow/repository.py` 加载 instruments + 日 K，计算 **enriched** 表落 Parquet（路径 `data/kline_daily_enriched/date=YYYY-MM-DD/`）。`data/` 整体 **不入库**（见 `.gitignore`），更新代码不会覆盖本地数据。
+- **quant.db 唯一路径 = 仓库根 `data/quant.db`**（`CONFIG.db_path` / `QUANT_DB_PATH`）。脚本里引用 quant.db 一律用 `CONFIG.db_path`，不要用 `"data/quant.db"` 相对路径（从 `backend/` 运行会写到 `backend/data/` 遗留库，前端/模拟盘读不到）。
 - 计算主力用 **Polars**；查询用 **DuckDB**；存储 **Parquet**。唯一 pandas 边界是回测（`vectorbt`，ADR-19），别在其它处引入 pandas。
 - 回测依赖可选：`uv sync --extra backtest`（vectorbt 体积大、macOS/Intel 可能需现场编译）。
 - 策略系统：`backend/app/strategy/`，18 个内置策略在 `builtin/`。扩展方式见 `docs/strategy.md` 与 `backend/app/strategy/prompts/strategy-guide.md`（AI 生成与手写规范）。
