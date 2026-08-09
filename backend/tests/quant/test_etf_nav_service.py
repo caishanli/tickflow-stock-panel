@@ -3,7 +3,6 @@ import datetime as _dt
 from datetime import date
 
 import polars as pl
-import pytest
 
 from app.services import etf_nav_service as svc
 from app.services import mootdx_service
@@ -51,8 +50,33 @@ def test_missing_nav_days_respects_market_close(tmp_path, monkeypatch):
     assert _dt.date(2026, 8, 7) in missing
     # 已有当日分区 → 不再缺失
     (tmp_path / "etf_nav" / "date=2026-08-07").mkdir(parents=True)
-    assert _dt.date(2026, 8, 7) not in svc._missing_etf_nav_days(
-        now=_dt.datetime(2026, 8, 7, 15, 30))
+    assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30)) == []
+
+
+def test_missing_nav_days_only_syncs_latest_not_history(tmp_path, monkeypatch):
+    """历史不补：只有最新缺失交易日会被回源，不会写假历史分区。
+
+    akshare fund_etf_fund_daily_em 只有当前快照（无逐日历史），回补历史只会
+    把今日净值写成 4/1 以来的每一天。因此 _missing_etf_nav_days 最多返回
+    **一个**候选日（最新分区之后最近一个已收盘交易日）。
+    """
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    # 已有 08-05 分区，今天是 08-07 收盘后 → 只缺 08-07，不返回 08-06 之前的历史
+    (tmp_path / "etf_nav" / "date=2026-08-05").mkdir(parents=True)
+    missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30))
+    assert missing == [_dt.date(2026, 8, 7)]
+    assert len(missing) <= 1  # 历史不补的核心断言
+
+
+def test_missing_nav_days_empty_root_returns_single_latest(tmp_path, monkeypatch):
+    """冷启动空分区：只返回最近一个交易日，不铺开 4/1 以来的全部历史。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30))
+    assert len(missing) <= 1
 
 
 def test_scan_missing_partitions_has_etf_nav(tmp_path, monkeypatch):
@@ -63,3 +87,4 @@ def test_scan_missing_partitions_has_etf_nav(tmp_path, monkeypatch):
     missing = mootdx_service.scan_missing_partitions()
     assert "etf_nav" in missing
     assert isinstance(missing["etf_nav"], list)
+    assert len(missing["etf_nav"]) <= 1

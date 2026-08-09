@@ -25,7 +25,6 @@ import polars as pl
 
 from app.quant.jqengine.datasource.manager import DataManager
 from app.quant.jqengine.datasource.mootdx_src import MootdxSource
-from app.services.etf_nav_service import ETF_NAV_ROOT
 
 logger = logging.getLogger("app.services.mootdx_service")
 
@@ -738,13 +737,14 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
     """
     today = _date.today()
     calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
+    from app.services.etf_nav_service import _missing_etf_nav_days as _missing_nav
     return {
         "kline_daily":       _missing_days_in(calendar, STOCK_DAILY_ROOT),
         "kline_etf_daily":   _missing_days_in(calendar, ETF_DAILY_ROOT),
         "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
         "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
         "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
-        "etf_nav":           _missing_days_in(calendar, ETF_NAV_ROOT),
+        "etf_nav":           _missing_nav(),
     }
 
 

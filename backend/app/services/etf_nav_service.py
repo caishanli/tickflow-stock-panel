@@ -85,19 +85,24 @@ def _market_closed(now: _dt.datetime | None = None) -> bool:
 
 
 def _missing_etf_nav_days(now: _dt.datetime | None = None) -> list[_date]:
-    """找出分区缺失的净值交易日（最新分区日期 → 今天）。
+    """返回需回源的净值交易日：**最多一个**（最新缺失日，历史不补）。
 
-    盘中（<15:00）不把今天当缺失：当日净值尚未披露。收盘后算缺失。
+    akshare ``fund_etf_fund_daily_em`` 只有当前快照（无逐日历史），回补历史
+    只会把今日净值写成过去每一天（假数据）。因此本函数只返回最新分区之后
+    最近一个**已收盘**交易日：盘中（<15:00）不算缺失（当日净值未披露）；
+    空分区返回最近一个交易日；最新分区已是最新交易日 → 返回空。
     """
     from app.services.mootdx_service import _trade_days_up_to
     existing = _partition_dates()
     now = now or _dt.datetime.now()
     today = now.date()
-    if not existing:
-        if _market_closed(now):
-            return _trade_days_up_to(today)
+    if not _market_closed(now):
         return []
-    latest = _date.fromisoformat(existing[-1])
-    if latest >= today and not _market_closed(now):
+    # 候选日 = 最新分区之后第一个需回补的交易日（只取最近一个）
+    recent = _trade_days_up_to(today)
+    if not recent:
         return []
-    return [d for d in _trade_days_up_to(today) if latest < d <= today]
+    latest_day = recent[-1]
+    if existing and _date.fromisoformat(existing[-1]) >= latest_day:
+        return []
+    return [latest_day]
