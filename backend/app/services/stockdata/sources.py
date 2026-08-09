@@ -366,6 +366,24 @@ class DataSources:
         key = f"daily:{','.join(sorted(codes))}:{start_date}:{end_date}"
         return self.get_or_fetch(key, _HIST_TTL, _load)
 
+    def get_etf_nav(self, codes: list[str], date: str | None = None) -> pl.DataFrame:
+        """读 etf_nav 分区（date 给定用该日，None 用最新分区）。"""
+        def _load():
+            syms = {_to_jq(c) for c in codes}
+            cols = ["symbol", "unit_nav", "date"]
+            lo = hi = date
+            if date is None:
+                parts_root = os.path.join(self.data_root, "etf_nav")
+                dates = sorted(
+                    d[5:] for d in os.listdir(parts_root)
+                    if d.startswith("date=")) if os.path.isdir(parts_root) else []
+                if not dates:
+                    return pl.DataFrame()
+                hi = dates[-1]
+            return self._scan_partitions("etf_nav", lo, hi, syms, cols)
+        key = f"nav:{','.join(sorted(codes))}:{date or 'latest'}"
+        return self.get_or_fetch(key, _HIST_TTL, _load)
+
     def get_minute(self, codes: list[str], lo_ts, hi_ts) -> pl.DataFrame:
         """历史分钟读分区；若请求范围包含今日，叠加当日分钟内存库（网络数据）。"""
         def _load():

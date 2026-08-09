@@ -97,6 +97,11 @@ def h_get_adj_factors(p, s: DataSources):
     return "parquet", s.get_adj_factors()
 
 
+def h_get_etf_nav(p, s: DataSources):
+    codes = _norm_codes(p["security"])
+    return "parquet", s.get_etf_nav(codes, p.get("date"))
+
+
 def h_trigger_sync(p, s: DataSources):
     from .scheduler import trigger_sync
     kind = p.get("kind", "backfill")
@@ -117,6 +122,7 @@ HANDLERS = {
     "get_index_stocks": h_get_index_stocks,
     "get_stock_names": h_get_stock_names,
     "get_adj_factors": h_get_adj_factors,
+    "get_etf_nav": h_get_etf_nav,
     "trigger_sync": h_trigger_sync,
 }
 

@@ -478,29 +478,49 @@ def get_extras(field, securities, start_date=None, end_date=None, count=None,
     """聚宽 get_extras 兼容 shim（模拟盘引擎版）。
 
     与 ``app.quant.jqcompat.get_extras`` 同口径：当前仅支持
-    field='unit_net_value'（ETF 净值，以官方 close 近似），其余字段返回空并 warn。
+    field='unit_net_value'（ETF 真实净值），其余字段返回空并 warn。
     返回 DataFrame：行=日期，列=security，供策略 ``df.loc[date, code]`` 取用。
     """
     if field != "unit_net_value":
         _emit_sink("warn", f"[get_extras] field={field} 未实现，返回空 DataFrame")
         return pd.DataFrame()
     codes = [securities] if isinstance(securities, str) else list(securities)
+    end_dt = pd.Timestamp(end_date) if end_date is not None else (
+        getattr(_state.get("ctx"), "current_dt", None) or pd.Timestamp.now())
+    navs = _get_etf_nav_df(codes, end_dt.date())
+    if isinstance(securities, str):
+        return navs[[codes[0]]] if codes[0] in navs.columns else pd.DataFrame()
+    return navs
+
+
+def _get_nav_manager():
+    return _state.get("manager")
+
+
+def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
+    """从 StockDataClient 拉真实单位净值：end_date 精确优先，回退最近可用日。
+
+    返回 DataFrame：行=日期，列=security。无数据返回空 DataFrame。
+    """
+    mgr = _get_nav_manager()
+    if mgr is None or not hasattr(mgr, "client"):
+        _emit_sink("warn", "[get_extras] 无可用 DataManager，返回空")
+        return pd.DataFrame()
+    raw = mgr.client.get_etf_nav(codes, str(end_date))
+    if not raw:
+        return pd.DataFrame()
     out = {}
     for code in codes:
-        bars = get_price(code, start_date=start_date, end_date=end_date,
-                         frequency="1d", fields=["close"], fq=fq, panel=False)
-        if bars is None or bars.empty:
+        df = raw.get(code)
+        if df is None or df.empty:
             continue
-        if "time" in bars.columns:
-            bars = bars.set_index("time")
-        if "close" in bars.columns:
-            out[code] = bars["close"]
+        idx = (pd.to_datetime(df["date"]) if "date" in df.columns
+               else pd.to_datetime(df.index))
+        out[code] = pd.Series(df["unit_nav"].values, index=idx)
     if not out:
         return pd.DataFrame()
-    result = pd.DataFrame(out)
-    if isinstance(securities, str):
-        return result[[codes[0]]]
-    return result
+    result = pd.DataFrame(out).sort_index()
+    return result[result.index <= pd.Timestamp(end_date)]
 
 
 def attribute_history(security, count, unit="1d", fields=None, skip_paused=True, df=True):

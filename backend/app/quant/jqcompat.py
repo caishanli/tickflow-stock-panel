@@ -473,8 +473,7 @@ def get_extras(field, securities, start_date=None, end_date=None, count=None,
                **kwargs):
     """聚宽 get_extras 兼容 shim。
 
-    当前仅支持 field='unit_net_value'（ETF 净值），其余字段返回空 DataFrame 并 warn。
-    ETF 净值无独立数据源时以 close 近似。
+    当前仅支持 field='unit_net_value'（ETF 真实净值），其余字段返回空 DataFrame 并 warn。
     """
     import logging as _log
     if field != "unit_net_value":
@@ -483,20 +482,46 @@ def get_extras(field, securities, start_date=None, end_date=None, count=None,
     codes = [securities] if isinstance(securities, str) else list(securities)
     env = Environment.get_instance()
     end_dt = pd.Timestamp(end_date) if end_date is not None else env.trading_dt
-    start_dt = pd.Timestamp(start_date) if start_date is not None else end_dt
+    navs = _get_etf_nav_df(codes, end_dt.date())
+    if isinstance(securities, str):
+        return navs[[codes[0]]] if codes[0] in navs.columns else pd.DataFrame()
+    return navs
+
+
+def _get_nav_manager():
+    try:
+        env = Environment.get_instance()
+        ds = getattr(env, "data_source", None)
+        return getattr(ds, "_dm", None)
+    except Exception:
+        return None
+
+
+def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
+    """从 StockDataClient 拉真实单位净值：end_date 精确优先，回退最近可用日。
+
+    返回 DataFrame：行=日期，列=security。无数据返回空 DataFrame。
+    """
+    import logging as _log
+    mgr = _get_nav_manager()
+    if mgr is None or not hasattr(mgr, "client"):
+        _log.warning("[jqcompat] get_extras 无可用 DataManager，返回空")
+        return pd.DataFrame()
+    raw = mgr.client.get_etf_nav(codes, str(end_date))
+    if not raw:
+        return pd.DataFrame()
     out = {}
     for code in codes:
-        bars = get_price(code, start_date=str(start_dt.date()),
-                         end_date=str(end_dt.date()),
-                         frequency="1d", fields=["close"], panel=False, fq=fq)
-        if bars is not None and not bars.empty:
-            out[code] = bars.set_index("time")["close"]
+        df = raw.get(code)
+        if df is None or df.empty:
+            continue
+        idx = (pd.to_datetime(df["date"]) if "date" in df.columns
+               else pd.to_datetime(df.index))
+        out[code] = pd.Series(df["unit_nav"].values, index=idx)
     if not out:
         return pd.DataFrame()
-    result = pd.DataFrame(out)
-    if isinstance(securities, str) and code in result.columns:
-        return result[[code]]
-    return result
+    result = pd.DataFrame(out).sort_index()
+    return result[result.index <= pd.Timestamp(end_date)]
 
 
 def set_benchmark(code):
