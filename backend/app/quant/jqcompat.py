@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
 import sys
@@ -44,6 +45,7 @@ _LIST_DATES = {}                  # code -> (list_date, delist_date) 'YYYY-MM-DD
 _EVERY_BAR_CALLBACKS = []         # 'every_bar' 调度回调
 _DAILY_AT = {}                      # (hour, minute) -> 聚宽 run_daily(time='HH:MM') 回调
 _FQ_WARNED = set()                  # 已提示 fq 口径不支持的标的（install_jqcompat 每次回测重置）
+_WARNED_NO_NAV: set[str] = set()     # 「历史无净值分区」warning 每会话只提示一次
 
 
 def _set_current_bar_dict(bd):
@@ -473,8 +475,7 @@ def get_extras(field, securities, start_date=None, end_date=None, count=None,
                **kwargs):
     """聚宽 get_extras 兼容 shim。
 
-    当前仅支持 field='unit_net_value'（ETF 净值），其余字段返回空 DataFrame 并 warn。
-    ETF 净值无独立数据源时以 close 近似。
+    当前仅支持 field='unit_net_value'（ETF 真实净值），其余字段返回空 DataFrame 并 warn。
     """
     import logging as _log
     if field != "unit_net_value":
@@ -483,19 +484,63 @@ def get_extras(field, securities, start_date=None, end_date=None, count=None,
     codes = [securities] if isinstance(securities, str) else list(securities)
     env = Environment.get_instance()
     end_dt = pd.Timestamp(end_date) if end_date is not None else env.trading_dt
-    start_dt = pd.Timestamp(start_date) if start_date is not None else end_dt
+    navs = _get_etf_nav_df(codes, end_dt.date())
+    if isinstance(securities, str):
+        return navs[[codes[0]]] if codes[0] in navs.columns else pd.DataFrame()
+    return navs
+
+
+def _get_nav_manager():
+    try:
+        env = Environment.get_instance()
+        ds = getattr(env, "data_source", None)
+        return getattr(ds, "_dm", None)
+    except Exception:
+        return None
+
+
+def _build_nav_frame(raw, codes: list[str], end_date) -> pd.DataFrame:
+    """把 client 返回的 {code: df} 归一为 行=日期、列=security 的 DataFrame。"""
+    if not raw:
+        return pd.DataFrame()
     out = {}
     for code in codes:
-        bars = get_price(code, start_date=str(start_dt.date()),
-                         end_date=str(end_dt.date()),
-                         frequency="1d", fields=["close"], panel=False, fq=fq)
-        if bars is not None and not bars.empty:
-            out[code] = bars.set_index("time")["close"]
+        df = raw.get(code)
+        if df is None or df.empty:
+            continue
+        idx = (pd.to_datetime(df["date"]) if "date" in df.columns
+               else pd.to_datetime(df.index))
+        out[code] = pd.Series(df["unit_nav"].values, index=idx)
     if not out:
         return pd.DataFrame()
-    result = pd.DataFrame(out)
-    if isinstance(securities, str) and code in result.columns:
-        return result[[code]]
+    result = pd.DataFrame(out).sort_index()
+    return result[result.index <= pd.Timestamp(end_date)]
+
+
+def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
+    """从 StockDataClient 拉真实单位净值：end_date 精确分区优先，缺失回退最新分区。
+
+    先请求 ``get_etf_nav(codes, str(end_date))``；若全部标的为空（精确分区缺失，
+    如回测早期区间历史不补），再请求 ``get_etf_nav(codes, None)``（最新分区）
+    并保留 index <= end_date 的行。仍为空且 end_date 为历史日期时，每会话
+    一次性 warning（历史不补）。返回 DataFrame：行=日期，列=security。
+    无数据返回空 DataFrame。
+    """
+    import logging as _log
+    mgr = _get_nav_manager()
+    if mgr is None or not hasattr(mgr, "client"):
+        _log.warning("[jqcompat] get_extras 无可用 DataManager，返回空")
+        return pd.DataFrame()
+    result = _build_nav_frame(
+        mgr.client.get_etf_nav(codes, str(end_date)), codes, end_date)
+    if result.empty:
+        result = _build_nav_frame(
+            mgr.client.get_etf_nav(codes, None), codes, end_date)
+    if (result.empty and end_date is not None
+            and _dt.date.fromisoformat(str(end_date)) < _dt.date.today()
+            and not _WARNED_NO_NAV):
+        _WARNED_NO_NAV.add("unit_net_value")
+        _log.warning("[jqcompat] get_extras unit_net_value 无净值分区（历史不补），返回空")
     return result
 
 

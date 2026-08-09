@@ -18,6 +18,7 @@ dependencies = [
     "duckdb>=1.0",
     "pyarrow>=16.0",
     "baostock>=0.9",              # 全市场 5min/日线/复权因子回源 (backfill_baostock_3y)
+    "akshare>=1.18,<2",           # ETF 单位净值回源 (etf_nav_service)
     "pandas>=2.2",                # 仅在 BacktestService 边界使用,见 §7.4 / ADR-19
     "psutil>=5.9",                # 独立回测 worker 的峰值 RSS 与退出后内存指标
     # llvmlite 不再提供 macOS Intel wheel；该平台使用 Matrix 纯 Python fallback。

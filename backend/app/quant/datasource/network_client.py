@@ -162,6 +162,12 @@ class StockDataClient:
             return pd.DataFrame()
         return pl.read_parquet(io.BytesIO(resp["d"])).to_pandas()
 
+    def get_etf_nav(self, codes, date=None) -> dict[str, pd.DataFrame]:
+        resp = self._request("get_etf_nav", {
+            "security": codes, "date": date,
+        })
+        return self._parquet_to_dict(resp)
+
     # ---- 列表/元数据 ----
     def get_trade_days(self, start_date, end_date) -> list[str]:
         return self._request("get_trade_days", {

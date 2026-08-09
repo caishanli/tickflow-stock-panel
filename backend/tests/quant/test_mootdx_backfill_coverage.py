@@ -100,9 +100,20 @@ def test_adj_factor_stale(tmp_path, monkeypatch):
     assert ms._adj_factor_stale() is True
 
 
+def _stub_etf_nav(monkeypatch, latest: list[str] | None = None):
+    """etf_nav 全链路 stub：避免 backfill_to_now 读真实 data/etf_nav、触发
+    akshare 网络回源或踩到被 monkeypatch 的 fake _date。"""
+    from app.services import etf_nav_service
+    monkeypatch.setattr(etf_nav_service, "_partition_dates",
+                        lambda: (latest if latest is not None else []))
+    monkeypatch.setattr(etf_nav_service, "_missing_etf_nav_days", lambda now=None: [])
+    monkeypatch.setattr(etf_nav_service, "sync_etf_nav", lambda day=None: 0)
+
+
 def test_backfill_to_now_includes_index_and_adj(monkeypatch, tmp_path):
     """空分区场景：因子表空 → 触发 sync_adj_factor；结果含 missing；触发钉钉。"""
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    _stub_etf_nav(monkeypatch)
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
     monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
     monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
@@ -153,6 +164,7 @@ def test_backfill_noop_when_all_current(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
     monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch, latest=["2026-08-04"])  # etf_nav 视为已最新，使 empty=False
 
     monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
@@ -188,6 +200,7 @@ def test_backfill_runs_sync_per_gap_day(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
     monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch)
     monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
     # 股票+ETF 日线都缺 8/5、8/6 两个交易日
@@ -222,6 +235,7 @@ def test_backfill_seeds_window_when_root_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
     monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch)
     monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])  # 空根返回 []（既有语义）

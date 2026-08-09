@@ -166,8 +166,23 @@ def test_loader_exposes_intraday_hooks():
 
 # ---- get_extras shim（模拟盘引擎） ----
 
+class _NavClient:
+    """最小 fake：按代码返回含 date/unit_nav 的 DataFrame。"""
+    def __init__(self, navs):
+        self.navs = navs  # {code: {date_str: nav}}
+
+    def get_etf_nav(self, codes, date=None):
+        import pandas as pd
+        out = {}
+        for c in codes:
+            rows = self.navs.get(c, {})
+            idx = sorted(k for k in rows if date is None or k <= date)
+            out[c] = pd.DataFrame({"date": idx, "unit_nav": [rows[k] for k in idx]})
+        return out
+
+
 def _daily_mgr():
-    """返回 ``fetch->get_daily`` 的形如 DataManager 掉线的 stub。"""
+    """返回 ``fetch->get_daily`` 且带 ``client.get_etf_nav`` 的 stub。"""
     import pandas as pd
 
     idx = pd.date_range("2026-07-01", periods=3, freq="D")
@@ -179,6 +194,7 @@ def _daily_mgr():
         sources = {}
         _daily_mem = {"get_daily_510300.XSHG": df}
         _minute_mem = {}
+        client = _NavClient({"510300.XSHG": {"2026-07-03": 1.23}})
         def fetch(self, meth, code, start, end):
             return self._daily_mem.get(f"{meth}_{code}")
     return _M()
@@ -188,7 +204,7 @@ def test_get_extras_unit_net_value_codes():
     api._reset(_daily_mgr(), 0.0003, 0.001, 10000.0)
     df = api.get_extras("unit_net_value", ["510300.XSHG"], "2026-07-01", "2026-07-03")
     assert list(df.columns) == ["510300.XSHG"]
-    assert df[df.columns[0]].iloc[-1] == 1.2  # close 近似 NAV，末行为最终日期
+    assert df[df.columns[0]].iloc[-1] == 1.23  # 真实净值（fake client）
     # 单一代码调用形态（字符串）：仍返回单列 DataFrame，行=日期
     single = api.get_extras("unit_net_value", "510300.XSHG",
                             "2026-07-01", "2026-07-03")
@@ -222,4 +238,4 @@ def test_strategy_runtime_can_call_get_extras():
     assert len(daily) == 1
     func, t = daily[0]
     assert t == "13:10"
-    assert func(bundle.ctx) == 1.2
+    assert func(bundle.ctx) == 1.23  # 真实净值（fake client）

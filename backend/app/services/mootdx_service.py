@@ -507,7 +507,8 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
     """
     result: dict = {
         "daily_days": [], "index_daily_days": [],
-        "etf_minute_days": [], "stock_minute_days": [], "errors": [],
+        "etf_minute_days": [], "stock_minute_days": [],
+        "etf_nav_days": [], "errors": [],
     }
 
     for day in missing.get("kline_daily", []) + missing.get("kline_etf_daily", []):
@@ -535,6 +536,14 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
             result["stock_minute_days"].extend(str(d) for d in min_days)
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"stock_minute {min_days}: {e}")
+
+    for day in missing.get("etf_nav", []):
+        try:
+            from app.services import etf_nav_service
+            etf_nav_service.sync_etf_nav(day)
+            result["etf_nav_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"etf_nav {day}: {e}")
 
     return result
 
@@ -721,19 +730,21 @@ def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
 
 
 def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]]:
-    """分区级缺失扫描：4/1（或 start）至今，5 类数据按交易日历逐日比对。
+    """分区级缺失扫描：4/1（或 start）至今，6 类数据按交易日历逐日比对。
 
     检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
     仅分区级（分区存在即视为该日已覆盖），不逐 symbol 校验。
     """
     today = _date.today()
     calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
+    from app.services.etf_nav_service import _missing_etf_nav_days as _missing_nav
     return {
         "kline_daily":       _missing_days_in(calendar, STOCK_DAILY_ROOT),
         "kline_etf_daily":   _missing_days_in(calendar, ETF_DAILY_ROOT),
         "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
         "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
         "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
+        "etf_nav":           _missing_nav(),
     }
 
 
@@ -1142,13 +1153,16 @@ def backfill_to_now() -> dict[str, Any]:
         "daily_days": [], "daily_written": {},
         "index_daily_days": [], "index_daily_written": {},
         "adj_factor": None,
-        "stock_minute_rows": 0, "errors": [],
+        "stock_minute_rows": 0, "etf_nav_days": [], "errors": [],
     }
 
+    from app.services import etf_nav_service
     stocks_daily      = _partition_dates(STOCK_DAILY_ROOT)
     etf_daily_days    = _partition_dates(ETF_DAILY_ROOT)
     index_daily_days  = _partition_dates(INDEX_DAILY_ROOT)
     etf_minute_days   = _partition_dates(ETF_MINUTE_ROOT)
+    etf_nav_days      = etf_nav_service._partition_dates()
+    missing_nav_days  = etf_nav_service._missing_etf_nav_days()
 
     result["missing"] = {
         "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
@@ -1160,6 +1174,8 @@ def backfill_to_now() -> dict[str, Any]:
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
         "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
+        "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
+                               "empty": not etf_nav_days, "missing": bool(missing_nav_days)},
     }
 
     # 1. ETF 分钟
@@ -1217,6 +1233,15 @@ def backfill_to_now() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")
+
+    # 3b. ETF 单位净值（akshare，只补最新缺失交易日；盘中未收盘 → 目标前一交易日）
+    for day in missing_nav_days:
+        try:
+            etf_nav_service.sync_etf_nav(day)
+            result["etf_nav_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 净值回源 %s 失败: %s", day, e)
+            result["errors"].append(f"etf_nav {day}: {e}")
 
     # 4. 缺口告警（日志 + 钉钉）
     if any(st["missing"] or st["empty"] for st in result["missing"].values()):
