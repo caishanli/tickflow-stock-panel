@@ -3,6 +3,7 @@ import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from app.quant.rqalpha_bridge import run_jq_backtest
+from app.quant.config import CONFIG
 
 strategy_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..",
@@ -17,7 +18,7 @@ params = {
 }
 
 t0 = time.time()
-result = run_jq_backtest(strategy_path, params, db_path="data/quant.db")
+result = run_jq_backtest(strategy_path, params, db_path=CONFIG.db_path)
 elapsed = time.time() - t0
 print(f"\n===== 回测总耗时: {elapsed:.1f}s =====")
 if isinstance(result, dict):
