@@ -737,7 +737,9 @@ function LogList({ logs }: { logs: any[] }) {
   return (
     <div className="space-y-0.5 text-[11px] text-muted font-mono">
       {logs.map((l, i) => (
-        <div key={i}>{typeof l === 'string' ? l : `${l.level ?? ''} ${l.message ?? JSON.stringify(l)}`}</div>
+        <div key={i}>
+          {typeof l === 'string' ? l : `${l.ts ?? ''} [${l.level ?? 'info'}] ${l.message ?? JSON.stringify(l)}`}
+        </div>
       ))}
     </div>
   )
@@ -769,6 +771,7 @@ function TradeTable({ trades }: { trades: any[] }) {
             <th className="px-2 py-1.5 font-normal">方向</th>
             <th className="px-2 py-1.5 font-normal text-right">价格</th>
             <th className="px-2 py-1.5 font-normal text-right">数量</th>
+            <th className="px-2 py-1.5 font-normal text-right">手续费</th>
           </tr>
         </thead>
         <tbody className="text-foreground">
@@ -779,6 +782,7 @@ function TradeTable({ trades }: { trades: any[] }) {
               <td className={`px-2 py-1.5 ${(t.action ?? t.side) === 'BUY' || (t.action ?? t.side) === 'buy' ? 'text-bull' : 'text-bear'}`}>{t.action ?? t.side ?? ''}</td>
               <td className="px-2 py-1.5 text-right">{t.price ?? ''}</td>
               <td className="px-2 py-1.5 text-right">{t.amount ?? t.qty ?? ''}</td>
+              <td className="px-2 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
             </tr>
           ))}
         </tbody>

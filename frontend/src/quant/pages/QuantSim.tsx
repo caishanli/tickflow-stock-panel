@@ -537,7 +537,6 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal">方向</th>
                     <th className="px-3 py-1.5 font-normal text-right">价格</th>
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                    <th className="px-3 py-1.5 font-normal text-right">手续费</th>
                     <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
                   </tr>
                 </thead>
@@ -552,7 +551,6 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       </td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
                       <td className="px-3 py-1.5 text-right num">{t.amount}</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
                       <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
                       </td>

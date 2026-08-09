@@ -112,7 +112,8 @@ def _mootdx_style_df(closes=(10.0, 11.0, 12.0)):
 def test_m8_tushare_style_df_converts():
     """tushare 风格 (trade_date/vol) 不再 KeyError；vol(手)×100 → volume(股)。"""
     arr = bridge.QuantRQAlphaDataSource._df_to_recarray(_tushare_style_df())
-    assert arr["datetime"].tolist() == [20240102, 20240103, 20240104]
+    # datetime 为 rqalpha 口径 YYYYMMDD000000（同 jqcompat _daily_to_recarray）
+    assert arr["datetime"].tolist() == [20240102000000, 20240103000000, 20240104000000]
     assert arr["volume"].tolist() == [5000.0, 5000.0, 5000.0]  # 与 mootdx 源 vol×100 口径一致
     assert arr["close"].tolist() == [10.0, 11.0, 12.0]
 
@@ -120,7 +121,8 @@ def test_m8_tushare_style_df_converts():
 def test_m8_mootdx_style_df_converts():
     """mootdx 风格 (datetime 索引 + vol) 不再 KeyError；索引 → date 列。"""
     arr = bridge.QuantRQAlphaDataSource._df_to_recarray(_mootdx_style_df())
-    assert arr["datetime"].tolist() == [20240102, 20240103, 20240104]
+    # datetime 为 rqalpha 口径 YYYYMMDD000000（同 jqcompat _daily_to_recarray）
+    assert arr["datetime"].tolist() == [20240102000000, 20240103000000, 20240104000000]
     assert arr["volume"].tolist() == [5000.0, 5000.0, 5000.0]
 
 

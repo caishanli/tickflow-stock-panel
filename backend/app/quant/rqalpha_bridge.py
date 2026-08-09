@@ -30,7 +30,7 @@ from rqalpha.model.instrument import Instrument
 from . import db
 from .config import CONFIG, QuantConfig
 # 涨跌停幅度分档公共函数（与 jqcompat 同口径复用，避免两处各写一份分档规则）
-from .jqcompat import _is_st_name, _limit_rate
+from .jqcompat import _dt_to_int, _is_st_name, _limit_rate
 from .jqengine.config import CONFIG as _JQ_ENGINE_CONFIG
 
 # rqalpha 6.2.1 兼容补丁：sys_analyser tear_down 仍使用 pandas 3 已移除的
@@ -127,6 +127,22 @@ def _now():
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _engine_ts(env) -> str:
+    """日志时间戳：回测引擎当前推进时刻（trading_dt），引擎未运行退回真实时钟。
+
+    与模拟盘补跑日志口径一致（补跑用引擎推进时刻、实时用真实时间）：让回测
+    运行日志按 bar 的模拟时间推进，而不是真实墙钟——用户看到的是逐 bar 的交易
+    推进时间（如 2026-07-10 10:30:00），而非提交回测的当下时刻。
+    """
+    try:
+        dt = getattr(env, "trading_dt", None)
+        if dt is not None:
+            return pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:  # noqa: BLE001
+        pass
+    return _now()
+
+
 def _log_progress(run_id: str | None, msg: str, level: str = "INFO") -> None:
     """运行期阶段进度实时落库（SSE 即刻推送到前端日志页签）。
 
@@ -214,6 +230,9 @@ class QuantRQAlphaDataSource:
         self._params = params
 
         symbols = list(params.get("symbols") or [])
+        benchmark = params.get("benchmark")
+        if benchmark and benchmark not in symbols:
+            symbols = symbols + [benchmark]  # 基准需注册 instrument + bars，供 _benchmark_nav 取数
         start = params.get("start")
         end = params.get("end")
 
@@ -242,7 +261,15 @@ class QuantRQAlphaDataSource:
 
         for code in symbols:
             try:
-                df = provider.get_daily(code, start, end)
+                # 多取回测起点前 ~10 个自然日：rqalpha sys_analyser 校验基准时
+                # 需要起点前一交易日的数据（get_previous_trading_date + 收益种子），
+                # 与 jqcompat 路径的 lookback 预取同口径；无基准时不引入额外数据。
+                fetch_start = (
+                    (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+                    if start and benchmark
+                    else start
+                )
+                df = provider.get_daily(code, fetch_start, end)
             except Exception:
                 df = None
             if df is None or len(df) == 0:
@@ -299,7 +326,7 @@ class QuantRQAlphaDataSource:
         n = len(df)
         arr = np.zeros(n, dtype=_BAR_DTYPE)
         arr["datetime"] = df["date"].map(
-            lambda d: int(pd.Timestamp(d).strftime("%Y%m%d"))
+            lambda d: int(pd.Timestamp(d).strftime("%Y%m%d")) * 1000000
         ).to_numpy()
         arr["open"] = df["open"].to_numpy(dtype=np.float64)
         arr["close"] = df["close"].to_numpy(dtype=np.float64)
@@ -369,7 +396,7 @@ class QuantRQAlphaDataSource:
         vol_by_day = {}
         if bars is not None and len(bars):
             for _dt_int, _vol in zip(bars["datetime"], bars["volume"]):
-                vol_by_day[int(_dt_int)] = float(_vol)
+                vol_by_day[int(_dt_int) // 1_000_000] = float(_vol)
         out = []
         for d in dates:
             day = int(pd.Timestamp(d).strftime("%Y%m%d"))
@@ -471,7 +498,7 @@ class QuantRQAlphaDataSource:
         _hms = (_t.hour, _t.minute, _t.second)
         _intraday = (0, 0, 0) < _hms < (15, 0, 0)
         side = "left" if (_intraday and not include_now) else "right"
-        i = bars["datetime"].searchsorted(np.uint64(int(pd.Timestamp(dt).strftime("%Y%m%d"))), side=side)
+        i = bars["datetime"].searchsorted(np.uint64(_dt_to_int(dt, "1d")), side=side)
         if bar_count is None:
             left = 0
         else:
@@ -489,7 +516,7 @@ class QuantRQAlphaDataSource:
         bars = self._all_day_bars_of(instrument)
         if len(bars) <= 0:
             return None
-        dt_int = np.uint64(int(pd.Timestamp(dt).strftime("%Y%m%d")))
+        dt_int = np.uint64(_dt_to_int(dt, "1d"))
         pos = bars["datetime"].searchsorted(dt_int)
         if pos >= len(bars) or bars["datetime"][pos] != dt_int:
             return None
@@ -570,11 +597,15 @@ def _install_live_mod():
         from rqalpha.interface import AbstractMod
 
         class _LiveHandler(logging.Handler):
+            def __init__(self, ts_fn):
+                super().__init__()
+                self._ts_fn = ts_fn
+
             def emit(self, record):
                 if _LIVE_RUN_ID is None:
                     return
                 try:
-                    db.insert_log(_LIVE_RUN_ID, _now(), record.levelname, self.format(record))
+                    db.insert_log(_LIVE_RUN_ID, self._ts_fn(), record.levelname, self.format(record))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -595,13 +626,17 @@ def _install_live_mod():
 
                     import app.quant.jqcompat as _jq
 
+                    # 日志时间戳用引擎推进时刻（bar 的模拟时间），与模拟盘补跑一致
+                    def _ts():
+                        return _engine_ts(env)
+
                     _jq.LIVE_SINK = lambda level, msg: (
-                        db.insert_log(_LIVE_RUN_ID, _now(), level, msg)
+                        db.insert_log(_LIVE_RUN_ID, _ts(), level, msg)
                         if _LIVE_RUN_ID is not None else None
                     )
                     self._handlers.append(("sink", _jq, None))
 
-                    h = _LiveHandler()
+                    h = _LiveHandler(_ts)
                     h.setLevel(_logging.INFO)
                     h.setFormatter(_logging.Formatter("%(message)s"))
                     _jq.logger.setLevel(_logging.INFO)
@@ -621,11 +656,17 @@ def _install_live_mod():
                 if not bench_code:
                     return 1.0
                 try:
-                    ins = self._env.data_proxy.get_instrument(bench_code)
-                    bar = self._env.data_proxy.get_bar(ins, dt, "1d")
+                    # data_proxy.get_bar 第一参必须是 order_book_id 字符串（内部
+                    # 自取 instrument），传 Instrument 对象会抛
+                    # "'Instrument' object is not iterable" → 基准恒 1.0（基线平直）。
+                    # 返回值是 rqalpha 的 BarObject：close 是属性（bar.close），
+                    # 不是 dict 键（bar["close"] 会 KeyError 被 except 吞掉 → 恒 1.0）。
+                    bar = self._env.data_proxy.get_bar(bench_code, dt, "1d")
                     if bar is None:
                         return 1.0
-                    close = float(bar["close"])
+                    close = float(bar.close)
+                    if close != close:  # NaN：当日基准 bar 缺失，跳过当日
+                        return 1.0
                     if self._bench_base_close is None:
                         self._bench_base_close = close
                     if not self._bench_base_close:
@@ -964,13 +1005,15 @@ def _build_config(params: dict) -> dict:
             "frequency": _norm_frequency(params.get("frequency", "1d")),
             "run_type": "b",
             "accounts": {"stock": float(params.get("capital", 100000.0))},
-            "benchmark": None,
+            # 基准：params 显式给 benchmark 时使用（UI 默认不给 → None，与 M13
+            # "无基准占位 1.0" 语义一致）；给了则回测基线/超额收益据此计算
+            "benchmark": params.get("benchmark"),
             "data_bundle_path": params.get("bundle_dir") or _dt_dir(),
             "matching_type": "current_bar",
             "strategy_file": "strategy.py",
         },
         "mod": {
-            "sys_analyser": {"record": True, "benchmark": None},
+            "sys_analyser": {"record": True, "benchmark": params.get("benchmark")},
             "sys_simulation": {
                 "slippage": float(params.get("slippage", 0.0)),
                 "matching_type": "current_bar",

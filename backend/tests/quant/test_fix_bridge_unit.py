@@ -159,16 +159,16 @@ def test_h1_bridge_datasource_daily_handle_bar_keeps_today():
     """UI 路径（frequency=1d）：handle_bar 于 15:00 触发，当日 bar 可见（原生语义不误伤）。"""
     ds = _make_bridge_ds()
     ins = list(ds.get_instruments(["600000.XSHG"]))[0]
-    # 日线 handle_bar（15:00）：含当日
+    # 日线 handle_bar（15:00）：含当日（datetime 为 rqalpha 口径 YYYYMMDD000000）
     bars = ds.history_bars(ins, 10, "1d", None, pd.Timestamp("2024-01-04 15:00"))
-    assert bars["datetime"].astype("int64").tolist()[-1] == 20240104
+    assert _bar_days(bars)[-1] == 20240104
     # 盘中时刻（如 jqdata shim 在分钟回测盘中取日线）：不含当日
     bars = ds.history_bars(ins, 10, "1d", None, pd.Timestamp("2024-01-04 10:00"))
-    assert bars["datetime"].astype("int64").tolist() == [20240102, 20240103]
+    assert _bar_days(bars) == [20240102, 20240103]
     # include_now=True：含当日
     bars = ds.history_bars(ins, 10, "1d", None, pd.Timestamp("2024-01-04 10:00"),
                            include_now=True)
-    assert bars["datetime"].astype("int64").tolist()[-1] == 20240104
+    assert _bar_days(bars)[-1] == 20240104
 
 
 def test_h1_bridge_datasource_midnight_dt_includes_today():
@@ -180,10 +180,10 @@ def test_h1_bridge_datasource_midnight_dt_includes_today():
     ds = _make_bridge_ds()
     ins = list(ds.get_instruments(["600000.XSHG"]))[0]
     bars = ds.history_bars(ins, 10, "1d", None, pd.Timestamp("2024-01-04 00:00"))
-    assert bars["datetime"].astype("int64").tolist()[-1] == 20240104
+    assert _bar_days(bars)[-1] == 20240104
     bars = ds.history_bars(ins, None, "1d", ["datetime", "close"],
                            pd.Timestamp("2024-01-04"))
-    assert bars["datetime"].astype("int64").tolist()[-1] == 20240104
+    assert _bar_days(bars)[-1] == 20240104
 
 
 # ---------------------------------------------------------------------------
