@@ -402,3 +402,63 @@ def test_minute_coverage_start(tmp_path, monkeypatch):
     import shutil
     shutil.rmtree(tmp_path / "kline_etf_minute")
     assert dm.minute_coverage_start() == pd.Timestamp("2018-02-09").date()
+
+
+# ---------------- fetch 缓存只存日线 DataFrame；元数据（list）不缓存 ----------------
+
+def test_fetch_etf_list_is_not_cached_as_daily(tmp_path):
+    """回归：mgr.fetch('get_etf_list') 返回 list，绝不能写入 _daily_mem。
+
+    旧实现把它塞进 _daily_mem[get_etf_list_]，二次 fetch 命中缓存分支后
+    DataCache._covers 对 list 调 df.columns → AttributeError → get_all_securities
+    兜底返回空 → 「未找到任何场内ETF / 无ETF通过流动性过滤」。修复后：
+    只对 DataFrame 写缓存；非 DataFrame 每次透传，可重复调用且不残留缓存。
+    """
+    class _ListClient:
+        def get_etf_list(self):
+            return ["510300.XSHG", "159915.XSHE"]
+
+        def get_stock_list(self):
+            return ["600000.XSHG"]
+        # _build_money_full / fetch 需要 get_daily 路径，提供空实现避免误用
+        def get_daily(self, code, start, end):
+            return pd.DataFrame()
+
+    dm = DataManager(token="", cache=DataCache(root=str(tmp_path)))
+    dm.sources = {"network": _ListClient()}
+    dm._offline = False
+
+    r1 = dm.fetch("get_etf_list")
+    r2 = dm.fetch("get_etf_list")
+    r3 = dm.fetch("get_etf_list")
+    assert r1 == r2 == r3 == ["510300.XSHG", "159915.XSHE"]
+    # 核心断言：非 DataFrame 值不落 _daily_mem
+    assert "get_etf_list_" not in dm._daily_mem
+    assert dm._daily_ver == 0  # 非 DataFrame 写入不 bump 版本号
+
+
+def test_fetch_daily_caches_dataframe_only(tmp_path):
+    """get_daily 返回 DataFrame 才写 _daily_mem；已写脏 list 缓存能在命中分支自愈。"""
+    calls = {"n": 0}
+
+    class _C:
+        def get_daily(self, code, start, end):
+            calls["n"] += 1
+            idx = pd.date_range("2026-01-01", periods=3, freq="D")
+            return pd.DataFrame(
+                {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                 "volume": 1000.0, "money": 1e7},
+                index=idx)
+
+    dm = DataManager(token="", cache=DataCache(root=str(tmp_path)))
+    dm.sources = {"network": _C()}
+    dm._offline = False
+    dm._daily_mem["get_daily_510300.XSHG"] = ["dirty.list"]  # 模拟旧版脏缓存
+    # 命中分支必须是 DataFrame 才信任；脏 list 应视为未命中 → 删除并回源
+    df = dm.fetch("get_daily", "510300.XSHG", "2026-01-01", "2026-01-03")
+    assert calls["n"] == 1  # 脏缓存未命中，回源取数
+    assert isinstance(df, pd.DataFrame) and len(df) == 3
+    assert "get_daily_510300.XSHG" in dm._daily_mem  # 回源结果已按 DataFrame 重新缓存
+    # 再次 fetch 命中缓存，不重复回源
+    dm.fetch("get_daily", "510300.XSHG", "2026-01-01", "2026-01-03")
+    assert calls["n"] == 1

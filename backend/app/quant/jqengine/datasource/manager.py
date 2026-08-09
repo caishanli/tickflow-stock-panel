@@ -563,7 +563,11 @@ class DataManager:
         # preload_daily 已预加载全量日线，此处一般命中内存。
         if cache_key in self._daily_mem:
             mem = self._daily_mem[cache_key]
-            if mem is not None and not (hasattr(mem, "empty") and mem.empty):
+            # _daily_mem 只缓存日线 DataFrame；非 DataFrame 缓存（误写入的
+            # get_etf_list/list 元数据等）直接视为未命中，删除后回源，避免
+            # _covers 对 list 调 df.columns 崩溃 → ETF 列表二次拉取变空。
+            if (isinstance(mem, pd.DataFrame)
+                    and not (hasattr(mem, "empty") and mem.empty)):
                 # 内存命中仍需检查是否覆盖请求区间：preload 可能加载了截断的本地
                 # 日线（如某 ETF 本地只到 1/30），若不检查覆盖会误当完整返回，
                 # 导致 6-7 月数据缺失、候选池错位。未覆盖则删除内存缓存，走
@@ -610,7 +614,8 @@ class DataManager:
                     self._src_fail["network"] = 0
                     return df
                 result = getattr(self.sources["network"], method)(*args, **kwargs)
-                self._put_daily_mem_protected(cache_key, result)
+                if isinstance(result, pd.DataFrame):
+                    self._put_daily_mem_protected(cache_key, result)
                 return result
             except Exception as e:
                 last_err = f"{name}: {e}"
