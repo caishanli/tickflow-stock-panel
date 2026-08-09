@@ -622,6 +622,8 @@ def order(security, amount):
         cost = -(turnover - fee_amount - tax_amount)
     pos = p.positions.setdefault(security, Position())
     if amount > 0:
+        if float(pos.amount or 0.0) <= 0:
+            pos.entry_ts = ctx.current_dt  # 首次建仓记录买入时间
         total_cost = pos.amount * pos.avg_cost + amount * fill
         pos.amount += amount
         pos.avg_cost = total_cost / pos.amount if pos.amount else 0.0

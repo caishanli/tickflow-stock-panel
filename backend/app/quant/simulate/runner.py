@@ -299,8 +299,19 @@ def _restore_portfolio(ctx, st: dict) -> None:
             avg_cost=float(sp.get("avg_cost", 0.0) or 0.0),
             price=float(sp.get("price", 0.0) or 0.0),
             today_amount=float(sp.get("today_amount", 0.0) or 0.0),
+            entry_ts=sp.get("entry_ts"),
         )
     pf.cash = float(st.get("cash", pf.cash) or 0.0)
+
+
+def _entry_ts_str(ts) -> str | None:
+    """买入时间序列化为 ISO 字符串（Timestamp 不可 JSON 序列化）。"""
+    if ts is None:
+        return None
+    try:
+        return str(ts)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _state_from_portfolio(ctx, state: dict) -> dict:
@@ -310,6 +321,7 @@ def _state_from_portfolio(ctx, state: dict) -> dict:
             "amount": float(p.amount), "avg_cost": float(p.avg_cost),
             "price": float(p.price),
             "today_amount": float(getattr(p, "today_amount", 0.0) or 0.0),
+            "entry_ts": _entry_ts_str(getattr(p, "entry_ts", None)),
             "name": names.resolve_name(code),
         }
         for code, p in ctx.portfolio.positions.items()

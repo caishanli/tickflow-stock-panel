@@ -475,36 +475,38 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         {posEntries.length > 0 ? (
           <div className="overflow-auto max-h-60">
             <table className="w-full text-xs">
-              <thead className="text-muted sticky top-0 bg-surface">
-                <tr className="text-left">
-                  <th className="px-3 py-1.5 font-normal">名称</th>
-                  <th className="px-3 py-1.5 font-normal">代码</th>
-                  <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                  <th className="px-3 py-1.5 font-normal text-right">成本</th>
-                  <th className="px-3 py-1.5 font-normal text-right">现价</th>
-                  <th className="px-3 py-1.5 font-normal text-right">市值</th>
-                  <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
-                </tr>
-              </thead>
-              <tbody className="text-foreground">
-                {posEntries.map(([sym, p]: any) => {
-                  const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
-                  const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
-                  return (
-                    <tr key={sym} className="border-t border-border/60">
-                      <td className="px-3 py-1.5">{p.name ?? ''}</td>
-                      <td className="px-3 py-1.5 text-muted">{sym}</td>
-                      <td className="px-3 py-1.5 text-right num">{p.amount}</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(value)}</td>
-                      <td className={`px-3 py-1.5 text-right num ${pnlPct == null ? '' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
-                        {fmtPct(pnlPct)}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
+                <thead className="text-muted sticky top-0 bg-surface">
+                  <tr className="text-left">
+                    <th className="px-3 py-1.5 font-normal">买入时间</th>
+                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="px-3 py-1.5 font-normal">代码</th>
+                    <th className="px-3 py-1.5 font-normal text-right">数量</th>
+                    <th className="px-3 py-1.5 font-normal text-right">成本</th>
+                    <th className="px-3 py-1.5 font-normal text-right">现价</th>
+                    <th className="px-3 py-1.5 font-normal text-right">市值</th>
+                    <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                  </tr>
+                </thead>
+                <tbody className="text-foreground">
+                  {posEntries.map(([sym, p]: any) => {
+                    const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
+                    const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
+                    return (
+                      <tr key={sym} className="border-t border-border/60">
+                        <td className="px-3 py-1.5 text-muted">{p.entry_ts ? String(p.entry_ts).slice(0, 16) : '—'}</td>
+                        <td className="px-3 py-1.5">{p.name ?? ''}</td>
+                        <td className="px-3 py-1.5 text-muted">{sym}</td>
+                        <td className="px-3 py-1.5 text-right num">{p.amount}</td>
+                        <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
+                        <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
+                        <td className="px-3 py-1.5 text-right num">{fmtNum(value)}</td>
+                        <td className={`px-3 py-1.5 text-right num ${pnlPct == null ? '' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
+                          {fmtPct(pnlPct)}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
             </table>
           </div>
         ) : (
