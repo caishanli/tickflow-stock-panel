@@ -16,11 +16,14 @@ def test_sync_writes_partition_and_is_idempotent(tmp_path, monkeypatch):
     def fake_fund_etf_fund_daily_em():
         return pl.DataFrame({
             "基金代码": ["510300", "159915", "518880"],
-            "单位净值": [4.7556, 3.5860, 5.0123],
+            "2026-08-06-单位净值": [4.7111, 3.5800, 5.0100],
+            "2026-08-06-累计净值": [4.7111, 3.5800, 5.0100],
+            "2026-08-07-单位净值": [4.7556, 3.5860, 5.0123],
+            "2026-08-07-累计净值": [4.7556, 3.5860, 5.0123],
         })
 
     monkeypatch.setattr(svc, "_fund_etf_fund_daily_em", fake_fund_etf_fund_daily_em)
-    day = date(2026, 8, 7)
+    day = date(2026, 8, 6)  # 传入日仅作兜底；实际分区日 = 列名解析出的披露日 08-07
     n1 = svc.sync_etf_nav(day)
     n2 = svc.sync_etf_nav(day)  # 幂等：分区已存在 → 跳过
     assert n1 == 3
@@ -40,29 +43,62 @@ def test_symbol_market_mapping():
     assert svc._jq_symbol("518880") == "518880.XSHG"
 
 
+def _patch_trade_days(monkeypatch):
+    """把 _missing_etf_nav_days 依赖的交易日历 pin 死：8/6(周四)、8/7(周五)。"""
+    from app.services import mootdx_service
+    monkeypatch.setattr(mootdx_service, "_trade_days_up_to",
+                        lambda end: [_dt.date(2026, 8, 6), _dt.date(2026, 8, 7)])
+
+
 def test_missing_nav_days_respects_market_close(tmp_path, monkeypatch):
     monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
     import importlib
     importlib.reload(svc)
-    # 完全空分区：收盘前不算缺失（当日无当日净值），收盘后算今天
-    assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 14, 0)) == []
+    _patch_trade_days(monkeypatch)
+    # 盘中（<15:00）当日净值未披露 → 候选 = 前一交易日
+    assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 14, 0)) == [_dt.date(2026, 8, 6)]
+    # 收盘后当日净值已披露 → 候选 = 最新交易日
     missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30))
-    assert _dt.date(2026, 8, 7) in missing
+    assert missing == [_dt.date(2026, 8, 7)]
     # 已有当日分区 → 不再缺失
     (tmp_path / "etf_nav" / "date=2026-08-07").mkdir(parents=True)
     assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30)) == []
+
+
+def test_missing_nav_days_midnight_targets_previous_trading_day(tmp_path, monkeypatch):
+    """00:00 巡检：今日为交易日但净值未披露 → 目标前一交易日（修复 00:00 no-op）。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    _patch_trade_days(monkeypatch)
+    missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 0, 0))
+    assert missing == [_dt.date(2026, 8, 6)]
+    assert len(missing) <= 1
+
+
+def test_missing_nav_days_weekend_targets_latest_trading_day(tmp_path, monkeypatch):
+    """周末巡检（非交易日）：候选 = 最近一个交易日（周五净值已披露）。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    _patch_trade_days(monkeypatch)
+    # 8/8 是周六，8/7 是周五交易日；周六净值无新披露 → 候选 = 8/7
+    missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 8, 10, 0))
+    assert missing == [_dt.date(2026, 8, 7)]
+    assert len(missing) <= 1
 
 
 def test_missing_nav_days_only_syncs_latest_not_history(tmp_path, monkeypatch):
     """历史不补：只有最新缺失交易日会被回源，不会写假历史分区。
 
     akshare fund_etf_fund_daily_em 只有当前快照（无逐日历史），回补历史只会
-    把今日净值写成 4/1 以来的每一天。因此 _missing_etf_nav_days 最多返回
-    **一个**候选日（最新分区之后最近一个已收盘交易日）。
+    把今日净值写成过去每一天（假数据）。因此 _missing_etf_nav_days 最多返回
+    **一个**候选日（最新分区之后最近一个净值应已披露的交易日）。
     """
     monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
     import importlib
     importlib.reload(svc)
+    _patch_trade_days(monkeypatch)
     # 已有 08-05 分区，今天是 08-07 收盘后 → 只缺 08-07，不返回 08-06 之前的历史
     (tmp_path / "etf_nav" / "date=2026-08-05").mkdir(parents=True)
     missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30))
@@ -75,7 +111,9 @@ def test_missing_nav_days_empty_root_returns_single_latest(tmp_path, monkeypatch
     monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
     import importlib
     importlib.reload(svc)
+    _patch_trade_days(monkeypatch)
     missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30))
+    assert missing == [_dt.date(2026, 8, 7)]
     assert len(missing) <= 1
 
 

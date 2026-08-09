@@ -730,7 +730,7 @@ def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
 
 
 def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]]:
-    """分区级缺失扫描：4/1（或 start）至今，5 类数据按交易日历逐日比对。
+    """分区级缺失扫描：4/1（或 start）至今，6 类数据按交易日历逐日比对。
 
     检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
     仅分区级（分区存在即视为该日已覆盖），不逐 symbol 校验。
@@ -1162,6 +1162,7 @@ def backfill_to_now() -> dict[str, Any]:
     index_daily_days  = _partition_dates(INDEX_DAILY_ROOT)
     etf_minute_days   = _partition_dates(ETF_MINUTE_ROOT)
     etf_nav_days      = etf_nav_service._partition_dates()
+    missing_nav_days  = etf_nav_service._missing_etf_nav_days()
 
     result["missing"] = {
         "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
@@ -1174,7 +1175,7 @@ def backfill_to_now() -> dict[str, Any]:
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
         "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
         "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
-                               "empty": not etf_nav_days, "missing": bool(etf_nav_service._missing_etf_nav_days())},
+                               "empty": not etf_nav_days, "missing": bool(missing_nav_days)},
     }
 
     # 1. ETF 分钟
@@ -1233,8 +1234,8 @@ def backfill_to_now() -> dict[str, Any]:
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")
 
-    # 3b. ETF 单位净值（akshare，只补最新缺失交易日；盘中未收盘 → 无缺失）
-    for day in etf_nav_service._missing_etf_nav_days():
+    # 3b. ETF 单位净值（akshare，只补最新缺失交易日；盘中未收盘 → 目标前一交易日）
+    for day in missing_nav_days:
         try:
             etf_nav_service.sync_etf_nav(day)
             result["etf_nav_days"].append(str(day))

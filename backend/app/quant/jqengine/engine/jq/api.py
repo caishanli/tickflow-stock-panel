@@ -497,16 +497,8 @@ def _get_nav_manager():
     return _state.get("manager")
 
 
-def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
-    """从 StockDataClient 拉真实单位净值：end_date 精确优先，回退最近可用日。
-
-    返回 DataFrame：行=日期，列=security。无数据返回空 DataFrame。
-    """
-    mgr = _get_nav_manager()
-    if mgr is None or not hasattr(mgr, "client"):
-        _emit_sink("warn", "[get_extras] 无可用 DataManager，返回空")
-        return pd.DataFrame()
-    raw = mgr.client.get_etf_nav(codes, str(end_date))
+def _build_nav_frame(raw, codes: list[str], end_date) -> pd.DataFrame:
+    """把 client 返回的 {code: df} 归一为 行=日期、列=security 的 DataFrame。"""
     if not raw:
         return pd.DataFrame()
     out = {}
@@ -521,6 +513,25 @@ def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
         return pd.DataFrame()
     result = pd.DataFrame(out).sort_index()
     return result[result.index <= pd.Timestamp(end_date)]
+
+
+def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
+    """从 StockDataClient 拉真实单位净值：end_date 精确分区优先，缺失回退最新分区。
+
+    先请求 ``get_etf_nav(codes, str(end_date))``；若全部标的为空（精确分区缺失），
+    再请求 ``get_etf_nav(codes, None)``（最新分区）并保留 index <= end_date 的行。
+    返回 DataFrame：行=日期，列=security。无数据返回空 DataFrame。
+    """
+    mgr = _get_nav_manager()
+    if mgr is None or not hasattr(mgr, "client"):
+        _emit_sink("warn", "[get_extras] 无可用 DataManager，返回空")
+        return pd.DataFrame()
+    result = _build_nav_frame(
+        mgr.client.get_etf_nav(codes, str(end_date)), codes, end_date)
+    if result.empty:
+        result = _build_nav_frame(
+            mgr.client.get_etf_nav(codes, None), codes, end_date)
+    return result
 
 
 def attribute_history(security, count, unit="1d", fields=None, skip_paused=True, df=True):
