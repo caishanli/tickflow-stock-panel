@@ -209,7 +209,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   deleteMut: any
 }) {
   const qc = useQueryClient()
-  const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs'>('trades')
+  const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs' | 'alerts'>('trades')
   const [showDingtalkCfg, setShowDingtalkCfg] = useState(false)
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
   const { data: st } = useQuery({
@@ -365,6 +365,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const tradeList: any[] = Array.isArray(tr) ? tr : []
   const stopLossList: any[] = Array.isArray(st?.stop_loss) ? st.stop_loss : []
   const logList: any[] = Array.isArray(logs) ? logs : []
+  const alertList: any[] = logList.filter((l: any) => l.level === 'warn' || l.level === 'error')
 
   return (
     <div className="flex-1 overflow-auto p-4 space-y-4">
@@ -375,7 +376,19 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           <ArrowLeft size={14} />返回列表
         </button>
         <span className="text-sm font-medium text-foreground">{acct.name ?? '—'}</span>
-        <span className="text-xs text-muted font-mono">{aid}</span>
+        <span className="text-xs text-muted font-mono cursor-pointer hover:text-accent transition-colors"
+          title="点击复制账户ID"
+          onClick={() => {
+            const ta = document.createElement('textarea')
+            ta.value = aid
+            ta.style.position = 'fixed'
+            ta.style.left = '-9999px'
+            document.body.appendChild(ta)
+            ta.select()
+            try { document.execCommand('copy'); toast('账户ID已复制', 'success', 'top') }
+            catch { toast('复制失败', 'error') }
+            document.body.removeChild(ta)
+          }}>{aid}</span>
         <span className={`text-xs ${statusTone(acct.status)}`}>
           {STATUS_LABEL[acct.status] ?? acct.status ?? '—'}
         </span>
@@ -504,7 +517,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         <div className="flex gap-1 px-3 pt-3 pb-2 border-b border-border/60">
           {([['trades', `成交记录 (${tradeList.length})`],
              ['stoploss', `止损日志 (${stopLossList.length})`],
-             ['logs', `运行日志 (${logList.length})`]] as const).map(([k, label]) => (
+             ['logs', `运行日志 (${logList.length})`],
+             ['alerts', `异常 (${alertList.length})`]] as const).map(([k, label]) => (
             <button key={k} onClick={() => setTab(k)}
               className={`px-3 h-8 rounded-btn text-xs ${tab === k ? 'bg-accent text-white' : 'text-muted hover:text-foreground'}`}>
               {label}
@@ -562,9 +576,18 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
             {logList.length > 0 ? [...logList].reverse().map((l: any, i: number) => (
               <div key={i} className={l.level === 'error' ? 'text-bear' : l.level === 'warn' ? 'text-warning' : ''}>
-                {`${l.message ?? ''} [${l.level ?? 'info'}] ${l.ts ?? ''}`}
+                {`${l.ts ?? ''} [${l.level ?? 'info'}] ${l.message ?? ''}`}
               </div>
             )) : <div className="text-muted">暂无日志</div>}
+          </div>
+        )}
+        {tab === 'alerts' && (
+          <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+            {alertList.length > 0 ? [...alertList].reverse().map((l: any, i: number) => (
+              <div key={i} className={l.level === 'error' ? 'text-bear' : 'text-warning'}>
+                {`${l.ts ?? ''} [${l.level ?? 'warn'}] ${l.message ?? ''}`}
+              </div>
+            )) : <div className="text-muted">暂无异常</div>}
           </div>
         )}
       </div>
