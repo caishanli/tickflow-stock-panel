@@ -1,6 +1,8 @@
 import { useMemo } from 'react'
 import ReactECharts from 'echarts-for-react'
 
+import { fmtNum } from '../metrics'
+
 /** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
 function cssVar(name: string, fallback: string) {
   if (typeof window === 'undefined') return fallback
@@ -157,16 +159,18 @@ export function BacktestResult({ status, equity, trades, logs }: Props) {
                   <th className="px-3 py-1.5 font-normal">方向</th>
                   <th className="px-3 py-1.5 font-normal text-right">价格</th>
                   <th className="px-3 py-1.5 font-normal text-right">数量</th>
+                  <th className="px-3 py-1.5 font-normal text-right">手续费</th>
                 </tr>
               </thead>
               <tbody className="text-foreground">
                 {tradeList.map((t, i) => (
                   <tr key={i} className="border-t border-border/60">
-                    <td className="px-3 py-1.5 text-muted">{String(t.datetime ?? t.time ?? t.date ?? '')}</td>
-                    <td className="px-3 py-1.5">{t.symbol ?? t.code ?? ''}</td>
-                    <td className={`px-3 py-1.5 ${t.side === 'buy' || t.side === 'BUY' ? 'text-bull' : 'text-bear'}`}>{t.side ?? ''}</td>
+                    <td className="px-3 py-1.5 text-muted">{String(t.ts ?? t.datetime ?? t.time ?? t.date ?? '')}</td>
+                    <td className="px-3 py-1.5">{t.code ?? t.symbol ?? ''}</td>
+                    <td className={`px-3 py-1.5 ${t.side === 'buy' || t.side === 'BUY' || t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>{t.side ?? t.action ?? ''}</td>
                     <td className="px-3 py-1.5 text-right">{t.price ?? ''}</td>
-                    <td className="px-3 py-1.5 text-right">{t.quantity ?? t.qty ?? ''}</td>
+                    <td className="px-3 py-1.5 text-right">{t.amount ?? t.quantity ?? t.qty ?? ''}</td>
+                    <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
                   </tr>
                 ))}
               </tbody>
