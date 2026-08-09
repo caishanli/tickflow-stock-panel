@@ -38,12 +38,15 @@ def _run_sync():
             adj = mootdx_service.sync_adj_factor()
             stock = mootdx_service.sync_stock_minute(
                 limit=mootdx_service.STOCK_MINUTE_BATCH_LIMIT)
+            from app.services import etf_nav_service
+            nav = etf_nav_service.sync_etf_nav()
             with _lock:
                 _scheduler_state["last_sync"] = str(_dt.datetime.now())
                 _scheduler_state["sync_result"] = {
-                    "minute_rows": minutes, "adj": adj, "stock_minute_rows": stock}
-            logger.info("scheduled mootdx sync done: minute=%d rows, adj=%s, stock_minute_rows=%d",
-                        minutes, adj, stock)
+                    "minute_rows": minutes, "adj": adj, "stock_minute_rows": stock,
+                    "nav_rows": nav}
+            logger.info("scheduled mootdx sync done: minute=%d rows, adj=%s, stock_minute_rows=%d, nav_rows=%d",
+                        minutes, adj, stock, nav)
         except Exception:  # noqa: BLE001
             logger.exception("scheduled mootdx sync failed")
 

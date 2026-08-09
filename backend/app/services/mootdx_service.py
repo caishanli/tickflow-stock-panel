@@ -1153,13 +1153,15 @@ def backfill_to_now() -> dict[str, Any]:
         "daily_days": [], "daily_written": {},
         "index_daily_days": [], "index_daily_written": {},
         "adj_factor": None,
-        "stock_minute_rows": 0, "errors": [],
+        "stock_minute_rows": 0, "etf_nav_days": [], "errors": [],
     }
 
+    from app.services import etf_nav_service
     stocks_daily      = _partition_dates(STOCK_DAILY_ROOT)
     etf_daily_days    = _partition_dates(ETF_DAILY_ROOT)
     index_daily_days  = _partition_dates(INDEX_DAILY_ROOT)
     etf_minute_days   = _partition_dates(ETF_MINUTE_ROOT)
+    etf_nav_days      = etf_nav_service._partition_dates()
 
     result["missing"] = {
         "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
@@ -1171,6 +1173,8 @@ def backfill_to_now() -> dict[str, Any]:
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
         "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
+        "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
+                               "empty": not etf_nav_days, "missing": bool(etf_nav_service._missing_etf_nav_days())},
     }
 
     # 1. ETF 分钟
@@ -1228,6 +1232,15 @@ def backfill_to_now() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")
+
+    # 3b. ETF 单位净值（akshare，只补最新缺失交易日；盘中未收盘 → 无缺失）
+    for day in etf_nav_service._missing_etf_nav_days():
+        try:
+            etf_nav_service.sync_etf_nav(day)
+            result["etf_nav_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 净值回源 %s 失败: %s", day, e)
+            result["errors"].append(f"etf_nav {day}: {e}")
 
     # 4. 缺口告警（日志 + 钉钉）
     if any(st["missing"] or st["empty"] for st in result["missing"].values()):

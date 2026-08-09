@@ -88,3 +88,37 @@ def test_scan_missing_partitions_has_etf_nav(tmp_path, monkeypatch):
     assert "etf_nav" in missing
     assert isinstance(missing["etf_nav"], list)
     assert len(missing["etf_nav"]) <= 1
+
+
+def test_backfill_to_now_includes_etf_nav(tmp_path, monkeypatch):
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    importlib.reload(mootdx_service)
+
+    def fake_sync(day=None):
+        return 3
+
+    def fake_missing(now=None):
+        return [_dt.date(2026, 8, 7)]
+
+    monkeypatch.setattr(svc, "sync_etf_nav", fake_sync)
+    monkeypatch.setattr(svc, "_missing_etf_nav_days", fake_missing)
+    # 避免触发真实网络回源（mootdx 可达时 backfill_to_now 会真的回源几十个
+    # 交易日）。对齐 test_mootdx_backfill_coverage 的既有 backfill 测试口径，
+    # 把所有网络 sync 都 mock 成 no-op，只验证 etf_nav 接线。
+    monkeypatch.setattr(mootdx_service, "_missing_minute_days", lambda now=None: [])
+    monkeypatch.setattr(mootdx_service, "_missing_daily_days", lambda root, now=None: [])
+    monkeypatch.setattr(mootdx_service, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(mootdx_service, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(mootdx_service, "_adj_factor_stale", lambda: False)
+    monkeypatch.setattr(mootdx_service, "sync_etf_minute", lambda day=None: 0)
+    monkeypatch.setattr(mootdx_service, "sync_daily", lambda day: {"stock": 0, "etf": 0})
+    monkeypatch.setattr(mootdx_service, "sync_index_daily", lambda day: {"written": 0})
+    monkeypatch.setattr(mootdx_service, "sync_adj_factor", lambda: None)
+    monkeypatch.setattr(mootdx_service, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(mootdx_service, "_notify_missing", lambda m: None)
+
+    res = mootdx_service.backfill_to_now()
+    assert "etf_nav_days" in res
+    assert "etf_nav" in res.get("missing", {})
