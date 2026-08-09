@@ -25,6 +25,7 @@ import polars as pl
 
 from app.quant.jqengine.datasource.manager import DataManager
 from app.quant.jqengine.datasource.mootdx_src import MootdxSource
+from app.services.etf_nav_service import ETF_NAV_ROOT
 
 logger = logging.getLogger("app.services.mootdx_service")
 
@@ -507,7 +508,8 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
     """
     result: dict = {
         "daily_days": [], "index_daily_days": [],
-        "etf_minute_days": [], "stock_minute_days": [], "errors": [],
+        "etf_minute_days": [], "stock_minute_days": [],
+        "etf_nav_days": [], "errors": [],
     }
 
     for day in missing.get("kline_daily", []) + missing.get("kline_etf_daily", []):
@@ -535,6 +537,14 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
             result["stock_minute_days"].extend(str(d) for d in min_days)
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"stock_minute {min_days}: {e}")
+
+    for day in missing.get("etf_nav", []):
+        try:
+            from app.services import etf_nav_service
+            etf_nav_service.sync_etf_nav(day)
+            result["etf_nav_days"].append(str(day))
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"etf_nav {day}: {e}")
 
     return result
 
@@ -734,6 +744,7 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
         "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
         "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
         "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
+        "etf_nav":           _missing_days_in(calendar, ETF_NAV_ROOT),
     }
 
 
