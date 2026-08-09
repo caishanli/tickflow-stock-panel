@@ -63,6 +63,7 @@ def load_strategy(code, manager, fee, slippage, cash):
         "get_security_name": api.get_security_name,
         "get_all_securities": api.get_all_securities,
         "get_trade_days": api.get_trade_days,
+        "get_extras": api.get_extras,
         "attribute_history": api.attribute_history,
         "is_temporarily_suspended": api.is_temporarily_suspended,
         "PriceRelatedSlippage": api.PriceRelatedSlippage,

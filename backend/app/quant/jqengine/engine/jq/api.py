@@ -472,6 +472,37 @@ def get_price(security, start_date=None, end_date=None, count=None,
     return result
 
 
+def get_extras(field, securities, start_date=None, end_date=None, count=None,
+               frequency="daily", fields=None, skip_paused=True, fq="qfq",
+               df=True, **kwargs):
+    """聚宽 get_extras 兼容 shim（模拟盘引擎版）。
+
+    与 ``app.quant.jqcompat.get_extras`` 同口径：当前仅支持
+    field='unit_net_value'（ETF 净值，以官方 close 近似），其余字段返回空并 warn。
+    返回 DataFrame：行=日期，列=security，供策略 ``df.loc[date, code]`` 取用。
+    """
+    if field != "unit_net_value":
+        _emit_sink("warn", f"[get_extras] field={field} 未实现，返回空 DataFrame")
+        return pd.DataFrame()
+    codes = [securities] if isinstance(securities, str) else list(securities)
+    out = {}
+    for code in codes:
+        bars = get_price(code, start_date=start_date, end_date=end_date,
+                         frequency="1d", fields=["close"], fq=fq, panel=False)
+        if bars is None or bars.empty:
+            continue
+        if "time" in bars.columns:
+            bars = bars.set_index("time")
+        if "close" in bars.columns:
+            out[code] = bars["close"]
+    if not out:
+        return pd.DataFrame()
+    result = pd.DataFrame(out)
+    if isinstance(securities, str):
+        return result[[codes[0]]]
+    return result
+
+
 def attribute_history(security, count, unit="1d", fields=None, skip_paused=True, df=True):
     freq_map = {"1d": "daily", "1m": "minute"}
     freq = freq_map.get(unit, "daily")

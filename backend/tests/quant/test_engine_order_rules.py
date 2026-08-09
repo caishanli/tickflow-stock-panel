@@ -162,3 +162,64 @@ def test_loader_exposes_intraday_hooks():
     assert b.handle_data is not None
     assert b.before_trading_start is not None
     assert b.after_trading_end is None
+
+
+# ---- get_extras shim（模拟盘引擎） ----
+
+def _daily_mgr():
+    """返回 ``fetch->get_daily`` 的形如 DataManager 掉线的 stub。"""
+    import pandas as pd
+
+    idx = pd.date_range("2026-07-01", periods=3, freq="D")
+    df = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": [1.0, 1.1, 1.2],
+         "volume": 1000.0},
+        index=idx)
+    class _M:
+        sources = {}
+        _daily_mem = {"get_daily_510300.XSHG": df}
+        _minute_mem = {}
+        def fetch(self, meth, code, start, end):
+            return self._daily_mem.get(f"{meth}_{code}")
+    return _M()
+
+
+def test_get_extras_unit_net_value_codes():
+    api._reset(_daily_mgr(), 0.0003, 0.001, 10000.0)
+    df = api.get_extras("unit_net_value", ["510300.XSHG"], "2026-07-01", "2026-07-03")
+    assert list(df.columns) == ["510300.XSHG"]
+    assert df[df.columns[0]].iloc[-1] == 1.2  # close 近似 NAV，末行为最终日期
+    # 单一代码调用形态（字符串）：仍返回单列 DataFrame，行=日期
+    single = api.get_extras("unit_net_value", "510300.XSHG",
+                            "2026-07-01", "2026-07-03")
+    assert single.shape[1] == 1
+
+
+def test_get_extras_unsupported_field_empty():
+    _setup()
+    df = api.get_extras("acc_net_value", ["510300.XSHG"])
+    assert df.empty
+
+
+def test_strategy_runtime_can_call_get_extras():
+    """回归：策略在 run_daily 回调里调 get_extras（wufu1.7 13:10 动量计算路径）。
+
+    旧 loader 命名空间没注册 get_extras → 回调执行时 NameError →
+    「【动量计算】批量获取溢价率数据异常: name 'get_extras' is not defined」。
+    """
+    code = (
+        "def initialize(context):\n"
+        "    run_daily(calc, time='13:10')\n"
+        "def calc(context):\n"
+        "    nav = get_extras('unit_net_value', ['510300.XSHG'],\n"
+        "                     start_date='2026-07-01', end_date='2026-07-03')\n"
+        "    return nav[['510300.XSHG']].iloc[-1, 0]\n"
+    )
+    bundle = load_strategy(code, _daily_mgr(), 0.0003, 0.001, 10000.0)
+    # 回调在用户命名空间内定义，闭包指向 loader 注入的全局名 → 能解析到 get_extras
+    bundle.init_fn(bundle.ctx)
+    daily = bundle.daily
+    assert len(daily) == 1
+    func, t = daily[0]
+    assert t == "13:10"
+    assert func(bundle.ctx) == 1.2
