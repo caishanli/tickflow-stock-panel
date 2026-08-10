@@ -277,6 +277,112 @@ def test_sync_daily_writes_etf_not_filtered_by_stock_listing(monkeypatch, tmp_pa
     assert written.get("kline_etf_daily") == ["159518.SZ", "510300.SH"]
 
 
+def test_incomplete_etf_daily_detects_sparse_partitions(tmp_path, monkeypatch):
+    """残缺 ETF 日线分区（符号数 << 宇宙）应判为缺失，触发重写。
+
+    回归：全市场 1600+ 只 ETF，某日只有 1 只落盘（回源中断/宇宙零星），
+    分区目录存在 → 既有缺口判定视为"已覆盖"永不重写，收益曲线被残帧
+    污染。此测试要求内容级校验兜住该形态。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
+    # 整天集合内：8/3 完整（90 只全有），8/4、8/5 残缺（各 1 只）
+    root = tmp_path / "kline_etf_daily"
+    for d in ["2026-08-03", "2026-08-04", "2026-08-05"]:
+        (root / f"date={d}").mkdir(parents=True, exist_ok=True)
+    full = pl.DataFrame({
+        "symbol": [f"1599{dd:02d}.SZ" for dd in range(90)],
+        "open": [1.0] * 90, "close": [1.0] * 90,
+    })
+    full.write_parquet(root / "date=2026-08-03" / "part.parquet")
+    pl.DataFrame({"symbol": ["159900.SZ"], "open": [1.0], "close": [1.0]}).write_parquet(
+        root / "date=2026-08-04" / "part.parquet")
+    pl.DataFrame({"symbol": ["159901.SZ"], "open": [1.0], "close": [1.0]}).write_parquet(
+        root / "date=2026-08-05" / "part.parquet")
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_d(2026, 8, 3), _d(2026, 8, 4), _d(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_market_closed", lambda now: True)
+
+    leftovers = ms._incomplete_etf_daily_days()
+    assert _d(2026, 8, 4) in leftovers, "1只残缺日应被识别"
+    assert _d(2026, 8, 5) in leftovers, "1只残缺日应被识别"
+    assert _d(2026, 8, 3) not in leftovers, "完整日不应被误判"
+
+
+def test_incomplete_etf_daily_ignores_when_no_universe(monkeypatch, tmp_path):
+    """宇 宙为空时内容校验应跳过（避免误删/误判正常数据）。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [])
+    root = tmp_path / "kline_etf_daily"
+    (root / "date=2026-08-05").mkdir(parents=True)
+    pl.DataFrame({"symbol": ["159900.SZ"], "open": [1.0], "close": [1.0]}).write_parquet(
+        root / "date=2026-08-05" / "part.parquet")
+
+    assert ms._incomplete_etf_daily_days() == []
+
+
+def test_scan_missing_partitions_flags_sparse_etf_daily(tmp_path, monkeypatch):
+    """scan_missing_partitions 应把「目录存在但只有 1 只 ETF」的分区判为缺失。"""
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [_dt.date(2026, 8, 4)])
+
+    # ETF 分区 8/4 已存在（但残缺，被内容校验兜住）
+    root = tmp_path / "kline_etf_daily"
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+
+    missing = ms.scan_missing_partitions()
+    assert _dt.date(2026, 8, 4) in missing["kline_etf_daily"]
+
+
+def test_backfill_to_now_resyncs_sparse_etf_daily(tmp_path, monkeypatch):
+    """残缺 ETF 日线应触发 sync_daily 重写，且缺日被记入 daily_days。"""
+    import logging
+    from datetime import date as _d
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch)
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+    # 残缺日 = 8/5；其余判定给空，保证只有残缺触发 sync_daily
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [_d(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+    days = []
+    monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1000})
+
+    res = ms.backfill_to_now()
+
+    assert days == [_d(2026, 8, 5)], f"残缺日应触发 sync_daily, 实际 {days}"
+    assert "2026-08-05" in res["daily_days"]
+    assert res["missing"]["kline_etf_daily"]["missing"] is True
+
+
 def test_sync_daily_warns_when_etf_zero(caplog, monkeypatch, tmp_path):
     """ETF 全部拉取失败时 sync_daily 应打 warning（防静默写 0）。"""
     import logging

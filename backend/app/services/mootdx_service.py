@@ -44,6 +44,12 @@ FAILURE_LOG_PATH = DATA_ROOT / "mootdx_sync_failures.csv"
 # 只处理 2020 年以来的除权事件（回测窗口有限，太早的因子无意义）
 _SINCE_YEAR = 2020
 
+# ETF 日线内容完整性校验阈值：分区 symbol 覆盖率低于该值即判残缺重写。
+# 宇宙缺陷/真实退市不会把覆盖率打到 0.5 以下（全市场 1658 只正常全落盘）。
+_ETF_DAILY_MIN_COVERAGE = 0.5
+# 内容校验只看最近 N 个分区（早年分区无必要逐日读文件，性能考虑）。
+_ETF_DAILY_RECENT_LIMIT = 30
+
 
 def _append_failure(sym: str, reason: str) -> None:
     """把回源失败标的追加到 failure csv（symbol, 原因, 时间）。"""
@@ -734,13 +740,19 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
 
     检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
     仅分区级（分区存在即视为该日已覆盖），不逐 symbol 校验。
+
+    对 ETF 日线额外做内容级校验：``_incomplete_etf_daily_days()`` 能把
+    "目录存在但内容残缺"（如只剩 1 只）的日子也归为缺失，触发重写，防
+    残帧永久污染（见该函数 docstring）。
     """
     today = _date.today()
     calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
     from app.services.etf_nav_service import _missing_etf_nav_days as _missing_nav
+    missing_etf_daily = set(_missing_days_in(calendar, ETF_DAILY_ROOT))
+    missing_etf_daily |= set(_incomplete_etf_daily_days())
     return {
         "kline_daily":       _missing_days_in(calendar, STOCK_DAILY_ROOT),
-        "kline_etf_daily":   _missing_days_in(calendar, ETF_DAILY_ROOT),
+        "kline_etf_daily":   sorted(missing_etf_daily),
         "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
         "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
         "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
@@ -798,6 +810,53 @@ def _missing_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_da
         if stale:
             return sorted(set(days) | set(stale))
     return days
+
+
+def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
+    """返回 ETF 日线中**内容残缺**的分区日期（符号数 << ETF 宇宙）。
+
+    背景：宽缺口判定（``_missing_daily_days``/``_partition_dates``）只检查
+    分区目录是否存在，一个**只有 1 只 ETF **的分区与 1600 只的完整分区
+    被视为等价——一旦某天曾以残缺状态落盘（回源中断、宇宙快照零星等），
+    增量追溯永不重写，残帧永久污染净值曲线。
+
+    这里做内容级校验：对最近 ``recent``（默认 30）个分区，读 symbol 列与
+    ETF 宇宙比对，覆盖率 < ``_ETF_DAILY_MIN_COVERAGE``（默认 0.5）即判残缺。
+    宇宙为空时跳过（无基线可比）；覆盖率 >= 阈值的正常分区不误报。
+    """
+    existing = _partition_dates(ETF_DAILY_ROOT)
+    if not existing:
+        return []
+    try:
+        codes = _etf_universe()
+    except Exception:
+        logger.warning("mootdx_service: ETF 宇宙读取失败，跳过内容校验", exc_info=True)
+        return []
+    if not codes:
+        return []
+
+    recent = _ETF_DAILY_RECENT_LIMIT if recent is None else recent
+    target = set(_to_tf_symbol(c) for c in codes)
+    out: list[_date] = []
+    for ds in existing[-recent:]:
+        pdir = ETF_DAILY_ROOT / f"date={ds}"
+        parts = sorted(pdir.glob("*.parquet"))
+        if not parts:
+            continue
+        syms: set[str] = set()
+        for p in parts:
+            try:
+                df = pl.read_parquet(p, columns=None)  # ETF 分区无 date 列，读全列取 symbol
+                syms |= set(df["symbol"].to_list())
+            except Exception:
+                continue
+        coverage = len(syms & target) / len(target)
+        if coverage < _ETF_DAILY_MIN_COVERAGE:
+            out.append(_dt.date.fromisoformat(ds))
+    logger.info("mootdx_service: ETF 日线内容校验 %d/%d 分区, 残缺 %d: %s",
+                len(existing[-recent:]), len(existing), len(out),
+                [d.isoformat() for d in out])
+    return out
 
 
 def _stock_universe() -> list[str]:
@@ -1170,7 +1229,9 @@ def backfill_to_now() -> dict[str, Any]:
         "kline_daily":        {"latest": stocks_daily[-1] if stocks_daily else None,
                                "empty": not stocks_daily, "missing": bool(_missing_daily_days(STOCK_DAILY_ROOT))},
         "kline_etf_daily":    {"latest": etf_daily_days[-1] if etf_daily_days else None,
-                               "empty": not etf_daily_days, "missing": bool(_missing_daily_days(ETF_DAILY_ROOT))},
+                               "empty": not etf_daily_days,
+                               "missing": bool(_missing_daily_days(ETF_DAILY_ROOT)
+                                               or _incomplete_etf_daily_days())},
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
         "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
@@ -1191,9 +1252,13 @@ def backfill_to_now() -> dict[str, Any]:
     # 2. 日线（股票 + ETF）——统一用一个交易日历；空时补最近窗口
     today = _date.today()
     daily_days = sorted(set(_missing_daily_days(STOCK_DAILY_ROOT))
-                        | set(_missing_daily_days(ETF_DAILY_ROOT)))
+                        | set(_missing_daily_days(ETF_DAILY_ROOT))
+                        | set(_incomplete_etf_daily_days()))
+    # 股票日线根为空时的兜底种子窗口；残缺 ETF 日（内容校验）必须保留，
+    # 否则会被空窗分支整体覆盖而漏补。
     if _missing_daily_days(STOCK_DAILY_ROOT) == [] and not stocks_daily:
-        daily_days = sorted(set(_trade_days_up_to(today)) - set(_partition_dates(STOCK_DAILY_ROOT)))
+        seed = set(_trade_days_up_to(today)) - set(_partition_dates(STOCK_DAILY_ROOT))
+        daily_days = sorted(seed | set(_incomplete_etf_daily_days()))
     for day in daily_days:
         try:
             w = sync_daily(day)
