@@ -123,3 +123,36 @@ def test_backtest_run(client):
     r = client.get(f"/api/quant/backtest/{run_id}/status")
     assert r.status_code == 200
     assert r.json()["data"]["id"] == run_id
+
+
+def test_sim_status_returns_trade_days(client, monkeypatch):
+    import types
+
+    import app.quant.datasource.network_client as nc
+    from app.quant import db
+
+    db.insert_sim_account("a1", "acc", 100000.0, 0.03, "created",
+                          strategy_id="", start_date="2026-01-05")
+    days = ["2026-01-05", "2026-01-06", "2026-01-07"]
+    fake = types.SimpleNamespace(get_trade_days=lambda s, e: days)
+    monkeypatch.setattr(nc, "StockDataClient", lambda: fake)
+
+    r = client.get("/api/quant/sim/accounts/a1/status")
+    assert r.status_code == 200
+    assert r.json()["data"]["trade_days"] == days
+
+
+def test_build_trade_days_network_failure_fallback(monkeypatch):
+    import app.quant.datasource.network_client as nc
+    from app.quant.api import quant as qmod
+
+    class Boom:
+        def __init__(self):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(nc, "StockDataClient", Boom)
+
+    acct = {"start_date": "2026-08-03"}  # 周一，当天为工作日
+    days = qmod._build_trade_days(acct, [])
+    assert days and days[0] == "2026-08-03"
+    assert all(len(d) == 10 for d in days)

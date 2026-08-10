@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import io
 
 from fastapi import APIRouter, HTTPException
@@ -301,9 +302,37 @@ def sim_status(aid: str):
         raise HTTPException(404, "not found")
     sid = acct.get("strategy_id") or ""
     strat = get_strategy(sid) if sid else None
+    trades = db.get_sim_trades(aid)
     return {"data": {"account": acct, "strategy_name": (strat or {}).get("name", ""),
                      "state": db.read_sim_state(aid),
-                     "stop_loss": db.get_sim_stoploss(aid)}}
+                     "stop_loss": db.get_sim_stoploss(aid),
+                     "trade_days": _build_trade_days(acct, trades)}}
+
+
+def _build_trade_days(account: dict, trades: list[dict]) -> list[str]:
+    """账户区间 [start_date, 今天] 的真实交易日列表（YYYY-MM-DD）。
+
+    start_date 为空时取最早成交日，仍为空则取今天。真实日历取数失败/异常
+    时降级为工作日（周一~周五）日历，保证接口不挂。
+    """
+    today = datetime.date.today().isoformat()
+    start = (account.get("start_date") or "").strip()[:10]
+    if not start and trades:
+        start = str(trades[0].get("ts") or "")[:10]
+    if not start or start > today:
+        start = today
+    try:
+        from ..datasource.network_client import StockDataClient
+        days = StockDataClient().get_trade_days(start, today)
+        if days:
+            return sorted({str(d)[:10] for d in days})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import pandas as _pd
+        return [d.strftime("%Y-%m-%d") for d in _pd.bdate_range(start, today)]
+    except Exception:  # noqa: BLE001
+        return [start, today]
 
 
 def _build_benchmark_map(first_day: str, last_day: str) -> dict:
