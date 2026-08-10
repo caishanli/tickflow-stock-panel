@@ -474,6 +474,27 @@ def test_missing_daily_includes_today_when_partition_absent_after_close(tmp_path
     assert _dt.date(2026, 8, 5) in days
 
 
+def test_missing_daily_detects_hole_before_latest(tmp_path, monkeypatch):
+    """回归：latest 之前的历史中间洞也要报缺失（08-04/05 在 latest=08-06 前）。
+
+    背景：路径 bug（dbbf940 前）导致 08-04/05 回源失败永久搁浅，随后
+    backfill 补上 08-06/07，latest 跳到 08-07 后旧实现只查 latest 之后，
+    中间洞永远漏检。此处用交易日历窗口内"分区目录不存在"的日期判缺失。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_daily"
+    # 只有 08-06 一个分区（latest=08-06），08-04/08-05 是 latest 之前的洞
+    _mk_daily_part(root, "2026-08-06", mtime_hour=16)
+    monkeypatch.setattr(
+        ms, "_trade_days_up_to",
+        lambda end: [_dt.date(2026, 8, 4), _dt.date(2026, 8, 5), _dt.date(2026, 8, 6)])
+
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 6, 18, 0))
+    assert _dt.date(2026, 8, 4) in days
+    assert _dt.date(2026, 8, 5) in days
+    assert _dt.date(2026, 8, 6) not in days
+
+
 def test_stale_today_daily_days_detects_intraday_write(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
     root = tmp_path / "kline_index_daily"

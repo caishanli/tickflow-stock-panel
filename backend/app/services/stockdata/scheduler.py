@@ -66,7 +66,14 @@ def _sync_cron_loop():
 
 
 def _run_full_scan_once() -> None:
-    """00:00 全量缺失巡检 + 补全（单次执行体，与 15:35 用 _sync_lock 串行）。"""
+    """00:00 全量缺失巡检 + 补全（单次执行体，与 15:35 用 _sync_lock 串行）。
+
+    进入即标记 ``full_scan_started`` 为今天，完成后再写 ``full_scan_date``。
+    watchdog 用 ``full_scan_started`` 判断"今天的巡检是否已启动"——巡检缺席
+    （线程未拉起，如 08-09/08-10 连续两晚无完成日志）时能打 WARNING 告警。
+    """
+    with _lock:
+        _scheduler_state["full_scan_started"] = _dt.date.today().isoformat()
     with _sync_lock:
         try:
             from app.services import mootdx_service
@@ -74,6 +81,7 @@ def _run_full_scan_once() -> None:
             with _lock:
                 _scheduler_state["last_full_scan"] = str(_dt.datetime.now())
                 _scheduler_state["full_scan_result"] = res
+                _scheduler_state["full_scan_date"] = _dt.date.today().isoformat()
             logger.info("stockdata midnight full scan done: %s",
                         {k: len(v) for k, v in (res.get("missing") or {}).items()}
                         if isinstance(res.get("missing"), dict) else res)
@@ -91,6 +99,44 @@ def _midnight_scan_loop():
             last_date = now.date()
             threading.Thread(target=_run_full_scan_once, daemon=True).start()
         time.sleep(20)
+
+
+def _full_scan_started_today(state: dict, now: _dt.datetime) -> bool:
+    """watchdog 判定：今天的 00:00 巡检是否**已启动**（线程已拉起，含被锁阻塞中）。"""
+    return state.get("full_scan_started") == now.date().isoformat()
+
+
+def _warn_if_full_scan_incomplete(state: dict, now: _dt.datetime) -> None:
+    """今日巡检未启动则打 WARNING（供钉钉消费）；已启动静默。
+
+    判定用 ``full_scan_started`` 而非 ``full_scan_date``：scan 线程拉起后
+    可能被 ``_sync_lock`` 阻塞（15:35 长任务占用锁），00:05 时尚未完成是
+    正常的，不能误告警；只有今天**从未启动**（线程没拉起/巡检缺席，如
+    08-09/08-10）才算异常。
+    """
+    if not _full_scan_started_today(state, now):
+        logger.warning(
+            "stockdata midnight full scan NOT started today (%s): "
+            "loop not firing, thread stuck, or scheduler stopped",
+            now.date())
+
+
+def _full_scan_watchdog_loop():
+    """每天 00:05 检查今天的 00:00 巡检是否**已启动**；未启动打 WARNING。
+
+    00:00 巡检可能因线程异常或调度循环问题从未触发而缺席，光靠 00:00 时点
+    的触发日志无法发现（08-09/08-10 无 full scan 完成日志即是）。已启动但
+    被 ``_sync_lock`` 阻塞未完成不算异常（不误告警）。此 loop 跨日重置，
+    每日一次，发现未启动即告警（供钉钉消费）。
+    """
+    last_date = None
+    while not _stop.is_set():
+        now = _dt.datetime.now()
+        if (now.time() >= _dt.time(0, 5) and now.time() < _dt.time(0, 6)
+                and now.date() != last_date):
+            last_date = now.date()
+            _warn_if_full_scan_incomplete(_scheduler_state, now)
+        time.sleep(30)
 
 
 def _midnight_clear_loop(data_sources) -> None:
@@ -119,7 +165,8 @@ def start_scheduler(data_sources=None) -> None:
     if _threads:
         return
     _stop.clear()
-    targets = [_backfill_loop, _sync_cron_loop, _midnight_scan_loop]
+    targets = [_backfill_loop, _sync_cron_loop, _midnight_scan_loop,
+               _full_scan_watchdog_loop]
     if data_sources is not None:
         targets.append(lambda: _midnight_clear_loop(data_sources))
     for target in targets:

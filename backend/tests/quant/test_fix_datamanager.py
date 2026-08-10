@@ -175,7 +175,36 @@ def test_money_memo_full_frame_and_version(tmp_path):
     assert (res3["money"] >= 9e8).all()
 
 
-# ---------------- 占位成交额（停牌/退市 sentinel）不应计入"有成交" ----------------
+def test_money_window_aligns_to_trade_days_not_code_rows(tmp_path):
+    """get_daily_money_cached 窗口须按「end_date 前最近 count 个交易日」对齐，
+    而非 per-code 数据行的最后 count 行。
+
+    回归：已退市/停牌 ETF（如 560650，7/2 起 amount 为 sentinel 被剔除）的
+    ``tail(count)`` 会取到停牌前的陈旧日期（06-29/06-30/07-01），拖进策略
+    "全市场ETF总成交额"日志 → "0.00亿元 (1只ETF有成交)" 误导，且陈旧日期
+    混入均值拉低流动性阈值。窗口应只含 end_date 前的真实交易日。"""
+    dm = _make_dm(tmp_path, set_window=False)
+    # 交易日：仅 07-01 ~ 07-31（bdate_range 含周末跳过的交易日）
+    dates = pd.bdate_range("2026-07-01", "2026-07-31")
+    # 正常 ETF：全窗口有数据
+    dm._daily_mem["get_daily_510300.XSHG"] = _daily_df(dates, 1e6)
+    # 退市 ETF：仅 07-01~07-03 有正常成交，之后停牌（数据缺失/被过滤）
+    dm._daily_mem["get_daily_560650.XSHG"] = _daily_df(dates[:3], 1e3)
+
+    end = "2026-07-20"
+    res = dm.get_daily_money_cached(["510300.XSHG", "560650.XSHG"], end, count=3)
+    # 窗口应是 end_date 前最近 3 个交易日（07-16/17/20），而非各 code 的最后 3 行
+    expect_dates = [d for d in dates if d.date() <= pd.Timestamp(end).date()][-3:]
+    got_dates = sorted({d.date() for d in res["time"]})
+    assert [d.strftime("%Y-%m-%d") for d in got_dates] == \
+        [d.strftime("%Y-%m-%d") for d in expect_dates], f"窗口错误: {got_dates}"
+    # 退市 ETF 在窗口内无数据 → 缺席，不产生陈旧日期行
+    assert "560650.XSHG" not in set(res["code"])
+    # 正常 ETF 在窗口内完整返回 count 行
+    sub = res[res["code"] == "510300.XSHG"]
+    assert len(sub) == 3
+    assert list(sub["time"]) == list(pd.DatetimeIndex(expect_dates))
+
 
 def test_money_filter_excludes_placeholder_amount(tmp_path):
     """停牌/退市标的分区里 amount=2**-127（≈0 sentinel）不得算"有成交"。

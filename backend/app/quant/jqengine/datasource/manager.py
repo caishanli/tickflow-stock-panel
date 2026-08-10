@@ -1064,7 +1064,9 @@ class DataManager:
         缓存随"今天"延伸后，回测期内任何过去的 end_date 都被 tail 截空
         （实测 4 个回测期 end_date 全返回 0 行），策略流动性过滤静默失效。
         现改为 memo 缓存**未截断**的全量明细（键含日线数据版本号），每次
-        调用先按 end_date 过滤、再 per-code 取最近 count 行。
+        调用先按 end_date 过滤、再按 end_date 前最近 count 个交易日取窗口
+        （窗口按全市场日期集合对齐，非 per-code 行数——已退市 ETF 不会把
+        停牌前的陈旧日期拖进窗口）。
 
         性能：全量明细对固定 ``codes``+数据版本只算一次；后续每日调用仅
         过滤 + per-code tail（O(行数)），避免回测中每天对全市场 1600+ 只
@@ -1083,8 +1085,16 @@ class DataManager:
         sub = full[full["time"].dt.date <= end_dt]
         if sub.empty:
             return pd.DataFrame(columns=["code", "time", "money"])
-        # full 已按 (code, time) 升序，groupby tail 即每只 end_date 前最近 count 行
-        return sub.groupby("code", sort=False).tail(count)
+        # 窗口按「end_date 前最近 count 个交易日」对齐：full 含全市场所有 code
+        # 的行，其日期唯一集即为真实交易日。若按 per-code ``tail(count)``，已
+        # 退市/停牌 ETF（成交额被 sentinel 过滤后只剩停牌前的行）会取到陈旧
+        # 日期（如 560650 → 06-29/06-30/07-01），拖进策略"全市场ETF总成交额"
+        # 日志污染均值并拉低流动性阈值。改为取窗口内交易日、再过滤行，退市
+        # 标的在窗口内无数据即自然缺席（不产生陈旧日期行）。
+        window = sorted({d.date() for d in sub["time"]})[-count:]
+        out = sub[sub["time"].dt.date.isin(window)]
+        # full 已按 (code, time) 升序，保持行序即可（等价每只窗口内顺序）
+        return out.reset_index(drop=True)
 
     def _build_money_full(self, codes):
         """构建全量成交额明细（不截断、不按 end_date 过滤），结果 memo 化复用。

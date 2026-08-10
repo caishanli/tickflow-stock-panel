@@ -793,16 +793,27 @@ def _missing_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_da
     盘中半日快照（如 08-05 10:36 写入的坏分区），且写入后 ``latest==today``
     会让后续回源永久跳过修正。收盘后才把今天算缺失（若今日分区为盘中快照
     则一并重写，见 ``_stale_today_daily_days``），由 backfill 补全。
+
+    在交易日历窗口内检测**所有**缺失日，含 ``latest`` 之前的中间洞：路径
+    bug / 回源中断曾让某几日永久搁浅，若只查 ``latest < d`` 则 latest 跳过
+    后旧洞永远漏检（08-04/05 案例）。
+
+    中间洞检测限定在**最近 ``_DAILY_BACKFILL_LIMIT_DAYS`` 个交易日**内，
+    而不是整个交易日历：``_trade_days_up_to`` 可能返回远超 90 天的全量
+    历史（mootdx get_daily 忽略 start 参数），而分区在数据源覆盖起点前
+    的"合法空缺"（如股票日线 2023-07~2025-07 空缺）不该被当作缺失重拉。
+    窗口内的缺失即真实洞，latest 之后的部分照常补。
     """
     existing = _partition_dates(root)
     if not existing:
         return []
-    latest = _date.fromisoformat(existing[-1])
-    today = _date.today()
     now = now or _dt.datetime.now()
-    if latest >= today and not _market_closed(now):
+    today = now.date()
+    if existing[-1] >= today.isoformat() and not _market_closed(now):
         return []
-    days = [d for d in _trade_days_up_to(today) if latest < d <= today]
+    calendar = _trade_days_up_to(today)
+    recent = calendar[-_DAILY_BACKFILL_LIMIT_DAYS:]
+    days = _missing_days_in(recent, root)
     # 收盘后：今日分区若为盘中快照（mtime < 15:00），即使 latest==today
     # 也要强制重写为收盘完整数据（否则盘中坏分区会永久残留）。
     if _market_closed(now):
