@@ -77,25 +77,36 @@ def _dt_to_int(dt, freq):
 def _is_jq_etf_code(code):
     """聚宽 get_all_securities(['etf']) 的 ETF 判定。
 
-    深市只认 159xxx；沪市排除 506/508（科创板REIT/定开）、501-505/507（LOF/封闭式）、
-    511xxx 只认债券 ETF（511580 及以下，货币 ETF 511600+ 不属于 ETF）。
-    另需排除沪市 A 股（600/601/603/605/688/689）与北交所（BJ）——duckdb-storage
-    中该函数只在上游已过滤出 ETF 名录后做 guard；本分支 preload_daily 会把全市场
-    日线（含股票）灌进 _daily_mem，直接套用会把股票混入 ETF 宇宙。
-    支持 .XSHE/.XSHG 与 .SZ/.SH 两种后缀。
+    以聚宽全量 ETF 名单（etf_universe_snapshot.json 的段分布）为权威口径，
+    段判定与名单一一对应：
+
+    - 深市段：159 / 161 / 169 / 180 / 181（161/169/180/181 为 LOF/战略配售，
+      聚宽也计入 ETF 名单，如 161226 国投白银、169101 等）；
+    - 沪市段：501 / 506 / 510~518 / 520 / 526 / 530 / 551 / 560~563 / 588 / 589
+      （501 南方原油、506 科创板基金、511 含货币 ETF 如 511990/511880，
+      均被聚宽列入 ETF 名单）；
+    - 排除：沪市 A 股（600/601/603/605/688/689）、北交所（BJ）、不在名单的
+      其他段（如 502~505/507/508 封闭式）。
+
+    用途：preload_daily 会把全市场日线（含股票）灌进 _daily_mem，套用本函数
+    过滤出 ETF 宇宙。支持 .XSHE/.XSHG 与 .SZ/.SH 两种后缀。
+
+    历史修正：旧版武断排除 501/506/161/169/180/181 段与货币 ETF（511600+），
+    与聚宽名单冲突——501018(南方原油)、161226(白银 LOF) 被误判非 ETF，导致
+    快照缺整段、回源无数据、模拟盘全球池过滤剔标、选股分叉。
     """
     pure, _, exch = code.partition(".")
     exch = exch.upper()
     if exch in ("XSHE", "SZ"):
-        return pure.startswith("159")
+        return pure.startswith(("159", "161", "169", "180", "181"))
     if exch in ("XSHG", "SH"):
         if pure.startswith(("600", "601", "603", "605", "688", "689")):
             return False
-        return not (
-            pure.startswith(("506", "508"))
-            or pure.startswith(("501", "502", "503", "504", "505", "507"))
-            or (pure.startswith("511") and int(pure[3:6]) >= 600)
-        )
+        if pure.startswith(("501", "506")):
+            return True
+        return pure.startswith(("510", "511", "512", "513", "515", "516",
+                                "517", "518", "520", "526", "530", "551",
+                                "560", "561", "562", "563", "588", "589"))
     return False
 
 

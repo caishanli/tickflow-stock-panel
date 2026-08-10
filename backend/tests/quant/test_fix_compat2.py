@@ -367,3 +367,51 @@ def test_snapshot_cache_union_merge(tmp_path, monkeypatch):
     assert names["510300.XSHG"] == "ETF-510300"
     assert "589720.XSHG" not in names
     assert "589720.XSHG" not in list_dates
+
+
+# ---------------------------------------------------------------------------
+# _is_jq_etf_code：与聚宽 get_all_securities(['etf']) 名单口径对齐
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("code", [
+    "501018.XSHG",   # 南方原油 LOF——聚宽 ETF 名单含（本机快照 501 段唯一）
+    "161226.XSHE",   # 国投白银 LOF——聚宽 ETF 名单含（深市 161 段唯一）
+    "169101.XSHE",   # 深市 169 段（聚宽 ETF 名单含）
+    "180101.XSHE",   # 深市 180 段（聚宽 ETF 名单含）
+    "181001.XSHE",   # 深市 181 段（聚宽 ETF 名单含）
+    "506000.XSHG",   # 沪市 506 段（聚宽 ETF 名单含 9 只）
+    "159985.XSHE",   # 豆粕 ETF（深市 159）
+    "510300.XSHG",   # 沪深300 ETF（沪市 510）
+    "511990.XSHG",   # 货币 ETF 511580 及以下（债券ETF，聚宽含）
+    "520830.XSHG",   # 沙特 ETF（沪市 520）
+    "560050.XSHG",   # 沪市 560
+    "588000.XSHG",   # 科创50 ETF（沪市 588）
+    "511600.XSHG",   # 货币 ETF 511600+——聚宽 get_all_securities(['etf']) 也含（见快照 511 段）
+    "511880.XSHG",   # 银华日利（货币 ETF，聚宽名单含）
+])
+def test_is_jq_etf_code_true_for_jq_etf_universe_members(code):
+    """聚宽 ETF 名单中的标的必须判为 ETF——含 LOF(501/161)与 506/169/180 段。"""
+    from app.quant.jqcompat import _is_jq_etf_code
+    assert _is_jq_etf_code(code), f"{code} 应判为 ETF（聚宽名单含）"
+
+
+@pytest.mark.parametrize("code", [
+    "600519.XSHG",   # 贵州茅台（A股）
+    "000001.SZ",     # 平安银行（A股）
+    "300750.SZ",     # 宁德时代（A股创业板）
+    "920001.BJ",     # 北交所
+    "502000.XSHG",   # 沪市 502 封闭式（聚宽 ETF 名单无此段）
+    "610000.XSHG",   # 非名单沪市段
+])
+def test_is_jq_etf_code_false_for_non_etf(code):
+    """非 ETF（A股/北交所/货币/不在名单的 LOF）必须判 False。"""
+    from app.quant.jqcompat import _is_jq_etf_code
+    assert not _is_jq_etf_code(code), f"{code} 不应判为 ETF"
+
+
+def test_is_jq_etf_code_keeps_common_etf_segments():
+    """常规 ETF 段（510/513/159/588 等）不受 LOF 修正影响。"""
+    from app.quant.jqcompat import _is_jq_etf_code
+    for c in ["513310.XSHG", "510300.XSHG", "159985.XSHE", "588000.XSHG",
+              "518880.XSHG", "513500.XSHG"]:
+        assert _is_jq_etf_code(c), c

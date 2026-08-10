@@ -277,6 +277,35 @@ def test_sync_daily_writes_etf_not_filtered_by_stock_listing(monkeypatch, tmp_pa
     assert written.get("kline_etf_daily") == ["159518.SZ", "510300.SH"]
 
 
+def test_etf_universe_segment_missing_detects_missing_segments():
+    """宇宙缺整个段（如 501/161）应被检出——服务器快照缺 501/161 的回归。
+
+    旧校验只比「分区覆盖率 vs 当前宇宙」，而宇宙快照本身就缺段时覆盖率恒高，
+    永远发现不了。本函数以权威段结构为基线，缺段必报。
+    """
+    full = [f"{seg}{100:03d}.XSHG" for seg in ms._ETF_UNIVERSE_EXPECTED_SEGMENTS]
+    assert ms._etf_universe_segment_missing(full) == []
+
+    # 缺 501 和 161 段（服务器快照实际形态）
+    missing = [c for c in full if not c.startswith(("501", "161"))]
+    out = ms._etf_universe_segment_missing(missing)
+    assert "501" in out and "161" in out
+    assert "159" not in out and "506" not in out
+
+
+def test_etf_universe_segment_missing_empty():
+    """空宇宙 → 全部段缺失（但调用方应更早拦截空宇宙）。"""
+    out = ms._etf_universe_segment_missing([])
+    assert set(out) == set(ms._ETF_UNIVERSE_EXPECTED_SEGMENTS)
+
+
+def test_etf_universe_segment_missing_with_extra_segments():
+    """非权威段出现不报缺失，也不误报权威段。"""
+    codes = [f"{seg}{100:03d}.XSHG" for seg in ms._ETF_UNIVERSE_EXPECTED_SEGMENTS]
+    codes.append("999999.XSHG")  # 非权威段
+    assert ms._etf_universe_segment_missing(codes) == []
+
+
 def test_incomplete_etf_daily_detects_sparse_partitions(tmp_path, monkeypatch):
     """残缺 ETF 日线分区（符号数 << 宇宙）应判为缺失，触发重写。
 

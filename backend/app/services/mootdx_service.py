@@ -49,6 +49,18 @@ _SINCE_YEAR = 2020
 _ETF_DAILY_MIN_COVERAGE = 0.5
 # 内容校验只看最近 N 个分区（早年分区无必要逐日读文件，性能考虑）。
 _ETF_DAILY_RECENT_LIMIT = 30
+# 权威 ETF 代码段（对齐聚宽 get_all_securities(['etf']) 名单段分布）。
+# 深市 159/161/169/180/181；沪市 501/506/510~518/520/526/530/551/560~563/588/589。
+# 每个段在完整名单中至少出现 1 只；宇宙缺失整个段 = 快照/回源异常（如 501018
+# 南方原油、161226 白银 LOF 曾因 _is_jq_etf_code 误过滤整段消失）。
+_ETF_UNIVERSE_EXPECTED_SEGMENTS = (
+    "159", "161", "169", "180", "181",
+    "501", "506",
+    "510", "511", "512", "513", "515", "516", "517", "518",
+    "520", "526", "530", "551",
+    "560", "561", "562", "563",
+    "588", "589",
+)
 
 
 def _append_failure(sym: str, reason: str) -> None:
@@ -821,6 +833,22 @@ def _missing_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_da
         if stale:
             return sorted(set(days) | set(stale))
     return days
+
+
+def _etf_universe_segment_missing(codes: list[str]) -> list[str]:
+    """返回 ETF 宇宙中缺失的权威代码段（如 ``501``/``161``）。
+
+    背景：旧内容校验只比「分区覆盖率 vs 当前宇宙」，但宇宙快照本身可能残缺
+    （如服务器快照缺整个 501/161 段），此时分区覆盖率恒高、永不告警。本函数
+    以 ``_ETF_UNIVERSE_EXPECTED_SEGMENTS``（聚宽名单段结构）为权威基线，
+    宇宙里完全没有某段的任何代码即判该段缺失。
+
+    返回缺失段列表（空 = 完整）。调用方应在此之前拦截空宇宙。
+    """
+    if not codes:
+        return list(_ETF_UNIVERSE_EXPECTED_SEGMENTS)
+    have = {c.split(".", 1)[0][:3] for c in codes if "." in c}
+    return [seg for seg in _ETF_UNIVERSE_EXPECTED_SEGMENTS if seg not in have]
 
 
 def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
