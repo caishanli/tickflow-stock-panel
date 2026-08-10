@@ -215,6 +215,77 @@ def test_mark_to_market_no_change_is_clean(tmp_quant):
     assert st["positions"]["510300.XSHG"]["price"] == 10.0
 
 
+def test_hist_feed_falls_back_to_current_snapshot_when_minute_empty(tmp_quant):
+    """补跑 feed：get_minute 无当日分区数据（服务重启/分区未落盘）时，
+    回退 current_snapshot 实时兜底取当日真实价，而非整批跳过。"""
+    dm = _StubDM(close_price=None)          # get_minute_price_at 恒 None
+    dm.client = _FakeClient(price=12.0)     # current_snapshot 兜底源
+    now = pd.Timestamp(datetime.datetime.now().date()).replace(hour=10, minute=49)
+
+    prices, bar_dt = runner._hist_feed(dm, ["510300.XSHG"], now, {})
+
+    assert prices["510300.XSHG"] == 12.0
+    assert bar_dt is not None
+
+
+def test_hist_feed_skips_fallback_for_historical_day(tmp_quant):
+    """补跑 feed：历史日（分区应已存在）不触发 current_snapshot 兜底，
+    避免把今日实时价错配到历史 bar 上。"""
+    dm = _StubDM(close_price=None)
+    dm.client = _FakeClient(price=12.0)
+    now = pd.Timestamp("2026-07-16 10:49:00")   # 非今日
+
+    prices, bar_dt = runner._hist_feed(dm, ["510300.XSHG"], now, {})
+
+    assert prices == {}
+    assert bar_dt is None
+
+
+def test_strategy_loop_marks_positions_during_lunch_break(tmp_quant, monkeypatch):
+    """午休（11:30-13:00）持仓按最后可用价打标：补跑遇数据空洞后，
+    净值不再停在上午旧价，复市前即可纠正。"""
+    save_strategy("s_lunch", "s", STRATEGY_NOOP)
+    aid = service.account_create("acct_lunch", 100000.0, 0.03, "s_lunch")
+    st = _st()
+    st["dt"] = "2026-08-10 10:48:00"   # 今天上午，需补跑
+    protocol.save_state(aid, st)
+    pauses = iter([False] * 10 + [True])
+    monkeypatch.setattr(runner, "is_paused", lambda aid: next(pauses))
+    monkeypatch.setattr(runner, "in_trading", lambda now=None: False)   # 午休非交易
+    monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+
+    class _FixedNow(datetime.datetime):
+        current = datetime.datetime(2026, 8, 10, 12, 0, 0)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+
+    class _NoDataDM(_StubDM):
+        """补跑期间完全无数据（get_minute_price_at 与 current_snapshot 均空），
+        复现 stock data 服务重启后当日分区未落盘的竞态。"""
+
+        class _EmptyClient:
+            def current_snapshot(self, codes, as_of=None):
+                return {}
+
+        def __init__(self):
+            super().__init__(close_price=None)
+            self.client = self._EmptyClient()
+
+    runner.run_loop(aid, dm=_NoDataDM(), feed=_feed(12.0), matcher=Matcher(0.03))
+
+    st = protocol.read_state(aid)
+    assert st["positions"]["510300.XSHG"]["price"] == 12.0
+    assert st["net_value"] == pytest.approx(5000 * 12.0)
+    snaps = db.get_sim_snapshots(aid)
+    assert snaps and snaps[-1]["positions_value"] == pytest.approx(5000 * 12.0)
+
+
 def test_strategy_loop_live_marks_positions(tmp_quant, monkeypatch):
     """盘中实时：两次 tick 之间持仓价随最新行情打标，净值跟涨。"""
     save_strategy("s_mk", "s", STRATEGY_NOOP)

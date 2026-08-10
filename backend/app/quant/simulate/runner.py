@@ -590,13 +590,39 @@ def _hist_feed(dm, codes, now, _acc):
     走 ``dm.get_minute_price_at`` 滑窗加载（C1 近 3 月真实 1m / 更早 baostock 5m
     插值，均在内存，不落盘）；无数据标的缺席，全部无数据则 bar_dt=None（该 bar
     跳过，如停牌/数据空洞）。
+
+    当日（now 与真实今天同一天）全部取不到价时回退 ``current_snapshot`` 实时
+    兜底：stock data 服务刚重启/当日分区尚未落盘的竞态下，get_minute 分区取数
+    为空，但实时源可回源当日真实 1m——补跑不再整批静默跳过（复现：dev.sh 重启
+    后 11:51 补跑 ETF 分钟分区 11:51:51 才落盘，全部 bar 被跳过、持仓价停旧值）。
+    历史日分区应已存在，缺失即真实缺失（停牌），不做兜底，避免错配今日价。
     """
     prices = {}
     for code in dict.fromkeys(codes):
         p = dm.get_minute_price_at(code, now)
         if p is not None:
             prices[code] = float(p)
-    return prices, (now if prices else None)
+    if prices:
+        return prices, (now if prices else None)
+    now_ts = pd.Timestamp(now)
+    if now_ts.date() != pd.Timestamp(datetime.datetime.now()).date():
+        return prices, None
+    client = getattr(dm, "client", None)
+    if client is None:
+        return prices, None
+    try:
+        snap = client.current_snapshot(list(dict.fromkeys(codes)), as_of=now_ts)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[hist_feed] 当日实时兜底取数失败: %s", e)
+        return prices, None
+    for code, df in (snap or {}).items():
+        if df is None or (hasattr(df, "empty") and df.empty):
+            continue
+        sub = df[df.index <= now_ts]
+        if sub.empty:
+            continue
+        prices[code] = float(sub["close"].iloc[-1])
+    return prices, (now_ts if prices else None)
 
 
 def _flush_replay_batch(account_id: str, aux: dict) -> None:
@@ -1018,6 +1044,23 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
             elif t > SESSION_END_GRACE and hooks_done["eod"] != today:
                 _eod(account_id, bundle, ctx, dm, state, aux, now)
                 hooks_done["eod"] = today
+            elif datetime.time(11, 30) < t < datetime.time(13, 0):
+                # 午休打标：重启后补跑遇数据空洞时，持仓价停在旧值；午休期间
+                # 数据源一旦就绪（分区落盘），用最后可用价刷新持仓，不复市前
+                # 净值一直显示上午旧价。无跳变时静默（不落快照）。
+                if ctx.portfolio.positions:
+                    dirty = _mark_to_market(feed, dm, ctx, state,
+                                            aux.setdefault("last_mark", {}), now)
+                    if dirty:
+                        save_state(account_id, state)
+                        positions_value = round(sum(
+                            p.amount * p.price for p in ctx.portfolio.positions.values()), 4)
+                        db.insert_sim_snapshot(account_id, state["dt"], state["net_value"],
+                                               state["cash"], positions_value,
+                                               state["pnl"],
+                                               round(state["net_value"] / state["start_cash"] - 1, 6)
+                                               if state["start_cash"] else 0.0)
+                time.sleep(idle_interval)
             else:
                 time.sleep(idle_interval)
     except Exception:
