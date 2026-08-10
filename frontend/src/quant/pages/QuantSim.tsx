@@ -39,6 +39,67 @@ function fmtPct(v: any) {
   return `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}%`
 }
 
+/** 交易日历查找表：tradeDays 外的日期（如实时会话跨日新增）按工作日索引兜底插补 */
+function buildDayLookup(trades: any[], tradeDays: string[]): Map<string, number> {
+  const idx = new Map<string, number>()
+  tradeDays.filter(Boolean).sort().forEach((d: string, i: number) => idx.set(d, i))
+  let next = idx.size
+  const isWeekday = (d: string) => {
+    const t = new Date(`${d}T00:00:00`)
+    const w = t.getUTCDay()
+    return !Number.isNaN(t.getTime()) && w >= 1 && w <= 5
+  }
+  for (const t of trades) {
+    const d = String(t?.ts ?? '').slice(0, 10)
+    if (d && !idx.has(d) && isWeekday(d)) idx.set(d, next++)
+  }
+  return idx
+}
+
+/** 分标的 FIFO 配对，返回每行（按 ts 排序后的下标）持仓交易日数 */
+function computeHoldDays(trades: any[], tradeDays: string[]): Map<number, { hold: number | null; open: boolean }> {
+  const days = buildDayLookup(trades, tradeDays)
+  const out = new Map<number, { hold: number | null; open: boolean }>()
+  const acc = new Map<number, { sum: number; qty: number }>() // key: 买入行 sorted 下标
+  const lots: Record<string, { buyOrder: number; buyDay: number; amount: number }[]> = {}
+  const sorted = [...trades].sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
+  for (let oi = 0; oi < sorted.length; oi++) {
+    const t = sorted[oi]
+    const d = String(t.ts ?? '').slice(0, 10)
+    const day = days.get(d) ?? -1
+    const amt = Number(t.amount) || 0
+    if (String(t.action).toUpperCase() === 'BUY') {
+      (lots[String(t.code ?? '')] ??= []).push({ buyOrder: oi, buyDay: day, amount: amt })
+      out.set(oi, { hold: null, open: true })
+    } else {
+      const q = lots[String(t.code ?? '')] ?? []
+      let remaining = amt
+      let sum = 0, qty = 0
+      while (remaining > 0 && q.length > 0) {
+        const lot = q[0]
+        const take = Math.min(remaining, lot.amount)
+        if (day >= 0 && lot.buyDay >= 0) {
+          const diff = day - lot.buyDay
+          sum += diff * take
+          qty += take
+          const a = acc.get(lot.buyOrder) ?? { sum: 0, qty: 0 }
+          a.sum += diff * take
+          a.qty += take
+          acc.set(lot.buyOrder, a)
+        }
+        lot.amount -= take
+        remaining -= take
+        if (lot.amount <= 0) q.shift()
+      }
+      out.set(oi, { hold: qty > 0 ? Math.round(sum / qty) : null, open: false })
+    }
+  }
+  for (const [oi, a] of acc) {
+    if (a.qty > 0) out.set(oi, { hold: Math.round(a.sum / a.qty), open: false })
+  }
+  return out
+}
+
 export function QuantSim() {
   const qc = useQueryClient()
   const [view, setView] = useState<'list' | 'detail'>('list')
@@ -363,6 +424,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   }, [eq, st])
 
   const tradeList: any[] = Array.isArray(tr) ? tr : []
+
+  const tradeDays: string[] = Array.isArray(st?.trade_days) ? st.trade_days : []
+  // 成交记录持仓时长：按 ts 排序下标重算，SSE 追加卖出后买入行自动回填
+  const sortedTrades = useMemo(() => [...tradeList].sort((a: any, b: any) => String(a.ts).localeCompare(String(b.ts))), [tradeList])
+  const holdMap = useMemo(() => computeHoldDays(sortedTrades, tradeDays), [sortedTrades, tradeDays])
+  const holdOf = (origIdx: number) => holdMap.get(origIdx)
   const stopLossList: any[] = Array.isArray(st?.stop_loss) ? st.stop_loss : []
   const logList: any[] = Array.isArray(logs) ? logs : []
   const alertList: any[] = logList.filter((l: any) => l.level === 'warn' || l.level === 'error')
@@ -541,11 +608,14 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
                     <th className="px-3 py-1.5 font-normal text-right">手续费</th>
                     <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal text-right">持仓时长</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
-                  {[...tradeList].reverse().map((t: any, i: number) => (
-                    <tr key={i} className="border-t border-border/60">
+                  {[...sortedTrades].reverse().map((t: any, i: number) => {
+                    const h = holdOf(sortedTrades.length - 1 - i)
+                    return (
+                    <tr key={i} className="border-t border-border/60 hover:bg-elevated/60 transition-colors">
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
@@ -558,8 +628,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
                       </td>
+                      <td className="px-3 py-1.5 text-right num">
+                        {h?.open ? '持有中' : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`}
+                      </td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
