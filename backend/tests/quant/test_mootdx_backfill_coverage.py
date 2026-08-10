@@ -553,6 +553,68 @@ def test_missing_minute_guards_intraday_today(tmp_path, monkeypatch):
     assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == []
 
 
+def test_scan_missing_partitions_reports_universe_segments(tmp_path, monkeypatch):
+    """scan_missing_partitions 应报告 ETF 宇宙缺失的代码段（快照缺段的回归）。
+
+    旧巡检只跑 ``_incomplete_etf_daily_days``（分区覆盖率 vs 当前宇宙），
+    宇宙快照缺整个 501/161 段时覆盖率恒高（缺 2/1662≈99.9%）永不告警。
+    本测试要求 scan 输出 ``etf_universe_segments`` 键承载段缺失信息。
+    """
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+    # 宇宙缺 501/161 段（服务器快照实际形态）
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [
+        "159985.XSHE", "510300.XSHG", "506000.XSHG", "169101.XSHE"])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [])
+
+    missing = ms.scan_missing_partitions()
+    assert "501" in missing["etf_universe_segments"]
+    assert "161" in missing["etf_universe_segments"]
+    assert "159" not in missing["etf_universe_segments"]
+
+
+def test_backfill_to_now_flags_missing_universe_segments(tmp_path, monkeypatch):
+    """backfill_to_now 报告宇宙缺段且触发告警。"""
+    from datetime import date as _d
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch)
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159985.XSHE", "510300.XSHG"])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    sent = []
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: sent.append(m))
+
+    res = ms.backfill_to_now()
+
+    segs = res["missing"]["kline_etf_daily"].get("segment_missing", [])
+    assert "501" in segs and "161" in segs, f"应报告缺段, 实际 {segs}"
+    assert sent, "宇宙缺段应触发告警"
+
+
 def test_scan_missing_partitions_finds_middle_gap(tmp_path, monkeypatch):
     import datetime as _dt
     from app.services import mootdx_service as ms

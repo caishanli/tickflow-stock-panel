@@ -756,12 +756,21 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
     对 ETF 日线额外做内容级校验：``_incomplete_etf_daily_days()`` 能把
     "目录存在但内容残缺"（如只剩 1 只）的日子也归为缺失，触发重写，防
     残帧永久污染（见该函数 docstring）。
+
+    额外返回 ``etf_universe_segments``（list[str]）：ETF 宇宙快照缺失的
+    权威代码段（如 501/161）。分区覆盖率 vs 残缺宇宙永远测不出"快照缺段"，
+    必须用权威段结构做基线（见 ``_etf_universe_segment_missing``）。
     """
     today = _date.today()
     calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
     from app.services.etf_nav_service import _missing_etf_nav_days as _missing_nav
     missing_etf_daily = set(_missing_days_in(calendar, ETF_DAILY_ROOT))
     missing_etf_daily |= set(_incomplete_etf_daily_days())
+    seg_missing = _safe_universe_segment_missing()
+    if seg_missing:
+        logger.warning("mootdx_service: ETF 宇宙快照缺代码段 %s，"
+                       "对应标的日线/分钟永不回源，请重建快照",
+                       seg_missing)
     return {
         "kline_daily":       _missing_days_in(calendar, STOCK_DAILY_ROOT),
         "kline_etf_daily":   sorted(missing_etf_daily),
@@ -769,6 +778,7 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
         "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
         "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
         "etf_nav":           _missing_nav(),
+        "etf_universe_segments": sorted(seg_missing),
     }
 
 
@@ -849,6 +859,18 @@ def _etf_universe_segment_missing(codes: list[str]) -> list[str]:
         return list(_ETF_UNIVERSE_EXPECTED_SEGMENTS)
     have = {c.split(".", 1)[0][:3] for c in codes if "." in c}
     return [seg for seg in _ETF_UNIVERSE_EXPECTED_SEGMENTS if seg not in have]
+
+
+def _safe_universe_segment_missing() -> list[str]:
+    """读取宇宙并返回缺失段；宇宙读取失败时降级为空（不阻断巡检）。"""
+    try:
+        codes = _etf_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: ETF 宇宙读取失败，跳过段校验", exc_info=True)
+        return []
+    if not codes:
+        return []
+    return _etf_universe_segment_missing(codes)
 
 
 def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
@@ -1220,11 +1242,15 @@ def _adj_factor_stale() -> bool:
 
 
 def _notify_missing(missing: dict) -> None:
-    """空分区/缺口时打 WARNING 日志并尝试钉钉站内信通知用户。fire-and-forget。"""
+    """空分区/缺口/宇宙缺段时打 WARNING 日志并尝试钉钉站内信通知用户。fire-and-forget。"""
     lines = []
     for name, st in missing.items():
         latest = st.get("latest") or "无"
-        lines.append(f"- {name}: 最新 {latest}（empty={st.get('empty')}, missing={st.get('missing')}）")
+        line = f"- {name}: 最新 {latest}（empty={st.get('empty')}, missing={st.get('missing')}）"
+        seg = st.get("segment_missing")
+        if seg:
+            line += f" [宇宙缺代码段: {seg}]"
+        lines.append(line)
     msg = "mootdx 启动回源发现以下数据集缺失/缺口:\n" + "\n".join(lines)
     logger.warning("mootdx_service: %s", msg)
     try:
@@ -1270,7 +1296,8 @@ def backfill_to_now() -> dict[str, Any]:
         "kline_etf_daily":    {"latest": etf_daily_days[-1] if etf_daily_days else None,
                                "empty": not etf_daily_days,
                                "missing": bool(_missing_daily_days(ETF_DAILY_ROOT)
-                                               or _incomplete_etf_daily_days())},
+                                               or _incomplete_etf_daily_days()),
+                               "segment_missing": _safe_universe_segment_missing()},
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
         "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
@@ -1348,7 +1375,8 @@ def backfill_to_now() -> dict[str, Any]:
             result["errors"].append(f"etf_nav {day}: {e}")
 
     # 4. 缺口告警（日志 + 钉钉）
-    if any(st["missing"] or st["empty"] for st in result["missing"].values()):
+    if any((st["missing"] or st["empty"] or st.get("segment_missing"))
+           for st in result["missing"].values()):
         _notify_missing(result["missing"])
 
     logger.info("mootdx_service: 启动回源完成 %s", result)
