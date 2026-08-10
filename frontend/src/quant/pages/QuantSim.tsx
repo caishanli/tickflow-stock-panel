@@ -603,12 +603,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal">时间</th>
                     <th className="px-3 py-1.5 font-normal">名称</th>
                     <th className="px-3 py-1.5 font-normal">代码</th>
+                    <th className="px-3 py-1.5 font-normal">持仓时长</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
                     <th className="px-3 py-1.5 font-normal text-right">价格</th>
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
                     <th className="px-3 py-1.5 font-normal text-right">手续费</th>
                     <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal text-right">持仓时长</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -619,6 +619,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
+                      <td className="px-3 py-1.5">
+                        {h?.open ? '持有中' : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`}
+                      </td>
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
                         {t.action === 'BUY' ? '买入' : '卖出'}
                       </td>
@@ -627,9 +630,6 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
                       <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
-                      </td>
-                      <td className="px-3 py-1.5 text-right num">
-                        {h?.open ? '持有中' : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`}
                       </td>
                     </tr>
                     )
