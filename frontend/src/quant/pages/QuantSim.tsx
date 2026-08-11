@@ -272,6 +272,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const qc = useQueryClient()
   const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs' | 'alerts'>('trades')
   const [showDingtalkCfg, setShowDingtalkCfg] = useState(false)
+  // 止损日志：首拉由 status 的 stop_loss 初始化，盘中新止损由 onTrade(STOP_LOSS) 实时追加
+  const [stoplossRows, setStoplossRows] = useState<any[]>([])
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
   const { data: st } = useQuery({
     queryKey: ['quant', 'sim', aid, 'status'], queryFn: () => api.getSimStatus(aid),
@@ -308,8 +310,17 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         ...(prev || {}), account: { ...(prev?.account || {}), status: s.status }, state: s.state,
       })),
       onEquity: (e) => appendTo(['quant', 'sim', aid, 'equity'], e, (r) => String(r.dt)),
-      onTrade: (t) => appendTo(['quant', 'sim', aid, 'trades'], t,
-        (r) => `${r.ts}|${r.code}|${r.action}|${r.price}`),
+      onTrade: (t) => {
+        appendTo(['quant', 'sim', aid, 'trades'], t,
+          (r) => `${r.ts}|${r.code}|${r.action}|${r.price}`)
+        if (String(t.action) === 'STOP_LOSS') {
+          setStoplossRows((prev) => {
+            const sig = `${t.ts}|${t.code}|${t.price}`
+            if (prev.some((r) => `${r.ts}|${r.code}|${r.price}` === sig)) return prev
+            return [...prev, t]
+          })
+        }
+      },
       onLog: (l) => appendTo(['quant', 'sim', aid, 'logs'], l,
         (r) => `${r.ts}|${r.level}|${r.message}`),
     })
@@ -434,6 +445,17 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const logList: any[] = Array.isArray(logs) ? logs : []
   const alertList: any[] = logList.filter((l: any) => l.level === 'warn' || l.level === 'error')
 
+  // 止损日志初始化：status 的 stop_loss 是历史全量，与 onTrade 增量去重合并
+  useEffect(() => {
+    if (stopLossList.length === 0) return
+    setStoplossRows((prev) => {
+      const seen = new Set(prev.map((r) => `${r.ts}|${r.code}|${r.price}`))
+      const missing = stopLossList.filter((r) => !seen.has(`${r.ts}|${r.code}|${r.price}`))
+      if (missing.length === 0) return prev
+      return [...prev, ...missing]
+    })
+  }, [stopLossList])
+
   return (
     <div className="flex-1 overflow-auto p-4 space-y-4">
       {/* 顶栏：返回 + 账户信息 + 控制 */}
@@ -552,12 +574,14 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal text-right">现价</th>
                     <th className="px-3 py-1.5 font-normal text-right">市值</th>
                     <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal text-right">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
                   {posEntries.map(([sym, p]: any) => {
                     const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
                     const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
+                    const pnlAmt = pnlPct != null ? pnlPct * (Number(p.amount) || 0) * (Number(p.avg_cost) || 0) : null
                     return (
                       <tr key={sym} className="border-t border-border/60">
                         <td className="px-3 py-1.5 text-muted">{p.entry_ts ? String(p.entry_ts).slice(0, 16) : '—'}</td>
@@ -567,6 +591,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
                         <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
                         <td className="px-3 py-1.5 text-right num">{fmtNum(value)}</td>
+                        <td className={`px-3 py-1.5 text-right num ${pnlAmt == null ? '' : pnlAmt >= 0 ? 'text-bull' : 'text-bear'}`}>
+                          {pnlAmt == null ? '—' : fmtNum(pnlAmt)}
+                        </td>
                         <td className={`px-3 py-1.5 text-right num ${pnlPct == null ? '' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
                           {fmtPct(pnlPct)}
                         </td>
@@ -585,7 +612,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       <div className="rounded-card border border-border bg-surface overflow-hidden">
         <div className="flex gap-1 px-3 pt-3 pb-2 border-b border-border/60">
           {([['trades', `成交记录 (${tradeList.length})`],
-             ['stoploss', `止损日志 (${stopLossList.length})`],
+             ['stoploss', `止损日志 (${stoplossRows.length})`],
              ['logs', `运行日志 (${logList.length})`],
              ['alerts', `异常 (${alertList.length})`]] as const).map(([k, label]) => (
             <button key={k} onClick={() => setTab(k)}
@@ -609,6 +636,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
                     <th className="px-3 py-1.5 font-normal text-right">手续费</th>
                     <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal text-right">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -631,6 +659,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
                       </td>
+                      <td className={`px-3 py-1.5 text-right num ${t.action !== 'BUY' && typeof t.pnl_pct === 'number' ? (t.pnl_pct >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                        {t.action === 'BUY' ? '—' : fmtPct(t.pnl_pct)}
+                      </td>
                     </tr>
                     )
                   })}
@@ -640,7 +671,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           ) : <div className="px-4 py-4 text-xs text-muted">暂无成交</div>
         )}
         {tab === 'stoploss' && (
-          stopLossList.length > 0 ? (
+          stoplossRows.length > 0 ? (
             <div className="overflow-auto max-h-64">
               <table className="w-full text-xs">
                 <thead className="text-muted sticky top-0 bg-surface">
@@ -653,10 +684,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal text-right">数量</th>
                     <th className="px-3 py-1.5 font-normal text-right">手续费</th>
                     <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal text-right">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
-                  {[...stopLossList].reverse().map((t: any, i: number) => (
+                  {[...stoplossRows].reverse().map((t: any, i: number) => (
                     <tr key={i} className="border-t border-border/60 hover:bg-elevated/60 transition-colors">
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
@@ -667,6 +699,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
                       <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? 'text-bear' : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
+                      </td>
+                      <td className={`px-3 py-1.5 text-right num ${typeof t.pnl_pct === 'number' ? 'text-bear' : 'text-muted'}`}>
+                        {fmtPct(t.pnl_pct)}
                       </td>
                     </tr>
                   ))}
