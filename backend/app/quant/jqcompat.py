@@ -895,25 +895,44 @@ class _DayBarStore:
                 df = all_daily.get(code)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     candidates.append(df)
-            # 选日期范围最广的帧。帧已是 DatetimeIndex（_daily_mem 分区产物）
-            # 时直接用 index 算跨度，避免对每只全帧 _normalize_daily（pandas
-            # 全帧 astype×5+建 DataFrame，1600+ 只 × 2 次是回测预热热点）。
+            # 选帧优先"数据最新"：末日更晚的帧优先（如网络源 _daily_mem 最新到
+            # 今日，而 mootdx 旧缓存可能停在数日前——若按"区间内行数最多"选，
+            # 800 行的陈旧 mootdx 帧会盖过 89 行的新帧，导致回测用陈旧历史序列，
+            # 动量/均线/风控计算失真）。末日相同时才退化为比跨度。
             best_df = None
             best_span = 0
+            best_end = None
             for df in candidates:
                 try:
                     if isinstance(getattr(df, "index", None), pd.DatetimeIndex):
                         sub = df.index[(df.index >= ds) & (df.index <= de)]
                         span = len(sub)
+                        end_dt = df.index.max()
                     else:
                         tmp = _normalize_daily(df)
                         tmp = tmp[(tmp["date"] >= ds) & (tmp["date"] <= de)]
                         span = len(tmp)
+                        end_dt = tmp["date"].max()
                 except Exception:
-                    span = 0
-                if span > best_span:
-                    best_span = span
+                    span, end_dt = 0, None
+                end_dt = pd.Timestamp(end_dt) if end_dt is not None else None
+                better = False
+                if best_df is None:
+                    better = True
+                elif end_dt is not None and best_end is not None:
+                    # 优先末日更晚（数据更新）；末日相同比区间跨度
+                    if end_dt > best_end:
+                        better = True
+                    elif end_dt == best_end and span > best_span:
+                        better = True
+                elif end_dt is not None and best_end is None:
+                    better = True
+                elif end_dt is None and span > best_span:
+                    better = True
+                if better:
                     best_df = df
+                    best_span = span
+                    best_end = end_dt
             # 缓存数据覆盖不足 → 走 dm.fetch 网络回源补齐
             if best_df is None or best_span == 0:
                 try:

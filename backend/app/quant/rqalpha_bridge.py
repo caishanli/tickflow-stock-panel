@@ -1334,6 +1334,11 @@ def run_jq_backtest(strategy_path: str, params: dict,
     benchmark = params.get("benchmark", "510300.XSHG")
     start = (params.get("start") or "").strip() or "2026-01-01"
     end = (params.get("end") or "").strip() or "2026-07-08"
+    # 指数/基准/固定池补齐日线需覆盖回看窗口（策略动量/走弱期 MA 需要 start 前
+    # ~250 个自然日的历史）。若只用回测 start 补齐，_daily_mem 里指数帧从 start
+    # 起，_DayBarStore 选帧（优先末日晚）会选到缺历史的短帧，导致 MA 计算失真、
+    # 走弱期/动量判定与实时模拟盘不一致。
+    _data_start = (pd.Timestamp(start) - pd.Timedelta(days=250)).strftime("%Y-%m-%d")
 
     # ---- 构造 DataManager，加载原始缓存（离线，无网络回源） ----
     # 使用单例，确保策略侧 get_data_manager() 拿到同一实例，避免 _use_real_minute
@@ -1370,7 +1375,7 @@ def run_jq_backtest(strategy_path: str, params: dict,
         _refreshed = 0
         for _c in _refresh_codes:
             try:
-                dm.fetch("get_daily", _c, start, end)
+                dm.fetch("get_daily", _c, _data_start, end)
                 _refreshed += 1
             except Exception:
                 pass
