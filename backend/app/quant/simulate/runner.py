@@ -445,7 +445,6 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
     trades = getattr(jq_api, "_state", {}).get("trades") or []
     drained = aux.get("trades_drained", 0)
     is_replay = aux.get("replay_mode", False)
-    batch_trades = aux.get("batch_trades") if is_replay else None
     for t in trades[drained:]:
         amount = abs(t["amount"])
         if t["amount"] < 0 and t.get("avg_cost"):
@@ -457,10 +456,8 @@ def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> No
                      t["code"], "BUY" if t["amount"] > 0 else "SELL",
                      t["price"], amount, round(pnl, 4), round(pnl_pct, 4),
                      t.get("fee", 0.0), names.resolve_name(t["code"]))
-        if batch_trades is not None:
-            batch_trades.append(trade_row)
-        else:
-            db.insert_sim_trade(*trade_row)
+        # 成交逐笔落库, 补跑期间前端 SSE 实时可见, 不攒批等补跑结束才 flush
+        db.insert_sim_trade(*trade_row)
     aux["trades_drained"] = len(trades)
     pf = ctx.portfolio
     positions_value = round(sum(p.amount * p.price for p in pf.positions.values()), 4)
@@ -889,7 +886,12 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     # 止损巡检（matcher 在 state 口径上工作，结果回写 portfolio）
     _state_from_portfolio(ctx, state)
     state["dt"] = str(bar_ts)
-    matcher.step(state, prices, no_sell=no_sell)
+    # 止损费率对齐 jq 引擎撮合：策略 set_order_cost 设置的 close_commission，
+    # 未设置时回退 CONFIG.fee_rate（与 order() 的 comm_rate 默认口径一致）
+    fee_cfg = (jq_api._state.get("fee_config") or {})
+    matcher.step(state, prices, no_sell=no_sell,
+                 fee=fee_cfg.get("close_commission"),
+                 min_commission=fee_cfg.get("min_commission"))
     _apply_matcher_result(ctx, state)
     for code, pos in ctx.portfolio.positions.items():
         if code in prices:

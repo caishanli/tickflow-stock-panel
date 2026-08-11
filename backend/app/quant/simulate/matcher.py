@@ -24,6 +24,15 @@ def _is_etf(code: str) -> bool:
     return num.startswith(("5", "15", "16"))
 
 
+def _resolve_name(code: str) -> str:
+    """标的名称解析（延迟导入，失败回退代码本身）。"""
+    try:
+        from . import names
+        return names.resolve_name(code)
+    except Exception:  # noqa: BLE001
+        return code
+
+
 class Matcher:
     def __init__(self, stop_loss: float, account_id: str | None = None):
         self.stop_loss = float(stop_loss)
@@ -32,8 +41,9 @@ class Matcher:
 
     def step(self, state: dict, prices: dict, fee: float | None = None,
              stamp_tax: float | None = None, slippage: float | None = None,
-             no_sell: set | None = None) -> dict:
+             no_sell: set | None = None, min_commission: float | None = None) -> dict:
         fee = CONFIG.fee_rate if fee is None else float(fee)
+        min_commission = 0.0 if min_commission is None else float(min_commission)
         stamp_tax = DEFAULT_STAMP_TAX if stamp_tax is None else float(stamp_tax)
         slippage = CONFIG.slippage if slippage is None else float(slippage)
         no_sell = no_sell or set()
@@ -64,7 +74,8 @@ class Matcher:
             sell_amount = min(amount, sellable)
             fill = float(price) * (1 - slippage)  # 卖出滑点（主引擎滑点双边口径）
             tax = 0.0 if _is_etf(code) else stamp_tax  # ETF 免印花税
-            proceeds = sell_amount * fill * (1 - fee - tax)
+            commission = max(sell_amount * fill * fee, min_commission)  # 佣金含最低兜底
+            proceeds = sell_amount * fill - commission - sell_amount * fill * tax
             cash += proceeds
             log.append({
                 "dt": state.get("dt"),
@@ -75,10 +86,20 @@ class Matcher:
                 "pnl_pct": round(pnl_pct, 4),
             })
             if self.account_id:
-                # M15：止损落库，供 /sim/accounts/{aid}/status 的 stop_loss 字段读取
+                # M15：止损落库——sim_stop_loss（止损日志）与 sim_trades（成交记录）
+                # 双写，字段补全供表格展示
                 from .. import db
-                db.insert_sim_stoploss(self.account_id, state.get("dt"), code,
-                                       "STOP_LOSS", round(fill, 4), round(pnl_pct, 4))
+                ts = str(state.get("dt"))
+                name = _resolve_name(code)
+                pnl = (fill - avg_cost) * sell_amount
+                db.insert_sim_stoploss(self.account_id, ts, code, name,
+                                       "STOP_LOSS", round(fill, 4), sell_amount,
+                                       round(pnl, 4), round(pnl_pct, 4),
+                                       round(commission, 4))
+                db.insert_sim_trade(self.account_id, ts, code, "STOP_LOSS",
+                                    round(fill, 4), sell_amount,
+                                    round(pnl, 4), round(pnl_pct, 4),
+                                    round(commission, 4), name)
             if sell_amount < amount:
                 pos["amount"] = amount - sell_amount  # T+1 部分可卖：剩余数量留仓
             else:

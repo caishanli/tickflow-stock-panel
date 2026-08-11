@@ -623,7 +623,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         {h?.open ? '持有中' : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`}
                       </td>
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
-                        {t.action === 'BUY' ? '买入' : '卖出'}
+                        {t.action === 'BUY' ? '买入' : t.action === 'STOP_LOSS' ? '止损' : '卖出'}
                       </td>
                       <td className="px-3 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
                       <td className="px-3 py-1.5 text-right num">{t.amount}</td>
@@ -640,13 +640,40 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           ) : <div className="px-4 py-4 text-xs text-muted">暂无成交</div>
         )}
         {tab === 'stoploss' && (
-          <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
-            {stopLossList.length > 0 ? stopLossList.map((l: any, i: number) => (
-              <div key={i}>
-                {`${l.ts ?? ''} ${l.code ?? ''} ${l.action ?? ''} @ ${l.price ?? ''} (${typeof l.pnl_pct === 'number' ? (l.pnl_pct * 100).toFixed(2) + '%' : ''})`}
-              </div>
-            )) : <div className="text-muted">暂无触发</div>}
-          </div>
+          stopLossList.length > 0 ? (
+            <div className="overflow-auto max-h-64">
+              <table className="w-full text-xs">
+                <thead className="text-muted sticky top-0 bg-surface">
+                  <tr className="text-left">
+                    <th className="px-3 py-1.5 font-normal">时间</th>
+                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="px-3 py-1.5 font-normal">代码</th>
+                    <th className="px-3 py-1.5 font-normal">方向</th>
+                    <th className="px-3 py-1.5 font-normal text-right">价格</th>
+                    <th className="px-3 py-1.5 font-normal text-right">数量</th>
+                    <th className="px-3 py-1.5 font-normal text-right">手续费</th>
+                    <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
+                  </tr>
+                </thead>
+                <tbody className="text-foreground">
+                  {[...stopLossList].reverse().map((t: any, i: number) => (
+                    <tr key={i} className="border-t border-border/60 hover:bg-elevated/60 transition-colors">
+                      <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
+                      <td className="px-3 py-1.5">{t.name ?? ''}</td>
+                      <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
+                      <td className="px-3 py-1.5 text-bear">止损</td>
+                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
+                      <td className="px-3 py-1.5 text-right num">{t.amount}</td>
+                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
+                      <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? 'text-bear' : 'text-muted'}`}>
+                        {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <div className="px-4 py-4 text-xs text-muted">暂无止损</div>
         )}
         {tab === 'logs' && (
           <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">

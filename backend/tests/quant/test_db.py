@@ -34,7 +34,7 @@ def test_sim_account_and_state():
     assert st["cash"] == 99000.0 and st["pnl"] == -1000.0
     db.insert_sim_snapshot("a1", "2024-01-02 09:30", 99000.0, 99000.0, 0.0, -1000.0, -0.01)
     db.insert_sim_trade("a1", "2024-01-02 09:31", "600000.XSHG", "SELL", 10.0, 100, -50.0, -0.005, 0.0)
-    db.insert_sim_stoploss("a1", "2024-01-02 09:31", "600000.XSHG", "STOP_LOSS", 9.9, -0.01)
+    db.insert_sim_stoploss("a1", "2024-01-02 09:31", "600000.XSHG", "浦发银行", "STOP_LOSS", 9.9, 100, -50.0, -0.01, 0.0)
     assert len(db.get_sim_snapshots("a1")) == 1
     assert len(db.get_sim_trades("a1")) == 1
     assert len(db.get_sim_stoploss("a1")) == 1

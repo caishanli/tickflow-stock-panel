@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS sim_trades (
     account_id TEXT, ts TEXT, code TEXT, name TEXT, action TEXT, price REAL, amount REAL,
     pnl REAL, pnl_pct REAL, commission REAL);
 CREATE TABLE IF NOT EXISTS sim_stop_loss (
-    account_id TEXT, ts TEXT, code TEXT, action TEXT, price REAL, pnl_pct REAL);
+    account_id TEXT, ts TEXT, code TEXT, name TEXT, action TEXT, price REAL,
+    amount REAL, pnl REAL, pnl_pct REAL, commission REAL);
 CREATE TABLE IF NOT EXISTS sim_logs (
     account_id TEXT, ts TEXT, level TEXT, message TEXT);
 CREATE TABLE IF NOT EXISTS quant_settings (
@@ -85,6 +86,12 @@ def init_db(path: str | None = None) -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(sim_trades)")}
         if "name" not in cols:
             conn.execute("ALTER TABLE sim_trades ADD COLUMN name TEXT")
+        # 兼容旧库：sim_stop_loss 补 name/amount/pnl/commission 列（止损日志表格展示）
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sim_stop_loss)")}
+        for col, ddl in (("name", "TEXT"), ("amount", "REAL"),
+                         ("pnl", "REAL"), ("commission", "REAL")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE sim_stop_loss ADD COLUMN {col} {ddl}")
         conn.commit()
     finally:
         conn.close()
@@ -520,18 +527,21 @@ def get_sim_trades(account_id):
     return [dict(r) for r in rows]
 
 
-def insert_sim_stoploss(account_id, ts, code, action, price, pnl_pct):
+def insert_sim_stoploss(account_id, ts, code, name, action, price, amount, pnl,
+                        pnl_pct, commission):
     with get_conn() as c:
         c.execute(
-            "INSERT INTO sim_stop_loss(account_id,ts,code,action,price,pnl_pct) VALUES(?,?,?,?,?,?)",
-            (account_id, ts, code, action, price, pnl_pct),
+            "INSERT INTO sim_stop_loss(account_id,ts,code,name,action,price,amount,pnl,pnl_pct,commission) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (account_id, ts, code, name, action, price, amount, pnl, pnl_pct, commission),
         )
 
 
 def get_sim_stoploss(account_id):
     with get_conn() as c:
         rows = c.execute(
-            "SELECT ts,code,action,price,pnl_pct FROM sim_stop_loss WHERE account_id=? ORDER BY ts",
+            "SELECT ts,code,name,action,price,amount,pnl,pnl_pct,commission "
+            "FROM sim_stop_loss WHERE account_id=? ORDER BY ts",
             (account_id,),
         ).fetchall()
     return [dict(r) for r in rows]

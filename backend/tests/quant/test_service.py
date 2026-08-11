@@ -70,7 +70,7 @@ def test_account_reset(tmp_quant):
     db.upsert_sim_state(aid, 200000.0, "{}", 200000.0, 0.0, 200000.0, "[]", datetime.datetime.now().isoformat())
     db.insert_sim_snapshot(aid, "2024-01-02", 200000.0, 200000.0, 0.0, 0.0, 0.0)
     db.insert_sim_trade(aid, "2024-01-02", "600000.XSHG", "BUY", 10.0, 100, 0.0, 0.0, 0.0)
-    db.insert_sim_stoploss(aid, "2024-01-02", "600000.XSHG", "SELL", 10.0, -0.02)
+    db.insert_sim_stoploss(aid, "2024-01-02", "600000.XSHG", "浦发银行", "SELL", 10.0, 100, -50.0, -0.02, 0.0)
 
     service.account_reset(aid)
 
