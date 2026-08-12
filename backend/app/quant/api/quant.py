@@ -465,10 +465,20 @@ def sim_equity(aid: str):
     first_day = str(snaps[0].get("dt", ""))[:10]
     last_day = str(snaps[-1].get("dt", ""))[:10]
     bench = _build_benchmark_map(first_day, last_day)
+    # 前端净值曲线/指标只消费每日首末点：按天保留首尾两条，盘中明细不传输
+    # （分钟快照 5000+ 行 → 每交易日 2 行，payload 由 ~800KB 降到 ~7KB）
+    per_day: dict[str, list] = {}
     for s in snaps:
+        per_day.setdefault(str(s.get("dt", ""))[:10], []).append(s)
+    out: list[dict] = []
+    for rows in per_day.values():
+        out.append(rows[0])
+        if len(rows) > 1:
+            out.append(rows[-1])
+    for s in out:
         day = str(s.get("dt", ""))[:10].replace("-", "")
         s["benchmark_pct"] = bench.get(day, 0)
-    return {"data": snaps}
+    return {"data": out}
 
 
 @router.get("/sim/accounts/{aid}/trades")
