@@ -927,6 +927,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     ctx = bundle.ctx
     if has_saved:
         _restore_portfolio(ctx, st)
+    _emit_log(account_id, "info", "策略编译完成，正在初始化数据与指标…")
     try:
         bundle.init_fn(ctx)
     except Exception as e:  # noqa: BLE001
@@ -1083,6 +1084,8 @@ def run_loop(account_id: str, provider: QuantDataProvider | None = None,
     acct = db.get_sim_account(account_id)
     if not acct:
         return
+    # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
+    _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
     stop = acct.get("stop_loss") or 0.03
     matcher = matcher or Matcher(stop, account_id=account_id)
     if (acct.get("strategy_id") or "").strip():

@@ -210,6 +210,29 @@ def test_strategy_loop_missing_strategy_marks_failed(tmp_quant, monkeypatch):
     assert any("策略不存在" in l["message"] for l in db.get_sim_logs(aid))
 
 
+# ---- 启动反馈：首条日志须在策略编译/数据预载前落库 ----
+def test_run_loop_early_startup_log_before_compile(tmp_quant, monkeypatch):
+    """进程入口即写启动日志：策略编译失败时也能先看到启动反馈，而非长时间空白。"""
+    aid = service.account_create("acct_early", 100000.0, 0.03, "no_such_strategy")
+    monkeypatch.setattr(runner, "is_paused", lambda aid: False)
+    runner.run_loop(aid, dm=_StubDM(), feed=_feed_factory(), matcher=Matcher(0.03))
+    logs = db.get_sim_logs(aid)
+    assert logs[0]["message"].startswith("模拟盘进程已启动")
+    assert any("策略不存在" in l["message"] for l in logs)
+
+
+def test_run_loop_emits_progress_logs(tmp_quant, monkeypatch):
+    """正常启动路径：启动日志最先落库，编译完成后补一条进度日志。"""
+    save_strategy("s_prog", "s", STRATEGY_NOOP)
+    aid = service.account_create("acct_prog", 100000.0, 0.03, "s_prog")
+    _patch_one_loop(monkeypatch)
+    runner.run_loop(aid, dm=_StubDM(), feed=_feed_factory(10.0), matcher=Matcher(0.03))
+    logs = db.get_sim_logs(aid)
+    assert logs[0]["message"].startswith("模拟盘进程已启动")
+    assert any("编译完成" in l["message"] for l in logs)
+    assert any("策略模拟盘启动" in l["message"] for l in logs)
+
+
 # ---- run_daily 调度 ----
 def test_daily_due_times():
     assert runner._daily_due("open", pd.Timestamp("2026-07-17 09:31"))
@@ -265,6 +288,23 @@ def test_api_sim_status_includes_strategy_name(tmp_quant, api_client):
     r = api_client.get("/api/quant/sim/accounts/a_nm/status")
     assert r.status_code == 200
     assert r.json()["data"]["strategy_name"] == "五福轮动"
+
+
+def test_api_sim_equity_aggregates_daily_first_last(tmp_quant, api_client):
+    """equity 接口按天只返回首末两条（前端曲线只消费日线首末点，分钟明细不传输）。"""
+    db.insert_sim_account("a_eq", "a", 1.0, 0.03, "created", "")
+    for dt, nv in [("2026-07-10 09:31:00", 100.0), ("2026-07-10 10:00:00", 101.0),
+                   ("2026-07-10 15:05:00", 102.0), ("2026-07-13 09:31:00", 103.0),
+                   ("2026-07-13 15:05:00", 104.0)]:
+        db.insert_sim_snapshot("a_eq", dt, nv, 50.0, 50.0, 2.0, 0.02)
+    r = api_client.get("/api/quant/sim/accounts/a_eq/equity")
+    rows = r.json()["data"]
+    assert [x["dt"] for x in rows] == [
+        "2026-07-10 09:31:00", "2026-07-10 15:05:00",   # 首末各一条
+        "2026-07-13 09:31:00", "2026-07-13 15:05:00",
+    ]
+    assert rows[0]["net_value"] == 100.0 and rows[1]["net_value"] == 102.0
+    assert "benchmark_pct" in rows[0]
 
 
 # ---- 开始模拟日期：历史补跑 / 未来空转 ----

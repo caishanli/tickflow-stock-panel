@@ -362,6 +362,19 @@ async def auth_middleware(request: Request, call_next):
     return JSONResponse(status_code=401, content={"detail": "未登录或会话已过期"})
 
 
+@app.middleware("http")
+async def api_no_cache_middleware(request: Request, call_next):
+    """所有 /api/ 动态响应禁止浏览器缓存。
+
+    无 Cache-Control 时 Chrome 会对 GET 响应做启发式缓存，前端拿到过期快照
+    （如模拟盘日志只显示到某一天，刷新才恢复）。SSE 流已有 no-cache，不覆盖。
+    """
+    resp = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
 # 路由
 app.include_router(core_router)
 app.include_router(auth_api.router)
