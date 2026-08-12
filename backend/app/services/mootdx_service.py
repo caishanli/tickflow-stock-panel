@@ -49,6 +49,12 @@ _SINCE_YEAR = 2020
 _ETF_DAILY_MIN_COVERAGE = 0.5
 # 内容校验只看最近 N 个分区（早年分区无必要逐日读文件，性能考虑）。
 _ETF_DAILY_RECENT_LIMIT = 30
+# 股票分钟内容完整性校验阈值：分区 symbol 覆盖率低于该值即判残缺重写；
+# 可由环境变量覆盖（STOCK_MINUTE_MIN_COVERAGE=0.3），默认 0.5。
+_STOCK_MINUTE_MIN_COVERAGE = float(os.getenv("STOCK_MINUTE_MIN_COVERAGE", "0.5"))
+# 股票分钟内容校验看最近 N 个分区（全市场 ~5200 只，逐日读 symbol 列成本更高，
+# 只看近窗口）。可由 STOCK_MINUTE_RECENT_LIMIT 覆盖。
+_STOCK_MINUTE_RECENT_LIMIT = int(os.getenv("STOCK_MINUTE_RECENT_LIMIT", "30"))
 # 权威 ETF 代码段（对齐聚宽 get_all_securities(['etf']) 名单段分布）。
 # 深市 159/161/169/180/181；沪市 501/506/510~518/520/526/530/551/560~563/588/589。
 # 每个段在完整名单中至少出现 1 只；宇宙缺失整个段 = 快照/回源异常（如 501018
@@ -766,6 +772,8 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
     from app.services.etf_nav_service import _missing_etf_nav_days as _missing_nav
     missing_etf_daily = set(_missing_days_in(calendar, ETF_DAILY_ROOT))
     missing_etf_daily |= set(_incomplete_etf_daily_days())
+    missing_stock_minute = set(_missing_days_in(calendar, STOCK_MINUTE_ROOT))
+    missing_stock_minute |= set(_incomplete_stock_minute_days())
     seg_missing = _safe_universe_segment_missing()
     if seg_missing:
         logger.warning("mootdx_service: ETF 宇宙快照缺代码段 %s，"
@@ -776,7 +784,7 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
         "kline_etf_daily":   sorted(missing_etf_daily),
         "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
         "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
-        "kline_minute":      _missing_days_in(calendar, STOCK_MINUTE_ROOT),
+        "kline_minute":      sorted(missing_stock_minute),
         "etf_nav":           _missing_nav(),
         "etf_universe_segments": sorted(seg_missing),
     }
@@ -915,6 +923,64 @@ def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
         if coverage < _ETF_DAILY_MIN_COVERAGE:
             out.append(_dt.date.fromisoformat(ds))
     logger.info("mootdx_service: ETF 日线内容校验 %d/%d 分区, 残缺 %d: %s",
+                len(existing[-recent:]), len(existing), len(out),
+                [d.isoformat() for d in out])
+    return out
+
+
+def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
+    """返回股票分钟 ``kline_minute`` 中**内容残缺**的分区日期（symbol 覆盖率 << 宇宙）。
+
+    背景：宽缺口判定（``_missing_days_in``/``_partition_dates``）只检查分区
+    目录是否存在，一个只有 1 只股票的分区与完整分区被视为等价——一旦某天曾
+    以残缺状态落盘（回源中断、全市场失败如 pytdx 缺失事故 5226 只全失败），
+    增量追溯永不重写，最新交易日分钟数据永久缺失。
+
+    这里做内容级校验：对最近 ``recent``（默认由 ``_STOCK_MINUTE_RECENT_LIMIT``
+    控制）个分区，读 symbol 列与股票宇宙（``_stock_universe``，.SH/.SZ）比对，
+    覆盖率 < ``_STOCK_MINUTE_MIN_COVERAGE``（默认 0.5）即判残缺。宇宙为空时
+    跳过（无基线可比）；覆盖率 >= 阈值的正常分区不误报。
+
+    盘中（<15:00）跳过当日分区：当日分钟本就走了一半（未收盘），覆盖率天然
+    偏低，误判会触发 ``sync_stock_minute_range`` 全市场重拉（~2h 浪费），
+    且写回的是半程数据。收盘后才把当日纳入残缺校验（对齐 ``_missing_minute_days``
+    口径）。
+    """
+    existing = _partition_dates(STOCK_MINUTE_ROOT)
+    if not existing:
+        return []
+    try:
+        codes = _stock_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: 股票宇宙读取失败，跳过分钟内容校验", exc_info=True)
+        return []
+    if not codes:
+        return []
+
+    today = _date.today()
+    recent = _STOCK_MINUTE_RECENT_LIMIT if recent is None else recent
+    target = set(codes)
+    out: list[_date] = []
+    for ds in existing[-recent:]:
+        d = _dt.date.fromisoformat(ds)
+        if d == today and not _market_closed():
+            logger.info("mootdx_service: 当日 %s 盘中未收盘，跳过残缺校验", ds)
+            continue
+        pdir = STOCK_MINUTE_ROOT / f"date={ds}"
+        parts = sorted(pdir.glob("*.parquet"))
+        if not parts:
+            continue
+        syms: set[str] = set()
+        for p in parts:
+            try:
+                df = pl.read_parquet(p, columns=["symbol"])
+                syms |= set(df["symbol"].to_list())
+            except Exception:  # noqa: BLE001
+                continue
+        coverage = len(syms & target) / len(target)
+        if coverage < _STOCK_MINUTE_MIN_COVERAGE:
+            out.append(_dt.date.fromisoformat(ds))
+    logger.info("mootdx_service: 股票分钟内容校验 %d/%d 分区, 残缺 %d: %s",
                 len(existing[-recent:]), len(existing), len(out),
                 [d.isoformat() for d in out])
     return out
@@ -1277,7 +1343,7 @@ def backfill_to_now() -> dict[str, Any]:
         "daily_days": [], "daily_written": {},
         "index_daily_days": [], "index_daily_written": {},
         "adj_factor": None,
-        "stock_minute_rows": 0, "etf_nav_days": [], "errors": [],
+        "stock_minute_rows": 0, "stock_minute_days": [], "etf_nav_days": [], "errors": [],
     }
 
     from app.services import etf_nav_service
@@ -1300,6 +1366,8 @@ def backfill_to_now() -> dict[str, Any]:
                                "segment_missing": _safe_universe_segment_missing()},
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
+        "kline_minute":       {"latest": None, "empty": not _partition_dates(STOCK_MINUTE_ROOT),
+                               "missing": bool(_incomplete_stock_minute_days())},
         "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
         "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
                                "empty": not etf_nav_days, "missing": bool(missing_nav_days)},
@@ -1357,10 +1425,21 @@ def backfill_to_now() -> dict[str, Any]:
             logger.warning("mootdx_service: 因子表回源失败: %s", e)
             result["errors"].append(f"adj_factor: {e}")
 
-    # 3. 股票分钟增量慢跑（每次一批，resume 跳过已覆盖，多轮自动补齐）
+    # 3. 股票分钟：先修复内容残缺分区（range 全量，走所有缺失日前的分支），
+    #    再跑增量慢跑（每次一批，resume 跳过已覆盖，多轮自动补齐）
+    incomplete_minute = _incomplete_stock_minute_days()
+    if incomplete_minute:
+        try:
+            n = sync_stock_minute_range(incomplete_minute)
+            result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
+            result["stock_minute_days"] = [d.isoformat() for d in incomplete_minute]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 股票分钟残缺分区重写失败 %s: %s",
+                           incomplete_minute, e)
+            result["errors"].append(f"stock_minute_range {incomplete_minute}: {e}")
     try:
         n = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
-        result["stock_minute_rows"] = n
+        result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
     except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")

@@ -3,6 +3,7 @@
 # 作者：烟花三月ETF
 # v5.3（本地改进版）：A1 盈利保护止损 / A2 持仓宽容（调仓惰性）/ A3 走弱期退出确认，均可独立开关。
 # v5.4（胜率导向）：D1 锁盈止损（保护线 1.0→成本×X） / D2 买入过滤收紧 / D3 高位回落止盈，均可独立开关。
+# v5.4 优化（2026-08-12）：A3 退出均线 20→15（弱市反弹更快回补 A 股池，避免错过反弹被锁在全球池）。
 
 import numpy as np
 import math
@@ -208,7 +209,7 @@ def initialize(context):
     g.profit_protect_stop = 1.04                         # A1 保护线：1.0=保本，>1.0=锁盈（v5.4 D1，最终配置 1.04）
     g._profit_protected = {}                             # A1 状态：code -> 是否已触发盈利保护
     g.hold_buffer = 1.0                                  # A2 持仓宽容：回测验证为负贡献，默认关闭（1.0=关闭）
-    g.weak_exit_ma_lookback = 20                         # A3 走弱期退出均线周期（进入仍用 weak_period_ma_lookback）
+    g.weak_exit_ma_lookback = 15                         # A3 走弱期退出均线周期（进入仍用 weak_period_ma_lookback）
 
     # ==================== v5.4 胜率导向开关 ====================
     # D2a 动量下限=D2b R²阈值/D2c 量比上限/D2d 单日跌幅上限 复用上方原过滤参数（min_score_threshold/r2_threshold/volume_threshold/loss）

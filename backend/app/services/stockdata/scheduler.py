@@ -30,23 +30,41 @@ def _backfill_loop():
         logger.exception("stockdata startup backfill failed")
 
 
-def _run_sync():
+def _run_sync(full_stock_minute: bool = False):
+    """收盘后同步（15:35 cron 传 full_stock_minute=True）。
+
+    ``full_stock_minute``：收盘后整批把当天全市场股票分钟拉全（~2h），否则
+    增量慢跑（每轮 limit=20）。手动 trigger_sync 保持增量 + 不落日线
+    （盘中触发写半程日线会污染分区）。
+    """
     with _sync_lock:
         try:
             from app.services import mootdx_service
             minutes = mootdx_service.sync_etf_minute()
             adj = mootdx_service.sync_adj_factor()
-            stock = mootdx_service.sync_stock_minute(
-                limit=mootdx_service.STOCK_MINUTE_BATCH_LIMIT)
-            from app.services import etf_nav_service
-            nav = etf_nav_service.sync_etf_nav()
+            daily: dict | None = None
+            index_daily: dict | None = None
+            if full_stock_minute:
+                # 收盘后：当天全市场股票分钟一次拉全（增量慢跑 20 只/轮
+                # 每交易日只补 20 只，5200 只需 260 轮，永远追不上当天）。
+                stock = mootdx_service.sync_stock_minute(limit=None)
+                from app.services import etf_nav_service
+                nav = etf_nav_service.sync_etf_nav()
+                today = _dt.date.today()
+                daily = mootdx_service.sync_daily(today)
+                index_daily = mootdx_service.sync_index_daily(today)
+            else:
+                stock = mootdx_service.sync_stock_minute(
+                    limit=mootdx_service.STOCK_MINUTE_BATCH_LIMIT)
+                from app.services import etf_nav_service
+                nav = etf_nav_service.sync_etf_nav()
             with _lock:
                 _scheduler_state["last_sync"] = str(_dt.datetime.now())
                 _scheduler_state["sync_result"] = {
                     "minute_rows": minutes, "adj": adj, "stock_minute_rows": stock,
-                    "nav_rows": nav}
-            logger.info("scheduled mootdx sync done: minute=%d rows, adj=%s, stock_minute_rows=%d, nav_rows=%d",
-                        minutes, adj, stock, nav)
+                    "nav_rows": nav, "daily": daily, "index_daily": index_daily}
+            logger.info("scheduled mootdx sync done: minute=%d rows, adj=%s, stock_minute_rows=%d, nav_rows=%d, daily=%s, index_daily=%s",
+                        minutes, adj, stock, nav, daily, index_daily)
         except Exception:  # noqa: BLE001
             logger.exception("scheduled mootdx sync failed")
 
@@ -61,7 +79,8 @@ def _sync_cron_loop():
                 last = _scheduler_state.get("sync_job")
             if last != now.date().isoformat():
                 _scheduler_state["sync_job"] = now.date().isoformat()
-                threading.Thread(target=_run_sync, daemon=True).start()
+                threading.Thread(target=_run_sync, kwargs={"full_stock_minute": True},
+                                 daemon=True).start()
         time.sleep(30)
 
 

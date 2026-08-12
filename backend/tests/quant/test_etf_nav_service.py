@@ -36,6 +36,29 @@ def test_sync_writes_partition_and_is_idempotent(tmp_path, monkeypatch):
     assert set(df["date"].to_list()) == {"2026-08-07"}
 
 
+def test_sync_drops_dash_values(tmp_path, monkeypatch):
+    """akshare 当日无净值/停牌的 ETF 返回 "---"，应丢弃而非拖垮整个分区写入。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+
+    def fake_fund_etf_fund_daily_em():
+        return pl.DataFrame({
+            "基金代码": ["510300", "159915", "518880"],
+            "2026-08-07-单位净值": ["4.7556", "---", "5.0123"],
+            "2026-08-07-累计净值": ["4.7556", "---", "5.0123"],
+        })
+
+    monkeypatch.setattr(svc, "_fund_etf_fund_daily_em", fake_fund_etf_fund_daily_em)
+    n = svc.sync_etf_nav()
+    assert n == 2  # "---" 行被丢弃，只写入 2 只
+    part = tmp_path / "etf_nav" / "date=2026-08-07" / "part.parquet"
+    assert part.exists()
+    df = pl.read_parquet(part)
+    assert df["symbol"].to_list() == ["510300.XSHG", "518880.XSHG"]
+    assert df["unit_nav"].dtype == pl.Float64
+
+
 def test_symbol_market_mapping():
     # 5/6/9 开头 → 沪市 XSHG；0/1/2/3 开头 → 深市 XSHE
     assert svc._jq_symbol("510300") == "510300.XSHG"

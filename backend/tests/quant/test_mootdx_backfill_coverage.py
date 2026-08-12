@@ -341,6 +341,40 @@ def test_incomplete_etf_daily_detects_sparse_partitions(tmp_path, monkeypatch):
     assert _d(2026, 8, 3) not in leftovers, "完整日不应被误判"
 
 
+def test_incomplete_stock_minute_skips_today_intraday(tmp_path, monkeypatch):
+    """盘中（<15:00）当日分区覆盖率天然偏低，不应误判为残缺触发全市场重拉。
+
+    回归：修复"启动回源把今日盘中半程数据当残缺 → sync_stock_minute_range
+    全市场重拉 ~2h 浪费"。收盘后才把当日纳入残缺校验。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(90)])
+    root = tmp_path / "kline_minute"
+    for d in ["2026-08-04", "2026-08-05"]:
+        (root / f"date={d}").mkdir(parents=True, exist_ok=True)
+    # 昨日 8/4 残缺、今日 8/5 也只有 1 只（盘中半程）
+    for d in ["2026-08-04", "2026-08-05"]:
+        pl.DataFrame({
+            "symbol": ["600000.SH"], "datetime": [_dt.datetime(2026, 8, int(d[8:]), 9, 31)],
+            "close": [1.0],
+        }).write_parquet(root / f"date={d}" / "part.parquet")
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda: False)  # 盘中
+
+    leftovers = ms._incomplete_stock_minute_days()
+    assert _d(2026, 8, 4) in leftovers, "昨日残缺仍应被识别"
+    assert _d(2026, 8, 5) not in leftovers, "盘中当日不应被误判"
+
+    # 收盘后当日仍残缺 → 纳入校验
+    monkeypatch.setattr(ms, "_market_closed", lambda: True)
+    leftovers = ms._incomplete_stock_minute_days()
+    assert _d(2026, 8, 5) in leftovers, "收盘后当日残缺应被识别"
+
+
 def test_incomplete_etf_daily_ignores_when_no_universe(monkeypatch, tmp_path):
     """宇 宙为空时内容校验应跳过（避免误删/误判正常数据）。"""
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
@@ -930,3 +964,151 @@ def test_put_daily_mem_protected_writes_new_or_wider():
     dm2._put_daily_mem_protected("get_daily_000300.XSHG", full)
     assert len(dm2._daily_mem["get_daily_000300.XSHG"]) == 2
     assert dm2._daily_ver == 6
+
+
+# ---------------------------------------------------------------------------
+# 股票分钟 kline_minute 内容级 symbol 覆盖率校验（pytdx 缺失事故的回归）
+# ---------------------------------------------------------------------------
+
+def test_incomplete_stock_minute_detects_sparse_partitions(tmp_path, monkeypatch):
+    """残缺股票分钟分区（symbol 数 << 股票宇宙）应判为缺失，触发重写。
+
+    回归：08-11 服务器重建 venv 丢弃 pytdx，回源全失败 5226 只 → 当日分区
+    只写入极少数（如 1 只）甚至为空。分区目录存在 → 既有缺口判定视为
+    "已覆盖"永不重写，最新交易日分钟数据永久缺失（回测/模拟盘 get_minute
+    拿到昨天的数据）。此测试要求内容级校验兜住该形态。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(90)])
+    # 整天集合内：8/3 完整（90 只全有），8/4、8/5 残缺（各 1 只）
+    root = tmp_path / "kline_minute"
+    for d in ["2026-08-03", "2026-08-04", "2026-08-05"]:
+        (root / f"date={d}").mkdir(parents=True, exist_ok=True)
+    full = pl.DataFrame({
+        "symbol": [f"6000{dd:03d}.SH" for dd in range(90)],
+        "datetime": [_dt.datetime(2026, 8, 3, 9, 31)] * 90,
+        "close": [1.0] * 90,
+    })
+    full.write_parquet(root / "date=2026-08-03" / "part.parquet")
+    pl.DataFrame({
+        "symbol": ["6000000.SH"], "datetime": [_dt.datetime(2026, 8, 4, 9, 31)],
+        "close": [1.0],
+    }).write_parquet(root / "date=2026-08-04" / "part.parquet")
+    # 覆盖率为 1/90，与 8/4 相同；用另一只保持独立断言
+    pl.DataFrame({
+        "symbol": ["6000001.SH"], "datetime": [_dt.datetime(2026, 8, 5, 9, 31)],
+        "close": [1.0],
+    }).write_parquet(root / "date=2026-08-05" / "part.parquet")
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda: True)
+
+    leftovers = ms._incomplete_stock_minute_days()
+    assert _d(2026, 8, 4) in leftovers, "1只残缺日应被识别"
+    assert _d(2026, 8, 5) in leftovers, "1只残缺日应被识别"
+    assert _d(2026, 8, 3) not in leftovers, "完整日不应被误判"
+
+
+def test_incomplete_stock_minute_ignores_when_no_universe(monkeypatch, tmp_path):
+    """股票宇宙为空时内容校验应跳过（避免误判正常数据）。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [])
+    root = tmp_path / "kline_minute"
+    (root / "date=2026-08-05").mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["600000.SH"], "datetime": [_dt.datetime(2026, 8, 5, 9, 31)],
+        "close": [1.0],
+    }).write_parquet(root / "date=2026-08-05" / "part.parquet")
+
+    assert ms._incomplete_stock_minute_days() == []
+
+
+def test_incomplete_stock_minute_respects_recent_limit(tmp_path, monkeypatch):
+    """内容校验只查最近 recent 个分区；更早的残缺不算（性能设计）。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(90)])
+    root = tmp_path / "kline_minute"
+    for d in ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05"]:
+        (root / f"date={d}").mkdir(parents=True, exist_ok=True)
+    # 8/1、8/2 残缺，8/3/4/5 完整
+    for d in ["2026-08-01", "2026-08-02"]:
+        pl.DataFrame({
+            "symbol": ["600000.SH"], "datetime": [_dt.datetime(2026, 8, int(d[8:]), 9, 31)],
+            "close": [1.0],
+        }).write_parquet(root / f"date={d}" / "part.parquet")
+    for d in ["2026-08-03", "2026-08-04", "2026-08-05"]:
+        full = pl.DataFrame({
+            "symbol": [f"6000{dd:03d}.SH" for dd in range(90)],
+            "datetime": [_dt.datetime(2026, 8, int(d[8:]), 9, 31)] * 90,
+            "close": [1.0] * 90,
+        })
+        full.write_parquet(root / f"date={d}" / "part.parquet")
+
+    leftovers = ms._incomplete_stock_minute_days(recent=3)
+    assert _dt.date(2026, 8, 1) not in leftovers
+    assert _dt.date(2026, 8, 2) not in leftovers
+
+
+def test_scan_missing_partitions_flags_sparse_stock_minute(tmp_path, monkeypatch):
+    """scan_missing_partitions 应把「目录存在但只写入 1 只」的股票分钟判为缺失。"""
+    import datetime as _dt
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(90)])
+    monkeypatch.setattr(ms, "_incomplete_stock_minute_days",
+                        lambda recent=None: [_dt.date(2026, 8, 4)])
+
+    # kline_minute 8/4 已存在（但残缺，被内容校验兜住）
+    root = tmp_path / "kline_minute"
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+
+    missing = ms.scan_missing_partitions()
+    assert _dt.date(2026, 8, 4) in missing["kline_minute"]
+
+
+def test_backfill_to_now_resyncs_sparse_stock_minute(tmp_path, monkeypatch):
+    """残缺股票分钟应触发 sync_stock_minute_range 重写，且在增量慢跑前执行。"""
+    from datetime import date as _d
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch)
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
+    # 残缺日 = 8/5；其余判定给空，保证只有残缺触发 range 重写
+    monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [_d(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1000})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+    calls = []
+    monkeypatch.setattr(ms, "sync_stock_minute_range",
+                        lambda days: calls.append(list(days)) or 100)
+
+    res = ms.backfill_to_now()
+
+    assert calls == [[_d(2026, 8, 5)]], f"残缺日应触发 range 重写, 实际 {calls}"
+    assert res["missing"]["kline_minute"]["missing"] is True
