@@ -483,7 +483,21 @@ def _mk_daily_part(root, day, mtime_hour):
         "symbol": ["000300.SH"], "open": [4550.0], "high": [4620.0],
         "low": [4550.0], "close": [4619.7], "volume": [1.0], "amount": [1.0],
     }).write_parquet(part)
-    os.utime(part, (_dt.datetime(2026, 8, 5, mtime_hour, 0).timestamp(),) * 2)
+    y, m, d = (int(x) for x in day.split("-"))
+    os.utime(part, (_dt.datetime(y, m, d, mtime_hour, 0).timestamp(),) * 2)
+    return part
+
+
+def _mk_daily_part_mtime(root, day, mtime: _dt.datetime):
+    """写一个日线分区并把 part.parquet 的 mtime 设为指定时刻（不受 08-05 写死限制）。"""
+    pdir = root / f"date={day}"
+    pdir.mkdir(parents=True, exist_ok=True)
+    part = pdir / "part.parquet"
+    pl.DataFrame({
+        "symbol": ["000300.SH"], "open": [4550.0], "high": [4620.0],
+        "low": [4550.0], "close": [4619.7], "volume": [1.0], "amount": [1.0],
+    }).write_parquet(part)
+    os.utime(part, (mtime.timestamp(),) * 2)
     return part
 
 
@@ -571,6 +585,71 @@ def test_stale_today_daily_days_detects_intraday_write(tmp_path, monkeypatch):
     _mk_daily_part(root, "2026-08-05", mtime_hour=10)
     assert ms._stale_today_daily_days(root, _dt.datetime(2026, 8, 5, 10, 55)) \
         == [_dt.date(2026, 8, 5)]  # 仍返回（调用方只在收盘后使用）
+
+
+def test_missing_daily_selfheals_yesterday_stale_partition(tmp_path, monkeypatch):
+    """回归 08-11 半程快照：昨天盘中写入的日线分区，今天收盘后也应被强制重写。
+
+    ``_stale_today_daily_days`` 只查"今天"，昨天（08-11 12:50）写入的半日
+    快照一旦跨天就永远漏检。``_missing_daily_days`` 收盘后必须把「最近分区
+    中任何早于该分区自身日期收盘时刻」写入的旧分区判为需重写。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_etf_daily"
+    # 昨天 08-11 12:50（盘中）写入的分区 → 半程快照
+    _mk_daily_part_mtime(root, "2026-08-11", _dt.datetime(2026, 8, 11, 12, 50))
+    # 08-10 是正常收盘后写入
+    _mk_daily_part_mtime(root, "2026-08-10", _dt.datetime(2026, 8, 10, 16, 0))
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 10), _dt.date(2026, 8, 11), _dt.date(2026, 8, 12)])
+
+    # 今天（08-12）收盘后巡检 → 应把昨天 08-11 的盘中快照判为需重写
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 12, 18, 0))
+    assert _dt.date(2026, 8, 11) in days, f"应重写 08-11 半程快照, 实际 {days}"
+
+
+def test_missing_daily_does_not_backfill_today_intraday_when_missing(tmp_path, monkeypatch):
+    """盘中：今日分区缺失时也不该回源今天（否则写半程日线污染分区）。
+
+    08-11 服务器 12:50 重启时 ``_missing_daily_days`` 把"今天"当成缺失日，
+    触发 ``sync_daily(today)`` 拉回盘中半日数据落盘——这正是坏分区源头。
+    盘中（<15:00）无论今日分区是否存在，都不把今天当缺失日。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_etf_daily"
+    _mk_daily_part_mtime(root, "2026-08-10", _dt.datetime(2026, 8, 10, 16, 0))
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 10), _dt.date(2026, 8, 11)])
+
+    # 08-11 12:50 盘中：今日（08-11）分区缺失 → 不该回源今天
+    days = ms._missing_daily_days(root, _dt.datetime(2026, 8, 11, 12, 50))
+    assert days == [], f"盘中不应回源今日半程数据, 实际 {days}"
+
+
+def test_scan_missing_partitions_flags_stale_yesterday_etf_daily(tmp_path, monkeypatch):
+    """00:00 全量巡检也应把「昨天盘中半程快照」的 ETF 日线判为缺失重写。"""
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
+        _dt.date(2026, 8, 10), _dt.date(2026, 8, 11)])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+
+    # 昨天 08-11 12:50 盘中写入的 ETF 日线分区（半程快照，symbol 全覆盖）
+    root = tmp_path / "kline_etf_daily"
+    _mk_daily_part_mtime(root, "2026-08-11", _dt.datetime(2026, 8, 11, 12, 50))
+
+    missing = ms.scan_missing_partitions()
+    assert _dt.date(2026, 8, 11) in missing["kline_etf_daily"], \
+        f"00:00 巡检应重写昨日半程快照, 实际 {missing['kline_etf_daily']}"
 
 
 def test_missing_minute_guards_intraday_today(tmp_path, monkeypatch):
