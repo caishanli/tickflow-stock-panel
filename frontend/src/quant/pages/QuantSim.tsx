@@ -133,7 +133,12 @@ export function QuantSim() {
     return (id: string) => m.get(id) || id || '—'
   }, [strategies])
 
-  const invalidate = () => qc.invalidateQueries({ queryKey: ['quant', 'sim'] })
+  // 只重取账户列表 + 状态：日志/成交/净值由 SSE 增量推送与断线自愈补拉维护，
+  // 全量重取会在启动瞬间拿到空快照并覆盖 SSE 已推送的行（重取响应晚到即冲空表格）
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ['quant', 'sim', 'accounts'] })
+    if (sel) qc.invalidateQueries({ queryKey: ['quant', 'sim', sel, 'status'] })
+  }
   const startMut = useMutation({ mutationFn: () => api.startAccount(sel!), onSuccess: invalidate })
   const pauseMut = useMutation({ mutationFn: () => api.pauseAccount(sel!), onSuccess: invalidate })
   const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: invalidate })
@@ -292,17 +297,22 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   // 止损日志：首拉由 status 的 stop_loss 初始化，盘中新止损由 onTrade(STOP_LOSS) 实时追加
   const [stoplossRows, setStoplossRows] = useState<any[]>([])
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
+  // 兜底：SSE 断线/后台标签页挂起后数据可能长期缺失，10s 定时重取 + 窗口聚焦重取自愈
   const { data: st } = useQuery({
     queryKey: ['quant', 'sim', aid, 'status'], queryFn: () => api.getSimStatus(aid),
+    refetchInterval: 10_000, refetchOnWindowFocus: true,
   })
   const { data: eq } = useQuery({
     queryKey: ['quant', 'sim', aid, 'equity'], queryFn: () => api.getSimEquity(aid),
+    refetchInterval: 10_000, refetchOnWindowFocus: true,
   })
   const { data: tr } = useQuery({
     queryKey: ['quant', 'sim', aid, 'trades'], queryFn: () => api.getSimTrades(aid),
+    refetchInterval: 10_000, refetchOnWindowFocus: true,
   })
   const { data: logs } = useQuery({
     queryKey: ['quant', 'sim', aid, 'logs'], queryFn: () => api.getSimLogs(aid),
+    refetchInterval: 10_000, refetchOnWindowFocus: true,
   })
   const { data: nameSource } = useQuery({
     queryKey: ['quant', 'sim', 'name-source'], queryFn: () => api.getSimNameSource(),
@@ -532,15 +542,6 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     })
   }, [stopLossList])
 
-  // 重置成功后清空本地累计的止损行与 SSE 追加过的查询数据，避免旧数据残留
-  useEffect(() => {
-    if (!resetMut.isSuccess) return
-    setStoplossRows([])
-    qc.setQueryData(['quant', 'sim', aid, 'trades'], [])
-    qc.setQueryData(['quant', 'sim', aid, 'logs'], [])
-    qc.setQueryData(['quant', 'sim', aid, 'equity'], [])
-  }, [resetMut.isSuccess, aid, qc])
-
   return (
     <div className="flex-1 overflow-auto p-4 space-y-4">
       {/* 顶栏：返回 + 账户信息 + 控制 */}
@@ -589,7 +590,15 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-accent text-white text-xs disabled:opacity-50">
             {acct.status === 'running' ? <><Square size={13} />暂停</> : <><Play size={13} />启动</>}
           </button>
-          <button onClick={() => { if (window.confirm('确定重置该模拟账户？将清空当前持仓与状态，重新开始。')) resetMut.mutate() }} disabled={resetMut.isPending}
+          <button onClick={() => {
+            if (!window.confirm('确定重置该模拟账户？将清空当前持仓与状态，重新开始。')) return
+            // 乐观清空：本地止损行与交易/日志/净值缓存（重置后明细由 SSE 增量重建）
+            setStoplossRows([])
+            qc.setQueryData(['quant', 'sim', aid, 'trades'], [])
+            qc.setQueryData(['quant', 'sim', aid, 'logs'], [])
+            qc.setQueryData(['quant', 'sim', aid, 'equity'], [])
+            resetMut.mutate()
+          }} disabled={resetMut.isPending}
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
             <RotateCcw size={13} />重置
           </button>
