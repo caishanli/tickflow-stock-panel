@@ -39,6 +39,11 @@ function fmtPct(v: any) {
   return `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}%`
 }
 
+function fmtStopLoss(v: any) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
+  return `${(v * 100).toFixed(2)}%`
+}
+
 const RANGES: { label: string; days: number | null }[] = [
   { label: '全部', days: null },
   { label: '一星期', days: 7 },
@@ -317,6 +322,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
 
   useEffect(() => {
     if (!aid) return
+    let hadError = false
     const es = openSimStream(aid, {
       onStatus: (s) => qc.setQueryData(['quant', 'sim', aid, 'status'], (prev: any) => ({
         ...(prev || {}), account: { ...(prev?.account || {}), status: s.status }, state: s.state,
@@ -335,6 +341,17 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       },
       onLog: (l) => appendTo(['quant', 'sim', aid, 'logs'], l,
         (r) => `${r.ts}|${r.level}|${r.message}`),
+    })
+    // SSE 断线重连后按最新 rowid 续推，断线期间写入的日志/成交/净值不会被推送，
+    // 必须补拉全量自愈，否则缺失段永久保留（直到手动刷新）
+    es.addEventListener('error', () => { hadError = true })
+    es.addEventListener('open', () => {
+      if (hadError) {
+        hadError = false
+        qc.invalidateQueries({ queryKey: ['quant', 'sim', aid, 'logs'] })
+        qc.invalidateQueries({ queryKey: ['quant', 'sim', aid, 'trades'] })
+        qc.invalidateQueries({ queryKey: ['quant', 'sim', aid, 'equity'] })
+      }
     })
     return () => { es.close() }
   }, [aid, qc])
@@ -515,6 +532,15 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     })
   }, [stopLossList])
 
+  // 重置成功后清空本地累计的止损行与 SSE 追加过的查询数据，避免旧数据残留
+  useEffect(() => {
+    if (!resetMut.isSuccess) return
+    setStoplossRows([])
+    qc.setQueryData(['quant', 'sim', aid, 'trades'], [])
+    qc.setQueryData(['quant', 'sim', aid, 'logs'], [])
+    qc.setQueryData(['quant', 'sim', aid, 'equity'], [])
+  }, [resetMut.isSuccess, aid, qc])
+
   return (
     <div className="flex-1 overflow-auto p-4 space-y-4">
       {/* 顶栏：返回 + 账户信息 + 控制 */}
@@ -541,12 +567,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           {STATUS_LABEL[acct.status] ?? acct.status ?? '—'}
         </span>
         <span className="text-xs text-muted">
-          策略 {strategyName(acct.strategy_id)} · {FREQ_LABEL[acct.frequency] ?? '分钟级'}
+          初始资金 {fmtNum(acct.capital)} · 止损 {fmtStopLoss(acct.stop_loss)} · 策略 {strategyName(acct.strategy_id)} · {FREQ_LABEL[acct.frequency] ?? '分钟级'}
           {acct.start_date ? ` · 自 ${acct.start_date}` : ''}
         </span>
         <button onClick={() => toggleNameSource.mutate(nameSource?.source === 'jq' ? 'tdx' : 'jq')}
           className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg bg-elevated text-foreground text-xs">
-          策略名称：{nameSource?.source === 'tdx' ? '通达信' : '聚宽'}
+           标的名称源：{nameSource?.source === 'tdx' ? '通达信' : '聚宽'}
         </button>
         <div className="ml-auto flex gap-2">
           <button onClick={() => setShowDingtalkCfg(true)}
