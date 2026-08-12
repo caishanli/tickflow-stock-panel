@@ -39,6 +39,15 @@ function fmtPct(v: any) {
   return `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}%`
 }
 
+const RANGES: { label: string; days: number | null }[] = [
+  { label: '全部', days: null },
+  { label: '一星期', days: 7 },
+  { label: '1个月', days: 30 },
+  { label: '3个月', days: 90 },
+  { label: '6个月', days: 180 },
+  { label: '1年', days: 365 },
+]
+
 /** 交易日历查找表：tradeDays 外的日期（如实时会话跨日新增）按工作日索引兜底插补 */
 function buildDayLookup(trades: any[], tradeDays: string[]): Map<string, number> {
   const idx = new Map<string, number>()
@@ -70,7 +79,9 @@ function computeHoldDays(trades: any[], tradeDays: string[]): Map<number, { hold
     const amt = Number(t.amount) || 0
     if (String(t.action).toUpperCase() === 'BUY') {
       (lots[String(t.code ?? '')] ??= []).push({ buyOrder: oi, buyDay: day, amount: amt })
-      out.set(oi, { hold: null, open: true })
+      // 持有中：按已持有的交易日数计（截至最新交易日 = 查找表最大下标）
+      const now = days.size - 1
+      out.set(oi, { hold: day >= 0 ? Math.max(0, now - day) : null, open: true })
     } else {
       const q = lots[String(t.code ?? '')] ?? []
       let remaining = amt
@@ -272,6 +283,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const qc = useQueryClient()
   const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs' | 'alerts'>('trades')
   const [showDingtalkCfg, setShowDingtalkCfg] = useState(false)
+  const [rangeDays, setRangeDays] = useState<number | null>(null)
   // 止损日志：首拉由 status 的 stop_loss 初始化，盘中新止损由 onTrade(STOP_LOSS) 实时追加
   const [stoplossRows, setStoplossRows] = useState<any[]>([])
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
@@ -333,24 +345,71 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const posEntries = Object.entries(positions)
   const positionsValue = posEntries.reduce(
     (s, [, p]) => s + (Number(p.amount) || 0) * (Number(p.price) || 0), 0)
-  const ret = typeof state?.net_value === 'number' && state?.start_cash
-    ? state.net_value / state.start_cash - 1 : null
+  // 按天聚合：每天取最后一个点的净值，日线级别展示（供曲线与指标卡共用）；
+  // 同时保留每天第一个点，作为窗口/全程的起点基准
+  const { daily, firstOfDay } = useMemo(() => {
+    const raw: any[] = Array.isArray(eq) ? eq : []
+    const dayFirst = new Map<string, any>()
+    const dayLast = new Map<string, any>()
+    for (const d of raw) {
+      const day = String(d.dt ?? '').slice(0, 10)
+      if (!day) continue
+      if (!dayFirst.has(day)) dayFirst.set(day, d)
+      dayLast.set(day, d)
+    }
+    return { daily: Array.from(dayLast.values()), firstOfDay: dayFirst }
+  }, [eq])
+  // 窗口切分：日历天过滤，不足 2 点回退全部；窗口首日改用当天第一个点，
+  // 否则首日盘中收益（如开户当天 100000→100551）会被窗口基准吞掉
+  const windowed = useMemo(() => {
+    let w: any[]
+    if (rangeDays == null) {
+      w = [...daily]
+    } else {
+      const t = new Date()
+      const cutoff = new Date(t.getFullYear(), t.getMonth(), t.getDate() - rangeDays)
+      const m = String(cutoff.getMonth() + 1).padStart(2, '0')
+      const d = String(cutoff.getDate()).padStart(2, '0')
+      const cutoffStr = `${cutoff.getFullYear()}-${m}-${d}`
+      const filtered = daily.filter((x) => String(x.dt ?? '').slice(0, 10) >= cutoffStr)
+      w = filtered.length >= 2 ? filtered : [...daily]
+    }
+    if (w.length > 0) {
+      const first = firstOfDay.get(String(w[0].dt ?? '').slice(0, 10))
+      if (first && String(first.dt) !== String(w[0].dt)) w = [first, ...w]
+    }
+    return w
+  }, [daily, firstOfDay, rangeDays])
+  // 收益基准：账户初始资金（缺失时兜底首日净值）
+  const baseNV = useMemo(
+    () => Number(st?.state?.start_cash ?? st?.start_cash) ||
+      (daily.length > 0 ? Number(daily[0].net_value) : 1),
+    [st, daily],
+  )
+  const winFirst = windowed.length > 0 ? windowed[0] : null
+  const winLast = windowed.length > 0 ? windowed[windowed.length - 1] : null
+  // 总收益率与区间收益率
+  const totalRet = baseNV ? (typeof state?.net_value === 'number' && Number.isFinite(state.net_value)
+    ? state.net_value / baseNV - 1 : null) : null
+  const winRet = (rangeDays != null && winFirst != null && winLast != null && Number(winFirst.net_value) > 0)
+    ? Number(winLast.net_value) / Number(winFirst.net_value) - 1
+    : null
+  const winPnl = (rangeDays != null && winFirst != null && winLast != null)
+    ? Number(winLast.net_value) - Number(winFirst.net_value)
+    : null
+  const displayRet = winRet != null ? winRet : totalRet
+  const displayPnl = winPnl != null ? winPnl : state?.pnl
 
   const curve = useMemo(() => {
     const accent = '#3b82f6'
     const benchColor = '#f59e0b'
-    const raw: any[] = Array.isArray(eq) ? eq : []
-    // 按天聚合：每天取最后一个点的净值，日线级别展示
-    const dayMap = new Map<string, any>()
-    for (const d of raw) {
-      const day = String(d.dt ?? '').slice(0, 10)
-      if (day) dayMap.set(day, d)
-    }
-    const data = Array.from(dayMap.values())
-    // 策略收益率(%)：以初始资金为基准（首日即反映当天盈亏）
-    const baseNV = Number(st?.state?.start_cash ?? st?.start_cash ?? (data.length > 0 ? data[0].net_value : 0)) || 1
+    const data: any[] = windowed
+    // 策略收益率(%)：相对初始资金累计（首日即反映当天盈亏）
     const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / baseNV) - 1) * 100).toFixed(2)))
     const benchPct = data.map((d) => Number(d.benchmark_pct ?? 0))
+    // 直接显示实际累计收益：策略相对初始资金，基准用后端原始累计值（不归一到 0）
+    const stratWin = stratPct
+    const benchWin = benchPct
     // 当日涨跌幅(%)：从累计收益率反推，(1+r_n)/(1+r_{n-1})-1
     const stratDaily = stratPct.map((v, i) =>
       i === 0 ? 0 : Number((((1 + v / 100) / (1 + stratPct[i - 1] / 100) - 1) * 100).toFixed(2)))
@@ -359,7 +418,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     const xLabels = data.map((d) => String(d.dt ?? '').slice(0, 10))
     return {
       animation: false,
-      grid: { left: 64, right: 16, top: 30, bottom: 32 },
+      grid: { left: 64, right: 16, top: 30, bottom: 46 },
       legend: {
         data: ['策略收益(累计)', '沪深300(累计)'],
         textStyle: { color: cssVar('--muted', '#94a3b8'), fontSize: 11 },
@@ -374,8 +433,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           if (!params || params.length === 0) return ''
           const idx = params[0].dataIndex
           const day = xLabels[idx] ?? ''
-          const sCum = stratPct[idx] ?? 0
-          const bCum = benchPct[idx] ?? 0
+          const sCum = stratWin[idx] ?? 0
+          const bCum = benchWin[idx] ?? 0
           const sDay = stratDaily[idx] ?? 0
           const bDay = benchDaily[idx] ?? 0
           const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
@@ -413,7 +472,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         {
           name: '策略收益(累计)',
           type: 'line',
-          data: stratPct,
+          data: stratWin,
           symbol: 'none',
           lineStyle: { color: accent, width: 2 },
           areaStyle: {
@@ -426,13 +485,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         {
           name: '沪深300(累计)',
           type: 'line',
-          data: benchPct,
+          data: benchWin,
           symbol: 'none',
           lineStyle: { color: benchColor, width: 1.5, type: 'dashed' },
         },
       ],
     } as any
-  }, [eq, st])
+  }, [windowed, baseNV])
 
   const tradeList: any[] = Array.isArray(tr) ? tr : []
 
@@ -498,15 +557,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             className="inline-flex items-center gap-1 px-2 h-9 rounded-lg bg-elevated text-foreground text-xs">
             {acct?.dingtalk_enabled ? '关闭' : '开启'}
           </button>
-          <button onClick={() => startMut.mutate()} disabled={startMut.isPending || acct.status === 'running'}
+          <button
+            onClick={() => (acct.status === 'running' ? pauseMut.mutate() : startMut.mutate())}
+            disabled={startMut.isPending || pauseMut.isPending}
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-accent text-white text-xs disabled:opacity-50">
-            <Play size={13} />启动
+            {acct.status === 'running' ? <><Square size={13} />暂停</> : <><Play size={13} />启动</>}
           </button>
-          <button onClick={() => pauseMut.mutate()} disabled={pauseMut.isPending || acct.status !== 'running'}
-            className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
-            <Square size={13} />暂停
-          </button>
-          <button onClick={() => resetMut.mutate()} disabled={resetMut.isPending}
+          <button onClick={() => { if (window.confirm('确定重置该模拟账户？将清空当前持仓与状态，重新开始。')) resetMut.mutate() }} disabled={resetMut.isPending}
             className="inline-flex items-center gap-1 px-3 h-9 rounded-lg bg-elevated text-foreground text-xs disabled:opacity-50">
             <RotateCcw size={13} />重置
           </button>
@@ -534,21 +591,31 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         </div>
         <div className="rounded-card border border-border bg-surface px-3 py-2">
           <div className="text-[10px] text-muted">盈亏</div>
-          <div className={`text-sm font-medium num ${typeof state?.pnl === 'number' && state.pnl < 0 ? 'text-bear' : 'text-bull'}`}>
-            {fmtNum(state?.pnl)}
+          <div className={`text-sm font-medium num ${typeof displayPnl === 'number' && displayPnl < 0 ? 'text-bear' : 'text-bull'}`}>
+            {fmtNum(displayPnl)}
           </div>
         </div>
         <div className="rounded-card border border-border bg-surface px-3 py-2">
           <div className="text-[10px] text-muted">收益率</div>
-          <div className={`text-sm font-medium num ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>
-            {fmtPct(ret)}
+          <div className={`text-sm font-medium num ${displayRet == null ? '' : displayRet >= 0 ? 'text-bull' : 'text-bear'}`}>
+            {fmtPct(displayRet)}
           </div>
         </div>
       </div>
 
       {/* 净值曲线 */}
       <div className="rounded-card border border-border bg-surface">
-        <div className="px-4 pt-3 text-xs text-foreground font-medium">净值曲线</div>
+        <div className="px-4 pt-3 flex items-center justify-between">
+          <span className="text-xs text-foreground font-medium">净值曲线</span>
+          <div className="flex gap-1 pr-2">
+            {RANGES.map((r) => (
+              <button key={r.label} onClick={() => setRangeDays(r.days)}
+                className={`px-2.5 h-6 rounded-btn text-[11px] ${rangeDays === r.days ? 'bg-accent text-white' : 'text-muted hover:text-foreground'}`}>
+                {r.label}
+              </button>
+            ))}
+          </div>
+        </div>
         {Array.isArray(eq) && eq.length > 0 ? (
           <ReactECharts option={curve} style={{ height: 300 }} notMerge />
         ) : (
@@ -647,9 +714,14 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
-                      <td className="px-3 py-1.5">
-                        {h?.open ? '持有中' : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`}
-                      </td>
+                      {(() => {
+                        const holdText = t.action === 'BUY'
+                          ? (h?.open
+                              ? (h?.hold == null ? '持仓中' : h.hold === 0 ? '<1天（持仓中）' : `${h.hold}个交易日（持仓中）`)
+                              : '—')
+                          : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`
+                        return <td className={`px-3 py-1.5 num ${holdText === '—' ? 'text-muted' : ''}`}>{holdText}</td>
+                      })()}
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
                         {t.action === 'BUY' ? '买入' : t.action === 'STOP_LOSS' ? '止损' : '卖出'}
                       </td>
