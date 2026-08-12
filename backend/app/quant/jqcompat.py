@@ -915,7 +915,9 @@ class _DayBarStore:
                         end_dt = tmp["date"].max()
                 except Exception:
                     span, end_dt = 0, None
-                end_dt = pd.Timestamp(end_dt) if end_dt is not None else None
+                # NaT/NaN 视为无效 None: 坏候选 end 为 NaT 时会毒化后续选择,
+                # end_dt > NaT 恒 False 导致回测结果依赖候选顺序(哈希态).
+                end_dt = pd.Timestamp(end_dt) if end_dt is not None and not pd.isna(end_dt) else None
                 better = False
                 if best_df is None:
                     better = True
