@@ -100,6 +100,7 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
 
 # Backend deps
 COPY README.md /README.md
+COPY README.md README.md  # readme 路径已改为 backend/README.md -> ../README.md（uv 要求 readme 在项目目录内）
 COPY backend/pyproject.toml backend/uv.lock* ./
 # uv 原生支持同时挂多个 index(主源 + 备用源),会自动在两源中查找,
 # 比逐个重试更稳健 —— 任一源缺包时另一源补位。

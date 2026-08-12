@@ -2,7 +2,7 @@
 name = "tickflow-stock-panel-backend"
 version = "0.1.83"
 description = "A 股选股 + 监控 + 回测面板 — TickFlow 适配"
-readme = "../README.md"
+readme = "README.md"  # 仓库根 README 的 symlink（backend/README.md）
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
@@ -68,6 +68,10 @@ desktop = [
 quant = [
     "rqalpha>=0.26",
     "mootdx>=0.11.7",
+    # mootdx_src.py 用 pytdx 替换 mootdx 内置 tdxpy（tdxpy 0.2.7 协议不兼容），
+    # 是运行期硬依赖。mootdx 自身不声明它（只依赖 tdxpy），若不显式声明会在
+    # 重建 venv 时被丢弃，导致全市场分钟/日线回源失败（08-11 服务器事故）。
+    "pytdx>=1.72",
     "requests>=2.31",
 ]
 

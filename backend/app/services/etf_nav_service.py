@@ -97,9 +97,19 @@ def sync_etf_nav(day: _date | None = None) -> int:
         {unit_col: "单位净值"})
     df = df.with_columns(
         pl.col("基金代码").map_elements(_jq_symbol, return_dtype=pl.Utf8).alias("symbol"),
-        pl.col("单位净值").cast(pl.Float64).alias("unit_nav"),
+        # akshare 对当日无净值/停牌的 ETF 返回 "---"，严格 cast 会拖垮整个分区
+        # 写入；容错解析（先转字符串）→ 丢弃解析不出数值的行。
+        pl.col("单位净值").cast(pl.Utf8, strict=False)
+                          .str.strip_chars()
+                          .str.replace("---", "", literal=True)
+                          .str.contains(r"^-?\d+(\.\d+)?$", strict=False)
+                          .alias("_valid"),
+        pl.col("单位净值").cast(pl.Utf8, strict=False)
+                          .str.strip_chars()
+                          .cast(pl.Float64, strict=False)
+                          .alias("unit_nav"),
         pl.lit(nav_date.isoformat()).alias("date"),
-    ).select(["symbol", "unit_nav", "date"])
+    ).filter(pl.col("_valid")).drop("_valid").select(["symbol", "unit_nav", "date"])
     pdir.mkdir(parents=True, exist_ok=True)
     tmp = pdir / "part.tmp"
     df.sort("symbol").write_parquet(tmp)
