@@ -737,7 +737,10 @@ def _trade_days_up_to(end: _date) -> list[_date]:
                            end.strftime("%Y%m%d"))
         if df is not None and not df.empty:
             days = sorted(d.date() for d in df.index)
-            return [d for d in days if d <= end]
+            # mootdx get_daily 忽略 start 参数，返回 000300 全历史（自 2023 起）。
+            # 必须显式过滤下界，否则空分区 seed 会把全历史交易日列入回源
+            # （08-07 空 kline_daily 目录触发 2023-04-20 起连续数日全量回源）。
+            return [d for d in days if start <= d <= end]
     except Exception as e:
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
     # 兜底：工作日近似
@@ -761,7 +764,9 @@ def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
         df = src.get_daily("000300.XSHG", start.strftime("%Y%m%d"),
                            end.strftime("%Y%m%d"))
         if df is not None and not df.empty:
-            return sorted(d.date() for d in df.index if d.date() <= end)
+            # mootdx get_daily 忽略 start 参数返回全历史，需显式过滤下界
+            return sorted(d.date() for d in df.index
+                          if start <= d.date() <= end)
     except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
     days = []

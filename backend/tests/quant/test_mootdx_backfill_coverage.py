@@ -40,6 +40,44 @@ def test_trade_days_in_range(monkeypatch):
     assert days == [_dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)]
 
 
+def test_trade_days_in_range_filters_lower_bound(monkeypatch):
+    """mootdx get_daily 忽略 start 返回全历史时，下界必须显式过滤（08-07 全量回源回归）。
+
+    回归背景：get_daily 返回 2023 年起的全量索引，旧实现只过滤上界，
+    空分区 seed / 00:00 巡检会把全历史交易日当缺失重拉（08-07 空 kline_daily
+    目录触发 2023-04-20 起连续数日回源）。
+    """
+    class _FullHistSrc:
+        def get_daily(self, code, start, end):
+            idx = pd.DatetimeIndex(pd.date_range("2023-04-20", "2026-08-06", freq="B"))
+            return pd.DataFrame({"open": [1.0] * len(idx)}, index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _FullHistSrc())
+    days = ms._trade_days_in_range(_dt.date(2026, 8, 1), _dt.date(2026, 8, 6))
+    assert days == [_dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5), _dt.date(2026, 8, 6)]
+
+
+def test_trade_days_up_to_filters_lower_bound(monkeypatch):
+    """_trade_days_up_to 窗口下界过滤：get_daily 返回全历史时只取最近窗口。"""
+    class _FullHistSrc:
+        def get_daily(self, code, start, end):
+            idx = pd.DatetimeIndex(pd.date_range("2023-04-20", "2026-08-06", freq="B"))
+            return pd.DataFrame({"open": [1.0] * len(idx)}, index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _FullHistSrc())
+    monkeypatch.setattr(ms, "_DAILY_BACKFILL_LIMIT_DAYS", 10)
+    days = ms._trade_days_up_to(_dt.date(2026, 8, 6))
+    lo = _dt.date(2026, 8, 6) - _dt.timedelta(days=10)
+    assert days, "窗口内应有交易日"
+    assert all(lo <= d <= _dt.date(2026, 8, 6) for d in days)
+    # 窗口 = 7-27(lo) ~ 8-06(end) 的全部工作日
+    assert days == [
+        _dt.date(2026, 7, 27), _dt.date(2026, 7, 28), _dt.date(2026, 7, 29),
+        _dt.date(2026, 7, 30), _dt.date(2026, 7, 31), _dt.date(2026, 8, 3),
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5), _dt.date(2026, 8, 6),
+    ]
+
+
 def test_trade_days_in_range_fallback_weekday(monkeypatch):
     class _FailSrc:
         def get_daily(self, code, start, end):
