@@ -6,6 +6,7 @@ import { StockIntradayChart } from '@/components/StockIntradayChart'
 import { useFinancialMetrics } from '@/lib/useFinancials'
 import { useCapabilities } from '@/lib/useSharedQueries'
 import type { ChartMarker, ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
+import type { IntradayMarker } from '@/components/EChartsIntraday'
 import {
   loadInfoFields,
   saveInfoFields,
@@ -34,6 +35,10 @@ interface Props {
   onToggleWatchlist?: () => void
   /** 分时图自动刷新间隔(ms)。undefined = 不轮询。个股对话框盘中实时刷新时传入。 */
   refetchIntervalMs?: number
+  /** 分时图买卖标记 (date 感知: 仅分时显示该日时渲染) */
+  intradayMarkers?: IntradayMarker[]
+  /** 初始选中的日期 (rows 就绪后优先选中, 仅应用一次) */
+  initialDate?: string
 }
 
 export { getDefaultRange }
@@ -54,6 +59,8 @@ export function StockPanel({
   inWatchlist,
   onToggleWatchlist,
   refetchIntervalMs,
+  intradayMarkers,
+  initialDate,
 }: Props) {
   const [linkedPrice, setLinkedPrice] = useState<number | null>(null)
   const [selectedDate, setSelectedDate] = useState<string | null>(null)
@@ -100,6 +107,7 @@ export function StockPanel({
     setSelectedDate(null)
     setLinkedPrice(null)
     setDailyResult(null)
+    initialApplied.current = false
   }, [symbol])
 
   // 当分时开启、无选中日期时，自动选中最新日期
@@ -108,6 +116,17 @@ export function StockPanel({
       setSelectedDate(rows[rows.length - 1].date)
     }
   }, [showIntraday, selectedDate, rows])
+
+  // 初始选中日期: rows 就绪后优先选中 initialDate (在 rows 内则选中, 否则回退最新),
+  // 仅应用一次防止覆盖用户手动点选; symbol 变化时重置
+  const initialApplied = useRef(false)
+  useEffect(() => {
+    if (initialDate && !initialApplied.current && rows.length > 0) {
+      initialApplied.current = true
+      const target = rows.find(r => r.date === initialDate) ?? rows[rows.length - 1]
+      setSelectedDate(target.date)
+    }
+  }, [initialDate, rows])
 
   const selectedIdx = selectedDate ? rows.findIndex(r => r.date === selectedDate) : -1
   const prevClose = selectedIdx > 0
@@ -162,6 +181,7 @@ export function StockPanel({
             onPriceHover={setLinkedPrice}
             className="flex-1 min-w-0 border-l border-border pl-3"
             refetchIntervalMs={refetchIntervalMs}
+            markers={intradayMarkers}
           />
         )}
       </div>

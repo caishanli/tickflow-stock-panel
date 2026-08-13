@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { api, type MinuteKlineRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { EChartsIntraday } from '@/components/EChartsIntraday'
+import { EChartsIntraday, type IntradayMarker } from '@/components/EChartsIntraday'
 
 interface Props {
   symbol: string
@@ -14,6 +14,8 @@ interface Props {
   onPriceHover?: (price: number | null) => void
   /** 自动刷新间隔(ms)。undefined/0 = 不轮询(默认)。个股对话框盘中实时刷新时传入。 */
   refetchIntervalMs?: number
+  /** 分时图买卖标记 (date 感知) */
+  markers?: IntradayMarker[]
 }
 
 export function StockIntradayChart({
@@ -24,6 +26,7 @@ export function StockIntradayChart({
   className,
   onPriceHover,
   refetchIntervalMs,
+  markers,
 }: Props) {
   const qc = useQueryClient()
   const [minuteDismissed, setMinuteDismissed] = useState(false)
@@ -116,6 +119,7 @@ export function StockIntradayChart({
           date={date}
           priceLimit={minute.data?.price_limit ?? undefined}
           onPriceHover={onPriceHover}
+          markers={markers}
         />
       )}
     </div>

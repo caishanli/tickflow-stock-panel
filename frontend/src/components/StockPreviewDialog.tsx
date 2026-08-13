@@ -6,6 +6,7 @@ import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { cnSignal } from '@/lib/signals'
 import { StockPanel, getDefaultRange } from '@/components/StockPanel'
+import type { IntradayMarker } from '@/components/EChartsIntraday'
 import { DatePicker } from '@/components/DatePicker'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { usePreferences, useQuoteStatus } from '@/lib/useSharedQueries'
@@ -23,6 +24,12 @@ interface Props {
     signals?: string[]
     message?: string
   } | null
+  /** 初始选中日期 (模拟盘成交行直接定位交易当日) */
+  initialDate?: string
+  /** 初始分时开关状态 (默认 false = 自选股原行为) */
+  initialIntraday?: boolean
+  /** 分时图买卖标识 */
+  intradayMarkers?: IntradayMarker[]
 }
 
 // ===== 板块标识（与 Screener 列表一致）=====
@@ -40,7 +47,7 @@ function boardTag(symbol: string): { label: string; color: string } | null {
   return null
 }
 
-export function StockPreviewDialog({ symbol, name, onClose, triggerInfo }: Props) {
+export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, initialDate, initialIntraday = false, intradayMarkers }: Props) {
   const [showIntraday, setShowIntraday] = useState(false)
   const [dateRange, setDateRange] = useState(getDefaultRange)
   const [showMonitorEditor, setShowMonitorEditor] = useState(false)
@@ -70,6 +77,11 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo }: Props
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
   }, [symbol, onClose])
+
+  // symbol 切换时重置分时开关到 initialIntraday (弹窗跨股复用不卸载)
+  useEffect(() => {
+    setShowIntraday(initialIntraday)
+  }, [symbol]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 焦点股票注册: SSE quotes_updated 推送时精准 invalidate 当前股票日K,
   // 让对话框日K最后一根蜡烛随实时价变化 (后端只读内存, 不调 TickFlow)。
@@ -263,6 +275,8 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo }: Props
                 inWatchlist={inWatchlist}
                 onToggleWatchlist={() => toggleWatchlist.mutate()}
                 refetchIntervalMs={intradayRefetchMs}
+                initialDate={initialDate}
+                intradayMarkers={intradayMarkers}
               />
             </div>
 
