@@ -78,9 +78,10 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, initial
     return () => document.removeEventListener('keydown', handler)
   }, [symbol, onClose])
 
-  // symbol 切换时重置分时开关到 initialIntraday (弹窗跨股复用不卸载)
+  // symbol 切换时仅当 initialIntraday 为 true 才强制打开分时 (模拟盘弹窗),
+  // 默认调用方保持原有「分时开关跨股保留」行为 (spec: 行为完全不变)
   useEffect(() => {
-    setShowIntraday(initialIntraday)
+    if (initialIntraday) setShowIntraday(true)
   }, [symbol]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 焦点股票注册: SSE quotes_updated 推送时精准 invalidate 当前股票日K,

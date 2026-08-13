@@ -73,7 +73,7 @@ function buildMarkerPoints(
   if (!markers || markers.length === 0) return []
   const out: any[] = []
   for (const m of markers) {
-    if (chartDate && m.date !== chartDate) continue
+    if (m.date !== chartDate) continue
     const idx = timeIndexMap.get(m.time)
     if (idx === undefined || !isValidPrice(closes[idx])) continue
     const stop = m.action === 'STOP_LOSS'
