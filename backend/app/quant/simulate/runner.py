@@ -173,6 +173,14 @@ def _send_dingtalk_async(account_id: str, msg: str) -> None:
         log.warning("[runner] 钉钉推送异常: %s", e)
 
 
+def _build_stop_loss_notify(stop: float, rec: dict) -> str:
+    """账户止损（Matcher）钉钉通知正文。rec 由 Matcher.on_stop_loss 提供。"""
+    pct = f"{rec['pnl_pct'] * 100:+.2f}%"
+    return (f"🚨 【账户止损】{rec['name']}({rec['code']}) 触发-{stop * 100:.0f}%止损 "
+            f"卖出{int(rec['amount'])}份 价格{rec['price']:.3f} 佣金{rec['commission']:.2f} "
+            f"盈亏{rec['pnl']:+.2f}({pct})")
+
+
 def _load_engine():
     """惰性加载 jqengine 单机引擎（看护模式不依赖）。"""
     from ..jqengine.engine.jq import api as jq_api
@@ -1091,7 +1099,9 @@ def run_loop(account_id: str, provider: QuantDataProvider | None = None,
     # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
     _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
     stop = acct.get("stop_loss") or 0.03
-    matcher = matcher or Matcher(stop, account_id=account_id)
+    def _notify_stop_loss(rec):
+        _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec))
+    matcher = matcher or Matcher(stop, account_id=account_id, on_stop_loss=_notify_stop_loss)
     if (acct.get("strategy_id") or "").strip():
         _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
                            idle_interval=idle_interval)

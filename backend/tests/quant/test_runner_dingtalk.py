@@ -54,3 +54,19 @@ def test_info_level_never_triggers_dingtalk():
             assert not mock_send.called
     finally:
         os.unlink(p)
+
+
+from app.quant.simulate.runner import _build_stop_loss_notify
+
+
+def test_build_stop_loss_notify_format():
+    rec = {"name": "标普油气ETF嘉实", "code": "159518.XSHE", "price": 1.163,
+           "amount": 88000.0, "pnl": -2992.0, "pnl_pct": -0.0312,
+           "commission": 10.23}
+    msg = _build_stop_loss_notify(0.03, rec)
+    assert "🚨 【账户止损】标普油气ETF嘉实(159518.XSHE)" in msg
+    assert "-3%止损" in msg
+    assert "卖出88000份" in msg
+    assert "价格1.163" in msg
+    assert "佣金10.23" in msg
+    assert "盈亏-2992.00(-3.12%)" in msg
