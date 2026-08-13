@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -135,28 +136,43 @@ def _emit_log(account_id: str, level: str, message: str,
               ts: str | None = None) -> None:
     """模拟盘日志落 sim_logs（供 /sim/accounts/{aid}/logs 读取），失败仅告警。
 
-    level=="notify" 且账户开启钉钉推送且非补跑时，异步发送到钉钉。
+    level=="notify" 时：实时逐笔推钉钉；补跑（_replay_active_ids）期间不逐笔推，
+    累积到 _replay_day_notifies 供当日汇总（见 _emit_eod_notify）。
     ts 默认用真实当前时间；补跑场景显式传引擎推进到的时间（见 _replay_*）。
     """
     try:
         db.insert_sim_log(account_id, ts or str(datetime.datetime.now()), level, message)
     except Exception:  # noqa: BLE001
         log.warning("[runner] 日志落库失败(%s): %s", level, message)
-    if level == "notify" and account_id not in _replay_active_ids:
-        try:
-            acct = db.get_sim_account(account_id) or {}
-            if acct.get("dingtalk_enabled"):
-                _DINGTALK_EXECUTOR.submit(_send_dingtalk_async, account_id, message)
-        except Exception:  # noqa: BLE001
-            log.warning("[runner] 钉钉推送调度失败: %s", message)
+    if level == "notify":
+        if account_id in _replay_active_ids:
+            hhmm = str(ts or datetime.datetime.now())[11:16]
+            _replay_day_notifies.append((hhmm, message))
+        else:
+            _dispatch_dingtalk(account_id, message, ts=ts)
 
 
-_DINGTALK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk")
+def _dispatch_dingtalk(account_id: str, message: str, ts: str | None = None) -> None:
+    """账户开启钉钉推送时异步发送通知（fire-and-forget，失败仅告警）。
+
+    ts 为引擎推进到的时间（补跑时为 bar 时间，用于通知落款；None 用当前墙钟）。
+    """
+    try:
+        acct = db.get_sim_account(account_id) or {}
+        if acct.get("dingtalk_enabled"):
+            _DINGTALK_EXECUTOR.submit(_send_dingtalk_async, account_id, message, ts)
+    except Exception:  # noqa: BLE001
+        log.warning("[runner] 钉钉推送调度失败: %s", message)
+
+
+_DINGTALK_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dingtalk")
 _replay_active_ids: set[str] = set()
+# 补跑当日通知累积（HH:MM, msg）：逐日汇总一条表格推送用。单进程单账户，安全。
+_replay_day_notifies: list[tuple[str, str]] = []
 
 
-def _send_dingtalk_async(account_id: str, msg: str) -> None:
-    """异步发送钉钉消息（fire-and-forget）。"""
+def _send_dingtalk_async(account_id: str, msg: str, ts: str | None = None) -> None:
+    """异步发送钉钉消息（fire-and-forget）。ts 为引擎时间（补跑 bar 时间），None 用当前墙钟。"""
     try:
         webhook_url = db.get_quant_setting("dingtalk_webhook_url") or ""
         if not webhook_url:
@@ -164,7 +180,7 @@ def _send_dingtalk_async(account_id: str, msg: str) -> None:
         secret = db.get_quant_setting("dingtalk_secret") or ""
         acct = db.get_sim_account(account_id) or {}
         name = acct.get("name", account_id)
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = ts or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         title = f"模拟盘通知 [{name}]"
         text = f"### {title}\n\n{msg}\n\n> 时间: {now}  \n> 账户: {account_id}"
         from ..notify import send_dingtalk
@@ -179,6 +195,89 @@ def _build_stop_loss_notify(stop: float, rec: dict) -> str:
     return (f"🚨 【账户止损】{rec['name']}({rec['code']}) 触发-{stop * 100:.0f}%止损 "
             f"卖出{int(rec['amount'])}份 价格{rec['price']:.3f} 佣金{rec['commission']:.2f} "
             f"盈亏{rec['pnl']:+.2f}({pct})")
+
+
+# 当日汇总表格的三种自有固定消息格式（策略 _notify_trade / Matcher 止损 / 无换仓）
+_BUY_RE = re.compile(r"^📥 买入 (.+)\((\S+)\) 数量(\d+) 价格([\d.]+)")
+_SELL_RE = re.compile(r"^📤 卖出 (.+)\((\S+)\) 数量(\d+) 价格([\d.]+).*盈利([+\-.\d]+)\(([^)]+)\)")
+_STOP_RE = re.compile(r"^🚨 【账户止损】(.+)\((\S+)\).*卖出(\d+)份 价格([\d.]+).*盈亏([+\-.\d]+)\(([^)]+)\)")
+_IDLE_RE = re.compile(r"^🈳 今日无换仓")
+
+
+def _build_daily_summary(day, notifies, net, day_pnl, day_pct,
+                         total_pnl, total_pct, holdings) -> str:
+    """补跑当日汇总：把当天通知解析成表格，附当日/累计收益。"""
+    rows = []
+    for hhmm, msg in notifies:
+        m = _BUY_RE.match(msg)
+        if m:
+            name, code, qty, price = m.groups()
+            rows.append((hhmm, "买入", f"{name}({code})", qty, price, "—"))
+            continue
+        m = _SELL_RE.match(msg)
+        if m:
+            name, code, qty, price, pnl, pct = m.groups()
+            rows.append((hhmm, "卖出", f"{name}({code})", qty, price, f"{pnl}({pct})"))
+            continue
+        m = _STOP_RE.match(msg)
+        if m:
+            name, code, qty, price, pnl, pct = m.groups()
+            rows.append((hhmm, "止损", f"{name}({code})", qty, price, f"{pnl}({pct})"))
+            continue
+        if _IDLE_RE.match(msg):
+            rows.append((hhmm, "无换仓", "维持当前仓位", "—", "—", "—"))
+            continue
+        rows.append((hhmm, "—", msg[:30], "—", "—", "—"))
+    if not rows:
+        rows.append(("—", "—", "无交易", "—", "—", "—"))
+    lines = [f"### 📊 模拟盘回放 {day}",
+             "| 时间 | 方向 | 标的 | 数量 | 价格 | 盈亏 |",
+             "|------|------|------|------|------|------|"]
+    for r in rows:
+        lines.append("| " + " | ".join(r) + " |")
+    lines.append(f"\n📈 当日 {day_pnl:+,.2f} ({day_pct:+.2%}) | "
+                 f"累计 {total_pnl:+,.2f} ({total_pct:+.2%}) | "
+                 f"总资产 {net:,.2f} | 持仓{holdings}只")
+    return "\n".join(lines)
+
+
+def _build_daily_pnl(day, net, day_pnl, day_pct, total_pnl, total_pct,
+                     holdings) -> str:
+    """实时模式每日收盘收益消息。"""
+    return (f"### 📈 模拟盘日收益 {day}\n\n"
+            f"当日收益: {day_pnl:+,.2f} ({day_pct:+.2%})\n"
+            f"累计收益: {total_pnl:+,.2f} ({total_pct:+.2%})\n"
+            f"总资产: {net:,.2f} | 持仓: {holdings}只")
+
+
+def _emit_eod_notify(account_id, ctx, state, aux, now) -> None:
+    """收盘推送：补跑 → 当日成交表格汇总；实时 → 当日收益消息。
+
+    在 _eod / _replay_partial_day 收盘处理后调用。当日/累计收益均基于
+    state 收盘重估后的净值；prev_close_net 在 aux 内逐日推进。
+    """
+    net = float(state.get("net_value", 0.0) or 0.0)
+    prev_close = aux.get("prev_close_net")
+    if prev_close is None:
+        prev_close = float(aux.get("start_cash", 0.0) or net or 0.0)
+    day_pnl = net - prev_close
+    day_pct = day_pnl / prev_close if prev_close else 0.0
+    total_pnl = float(state.get("pnl", 0.0) or 0.0)
+    start_cash = float(aux.get("start_cash", 0.0) or 0.0)
+    total_pct = total_pnl / start_cash if start_cash else 0.0
+    holdings = len(ctx.portfolio.positions)
+    aux["prev_close_net"] = net
+    day = str(now)[:10]
+    if aux.get("replay_mode"):
+        notifies = list(_replay_day_notifies)
+        _replay_day_notifies.clear()
+        msg = _build_daily_summary(day, notifies, net, day_pnl, day_pct,
+                                   total_pnl, total_pct, holdings)
+        _dispatch_dingtalk(account_id, msg, ts=str(now))
+    else:
+        msg = _build_daily_pnl(day, net, day_pnl, day_pct,
+                               total_pnl, total_pct, holdings)
+        _dispatch_dingtalk(account_id, msg, ts=str(now))
 
 
 def _load_engine():
@@ -423,6 +522,8 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
         # 供 _replay_log_sink 给补跑日志打历史时间戳，而非真实 wall-clock。
         aux["replay_dt"] = pd.Timestamp(now)
         aux["prev_close_cache"] = {}
+        # 新交易日：清空昨日累积的补跑当日通知
+        _replay_day_notifies.clear()
         # 每日清空无分钟数据缓存：新交易日可能有标的开始有数据（如新ETF上市）
         dm = aux.get("dm")
         if dm is not None and hasattr(dm, "_minute_empty"):
@@ -542,6 +643,8 @@ def _eod(account_id: str, bundle, ctx, dm, state: dict, aux: dict, now) -> None:
     _persist(account_id, ctx, state, now, aux["jq_api"], aux)
     # now 在补跑时是引擎推进到的当日收市时刻（15:05），日志时间戳随引擎而非真实时钟
     _emit_log(account_id, "info", "收盘处理完成，当日真实分钟数据已落盘", ts=str(now))
+    # 收盘推送：补跑 → 当日成交表格汇总；实时 → 当日收益
+    _emit_eod_notify(account_id, ctx, state, aux, now)
 
 
 # ---------------------------------------------------------------------------
@@ -676,10 +779,11 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
             _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
         # 收盘后启动/重置账户：补跑完今天后先按真实收盘价重估，再进实时
         if now.time() > SESSION_END_GRACE:
-            _revalue_at_close(dm, ctx, state,
-                              pd.Timestamp(datetime.datetime.combine(today, datetime.time(15, 5))))
-            _persist(account_id, ctx, state,
-                     datetime.datetime.combine(today, datetime.time(15, 5)), aux["jq_api"], aux)
+            close_dt = datetime.datetime.combine(today, datetime.time(15, 5))
+            _revalue_at_close(dm, ctx, state, pd.Timestamp(close_dt))
+            _persist(account_id, ctx, state, close_dt, aux["jq_api"], aux)
+            # 收盘推送（今天补跑完整）：当日成交表格汇总 + 收益
+            _emit_eod_notify(account_id, ctx, state, aux, close_dt)
         _emit_log(account_id, "info",
                   f"日内补跑完成，净值 {state.get('net_value', 0):.2f}",
                   ts=str(aux.get("replay_dt") or state.get("dt") or now))
@@ -783,10 +887,11 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                 _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
             # 收盘后启动/重置账户：补跑完今天后先按真实收盘价重估，再进实时
             if now.time() > SESSION_END_GRACE:
-                _revalue_at_close(dm, ctx, state,
-                                  pd.Timestamp(datetime.datetime.combine(today, datetime.time(15, 5))))
-                _persist(account_id, ctx, state,
-                         datetime.datetime.combine(today, datetime.time(15, 5)), aux["jq_api"], aux)
+                close_dt = datetime.datetime.combine(today, datetime.time(15, 5))
+                _revalue_at_close(dm, ctx, state, pd.Timestamp(close_dt))
+                _persist(account_id, ctx, state, close_dt, aux["jq_api"], aux)
+                # 收盘推送（今天补跑完整）：当日成交表格汇总 + 收益
+                _emit_eod_notify(account_id, ctx, state, aux, close_dt)
             _emit_log(account_id, "info",
                       f"今日 {now.strftime('%H:%M')} 前已回补，净值 {state.get('net_value', 0):.2f}",
                       ts=str(aux.get("replay_dt") or state.get("dt") or now))
@@ -968,6 +1073,9 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                 ts = datetime.datetime.now()
             aux.setdefault("batch_logs", []).append(
                 (account_id, str(ts)[:19], level, msg))
+            if level == "notify":
+                # 补跑不逐笔推钉钉：累积当日通知，收盘由 _emit_eod_notify 汇总成一条
+                _replay_day_notifies.append((str(ts)[11:16], msg))
         else:
             _emit_log(account_id, level, msg)
     jq_api._state["log_sink"] = _replay_log_sink
@@ -1100,7 +1208,8 @@ def run_loop(account_id: str, provider: QuantDataProvider | None = None,
     _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
     stop = acct.get("stop_loss") or 0.03
     def _notify_stop_loss(rec):
-        _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec))
+        _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec),
+                  ts=str(rec["dt"]))
     matcher = matcher or Matcher(stop, account_id=account_id, on_stop_loss=_notify_stop_loss)
     if (acct.get("strategy_id") or "").strip():
         _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
