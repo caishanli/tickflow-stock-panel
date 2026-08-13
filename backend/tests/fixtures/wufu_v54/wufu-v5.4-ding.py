@@ -219,6 +219,7 @@ def initialize(context):
     g.take_profit_pullback = 0.03                        # D3 回落：从持仓峰值回落≥3% 卖出
     g._peak_price = {}                                   # D3 状态：code -> 持仓期间最高价
     g._entry_date = {}                                   # ding：code -> 首次买入日期（持仓天数通知用）
+    g._daily_traded = False                              # ding：当日是否已下单（无换仓通知用）
 
     set_benchmark("510300.XSHG")
 # ==================== 定时任务 ====================
@@ -275,6 +276,7 @@ def check_weak_period_daily(context):
 def morning_routine(context):
     log.info("★" * 80)
     log.info("▶️ 【晨间流水线】启动...")
+    g._daily_traded = False                              # ding：每日交易前重置无换仓标志
     log.info("【持仓检查】检查当前持仓状态...")
     check_positions(context)    
     log.info("【回撤监控】监控策略回撤...")
@@ -336,6 +338,9 @@ def buy_routine(context):
     log.info("▶️ 【买入流水线】启动...")
     execute_buy_trades(context)
     log.info("⏸️ 【买入流水线】执行完毕！")
+    if not g._daily_traded:
+        holding_count = len(context.portfolio.positions)
+        log.notify(f"🈳 今日无换仓：持有{holding_count}只，维持当前仓位")
 
 def reset_daily_flags(context):
     g.cache_date = None
@@ -1315,6 +1320,7 @@ def smart_order_target_value(security, target_value, context):
         avg_cost = cur_pos.avg_cost if cur_pos else 0.0
         order_result = order(security, diff)
         if order_result:
+            g._daily_traded = True                       # ding：当日已有下单，不再发「无换仓」通知
             if diff > 0:
                 g._entry_date[security] = context.current_dt.date()
                 log.info(f"📥 买入 {security} {name} 数量{abs(diff)} 价格{price:.3f} (预估含成本价: {estimated_price:.3f})")

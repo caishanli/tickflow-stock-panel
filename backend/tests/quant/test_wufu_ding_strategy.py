@@ -22,6 +22,13 @@ def test_strategy_has_notify_on_buy_and_sell():
     assert "_notify_trade" in src
 
 
+def test_strategy_has_no_rebalance_notify():
+    """当日无换仓时 buy_routine 也发 log.notify（g._daily_traded 门控）。"""
+    src = STRATEGY.read_text(encoding="utf-8")
+    assert "g._daily_traded" in src
+    assert "今日无换仓" in src
+
+
 class _FakeLog:
     """桩 log：记录 notify/info 调用（引擎 LogProxy 的最小替身）。"""
 
