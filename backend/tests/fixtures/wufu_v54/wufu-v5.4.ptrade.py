@@ -13,12 +13,15 @@
 #   - 全局状态 g.* ：PTrade 同样支持并自动持久化
 #   - 调度：晨间 → before_trading_start；盘中 09:40/13:00/13:05/13:15 → run_daily；
 #           收盘重置 → after_trading_end；分钟止损 → handle_data
-#   - 日线历史：get_history(count, '1d', field, security_list, fq='pre')
-#   - 盘中数据：get_current_data()[code].lastPrice / .highLimit / .lowLimit / .paused / .name / .volume
-#   - 持仓：get_position(sec).amount / .avail_amount / .cost / .last_price
-#   - 现金/总资产：get_cash() + context.portfolio 双通道兜底（见 _get_available_cash/_get_total_value）
-#   - 动态 ETF 池：用 get_market_list()/get_market_detail() 枚举全市场基金，取不到时优雅降级为固定池
-#   - record()/log.set_level/set_option 等聚宽独有 API 已移除
+#   - 日线历史：get_history(count, '1d', field, security_list, fq='pre')；多标的返回格式随内置 Python 版本而异（_wide 兼容）
+#   - 盘中数据：PTrade 无 get_current_data()，由 handle_data 的 data 参数捕获快照（_set_last_data/_cd），
+#             SecurityUnitData 仅含 dt/open/high/low/close/price/volume/money；
+#             停牌用 get_stock_status(query_type='HALT')（_is_halted），涨跌停价用日线 high_limit/low_limit 字段（_limit_prices）
+#   - 持仓：get_position(sec) 返回 Position（amount / enable_amount / cost_basis / last_sale_price）
+#   - 现金/总资产：context.portfolio.cash / .portfolio_value（PTrade 无 get_cash）
+#   - 动态 ETF 池：用 get_market_list()/get_market_detail() 枚举全市场基金，取不到时优雅降级为固定池；
+#     全市场 6000+ 标的的成交额查询按 200 只分块（_get_money_avg_series），阈值按实际可交易池估算，避免回测挂起
+#   - record()/log.set_level/set_option 等聚宽独有 API 已移除；log 无 warn 方法（_warn 降级 warning/error）
 # ============================================================
 
 import numpy as np
@@ -87,9 +90,96 @@ def _last_n_trade_days(count):
         return []
 
 
+# ==================== 实时行情快照（PTrade 无 get_current_data，改由 handle_data 捕获 data 参数） ====================
+_LAST_DATA = {}
+_LAST_CTX = None
+
+
+class _BarUnit(object):
+    """把 handle_data 传入的 SecurityUnitData 包装为策略统一访问的行情单元。
+    PTrade 的 SecurityUnitData 仅含 dt/open/high/low/close/price/volume/money，
+    paused/涨跌停价需通过 get_stock_status/get_history 另行获取（见 _is_halted/_limit_prices）。"""
+
+    def __init__(self, code, raw):
+        self._code = code
+        self._raw = raw
+
+    def _field(self, *names):
+        r = self._raw
+        if r is None:
+            return None
+        for n in names:
+            try:
+                v = getattr(r, n, None)
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return None
+
+    @property
+    def lastPrice(self):
+        v = self._field('price', 'close')
+        return v if v is not None else 0
+
+    @property
+    def price(self):
+        return self.lastPrice
+
+    @property
+    def close(self):
+        return self.lastPrice
+
+    @property
+    def volume(self):
+        v = self._field('volume')
+        return v if v is not None else 0
+
+    @property
+    def money(self):
+        v = self._field('money')
+        return v if v is not None else 0
+
+    @property
+    def paused(self):
+        return False
+
+    @property
+    def highLimit(self):
+        return None
+
+    @property
+    def lowLimit(self):
+        return None
+
+    @property
+    def name(self):
+        return None
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def _set_last_data(data, context):
+    """由 handle_data / before_trading_start 调用，捕获最新行情快照。"""
+    global _LAST_DATA, _LAST_CTX
+    _LAST_CTX = context
+    if not data:
+        return
+    out = {}
+    try:
+        items = data.items() if hasattr(data, 'items') else []
+        for code, unit in items:
+            out[code] = _BarUnit(code, unit)
+    except Exception:
+        pass
+    if out:
+        _LAST_DATA = out
+
+
 def _cd():
-    """get_current_data() 封装（返回 dict：code -> SecurityUnitData）"""
-    return get_current_data()
+    """返回最近一次捕获的行情快照（dict：code -> _BarUnit），无快照时返回 {}。"""
+    return _LAST_DATA or {}
 
 
 def _cd_field(security, attr, default=None):
@@ -102,61 +192,84 @@ def _cd_field(security, attr, default=None):
         return default
 
 
-def _get_cash_map():
-    try:
-        ci = get_cash()
-    except Exception:
-        ci = None
-    out = {}
-    keys = ('asset', 'total_asset', 'total_value', 'cash',
-            'available', 'available_cash', 'marketvalue')
-    if isinstance(ci, dict):
-        for k in keys:
-            if k in ci:
-                out[k] = ci[k]
-    else:
-        for k in keys:
+# ==================== 停牌 / 涨跌停价（回测经 get_stock_status / 日线字段获取，按日缓存） ====================
+_HALT_CACHE = {}
+_LIMIT_CACHE = {}
+
+
+def _refresh_halt_status(codes, context):
+    global _HALT_CACHE
+    today = _today(context).strftime('%Y%m%d')
+    if today not in _HALT_CACHE:
+        result = {}
+        codes = list(codes)
+        CHUNK = 100
+        for i in range(0, len(codes), CHUNK):
+            chunk = codes[i:i + CHUNK]
             try:
-                v = getattr(ci, k, None)
-                if v is not None:
-                    out[k] = v
+                res = get_stock_status(chunk, query_type='HALT', query_date=today)
+                if res:
+                    result.update(res)
             except Exception:
-                pass
-    return out
+                continue
+        _HALT_CACHE[today] = result
+    return _HALT_CACHE[today]
+
+
+def _is_halted(code, context):
+    """停牌检测（get_stock_status HALT，按日缓存）。失败默认 False，不误判停牌。"""
+    try:
+        m = _HALT_CACHE.get(_today(context).strftime('%Y%m%d'))
+        if m is None:
+            m = _refresh_halt_status([code], context)
+        return bool(m.get(code))
+    except Exception:
+        return False
+
+
+def _single_daily_value(code, field, context):
+    try:
+        df = get_history(1, '1d', field, security_list=code, include=True)
+        v = _as_series_values(df)
+        if v is not None and len(v) > 0:
+            return float(v[-1])
+    except Exception:
+        pass
+    return None
+
+
+def _limit_prices(code, context):
+    """当日涨跌停价 (high, low)。回测经日线 high_limit/low_limit 字段获取，失败返回 (None, None) 由调用方跳过限制判断。"""
+    today = _today(context).strftime('%Y%m%d')
+    key = (today, code)
+    if key in _LIMIT_CACHE:
+        return _LIMIT_CACHE[key]
+    high = _single_daily_value(code, 'high_limit', context)
+    low = _single_daily_value(code, 'low_limit', context)
+    _LIMIT_CACHE[key] = (high, low)
+    return (high, low)
 
 
 def _get_total_value(context):
-    cm = _get_cash_map()
-    for k in ('asset', 'total_asset', 'total_value'):
-        v = cm.get(k)
-        if v:
-            try:
-                return float(v)
-            except Exception:
-                pass
+    """总资产（context.portfolio.portfolio_value，PTrade 无 get_cash）"""
     try:
         return float(context.portfolio.portfolio_value)
+    except Exception:
+        pass
+    try:
+        return float(context.portfolio.cash)
     except Exception:
         return 0.0
 
 
 def _get_available_cash(context):
-    cm = _get_cash_map()
-    for k in ('available', 'available_cash'):
-        v = cm.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                pass
-    v = cm.get('cash')
-    if v is not None:
-        try:
-            return float(v)
-        except Exception:
-            pass
+    """当前可用现金（context.portfolio.cash）"""
     try:
-        return float(getattr(context.portfolio, 'available_cash', None) or 0.0)
+        return float(context.portfolio.cash)
+    except Exception:
+        pass
+    try:
+        return float(context.portfolio.portfolio_value)
     except Exception:
         return 0.0
 
@@ -169,14 +282,22 @@ def _get_position(security):
 
 
 def _positions_map():
-    """返回 {security: Position}，仅含持仓数量>0 的标的"""
+    """返回 {security: Position}，仅含持仓数量>0 的标的。
+    PTrade get_positions() 返回 dict {code: Position}（个别版本为 list），此处双兼容。"""
     result = {}
     try:
-        for pos in get_positions():
-            if pos is None:
+        ps = get_positions()
+        if ps is None:
+            return result
+        if isinstance(ps, dict):
+            items = list(ps.items())
+        else:
+            items = [(getattr(p, 'sid', None) or getattr(p, 'security', None), p) for p in ps]
+        for sec, pos in items:
+            if not sec:
                 continue
-            sec = getattr(pos, 'security', None)
-            if sec and _pos_amount(pos) > 0:
+            sec = _pt(sec)
+            if _pos_amount(pos) > 0:
                 result[sec] = pos
     except Exception:
         pass
@@ -192,19 +313,22 @@ def _pos_amount(pos):
 def _pos_avail(pos):
     if pos is None:
         return 0
-    return float(getattr(pos, 'avail_amount', None) or getattr(pos, 'available_amount', None) or 0)
+    return float(getattr(pos, 'enable_amount', None) or getattr(pos, 'avail_amount', None)
+                 or getattr(pos, 'available_amount', None) or 0)
 
 
 def _pos_cost(pos):
     if pos is None:
         return 0.0
-    return float(getattr(pos, 'cost', None) or getattr(pos, 'cost_price', None) or 0.0)
+    return float(getattr(pos, 'cost_basis', None) or getattr(pos, 'cost', None)
+                 or getattr(pos, 'cost_price', None) or 0.0)
 
 
 def _pos_price(pos):
     if pos is None:
         return 0.0
-    return float(getattr(pos, 'last_price', None) or getattr(pos, 'price', None) or 0.0)
+    return float(getattr(pos, 'last_sale_price', None) or getattr(pos, 'last_price', None)
+                 or getattr(pos, 'price', None) or 0.0)
 
 
 def _as_series_values(obj):
@@ -255,6 +379,12 @@ def get_security_name(security):
     try:
         if getattr(g, 'etf_names_dict', {}) and security in g.etf_names_dict:
             return g.etf_names_dict[security]
+        try:
+            d = get_stock_name(security)
+            if d and d.get(security):
+                return d.get(security)
+        except Exception:
+            pass
         obj = _cd().get(security)
         if obj is not None:
             n = getattr(obj, 'name', None)
@@ -263,6 +393,81 @@ def get_security_name(security):
         return security
     except Exception:
         return security
+
+
+def _get_today_volumes(context, codes):
+    """批量取当日累计成交量（分钟线求和，分块避免超大查询挂起）。失败返回 {}。"""
+    out = {}
+    today = _today(context)
+    codes = list(codes)
+    CHUNK = 100
+    for i in range(0, len(codes), CHUNK):
+        chunk = codes[i:i + CHUNK]
+        try:
+            mdf = get_history(241, '1m', 'volume', security_list=chunk, include=True)
+            if mdf is None:
+                continue
+            if isinstance(mdf, pd.DataFrame) and 'code' in mdf.columns:
+                for code, gdf in mdf.groupby('code'):
+                    s = gdf['volume']
+                    if hasattr(gdf.index, 'date'):
+                        s = s[gdf.index.date == today]
+                    s = pd.to_numeric(s, errors='coerce').dropna()
+                    out[str(code)] = float(s.sum())
+            elif isinstance(mdf, pd.DataFrame):
+                for code in mdf.columns:
+                    s = mdf[code]
+                    if hasattr(mdf.index, 'date'):
+                        s = s[mdf.index.date == today]
+                    s = pd.to_numeric(s, errors='coerce').dropna()
+                    out[str(code)] = float(s.sum())
+        except Exception:
+            continue
+    return out
+
+
+def _get_money_avg_series(codes, count, context):
+    """分块 get_history 拉取成交额并计算日均，返回 pd.Series(code -> 日均成交额)。
+    避免对上千只标的单次 get_history 查询导致回测挂起。"""
+    result = pd.Series(dtype=float)
+    codes = list(codes)
+    CHUNK = 200
+    for i in range(0, len(codes), CHUNK):
+        chunk = codes[i:i + CHUNK]
+        try:
+            df = _wide(get_history(count, '1d', 'money', security_list=chunk))
+            if df is None or df.empty:
+                continue
+            df = df.fillna(0.0)
+            total = df.sum(axis=0)
+            avg = total / count
+            for code, v in avg.items():
+                if code in chunk:
+                    result[str(code)] = float(v)
+        except Exception:
+            continue
+    return result
+
+
+def _get_money_daily_totals(codes, context):
+    """按日汇总样本池成交额，返回 {日期: (总成交额, 有成交只数)}，失败返回 None。"""
+    try:
+        codes = list(codes)
+        CHUNK = 200
+        totals = {}
+        for i in range(0, len(codes), CHUNK):
+            chunk = codes[i:i + CHUNK]
+            df = _wide(get_history(3, '1d', 'money', security_list=chunk))
+            if df is None or df.empty:
+                continue
+            df = df.fillna(0.0)
+            for day, row in df.iterrows():
+                key = day.date() if hasattr(day, 'date') else day
+                m, cnt = totals.get(key, (0.0, 0))
+                totals[key] = (m + float(row.sum()), cnt + int((row > 0).sum()))
+        return totals
+    except Exception:
+        return None
 
 
 def _update_universe(pool=None):
@@ -619,6 +824,7 @@ def initialize(context):
 
 def before_trading_start(context, data):
     """PTrade 晨间钩子：替代聚宽 09:00 定时任务"""
+    _set_last_data(data, context)
     morning_routine(context)
 
 
@@ -629,6 +835,7 @@ def after_trading_end(context):
 
 def handle_data(context, data):
     """盘中每分钟调用（策略回测/实盘频率需设为分钟级）：分钟级固定止损"""
+    _set_last_data(data, context)
     minute_level_stop_loss(context)
 
 
@@ -714,8 +921,7 @@ def check_positions(context):
             log.info("📊 【持仓检查】%s %s, 数量: %d, 成本: %.3f, 当前价: %.3f" % (
                 security, security_name,
                 int(_pos_amount(position)), _pos_cost(position), _pos_price(position)))
-            obj = current_data.get(security)
-            if obj is not None and getattr(obj, 'paused', False):
+            if _is_halted(security, context):
                 log.info("⚠️ %s %s 今日停牌" % (security, security_name))
     except Exception as e:
         _warn("【持仓检查】执行异常: %s" % e)
@@ -758,7 +964,13 @@ def calculate_global_etf_threshold(context):
             fund_map = _ensure_fund_universe()
             g._cached_etf_universe = list(fund_map.keys()) if fund_map else []
             log.info("全市场基金总数: %d只 (已缓存)" % len(g._cached_etf_universe))
-        etf_list = g._cached_etf_universe
+        # 阈值基于实际可交易池（固定池+动态池）估算，避免对 6000+ 全市场基金做单次 get_history 挂起
+        base_codes = list(getattr(g, 'fixed_etf_pool', []) or [])
+        dynamic = list(getattr(g, 'dynamic_etf_pool', []) or [])
+        etf_list = []
+        for c in base_codes + dynamic:
+            if c not in etf_list:
+                etf_list.append(c)
         if not etf_list:
             _warn("未找到任何场内ETF，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
@@ -768,27 +980,21 @@ def calculate_global_etf_threshold(context):
             _warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
             g.avg_etf_money_threshold = 10000000
             return
-        start_day = trade_days[0]
-        money_df = _wide(get_history(3, '1d', 'money', security_list=etf_list))
-        if money_df is None or money_df.empty:
+        avg_daily_money = _get_money_avg_series(etf_list, 3, context)
+        if avg_daily_money.empty:
             _warn("无成交额数据，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
-        money_df = money_df.fillna(0.0)
-        daily_totals = money_df.sum(axis=1)
-        daily_counts = money_df[money_df > 0].count(axis=1)
-        for day, money in daily_totals.items():
-            count = daily_counts.get(day, 0)
-            log.info("  %s 全市场ETF总成交额: %.2f亿元 (%d只ETF有成交)" % (day.date(), money / 1e8, count))
-        if len(daily_totals) < 3:
-            _warn("仅有%d个有效交易日，使用保守阈值1000万" % len(daily_totals))
-            g.avg_etf_money_threshold = 10000000
-            return
-        avg_total_money = daily_totals.mean()
+        # 分日汇总用于日志展示
+        daily_totals = _get_money_daily_totals(etf_list, context)
+        if daily_totals is not None:
+            for day, (money, count) in daily_totals.items():
+                log.info("  %s 样本池ETF总成交额: %.2f亿元 (%d只ETF有成交)" % (day, money / 1e8, count))
+        avg_total_money = avg_daily_money.sum()
         threshold = avg_total_money / g.global_threshold_divisor
         g.avg_etf_money_threshold = threshold
-        log.info("【全局阈值更新完成】近%d日全市场ETF日均总成交额=%.2f亿元，阈值=%.0f万元(%s元)" % (
-            len(daily_totals), avg_total_money / 1e8, threshold / 1e4, format(threshold, ',.0f')))
+        log.info("【全局阈值更新完成】近3日样本池日均总成交额=%.2f亿元，阈值=%.0f万元(%s元)" % (
+            avg_total_money / 1e8, threshold / 1e4, format(threshold, ',.0f')))
     except Exception as e:
         _warn("计算全局阈值异常: %s，使用保守阈值1000万" % e)
         g.avg_etf_money_threshold = 10000000
@@ -807,14 +1013,11 @@ def filter_global_pool_by_volume(context):
     log.info("【全球池过滤】使用流动性门槛=日均%.0f万元" % (dynamic_threshold / 1e4))
     TRADE_DAYS_COUNT = 3
     try:
-        money_df = _wide(get_history(TRADE_DAYS_COUNT, '1d', 'money', security_list=g.global_etf_pool))
-        if money_df is None or money_df.empty:
+        avg_daily_money = _get_money_avg_series(g.global_etf_pool, TRADE_DAYS_COUNT, context)
+        if avg_daily_money.empty:
             _warn("【全球池过滤】无成交额数据，使用原始全球池")
             g.filtered_global_pool = g.global_etf_pool[:]
             return
-        money_df = money_df.fillna(0.0)
-        total_money = money_df.sum(axis=0)
-        avg_daily_money = total_money / TRADE_DAYS_COUNT
         qualified = avg_daily_money[avg_daily_money > dynamic_threshold]
         new_global_pool = qualified.index.tolist()
         removed = set(g.global_etf_pool) - set(new_global_pool)
@@ -945,12 +1148,9 @@ def update_sector_pool(context):
         if not etf_codes:
             return pd.Series(dtype=float), 0
         try:
-            money_df = _wide(get_history(TRADE_DAYS_COUNT, '1d', 'money', security_list=etf_codes))
-            if money_df is None or money_df.empty:
+            avg_daily_money = _get_money_avg_series(etf_codes, TRADE_DAYS_COUNT, context)
+            if avg_daily_money.empty:
                 return pd.Series(dtype=float), len(etf_codes)
-            money_df = money_df.fillna(0.0)
-            total_money = money_df.sum(axis=0)
-            avg_daily_money = total_money / TRADE_DAYS_COUNT
             qualified_series = avg_daily_money[avg_daily_money > dynamic_threshold].sort_values(ascending=False)
             filtered_out = len(etf_codes) - len(qualified_series)
             return qualified_series, filtered_out
@@ -1055,14 +1255,11 @@ def filter_fixed_pool_by_volume(context):
     log.info("【固定池过滤】使用流动性门槛=日均%.0f万元" % (dynamic_threshold / 1e4))
     TRADE_DAYS_COUNT = 3
     try:
-        money_df = _wide(get_history(TRADE_DAYS_COUNT, '1d', 'money', security_list=g.fixed_etf_pool))
-        if money_df is None or money_df.empty:
+        avg_daily_money = _get_money_avg_series(g.fixed_etf_pool, TRADE_DAYS_COUNT, context)
+        if avg_daily_money.empty:
             _warn("【固定池过滤】无法获取成交额数据，跳过过滤")
             g.filtered_fixed_pool = g.fixed_etf_pool[:]
             return
-        money_df = money_df.fillna(0.0)
-        total_money = money_df.sum(axis=0)
-        avg_daily_money = total_money / TRADE_DAYS_COUNT
         qualified = avg_daily_money[avg_daily_money > dynamic_threshold]
         new_fixed_pool = qualified.index.tolist()
         removed = set(g.fixed_etf_pool) - set(new_fixed_pool)
@@ -1308,15 +1505,7 @@ def apply_filters(metrics_list):
 
 
 def _get_today_volume(context, security):
-    """当日累计成交量（实盘优先取 get_current_data().volume，回测回退分钟线求和）"""
-    try:
-        obj = _cd().get(security)
-        if obj is not None:
-            v = getattr(obj, 'volume', None)
-            if v and float(v) > 0:
-                return float(v)
-    except Exception:
-        pass
+    """当日累计成交量（分钟线求和；PTrade 快照 volume 为单根分钟量，不能直接用）"""
     try:
         mdf = get_history(241, '1m', 'volume', security_list=security, include=True)
         vals = _as_series_values(mdf)
@@ -1347,23 +1536,17 @@ def get_final_ranked_etfs(context):
     if close_df is None or close_df.empty:
         _warn("【动量计算】无法获取历史价格数据")
         return []
-    # 当日累计成交量：优先用一次性 get_current_data()，缺失者再回退 _get_today_volume
-    today_vols = {}
-    for code in etf_set:
-        obj = current_data.get(code)
-        v = getattr(obj, 'volume', None) if obj else None
-        if v and float(v) > 0:
-            today_vols[code] = float(v)
-        else:
-            today_vols[code] = _get_today_volume(context, code)
+    # 当日累计成交量：批量分钟线求和（PTrade 快照 volume 为单根分钟量，不可直接累计）
+    today_vols = _get_today_volumes(context, etf_set)
     close_pivot = close_df
     volume_pivot = volume_df
     # ========== 遍历ETF计算动量得分 ==========
     skipped_no_minute = []
+    _refresh_halt_status(etf_set, context)
     for etf in etf_set:
         try:
             obj = current_data.get(etf)
-            if obj is not None and getattr(obj, 'paused', False):
+            if _is_halted(etf, context):
                 continue
             if is_temporarily_suspended(etf, context):
                 _debug("%s %s 盘中临时停牌，跳过计算" % (etf, get_security_name(etf)))
@@ -1384,6 +1567,9 @@ def get_final_ranked_etfs(context):
                 continue
             etf_name = get_security_name(etf)
             current_price = getattr(obj, 'lastPrice', 0) if obj else 0
+            if not current_price:
+                # 快照缺失（最近一分钟无成交/未进快照）时回退最近日线收盘价，避免误跳过
+                current_price = _single_daily_value(etf, 'close', context) or 0
             today_vol = today_vols.get(etf, 0)
             metrics = calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, current_price, today_vol, context)
         except RuntimeError as e:
@@ -1677,20 +1863,20 @@ def smart_order_target_value(security, target_value, context):
     data = _cd()
     name = get_security_name(security)
     obj = data.get(security)
-    if obj is None:
+    price = (getattr(obj, 'lastPrice', 0) or 0) if obj else 0
+    if not price:
+        # 快照缺失（如标的最近一分钟无成交）时回退最近日线收盘价
+        price = _single_daily_value(security, 'close', context) or 0
+    if not price:
         log.info("%s %s 无实时行情数据，跳过交易" % (security, name))
         return False
     # ========== 1. 全天停牌检测 ==========
-    if getattr(obj, 'paused', False):
+    if _is_halted(security, context):
         log.info("%s %s 全天停牌，跳过交易" % (security, name))
         return False
     # ========== 2. 盘中临时停牌检测 ==========
     if is_temporarily_suspended(security, context):
         log.info("%s %s 盘中临时停牌，跳过交易" % (security, name))
-        return False
-    price = getattr(obj, 'lastPrice', 0) or 0
-    if price == 0:
-        log.info("%s %s 当前价格为0，跳过交易" % (security, name))
         return False
     # ========== 3. 买入时使用预估成交价（包含佣金+滑点）计算股数 ==========
     estimated_price = price
@@ -1715,11 +1901,12 @@ def smart_order_target_value(security, target_value, context):
     cur_pos = _get_position(security)
     cur_amount = _pos_amount(cur_pos)
     diff = target_amount - cur_amount
-    # ========== 4. 涨跌停检测（统一：涨停跌停都不交易） ==========
-    if getattr(obj, 'lastPrice', 0) >= getattr(obj, 'highLimit', 0):
+    # ========== 4. 涨跌停检测（统一：涨停跌停都不交易；回测经日线字段获取，拿不到则跳过） ==========
+    high_limit, low_limit = _limit_prices(security, context)
+    if high_limit and price >= high_limit:
         log.info("%s %s 当前涨停，跳过交易" % (security, name))
         return False
-    if getattr(obj, 'lastPrice', 0) <= getattr(obj, 'lowLimit', 0):
+    if low_limit and price <= low_limit:
         log.info("%s %s 当前跌停，跳过交易" % (security, name))
         return False
     trade_val = abs(diff) * price
@@ -1807,13 +1994,17 @@ def check_defensive_etf_available(context):
     obj = current_data.get(defensive_etf)
     if obj is None:
         return False
-    if getattr(obj, 'paused', False):
+    price = getattr(obj, 'lastPrice', 0) or 0
+    if price == 0:
+        return False
+    if _is_halted(defensive_etf, context):
         log.info("防御性ETF %s 今日停牌" % defensive_etf)
         return False
-    if getattr(obj, 'lastPrice', 0) >= getattr(obj, 'highLimit', 0):
+    high_limit, low_limit = _limit_prices(defensive_etf, context)
+    if high_limit and price >= high_limit:
         log.info("防御性ETF %s 当前涨停" % defensive_etf)
         return False
-    if getattr(obj, 'lastPrice', 0) <= getattr(obj, 'lowLimit', 0):
+    if low_limit and price <= low_limit:
         log.info("防御性ETF %s 当前跌停" % defensive_etf)
         return False
     return True
