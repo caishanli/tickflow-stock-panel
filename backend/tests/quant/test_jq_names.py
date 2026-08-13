@@ -44,6 +44,29 @@ def test_get_all_securities_uses_jq_names_when_enabled(monkeypatch):
     assert row["display_name"] == "货币ETF-A"
 
 
+def test_get_security_info_display_name_uses_real_name(monkeypatch):
+    """get_security_info().display_name 返回真实名称（而非代码）。
+
+    策略 get_security_name 兜底依赖该字段；走弱期 etf_names_dict 为空时，
+    若这里返回代码会导致买卖通知显示成「代码(代码)」。
+    """
+    from app.quant.jqengine.engine.jq import api
+
+    monkeypatch.setattr(
+        api, "_state",
+        {"manager": _FakeMgr(), "sec_names": {}})
+    monkeypatch.setattr(
+        "app.quant.jqengine.engine.jq.api._name_source",
+        lambda: "jq",
+    )
+    monkeypatch.setattr(
+        "app.quant.jqengine.engine.jq.api._jq_names",
+        lambda: {"501018.XSHG": "南方原油", "159985.XSHE": "豆粕ETF华夏"},
+    )
+    assert api.get_security_info("501018.XSHG").display_name == "南方原油"
+    assert api.get_security_info("159985.XSHE").display_name == "豆粕ETF华夏"
+
+
 class _FakeMgr:
     sources: ClassVar[dict] = {"network": object()}
 
