@@ -1230,8 +1230,26 @@ def is_temporarily_suspended(security, context, minute_count=10):
             skip_paused=False,
             fq='pre'
         )
-        # 无数据或数据为空，视为停牌
+        # 无数据或数据为空：可能是真实停牌，也可能是当日分钟数据缺失
+        # （实时盘中当日分区未落盘/回源失败）。两者后果不同——数据缺失把活跃标的
+        # 误判成停牌会静默踢出动量排名（08-12 159768 案例）。用实时行情交叉验证：
+        # 有当前成交价则判定为盘中取数异常而非停牌，保留警告但不踢出。
         if minute_data is None or minute_data.empty:
+            try:
+                live = get_current_data()[security]
+                if live.paused:
+                    log.info(f"🔇 {security} {get_security_name(security)} 全天停牌")
+                    return True
+                if live.last_price > 0:
+                    log.warning(f"⚠️ {security} {get_security_name(security)} 分钟数据缺失"
+                                f"（{context.current_dt} 最近{minute_count}分钟无数据），"
+                                f"当前价 {live.last_price} 正常，判定为盘中取数异常，不按停牌处理")
+                    return False
+            except Exception:
+                pass
+            log.warning(f"⚠️ {security} {get_security_name(security)} 分钟数据缺失"
+                        f"（{context.current_dt} 最近{minute_count}分钟无数据），"
+                        f"按临时停牌处理，若为盘中取数异常请排查数据源")
             return True
         # 最近N分钟成交量都为0，视为临时停牌
         if (minute_data['volume'] == 0).all():
