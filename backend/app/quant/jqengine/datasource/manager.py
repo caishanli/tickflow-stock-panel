@@ -184,6 +184,7 @@ class DataManager:
         # 历史分钟线：优先走真实源（mootdx 分页回看）
         self._minute_win = None  # (start, end) 回测窗口
         self._minute_cov = {}  # code -> (lo_ts, hi_ts) 缓存帧已覆盖区间
+        self._minute_split_events = {}  # code -> [(split_date, ratio), ...]
         # M11 修复：分钟帧内存缓存改为有界 LRU（原无界 dict 永久持有帧，
         # 数百只 ETF × 全窗口 1m 帧可达 GB 级）。容量取 minute_mem_cap 参数
         # 或 MINUTE_MEM_CAP 环境变量，默认 800（与 scripts/run_jq_rqalpha.py
@@ -876,7 +877,10 @@ class DataManager:
                 df = batch.get(code)
                 if df is not None and not df.empty:
                     df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]
-                    df = self._adjust_for_splits(df)
+                    _events = self._split_events(df)
+                    self._minute_split_events[code] = _events
+                    if _events:
+                        df = self._adjust_for_splits(df, events=_events)
                     df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]
                     if not df.empty:
                         self._minute_mem[code] = df
@@ -917,25 +921,25 @@ class DataManager:
             return None
 
     @staticmethod
-    def _adjust_for_splits(df):
-        """检测分钟数据中的拆股/合股跳变并向前复权。
+    def _split_events(df):
+        """检测分钟数据中的拆股/合股跳变，返回 ``[(split_date, ratio), ...]``。
 
-        隔夜缺口 >30% 视为拆股信号，计算分割比率，将跳变点之前的所有价格
-        除以该比率（向前复权），确保跨拆股日的价格可比。
+        隔夜缺口 >30% 视为拆股信号，ratio = 次日首价/前日末价（如 3.08x 拆分
+        ratio≈0.325）。只做检测，不修改 df。事件按日期升序。
         """
         if df is None or df.empty or len(df) < 2:
-            return df
+            return []
         price_cols = ["open", "high", "low", "close"]
         has_price = any(c in df.columns for c in price_cols)
         if not has_price:
-            return df
+            return []
         ref = df["close"] if "close" in df.columns else df.get("open")
         if ref is None or ref.isna().all():
-            return df
+            return []
         dates = ref.index.normalize()
         unique_dates = dates.unique()
         if len(unique_dates) < 2:
-            return df
+            return []
         daily_last = ref.groupby(dates).last()
         daily_first = ref.groupby(dates).first()
         ratios = daily_first.values[1:] / daily_last.values[:-1]
@@ -943,11 +947,31 @@ class DataManager:
             (ratios < 0.5) | (ratios > 2.0)
         )
         if not split_mask.any():
-            return df
+            return []
         split_dates = unique_dates[1:][split_mask]
         split_ratios = ratios[split_mask]
-        result = df.copy()
+        out = []
         for split_date, ratio in zip(split_dates, split_ratios):
+            if np.isfinite(ratio) and ratio > 0:
+                out.append((pd.Timestamp(split_date), float(ratio)))
+        return out
+
+    @staticmethod
+    def _adjust_for_splits(df, events=None):
+        """按拆股/合股跳变向前复权：跳变点之前的所有价格乘以 ratio。
+
+        注意：该复权锚定到帧内**最新**事件，仅对 as-of 晚于最新事件的视角正确；
+        as-of 早于事件时须由查询侧撤销（见 jqcompat._apply_minute_split_dt）。
+        """
+        if df is None or df.empty or len(df) < 2:
+            return df
+        if events is None:
+            events = DataManager._split_events(df)
+        if not events:
+            return df
+        price_cols = ["open", "high", "low", "close"]
+        result = df.copy()
+        for split_date, ratio in events:
             if not np.isfinite(ratio) or ratio <= 0:
                 continue
             mask = result.index < split_date
@@ -1009,8 +1033,13 @@ class DataManager:
                 if col in layer.columns:
                     merged.loc[layer.index, col] = layer[col]
         merged = merged.sort_index()
-        # 拆股/合股调整：检测隔夜价格跳变（阈值30%），向前复权
-        merged = self._adjust_for_splits(merged)
+        # 拆股/合股调整：检测隔夜价格跳变（阈值30%），向前复权。
+        # 事件记录到 _minute_split_events 供查询侧按 as-of 撤销（锚定到最新事件
+        # 的复权对 as-of 早于事件的视角是错的——回测 04-21 会用 07-20 拆股价）。
+        _events = self._split_events(merged)
+        self._minute_split_events[code] = _events
+        if _events:
+            merged = self._adjust_for_splits(merged, events=_events)
         # H6b：合并结果裁剪到请求窗口 [lo, hi] 闭区间（防越界/未来泄漏）。
         return merged.loc[(merged.index >= lo_ts) & (merged.index <= hi_eff)]
 

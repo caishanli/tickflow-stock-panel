@@ -1460,6 +1460,42 @@ class JqDataSource:
         except Exception:
             return bars
 
+    def _apply_minute_split_dt(self, bars, order_book_id, dt):
+        """按 as-of 撤销分钟拆股复权：帧锚定到窗口内**最新**事件，as-of 早于
+        事件的视角须撤销（把 ex-date > dt 的事件对历史价的影响还原）。
+
+        否则回测区间含拆股时（如 588110 07-20 拆股），as-of 早于拆股日的
+        current_price/动量会用到复权后的低价，与日线口径（_apply_qfq_bars 按 dt
+        过滤事件）不一致，动量被污染、回测结果随窗口末端漂移。
+        """
+        try:
+            if len(bars) == 0:
+                return bars
+            events = getattr(self._dm, "_minute_split_events", {}).get(order_book_id, [])
+            if not events:
+                return bars
+            dt_ts = pd.Timestamp(dt)
+            future = [(e, f) for e, f in events if pd.Timestamp(e) > dt_ts]
+            if not future:
+                return bars
+            bars = bars.copy()
+            dates = bars["datetime"] // 1000000  # YYYYMMDD int
+            for ex_ts, ratio in future:
+                if not np.isfinite(ratio) or ratio <= 0:
+                    continue
+                ex_int = int(pd.Timestamp(ex_ts).year) * 10000 \
+                    + int(pd.Timestamp(ex_ts).month) * 100 \
+                    + int(pd.Timestamp(ex_ts).day)
+                mask = dates < ex_int
+                if not mask.any():
+                    continue
+                for col in ("open", "high", "low", "close"):
+                    if col in bars.dtype.names:
+                        bars[col][mask] = bars[col][mask] / ratio
+            return bars
+        except Exception:
+            return bars
+
     def history_bars(self, instrument, bar_count, frequency, fields, dt, **kwargs):
         freq = _norm_freq(frequency)
         bars = self._all_bars_of(instrument, freq)
@@ -1478,6 +1514,8 @@ class JqDataSource:
         if freq == "1d":
             if os.getenv("DISABLE_JQ_QFQ") != "1":
                 bars = self._apply_qfq_bars(bars, instrument.order_book_id, dt)
+        elif freq == "1m":
+            bars = self._apply_minute_split_dt(bars, instrument.order_book_id, dt)
         if fields is None:
             return bars
         if isinstance(fields, str):
@@ -1512,6 +1550,8 @@ class JqDataSource:
             bars = bars[left:i]
             if freq == "1d" and os.getenv("DISABLE_JQ_QFQ") != "1":
                 bars = self._apply_qfq_bars(bars, code, dt)
+            elif freq == "1m":
+                bars = self._apply_minute_split_dt(bars, code, dt)
             if fields is not None:
                 if isinstance(fields, str):
                     bars = bars[["datetime", fields] if fields != "datetime" else ["datetime"]]
@@ -1530,7 +1570,13 @@ class JqDataSource:
         pos = bars["datetime"].searchsorted(dt_int)
         if pos >= len(bars) or bars["datetime"][pos] != dt_int:
             return None
-        return bars[pos]
+        bar = bars[pos]
+        if freq == "1m":
+            _bar_slice = bars[pos:pos + 1]
+            _adj = self._apply_minute_split_dt(_bar_slice, instrument.order_book_id, dt)
+            if len(_adj):
+                bar = _adj[0]
+        return bar
 
     def current_snapshot(self, instrument, frequency, dt):
         from rqalpha.data.data_proxy import TickObject
