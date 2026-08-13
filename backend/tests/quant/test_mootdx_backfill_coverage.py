@@ -932,8 +932,9 @@ def test_backfill_missing_partitions_survives_per_day_error(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_throttle_backfill_sleeps_every_n(monkeypatch):
-    """每 _BACKFILL_THROTTLE_EVERY 个 symbol 后 sleep _BACKFILL_THROTTLE_SLEEP。"""
+    """非盘中：每 _BACKFILL_THROTTLE_EVERY 个 symbol 后 sleep _BACKFILL_THROTTLE_SLEEP。"""
     sleeps = []
+    monkeypatch.setattr(ms, "_is_market_open", lambda: False)
     monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 3)
     monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.05)
     monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
@@ -943,12 +944,42 @@ def test_throttle_backfill_sleeps_every_n(monkeypatch):
 
 
 def test_throttle_backfill_disabled_when_every_zero(monkeypatch):
-    """_BACKFILL_THROTTLE_EVERY<=0 时完全不禁流。"""
+    """非盘中：_BACKFILL_THROTTLE_EVERY<=0 时完全不禁流。"""
     sleeps = []
+    monkeypatch.setattr(ms, "_is_market_open", lambda: False)
     monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 0)
     monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.05)
     monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
     for i in range(10):
+        ms._throttle_backfill(i)
+    assert sleeps == []
+
+
+def test_throttle_backfill_intraday_slows_down(monkeypatch):
+    """盘中：使用独立降速参数，每 _BACKFILL_INTRADAY_EVERY 个 symbol 睡 1s。"""
+    sleeps = []
+    monkeypatch.setattr(ms, "_is_market_open", lambda: True)
+    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_EVERY", 2)
+    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_SLEEP", 0.05)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 5)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.2)
+    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
+    for i in range(4):
+        ms._throttle_backfill(i)
+    # 盘中每 2 个 symbol 触发（i=1, i=3），且不受非盘中参数影响
+    assert sleeps == [0.05, 0.05]
+
+
+def test_throttle_backfill_intraday_disabled_when_every_zero(monkeypatch):
+    """盘中：_BACKFILL_INTRADAY_EVERY<=0 时盘中不禁流。"""
+    sleeps = []
+    monkeypatch.setattr(ms, "_is_market_open", lambda: True)
+    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_EVERY", 0)
+    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_SLEEP", 0.05)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 5)
+    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.2)
+    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
+    for i in range(4):
         ms._throttle_backfill(i)
     assert sleeps == []
 

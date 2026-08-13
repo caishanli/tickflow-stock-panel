@@ -84,6 +84,22 @@ def _append_failure(sym: str, reason: str) -> None:
 # 主动 sleep 一小段让出资源。默认开启（每 5 个 symbol 睡 0.2s），环境变量可调。
 _BACKFILL_THROTTLE_EVERY = int(os.getenv("BACKFILL_THROTTLE_EVERY", "5"))
 _BACKFILL_THROTTLE_SLEEP = float(os.getenv("BACKFILL_THROTTLE_SLEEP", "0.2"))
+# 盘中让路降速（A 股交易时段）：服务器侧连接/频率配额是共享瓶颈，历史回源
+# 密集请求会把实时拉取挤到 30s 墙钟超时（08-13 盘中回源致活跃 ETF 分钟取数
+# 失败被误判停牌）。盘中每 1 个 symbol 睡 1s（约 1 req/s），把配额让给实时
+# 16-worker 共享池；收盘后恢复原节奏。环境变量可调（BACKFILL_INTRADAY_EVERY=0
+# 完全禁流，等价旧行为）。
+_BACKFILL_INTRADAY_EVERY = int(os.getenv("BACKFILL_INTRADAY_EVERY", "1"))
+_BACKFILL_INTRADAY_SLEEP = float(os.getenv("BACKFILL_INTRADAY_SLEEP", "1.0"))
+
+
+def _is_market_open(now: _dt.datetime | None = None) -> bool:
+    """A 股交易时段判定（口径同 stockdata.sources._in_trading）。"""
+    now = now or _dt.datetime.now()
+    t = now.time()
+    return (now.weekday() < 5
+            and (_dt.time(9, 30) <= t <= _dt.time(11, 30)
+                 or _dt.time(13, 0) <= t <= _dt.time(15, 0)))
 
 
 def _throttle_backfill(i: int) -> None:
@@ -92,7 +108,17 @@ def _throttle_backfill(i: int) -> None:
     ``i`` 为当前循环序号（0-based）。``sleep`` 主动释放 GIL 与 mootdx socket
     占用，给客户端实时请求让路（客户端走共享线程池，不受本函数影响）。
     仅在后台回源路径调用（sync_daily/sync_index_daily/sync_stock_minute/…）。
+
+    盘中（交易时段）使用独立的降速参数：mootdx 服务器对每 IP 的连接/请求
+    频率有限制，历史回源密集请求会把实时拉取挤到墙钟超时（08-13 13:55 事故
+    根因），盘中每只 symbol 睡 ``_BACKFILL_INTRADAY_SLEEP`` 秒让出配额。
     """
+    if _is_market_open():
+        if _BACKFILL_INTRADAY_EVERY <= 0:
+            return
+        if (i + 1) % _BACKFILL_INTRADAY_EVERY == 0:
+            time.sleep(_BACKFILL_INTRADAY_SLEEP)
+        return
     if _BACKFILL_THROTTLE_EVERY <= 0:
         return
     if (i + 1) % _BACKFILL_THROTTLE_EVERY == 0:
