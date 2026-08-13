@@ -491,3 +491,126 @@ def test_fetch_daily_caches_dataframe_only(tmp_path):
     # 再次 fetch 命中缓存，不重复回源
     dm.fetch("get_daily", "510300.XSHG", "2026-01-01", "2026-01-03")
     assert calls["n"] == 1
+
+
+# ---------------- 当日盘中分钟暂缺不得进 _minute_empty（08-13 案例） ----------------
+
+class _DelayedMinuteClient(_FakeClient):
+    """当日盘中模拟：``get_price``（只读 get_minute）返回空，但实时
+    ``current_snapshot`` 能返回当日分钟。
+
+    复现 08-13 模拟盘：进程启动回补到"今天"时，持仓标的当日分钟尚未被
+    实时 feed 填充，``get_minute``（只读分区+内存库）返回空 → 旧实现把标的
+    永久加入 ``_minute_empty``，且直接返回空 → 13:10 动量计算跳过它 →
+    静默换仓买错。修复：盘中取数空应回退 ``current_snapshot`` 实时回源。
+    """
+
+    def __init__(self, frames, snap_frames=None):
+        super().__init__(frames)
+        self.snap_frames = snap_frames if snap_frames is not None else frames
+
+    def get_price(self, security, start_date=None, end_date=None,
+                  frequency="daily", fields=None):
+        # 只读 get_minute 路径（_load_minute_from_partitions）：盘中当日分区未
+        # 落盘、内存库未填充 → 返回空，模拟真实服务端行为
+        return {}
+
+    def current_snapshot(self, codes, as_of=None):
+        out = {}
+        for c in ([security] if isinstance(codes, str) else list(codes)):
+            df = self.snap_frames.get(c)
+            if df is None:
+                continue
+            if as_of is not None:
+                df = df[df.index <= pd.Timestamp(as_of)]
+            out[c] = df
+        return out
+
+
+def test_minute_today_intraday_falls_back_to_realtime(tmp_path, monkeypatch):
+    """盘中当日分钟暂缺（get_minute 空）应回退 current_snapshot 实时回源取数。
+
+    回归：08-13 新启动账户回补到当天时，159768 的 get_minute 只读路径返回空
+    → 旧实现直接返回空、且把标的永久缓存进 _minute_empty → 13:10 动量计算
+    判成"临时停牌"静默换仓买 513360。修复后盘中应实时回源拿到当日分钟，
+    且不污染 _minute_empty。
+    """
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    today = "2026-03-25"
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp(f"{today} 12:00:00")))
+    dm = _make_dm(tmp_path)
+    frame = _real_minute_frame(CODE)
+    # get_price 恒空（模拟盘中当日分区未落盘），但 current_snapshot 有实时数据
+    dm.client = _DelayedMinuteClient({}, snap_frames={CODE: frame})
+    df = dm._ensure_minute_windowed(CODE, today)
+    # 盘中必须通过实时回源拿到当日分钟，而非直接返回空
+    assert df is not None and not df.empty
+    assert df.index.max() <= pd.Timestamp(f"{today} 15:00")
+    # 且不得污染 _minute_empty（活跃标的不被永久标记）
+    assert CODE not in dm._minute_empty
+
+
+def test_minute_history_missing_still_marks_empty(tmp_path, monkeypatch):
+    """历史日期分钟缺失仍应加入 _minute_empty（真无数据，避免重复请求）。
+
+    与盘中暂缺不同：历史日（非今天）get_minute 空 → 停牌/退市/无数据，
+    应缓存 _minute_empty 防重复联网。
+    """
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    today = "2026-03-25"
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp(f"{today} 12:00:00")))
+    dm = _make_dm(tmp_path)
+    dm.client = _DelayedMinuteClient({})  # 无任何数据
+    df = dm._ensure_minute_windowed(CODE, "2026-03-20")  # 历史日期
+    assert df is None
+    assert CODE in dm._minute_empty
+
+
+def test_preload_pool_intraday_falls_back_to_realtime_batch(tmp_path, monkeypatch):
+    """preload_minute_for_pool 盘中批量取数空 → 批量 current_snapshot 实时回源。
+
+    回归：08-13 新启动账户午盘 preload 时，159768 的批量 get_minute 空
+    （当日分区未落盘），若仅回退单标的会导致数百次实时回源调用拖慢午盘；
+    且不实时回源则 159768 被判"临时停牌"静默换仓。修复：批量实时回源。
+    """
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    today = "2026-03-25"
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp(f"{today} 12:00:00")))
+    dm = _make_dm(tmp_path)
+    frame = _real_minute_frame(CODE)
+    # get_price（只读批量 get_minute）恒空，但 current_snapshot 能返回当日分钟
+    dm.client = _DelayedMinuteClient({}, snap_frames={CODE: frame})
+    dm.preload_minute_for_pool([CODE], as_of=pd.Timestamp(f"{today} 13:10:00"))
+    # 批量实时回源后缓存应命中（非空）
+    df = dm._minute_mem.get(CODE)
+    assert df is not None and not df.empty
+    assert dm._minute_cov[CODE][1] >= pd.Timestamp(f"{today} 13:10:00")
+    assert CODE not in dm._minute_empty
+
+
+def test_minute_diag_logs_on_today_missing(tmp_path, monkeypatch, caplog):
+    """开启 _diag_minute 后，盘中取数空应输出可定位的诊断日志（不进 _minute_empty）。
+
+    便于排查"当日分钟缺失被误判临时停牌"（08-13 159768 案例）：日志应包含
+    标的名、窗口、以及"盘中取数空(未进_minute_empty)"，而非静默。
+    """
+    import logging
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    today = "2026-03-25"
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp(f"{today} 12:00:00")))
+    dm = _make_dm(tmp_path)
+    dm._diag_minute = True
+    dm.client = _DelayedMinuteClient({}, snap_frames={})  # 全部无数据
+    with caplog.at_level(logging.WARNING, logger="app.quant.jqengine.datasource.manager"):
+        dm._ensure_minute_windowed(CODE, today)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("盘中取数空" in m and CODE in m for m in msgs), msgs
+    assert CODE not in dm._minute_empty

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -186,6 +187,9 @@ def _make_dm():
     dm = get_data_manager()
     dm._use_real_minute = True
     dm._offline = False
+    # 盘中分钟取数诊断：SIM_MINUTE_DIAG=1 时记录每次取数 bar 数/缺失/回源，
+    # 用于排查"当日分钟缺失被误判临时停牌"（08-13 159768 案例）。默认关闭。
+    dm._diag_minute = os.getenv("SIM_MINUTE_DIAG", "") == "1"
     try:
         dm.preload_daily()
     except Exception as e:  # noqa: BLE001

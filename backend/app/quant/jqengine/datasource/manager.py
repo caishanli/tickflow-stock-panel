@@ -816,11 +816,29 @@ class DataManager:
         if df is not None:
             return df
         df = self._load_minute_merged(code, as_of=as_of_ts, full=False)
+        is_today = as_of_ts.normalize().date() == pd.Timestamp.today().date()
         if df is not None and not df.empty:
             self._minute_mem[code] = df
             self._minute_cov[code] = (lo_ts, hi_eff)
+            if is_today and getattr(self, "_diag_minute", False):
+                logger.info("[minute-diag] %s 盘中加载成功 bars=%d 末bar=%s as_of=%s",
+                            code, len(df), df.index.max(), as_of_ts)
+        elif is_today:
+            # 当日盘中分钟暂缺是正常状态（当日分区未落盘 / 实时分钟尚未被
+            # feed 填充），不能永久缓存进 _minute_empty——否则活跃标的被永久
+            # 跳过，动量计算判成"临时停牌"静默换仓（08-13 159768 案例）。
+            # 不写 _minute_mem/_minute_cov，也不进 _minute_empty，数据就绪后
+            # 重新加载即可取到。
+            if getattr(self, "_diag_minute", False):
+                logger.warning("[minute-diag] %s 盘中取数空(未进_minute_empty) "
+                               "lo=%s hi=%s as_of=%s", code, lo_ts, hi_eff, as_of_ts)
+            pass
         else:
+            # 历史日期取数空 → 真无数据（停牌/退市/指数等），缓存避免重复请求
             self._minute_empty.add(code)
+            if getattr(self, "_diag_minute", False):
+                logger.warning("[minute-diag] %s 历史取数空→加入_minute_empty "
+                               "lo=%s hi=%s as_of=%s", code, lo_ts, hi_eff, as_of_ts)
         return df
 
     def _load_minute_pool_from_partitions(self, codes, lo_ts, hi_ts):
@@ -872,6 +890,30 @@ class DataManager:
         # 分钟，而 _minute_cov 却记为覆盖到 15:00 → 缓存假阳性，收盘重估/补跑
         # 取到昨日价（回归：517520 补跑 8-07 取到 8-06 收盘 2.031）。
         batch = self._load_minute_pool_from_partitions(todo, lo_ts, hi_eff)
+        # 盘中实时场景：批量 get_minute 空（当日分区未落盘/内存库未填充）的标的，
+        # 用一次批量 current_snapshot 实时回源，避免逐标的单调（08-13 159768 案例）。
+        realtime_fill: dict = {}
+        if self._window_covers_today(lo_ts, hi_eff):
+            miss = [c for c in todo
+                    if (batch.get(c) is None
+                        or (hasattr(batch.get(c), "empty") and batch.get(c).empty))]
+            if miss:
+                try:
+                    realtime_fill = self.client.current_snapshot(
+                        miss, as_of=str(hi_eff or pd.Timestamp.now())) or {}
+                except Exception as e:
+                    logger.warning("[DataManager] 盘中批量实时回源失败 %s: %s",
+                                   len(miss), e)
+            if getattr(self, "_diag_minute", False):
+                logger.warning("[minute-diag] preload盘中批量: todo=%d miss=%d "
+                               "realtime_fill=%d lo=%s hi=%s",
+                               len(todo), len(miss), len(realtime_fill), lo_ts, hi_eff)
+                still_empty = [c for c in miss if c not in realtime_fill
+                               or (realtime_fill.get(c) is not None
+                                   and realtime_fill.get(c).empty)]
+                if still_empty:
+                    logger.warning("[minute-diag] preload盘中批量实时回源仍空标的: %s",
+                                   ",".join(still_empty[:20]))
         for code in todo:
             try:
                 df = batch.get(code)
@@ -887,7 +929,15 @@ class DataManager:
                         self._minute_cov[code] = (lo_ts, hi_eff)
                         loaded += 1
                         continue
-                # 批量缺失 → 回退单标的路径（保 _minute_empty 语义）
+                # 批量缺失 → 优先用批量实时回源结果，其次回退单标的路径
+                rdf = realtime_fill.get(code)
+                if rdf is not None and not rdf.empty:
+                    rdf = rdf.loc[(rdf.index >= lo_ts) & (rdf.index <= hi_eff)]
+                    if not rdf.empty:
+                        self._minute_mem[code] = rdf
+                        self._minute_cov[code] = (lo_ts, hi_eff)
+                        loaded += 1
+                        continue
                 df = self._ensure_minute_windowed(code, as_of_ts)
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     loaded += 1
@@ -1058,9 +1108,40 @@ class DataManager:
         if df is not None and not df.empty:
             self._minute_real_cov[code] = (df.index.min(), df.index.max())
             return df
+        # 盘中当日分钟暂缺（只读 get_minute 分区/内存库未就绪）→ 回退实时
+        # 回源 current_snapshot，避免活跃标的被当成"临时停牌"静默换仓
+        # （08-13 159768 案例）。仅当请求窗口覆盖"今天"（盘中实时场景）时
+        # 才回退；历史日期缺失是真无数据，走 _minute_empty 缓存。
+        if self._window_covers_today(lo_ts, hi_ts):
+            try:
+                snap = self.client.current_snapshot([code], as_of=str(hi_ts or pd.Timestamp.now()))
+            except Exception as e:
+                logger.warning("[DataManager] 盘中实时回源失败 %s: %s", code, e)
+                snap = {}
+            sdf = (snap or {}).get(code)
+            if sdf is not None and not sdf.empty:
+                self._minute_real_cov[code] = (sdf.index.min(), sdf.index.max())
+                if getattr(self, "_diag_minute", False):
+                    logger.info("[minute-diag] %s 盘中回退current_snapshot成功 "
+                                "bars=%d lo=%s hi=%s", code, len(sdf), lo_ts, hi_ts)
+                return sdf
+            if getattr(self, "_diag_minute", False):
+                logger.warning("[minute-diag] %s 盘中回退current_snapshot也空 "
+                               "lo=%s hi=%s (get_minute空+实时回源空)", code, lo_ts, hi_ts)
         if getattr(self, "_offline_missing_warn", False):
             logger.warning("[DataManager] 离线分钟缺失（网络无数据）: %s", code)
         return None
+
+    @staticmethod
+    def _window_covers_today(lo_ts, hi_ts) -> bool:
+        """请求窗口 [lo_ts, hi_ts] 是否覆盖今天（盘中实时场景判断）。
+
+        hi_ts 为空或为今天及之后 → 视为覆盖今天（实时取当日分钟）。
+        """
+        today = pd.Timestamp.now().normalize().date()
+        if hi_ts is None:
+            return True
+        return pd.Timestamp(hi_ts).normalize().date() >= today
 
     @staticmethod
     def _slice_minute(df, end_date, start_date=None):
