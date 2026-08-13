@@ -1026,22 +1026,11 @@ def is_temporarily_suspended(code, context=None):
 
 
 def get_security_info(code):
-    mgr = _state.get("manager")
-    names = _state.get("sec_names")
-    if names is None:
-        names = {}
-    if mgr and code not in names:
-        try:
-            etfs = mgr.fetch("get_etf_list")
-            if etfs:
-                for item in etfs:
-                    if isinstance(item, str):
-                        names[item] = item.split(".")[0]
-                    elif isinstance(item, dict):
-                        ts_c = item.get("ts_code", item.get("code", ""))
-                        jq_c = _ts_code_to_jq_code(ts_c)
-                        names[jq_c] = item.get("name", jq_c)
-                _state["sec_names"] = names
-        except Exception:
-            pass
-    return SimpleNamespace(display_name=names.get(code, code))
+    """返回标的简况。display_name 委托 get_security_name 的真实名称解析。
+
+    旧实现把 ts_code 当键、代码前缀当名称（string 项存 ``item.split('.')[0]``），
+    导致 ``get_security_info(c).display_name`` 常返回代码——策略 get_security_name
+    兜底（如走弱期 etf_names_dict 为空）时买卖日志/通知就显示成 ``代码(代码)``。
+    统一走 get_security_name（sec_names/jq名/网络名/etf_list 逐级解析）。
+    """
+    return SimpleNamespace(display_name=get_security_name(code))

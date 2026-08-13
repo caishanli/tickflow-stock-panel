@@ -34,10 +34,13 @@ def _resolve_name(code: str) -> str:
 
 
 class Matcher:
-    def __init__(self, stop_loss: float, account_id: str | None = None):
+    def __init__(self, stop_loss: float, account_id: str | None = None,
+                 on_stop_loss=None):
         self.stop_loss = float(stop_loss)
         # M15：account_id 非空时止损事件同时落库 sim_stop_loss 表
         self.account_id = account_id
+        # ding：止损触发回调（runner 注入 → log.notify → 钉钉）
+        self.on_stop_loss = on_stop_loss
 
     def step(self, state: dict, prices: dict, fee: float | None = None,
              stamp_tax: float | None = None, slippage: float | None = None,
@@ -85,6 +88,18 @@ class Matcher:
                 "amount": sell_amount,
                 "pnl_pct": round(pnl_pct, 4),
             })
+            if self.on_stop_loss:
+                self.on_stop_loss({
+                    "dt": state.get("dt"),
+                    "code": code,
+                    "name": _resolve_name(code),
+                    "action": "STOP_LOSS",
+                    "price": round(fill, 4),
+                    "amount": sell_amount,
+                    "pnl": round((fill - avg_cost) * sell_amount, 4),
+                    "pnl_pct": round(pnl_pct, 4),
+                    "commission": round(commission, 4),
+                })
             if self.account_id:
                 # M15：止损落库——sim_stop_loss（止损日志）与 sim_trades（成交记录）
                 # 双写，字段补全供表格展示
