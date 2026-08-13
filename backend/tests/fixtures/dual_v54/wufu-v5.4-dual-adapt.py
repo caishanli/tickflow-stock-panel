@@ -227,9 +227,9 @@ def initialize(context):
 # ==================== 定时任务 ====================
     run_daily(morning_routine, time='09:00')            # 09:00 晨间流水线：持仓检查→回撤监控→流动性阈值计算
     run_daily(check_weak_period_daily, time='09:40')    # 09:40 走弱期判断+池子更新
-    run_daily(afternoon_routine, time='13:00')          #  动量计算与排序（需早于卖出时间）         
-    run_daily(sell_routine, time='13:05')               #  卖出流水线（需早于买入时间）
-    run_daily(buy_routine, time='13:15')                #  买入流水线
+    run_daily(afternoon_routine, time='13:10')          #  动量计算与排序（需早于卖出时间）         
+    run_daily(sell_routine, time='13:10')               #  卖出流水线（需早于买入时间）
+    run_daily(buy_routine, time='13:10')                #  买入流水线
     run_daily(reset_daily_flags, time='15:10')          # 15:10 收盘流水线：重置价格缓存
     run_daily(minute_level_stop_loss, time='every_bar') # 分钟级固定止损
     
