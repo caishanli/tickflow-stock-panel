@@ -125,6 +125,11 @@ export function QuantSim() {
   const { data: accounts } = useQuery({
     queryKey: ['quant', 'sim', 'accounts'], queryFn: api.listAccounts,
     refetchInterval: view === 'list' ? 5000 : false,
+    // 列表页做监控台用：后台标签页/窗口失焦也要继续拉取，回到页面立即刷新，
+    // 否则全局 refetchOnWindowFocus=false + 默认 refetchIntervalInBackground=false
+    // 会让净值/收益率长期停留在旧值
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: true,
   })
   const { data: strategies } = useQuery({ queryKey: ['quant', 'strategies'], queryFn: api.listStrategies })
   const strategyName = useMemo(() => {
@@ -300,19 +305,19 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   // 兜底：SSE 断线/后台标签页挂起后数据可能长期缺失，10s 定时重取 + 窗口聚焦重取自愈
   const { data: st } = useQuery({
     queryKey: ['quant', 'sim', aid, 'status'], queryFn: () => api.getSimStatus(aid),
-    refetchInterval: 10_000, refetchOnWindowFocus: true,
+    refetchInterval: 10_000, refetchIntervalInBackground: true, refetchOnWindowFocus: true,
   })
   const { data: eq } = useQuery({
     queryKey: ['quant', 'sim', aid, 'equity'], queryFn: () => api.getSimEquity(aid),
-    refetchInterval: 10_000, refetchOnWindowFocus: true,
+    refetchInterval: 10_000, refetchIntervalInBackground: true, refetchOnWindowFocus: true,
   })
   const { data: tr } = useQuery({
     queryKey: ['quant', 'sim', aid, 'trades'], queryFn: () => api.getSimTrades(aid),
-    refetchInterval: 10_000, refetchOnWindowFocus: true,
+    refetchInterval: 10_000, refetchIntervalInBackground: true, refetchOnWindowFocus: true,
   })
   const { data: logs } = useQuery({
     queryKey: ['quant', 'sim', aid, 'logs'], queryFn: () => api.getSimLogs(aid),
-    refetchInterval: 10_000, refetchOnWindowFocus: true,
+    refetchInterval: 10_000, refetchIntervalInBackground: true, refetchOnWindowFocus: true,
   })
   const { data: nameSource } = useQuery({
     queryKey: ['quant', 'sim', 'name-source'], queryFn: () => api.getSimNameSource(),
