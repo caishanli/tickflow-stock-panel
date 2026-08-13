@@ -1,411 +1,717 @@
-# 模拟盘持仓/成交行点击弹窗 + 分时买卖标识 Implementation Plan
+# 量化专用交易弹窗（模拟盘/回测共用，单图+分钟/日线/周线）Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 量化模拟盘详情页持仓/成交记录行点击后，弹出与自选股一致的 `StockPreviewDialog`，分时图（当天分析线）上按交易时刻显示 B/S/止损 标记。
+**Goal:** 新建 `QuantTradeDialog`（单图 + 分钟/日线/周线切换）供量化模拟盘与量化回测使用；回滚共享弹窗的改动；回测 `TradeKlineModal` 替换为 `QuantTradeDialog`。
 
-**Architecture:** 纯前端。新增可选 props 沿 `StockPreviewDialog → StockPanel → StockIntradayChart → EChartsIntraday` 透传；`EChartsIntraday` 价格序列加 `markPoint` 渲染买卖标记（date 感知，仅当分时显示该标记所属日期时渲染）。`QuantSim.SimDetail` 维护 preview state，行点击组装标记数据。
+**Architecture:** 纯前端。新弹窗复制自选股弹窗壳 + 信息条/加自选/加监控逻辑，图表区为视图切换器 + 单图；周线为 `StockDailyKChart` 前端聚合日K（新增可选 `period` prop）；`StockPanel`/`StockPreviewDialog` 恢复 44a5ae5 之前状态；保留 `EChartsIntraday.markers`/`StockIntradayChart.markers`（分钟视图 B/S 标记已实现）。
 
 **Tech Stack:** React 18 + TS + Vite + ECharts 5 + @tanstack/react-query。无前端测试框架。
 
 ## Global Constraints
 
 - 后端零改动；不新增依赖。
-- 所有新增 props 均为**可选**，不破坏现有调用方（Watchlist/Screener/Indices 等）。
-- 标记时间用本地时间 `HH:MM` 直接定位分时 242 点全天轴（`FULL_DAY_TIMES`），无时区换算。
-- 标记只在分时当前 `date` 与标记 `date` 相同时渲染；标记时刻分钟数据 close 为 null（停牌/无成交）时过滤。
-- `pnpm lint` 当前**不可用**（无 eslint 配置文件，预存在问题）。验证门禁 = `pnpm build`（`tsc -b && vite build`），在 `frontend/` 目录执行。
+- **不修改其它弹窗逻辑**：`StockPanel`/`StockPreviewDialog` 恢复 44a5ae5 之前状态（用 `git checkout 44a5ae5^ -- <file>` 取原版）。
+- 保留：`StockIntradayChart.markers`、`EChartsIntraday.markers`（含 fail-closed date 契约 `if (m.date !== chartDate) continue`）。
+- 视图切换器按钮文案：分钟 / 日线 / 周线；默认视图 `'daily'`，模拟盘传 `initialView="minute"`。
+- 周K聚合：ISO 周（周一为一周首），日期标签为周首日，**本地日期手拼 `YYYY-MM-DD`（禁止 `toISOString().slice(0,10)`，时区会偏一天）**。
+- 分钟视图无数据沿用现有提示；标记时间 `HH:MM` 直接定位 242 点全天轴（无时区换算）。
+- 验证门禁 = `cd frontend && pnpm build`（tsc -b + vite build）。`pnpm lint` 不可用（无 eslint 配置，预存在问题，不算缺陷）。前端无测试框架，本计划不写单测（验证靠 tsc + 构建）。
 - 每次任务结束提交一个 commit；不提交 dist、data、node_modules。
 
 ---
 
-### Task 1: EChartsIntraday 买卖标记渲染
+### Task 1: 共享弹窗回滚（StockPanel / StockPreviewDialog）
 
 **Files:**
-- Modify: `frontend/src/components/EChartsIntraday.tsx`
+- Restore: `frontend/src/components/StockPanel.tsx`
+- Restore: `frontend/src/components/StockPreviewDialog.tsx`
 
 **Interfaces:**
-- Produces: `export interface IntradayMarker { date: string; time: string; price: number; action: 'BUY' | 'SELL' | 'STOP_LOSS' }`（本文件导出，后续任务引用）；`EChartsIntraday` 新增 prop `markers?: IntradayMarker[]`。
+- Consumes: 无（这两个文件恢复原状；`StockIntradayChart.markers` 与 `EChartsIntraday.markers` 保留不动）。
+- Produces: 无。
 
-- [ ] **Step 1: 新增 `IntradayMarker` 类型与 `markers` prop**
+- [ ] **Step 1: 恢复原版文件**
 
-在 `THEME` 常量定义（第 16 行附近）之后插入：
-
-```ts
-export interface IntradayMarker {
-  /** 标记所属交易日 YYYY-MM-DD，仅在分时显示该日时渲染 */
-  date: string
-  /** 交易时刻 HH:MM（本地时间，直接定位全天 242 点时间轴） */
-  time: string
-  /** 成交价（持仓行用成本价） */
-  price: number
-  action: 'BUY' | 'SELL' | 'STOP_LOSS'
-}
-```
-
-在 `Props` interface（第 18-27 行）末尾加：
-
-```ts
-  markers?: IntradayMarker[]
-```
-
-在组件签名（第 402 行 `export function EChartsIntraday({...}: Props)`）解构中加 `markers`：
-
-```ts
-export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimit, onPriceHover, showLimitLines = true, showAvgLine = true, markers }: Props) {
-```
-
-- [ ] **Step 2: 新增 `buildMarkerPoints` 辅助函数**
-
-放在 `fmtAmt`（第 49-53 行）之后：
-
-```ts
-/** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交 */
-function buildMarkerPoints(
-  markers: IntradayMarker[] | undefined,
-  chartDate: string | undefined,
-  closes: (number | null)[],
-  timeIndexMap: Map<string, number>,
-): any[] {
-  if (!markers || markers.length === 0) return []
-  const out: any[] = []
-  for (const m of markers) {
-    if (chartDate && m.date !== chartDate) continue
-    const idx = timeIndexMap.get(m.time)
-    if (idx === undefined || !isValidPrice(closes[idx])) continue
-    const stop = m.action === 'STOP_LOSS'
-    const buy = m.action === 'BUY'
-    out.push({
-      coord: [idx, m.price],
-      symbol: stop ? 'circle' : 'triangle',
-      symbolSize: stop ? 17 : 12,
-      symbolRotate: buy ? 0 : 180,
-      itemStyle: { color: stop ? '#F59E0B' : buy ? '#C74040' : '#2D9B65', borderColor: '#FFFFFF', borderWidth: 0.5 },
-      label: {
-        show: true,
-        position: 'inside',
-        color: '#FFFFFF',
-        fontSize: 7,
-        fontWeight: 'bold',
-        formatter: stop ? '止损' : buy ? 'B' : 'S',
-      },
-    })
-  }
-  return out
-}
-```
-
-- [ ] **Step 3: `buildOption` 接入标记**
-
-`buildOption` 签名（第 104 行）末尾追加两参：
-
-```ts
-function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgPrices: number[], lineColor: string, areaColor: string, yMode: YMode, ct: ChartTheme, priceLimit?: PriceLimitInfo, showLimitLines = true, showAvgLine = true, chartDate?: string, markers?: IntradayMarker[]): EChartsOption {
-```
-
-在数据映射 for 循环结束后（第 129 行 `}` 之后、`const areaStyle` 之前）插入：
-
-```ts
-  const markerPoints = buildMarkerPoints(markers, chartDate, closes, timeIndexMap)
-```
-
-价格序列（第 367-379 行对象）在 `markLine` 行之后加 `markPoint`：
-
-```ts
-        markLine: markLineData.length > 0 ? { symbol: 'none', data: markLineData, animation: false, silent: true } : undefined,
-        markPoint: markerPoints.length > 0 ? { data: markerPoints, animation: false, silent: true } : undefined,
-```
-
-- [ ] **Step 4: setOption 调用与 effect 依赖更新**
-
-第 491 行 `chart.setOption(...)` 调用末尾追加两参并把 `date, markers` 加入依赖数组：
-
-```ts
-      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), true)
-```
-
-第 495 行 effect 依赖数组改为：
-
-```ts
-  }, [data, prevClose, height, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers])
-```
-
-- [ ] **Step 5: 验证**
-
-Run: `cd frontend && pnpm build`
-Expected: `tsc -b` 与 `vite build` 均通过，无类型错误。
-
-- [ ] **Step 6: Commit**
+Run（从仓库根目录）：
 
 ```bash
-git add frontend/src/components/EChartsIntraday.tsx
-git commit -m "feat(intraday): 分时图支持买卖标记 markPoint (B/S/止损)"
+git checkout 44a5ae5^ -- frontend/src/components/StockPanel.tsx frontend/src/components/StockPreviewDialog.tsx
+git status --short
+```
+
+Expected: 两个文件显示为 Modified（内容回到 44a5ae5 之前），`EChartsIntraday.tsx`/`StockIntradayChart.tsx` 无改动。
+
+- [ ] **Step 2: 确认回滚干净**
+
+Run: `git diff --stat`
+Expected: 仅这 2 个文件；`git diff frontend/src/components/StockPanel.tsx` 中不再有 `initialDate`/`intradayMarkers`/`initialApplied`；`StockPreviewDialog.tsx` 不再有 `initialIntraday`/`intradayMarkers`/分时重置 effect（恢复为只有 `useState(false)` 的分时开关 + 头部「分时」按钮）。
+
+- [ ] **Step 3: 验证构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 通过，无类型错误（QuantSim 此时仍引用 `initialIntraday`/`intradayMarkers` props 会报错——见 Step 4 说明）。
+
+注意：Task 1 提交后到 Task 4 完成前，`QuantSim.tsx` 对已删除 props 的引用会让 `pnpm build` 失败。**本任务验证以「tsc 仅报 QuantSim.tsx 相关 props 缺失错误、无其它错误」为准**；若 `pnpm build` 失败仅因 QuantSim.tsx 引用已删 props，视为通过。
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add frontend/src/components/StockPanel.tsx frontend/src/components/StockPreviewDialog.tsx
+git commit -m "refactor(stock): 回滚共享弹窗改动 — StockPanel/StockPreviewDialog 恢复原状"
 ```
 
 ---
 
-### Task 2: 弹窗组件链透传可选 props
+### Task 2: StockDailyKChart 周线聚合（period prop）
 
 **Files:**
-- Modify: `frontend/src/components/StockIntradayChart.tsx`
-- Modify: `frontend/src/components/StockPanel.tsx`
-- Modify: `frontend/src/components/StockPreviewDialog.tsx`
+- Modify: `frontend/src/components/StockDailyKChart.tsx`
 
 **Interfaces:**
-- Consumes: `IntradayMarker`（Task 1 从 `EChartsIntraday` 导出）。
-- Produces: `StockPreviewDialog` 新增可选 props `initialDate?: string`、`initialIntraday?: boolean`（默认 false）、`intradayMarkers?: IntradayMarker[]`。
+- Produces: `export function aggregateWeekly(rows: KlineRow[]): KlineRow[]`；`StockDailyKChart` 新增可选 prop `period?: 'daily' | 'weekly'`（默认 `'daily'`）。
 
-- [ ] **Step 1: StockIntradayChart 透传 `markers`**
+- [ ] **Step 1: 新增 `aggregateWeekly` 导出函数**
 
-`frontend/src/components/StockIntradayChart.tsx`：
-
-```ts
-import { EChartsIntraday, type IntradayMarker } from '@/components/EChartsIntraday'
-```
-
-（第 6 行 import 改为上式，`EChartsIntraday` 值导入保留、追加类型导入。）
-
-`Props` interface 末尾加：
+放在 `toOHLC` 函数之后：
 
 ```ts
-  /** 分时图买卖标记 (date 感知) */
-  markers?: IntradayMarker[]
-```
-
-组件签名解构加 `markers`，`EChartsIntraday` 调用（第 112-119 行）追加：
-
-```ts
-        <EChartsIntraday
-          data={minuteRows}
-          height={height}
-          prevClose={prevClose}
-          date={date}
-          priceLimit={minute.data?.price_limit ?? undefined}
-          onPriceHover={onPriceHover}
-          markers={markers}
-        />
-```
-
-- [ ] **Step 2: StockPanel 新增 `intradayMarkers` + `initialDate`**
-
-`frontend/src/components/StockPanel.tsx` 第 8 行 import 后追加：
-
-```ts
-import type { IntradayMarker } from '@/components/EChartsIntraday'
-```
-
-`Props` interface（第 16-37 行）追加两字段：
-
-```ts
-  /** 分时图买卖标记 (date 感知: 仅分时显示该日时渲染) */
-  intradayMarkers?: IntradayMarker[]
-  /** 初始选中的日期 (rows 就绪后优先选中, 仅应用一次) */
-  initialDate?: string
-```
-
-组件签名（第 41-57 行）解构加 `intradayMarkers` 与 `initialDate`。
-
-`StockIntradayChart` 调用（第 157-165 行）追加 `markers={intradayMarkers}`。
-
-在「分时开启且无选中日期时自动选中最新日期」effect（第 106-110 行）之后新增：
-
-```ts
-  // 初始选中日期: rows 就绪后优先选中 initialDate (在 rows 内则选中, 否则回退最新),
-  // 仅应用一次防止覆盖用户手动点选; symbol 变化时重置
-  const initialApplied = useRef(false)
-  useEffect(() => {
-    if (initialDate && !initialApplied.current && rows.length > 0) {
-      initialApplied.current = true
-      const target = rows.find(r => r.date === initialDate) ?? rows[rows.length - 1]
-      setSelectedDate(target.date)
+/** 日K行按 ISO 周(周一为首)聚合为周K: 开=周首开/高=周内最高/低=周内最低/收=周末收(不足一周按实际)/量额求和, 周均线重算, 副图指标置 null */
+export function aggregateWeekly(rows: KlineRow[]): KlineRow[] {
+  const weeks = new Map<string, KlineRow>()
+  for (const r of rows) {
+    const date = typeof r.date === 'string' ? r.date.slice(0, 10) : String(r.date)
+    const d = new Date(`${date}T00:00:00`)
+    if (Number.isNaN(d.getTime())) continue
+    const dow = (d.getDay() + 6) % 7 // Mon=0
+    const start = new Date(d)
+    start.setDate(d.getDate() - dow)
+    // 本地日期手拼 (toISOString 会因时区偏一天)
+    const key = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`
+    const cur = weeks.get(key)
+    if (!cur) {
+      weeks.set(key, {
+        ...r, date: key,
+        open: r.open, high: r.high, low: r.low, close: r.close,
+        volume: r.volume ?? 0, amount: r.amount ?? 0,
+      })
+    } else {
+      cur.high = Math.max(Number(cur.high), Number(r.high))
+      cur.low = Math.min(Number(cur.low), Number(r.low))
+      cur.close = r.close
+      cur.volume = Number(cur.volume ?? 0) + Number(r.volume ?? 0)
+      cur.amount = Number(cur.amount ?? 0) + Number(r.amount ?? 0)
     }
-  }, [initialDate, rows])
+  }
+  const sorted = Array.from(weeks.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)))
+  const closes = sorted.map((r) => Number(r.close))
+  const ma = (n: number, i: number) =>
+    i + 1 < n ? null : closes.slice(i + 1 - n, i + 1).reduce((s, v) => s + v, 0) / n
+  return sorted.map((r, i) => ({
+    ...r,
+    ma5: ma(5, i), ma10: ma(10, i), ma20: ma(20, i), ma60: ma(60, i),
+    macd_dif: null, macd_dea: null, macd_hist: null,
+    rsi_6: null, rsi_14: null, rsi_24: null,
+    kdj_k: null, kdj_d: null, kdj_j: null,
+    boll_upper: null, boll_lower: null,
+  }))
+}
 ```
 
-在 symbol 变化重置 effect（第 96-103 行）体内加一行 `initialApplied.current = false`。
+- [ ] **Step 2: Props 增加 `period` 并接入渲染**
 
-- [ ] **Step 3: StockPreviewDialog 新增三可选 props**
-
-`frontend/src/components/StockPreviewDialog.tsx` 第 8 行后追加：
+`Props` interface（约第 56 行 `extColumns?: string` 之后）加：
 
 ```ts
-import type { IntradayMarker } from '@/components/EChartsIntraday'
+  /** 聚合周期: daily=日K(默认) / weekly=按ISO周聚合 */
+  period?: 'daily' | 'weekly'
 ```
 
-`Props` interface（第 14-26 行）`triggerInfo` 之后追加：
+组件签名解构加 `period = 'daily'`。
+
+`const rows = useMemo(() => toOHLC(kline.data?.rows ?? []), [kline.data?.rows])`（约第 151 行）替换为：
 
 ```ts
-  /** 初始选中日期 (模拟盘成交行直接定位交易当日) */
-  initialDate?: string
-  /** 初始分时开关状态 (默认 false = 自选股原行为) */
-  initialIntraday?: boolean
-  /** 分时图买卖标识 */
-  intradayMarkers?: IntradayMarker[]
+  const dailyRows = kline.data?.rows ?? []
+  const displayRows = useMemo(
+    () => period === 'weekly' ? aggregateWeekly(dailyRows) : dailyRows,
+    [period, dailyRows],
+  )
+  const rows = useMemo(() => toOHLC(displayRows), [displayRows])
 ```
 
-组件签名解构加三 props（`initialIntraday = false` 默认值）：
+`const limitMarkers = useMemo(() => buildLimitUpMarkers(kline.data?.rows ?? []), [kline.data?.rows])`（约第 152 行）替换为（涨跌停标记永远基于日K，周K日期为周首不匹配）：
 
 ```ts
-export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, initialDate, initialIntraday = false, intradayMarkers }: Props) {
+  const limitMarkers = useMemo(() => buildLimitUpMarkers(dailyRows), [dailyRows])
 ```
 
-在 ESC 关闭 effect（第 64-72 行）附近新增（切股不卸载弹窗，需手动同步分时开关）：
+`onDataChange` 的 effect（`{ rows, rawRows: kline.data?.rows ?? [], ... }`）保持不变（rawRows 仍为日K行，供信息条/昨收/选中日期使用）。
 
-```ts
-  // symbol 切换时重置分时开关到 initialIntraday (弹窗跨股复用不卸载)
-  useEffect(() => {
-    setShowIntraday(initialIntraday)
-  }, [symbol]) // eslint-disable-line react-hooks/exhaustive-deps
-```
-
-`StockPanel` 调用（第 256-266 行）追加两 props：
+JSX 中 `showIndicatorControls && rows.length > 0`（约第 172 行）替换为：
 
 ```tsx
-              <StockPanel
+      {showIndicatorControls && period !== 'weekly' && rows.length > 0 && (
+```
+
+（周线隐藏指标控制按钮，避免 macd/rsi/kdj/boll 为 null 时副图渲染异常。）
+
+- [ ] **Step 3: 验证构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 通过，无类型错误。
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add frontend/src/components/StockDailyKChart.tsx
+git commit -m "feat(kline): 日K周K前端聚合 — StockDailyKChart 支持 period=weekly"
+```
+
+---
+
+### Task 3: QuantTradeDialog 新组件（单图 + 分钟/日线/周线）
+
+**Files:**
+- Create: `frontend/src/components/QuantTradeDialog.tsx`
+
+**Interfaces:**
+- Consumes: `StockInfoBar`、`StockDailyKChart`（Task 2 的 `period`）、`StockIntradayChart`（`markers` prop）、`DatePicker`、`RuleEditor`、`IntradayMarker`（`EChartsIntraday` 导出）、`ChartMarker`/`ChartPriceLine`/`ChartRange`（`EChartsCandlestick` 导出）。
+- Produces: `export type QuantViewMode = 'minute' | 'daily' | 'weekly'`；`QuantTradeDialog`（props 见下）。
+
+- [ ] **Step 1: 创建完整组件**
+
+创建 `frontend/src/components/QuantTradeDialog.tsx`，内容如下（整文件）：
+
+```tsx
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AnimatePresence, motion } from 'framer-motion'
+import { RefreshCw, X } from 'lucide-react'
+import { api } from '@/lib/api'
+import { QK } from '@/lib/queryKeys'
+import { StockInfoBar } from '@/components/StockInfoBar'
+import { StockDailyKChart, getDefaultRange, type StockDailyKChartResult } from '@/components/StockDailyKChart'
+import { StockIntradayChart } from '@/components/StockIntradayChart'
+import { DatePicker } from '@/components/DatePicker'
+import { RuleEditor } from '@/components/monitor/RuleEditor'
+import { useCapabilities, usePreferences, useQuoteStatus } from '@/lib/useSharedQueries'
+import { useFinancialMetrics } from '@/lib/useFinancials'
+import { setFocusSymbol, clearFocusSymbol } from '@/lib/useQuoteStream'
+import { loadInfoFields, saveInfoFields, buildInfoExtColumnsParam, type ColumnConfig } from '@/lib/stock-info-fields'
+import type { ChartMarker, ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
+import type { IntradayMarker } from '@/components/EChartsIntraday'
+
+/** 视图模式: 分钟(当天分钟线) / 日线 / 周线 */
+export type QuantViewMode = 'minute' | 'daily' | 'weekly'
+
+// 预设快捷范围
+const PRESETS: { label: string; months: number }[] = [
+  { label: '半年', months: 6 },
+  { label: '1年', months: 12 },
+]
+
+const VIEW_LABEL: Record<QuantViewMode, string> = { minute: '分钟', daily: '日线', weekly: '周线' }
+
+function boardTag(symbol: string): { label: string; color: string } | null {
+  if (/^(300|301)/.test(symbol)) return { label: '创', color: 'text-[#f97316] bg-[#f97316]/12 border-[#f97316]/25' }
+  if (/^688/.test(symbol))       return { label: '科', color: 'text-purple-400 bg-purple-400/12 border-purple-400/25' }
+  if (/^[48]/.test(symbol))      return { label: '北', color: 'text-cyan-400 bg-cyan-400/12 border-cyan-400/25' }
+  return null
+}
+
+interface Props {
+  symbol: string | null
+  name?: string
+  onClose: () => void
+  /** 初始视图 (默认日线; 模拟盘传 minute) */
+  initialView?: QuantViewMode
+  /** 分钟视图初始选中日期 (成交行 = 交易当日) */
+  initialDate?: string
+  /** 外部日期范围 (回测按持仓区间传入) */
+  dateRange?: { start: string; end: string }
+  /** 日线视图标记 (回测成交标记) */
+  markers?: ChartMarker[]
+  /** 日线视图区间 (回测持仓区间) */
+  ranges?: ChartRange[]
+  /** 日线视图价格线 (回测买入价/卖出价) */
+  priceLines?: ChartPriceLine[]
+  /** 分钟视图买卖标记 (date 感知, 仅分钟视图渲染) */
+  intradayMarkers?: IntradayMarker[]
+  /** 日线视图涨跌停标记 (默认显示; 回测传 false) */
+  showLimitMarkers?: boolean
+  /** 日线视图标记开关按钮 (默认显示; 回测传 false) */
+  showMarkerToggle?: boolean
+}
+
+export function QuantTradeDialog({
+  symbol, name, onClose, initialView = 'daily', initialDate,
+  dateRange: externalDateRange, markers, ranges, priceLines,
+  intradayMarkers, showLimitMarkers = true, showMarkerToggle = true,
+}: Props) {
+  const qc = useQueryClient()
+  const [view, setView] = useState<QuantViewMode>(initialView)
+  const [selectedDate, setSelectedDate] = useState<string | null>(null)
+  const [dateRange, setDateRange] = useState<{ start: string; end: string }>(externalDateRange ?? getDefaultRange())
+  const [showMonitorEditor, setShowMonitorEditor] = useState(false)
+  const [dailyResult, setDailyResult] = useState<StockDailyKChartResult | null>(null)
+  const [fields, setFields] = useState<ColumnConfig[]>(loadInfoFields)
+  const extColumns = useMemo(() => buildInfoExtColumnsParam(fields), [fields])
+
+  // ESC 关闭
+  useEffect(() => {
+    if (!symbol) return
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [symbol, onClose])
+
+  // 焦点股票注册: SSE 实时 invalidate 当前股票日K
+  useEffect(() => {
+    if (!symbol) return
+    setFocusSymbol(symbol)
+    return () => clearFocusSymbol()
+  }, [symbol])
+
+  // symbol 切换(弹窗不卸载复用)时重置视图/日期, 重新应用 initialDate
+  const prevSymbol = useRef<string | null>(symbol)
+  const initialApplied = useRef(false)
+  useEffect(() => {
+    if (prevSymbol.current === symbol) return
+    prevSymbol.current = symbol
+    setView(initialView)
+    setSelectedDate(null)
+    setDailyResult(null)
+    initialApplied.current = false
+  }, [symbol, initialView])
+
+  // 加自选
+  const watchlist = useQuery({ queryKey: QK.watchlist, queryFn: api.watchlistList, enabled: !!symbol })
+  const inWatchlist = (watchlist.data?.symbols ?? []).some((s: any) => s.symbol === symbol)
+  const toggleWatchlist = useMutation({
+    mutationFn: () => inWatchlist ? api.watchlistRemove(symbol!) : api.watchlistAdd(symbol!),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK.watchlist })
+      qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
+    },
+  })
+
+  // 信息条指标配置 + 财务指标
+  const handleFieldsChange = useCallback((next: ColumnConfig[]) => {
+    setFields(next)
+    saveInfoFields(next)
+  }, [])
+  const { data: caps } = useCapabilities()
+  const hasFinancialCap = !!caps?.capabilities?.['financial']
+  const hasFinanceField = useMemo(
+    () => fields.some(f => f.visible && f.source.type === 'builtin'
+      && ['eps', 'bps', 'roe', 'pe_ttm', 'pb', 'gross_margin', 'net_margin', 'debt_ratio', 'revenue_yoy', 'net_income_yoy'].includes(f.source.key)),
+    [fields],
+  )
+  const financials = useFinancialMetrics(hasFinanceField && hasFinancialCap ? symbol : undefined)
+
+  // 分钟视图轮询偏好 (与自选股弹窗一致)
+  const { data: prefs } = usePreferences()
+  const { data: quoteStatus } = useQuoteStatus()
+  const realtimeRunning = quoteStatus?.running ?? false
+  const intradayRefreshOn = prefs?.minute_intraday_refresh ?? false
+  const intradayRefetchMs = (intradayRefreshOn && realtimeRunning)
+    ? (prefs?.minute_intraday_refresh_interval ?? 6) * 1000
+    : undefined
+
+  const rawRows: any[] = dailyResult?.rawRows ?? []
+
+  // initialDate: 日K rows 就绪后优先选中 (仅应用一次, 不在 rows 内回退最新)
+  useEffect(() => {
+    if (initialDate && !initialApplied.current && rawRows.length > 0) {
+      initialApplied.current = true
+      const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
+      setSelectedDate(target ? initialDate : String(rawRows[rawRows.length - 1].date).slice(0, 10))
+    }
+  }, [initialDate, rawRows])
+
+  // 分钟视图无选中日期时自动选中最新交易日
+  useEffect(() => {
+    if (view === 'minute' && !selectedDate && rawRows.length > 0) {
+      setSelectedDate(String(rawRows[rawRows.length - 1].date).slice(0, 10))
+    }
+  }, [view, selectedDate, rawRows])
+
+  // 分钟视图昨收 = 选中日的前一交易日收盘
+  const selectedIdx = selectedDate
+    ? rawRows.findIndex((r: any) => String(r.date).slice(0, 10) === selectedDate)
+    : -1
+  const prevClose = selectedIdx > 0
+    ? Number(rawRows[selectedIdx - 1].close)
+    : rawRows.length >= 2
+      ? Number(rawRows[rawRows.length - 2].close)
+      : undefined
+
+  const handleRefresh = () => {
+    if (!symbol) return
+    qc.invalidateQueries({ queryKey: ['kline', symbol!] })
+    if (view === 'minute') {
+      qc.invalidateQueries({ queryKey: ['kline-minute', symbol!] })
+    }
+  }
+
+  return (
+    <AnimatePresence>
+      {symbol && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          {/* 遮罩 */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={onClose}
+          />
+
+          {/* 弹窗主体 */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.97, y: 8 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            className="relative w-[92vw] max-w-[1100px] max-h-[95vh] rounded-card border border-border bg-base shadow-2xl overflow-hidden flex flex-col"
+          >
+            {/* 顶栏 */}
+            <div className="flex items-center justify-between px-5 py-3 border-b border-border shrink-0">
+              <div className="flex items-center gap-2">
+                {(() => {
+                  const board = symbol ? boardTag(symbol) : null
+                  return board ? (
+                    <span className={`inline-flex items-center justify-center w-[18px] h-[18px] rounded text-[9px] font-bold leading-none border ${board.color}`}>
+                      {board.label}
+                    </span>
+                  ) : null
+                })()}
+                <span className="font-mono text-sm font-medium text-foreground">{symbol}</span>
+                {name && <span className="text-xs text-muted">{name}</span>}
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                {PRESETS.map(p => {
+                  const now = new Date()
+                  const s = new Date(now)
+                  s.setMonth(s.getMonth() - p.months)
+                  const expected = s.toISOString().slice(0, 10)
+                  const isActive = dateRange.start === expected
+                  return (
+                    <button
+                      key={p.label}
+                      onClick={() => {
+                        const end = new Date().toISOString().slice(0, 10)
+                        const ns = new Date()
+                        ns.setMonth(ns.getMonth() - p.months)
+                        setDateRange({ start: ns.toISOString().slice(0, 10), end })
+                      }}
+                      className={`h-6 px-1.5 rounded text-[11px] transition-colors cursor-pointer
+                        ${isActive
+                          ? 'bg-accent/20 text-accent font-medium border border-accent/30'
+                          : 'text-muted hover:text-foreground hover:bg-elevated border border-transparent'
+                        }`}
+                    >
+                      {p.label}
+                    </button>
+                  )
+                })}
+                <DatePicker
+                  value={dateRange.start}
+                  onChange={(v) => setDateRange(prev => ({ ...prev, start: v }))}
+                  max={dateRange.end}
+                />
+                <span className="text-muted/40 text-[10px]">~</span>
+                <DatePicker
+                  value={dateRange.end}
+                  onChange={(v) => setDateRange(prev => ({ ...prev, end: v }))}
+                  min={dateRange.start}
+                />
+
+                <span className="text-muted/20 mx-0.5">|</span>
+
+                <button
+                  onClick={handleRefresh}
+                  className="p-1 rounded-btn text-secondary hover:text-foreground hover:bg-elevated transition-colors"
+                  title="刷新"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                </button>
+
+                <button
+                  onClick={onClose}
+                  className="p-1 rounded-btn text-secondary hover:text-foreground hover:bg-elevated transition-colors"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* 内容 */}
+            <div className="flex-1 overflow-auto p-4">
+              <StockInfoBar
                 symbol={symbol}
-                height={420}
-                showIntraday={showIntraday}
-                onSelectDate={() => { if (!showIntraday) setShowIntraday(true) }}
-                dateRange={dateRange}
+                name={dailyResult?.name}
+                stockInfo={dailyResult?.stockInfo}
+                rows={rawRows}
+                fields={fields}
+                onFieldsChange={handleFieldsChange}
+                financialMetrics={financials.data?.data?.[0]}
                 onMonitor={() => setShowMonitorEditor(true)}
                 inWatchlist={inWatchlist}
                 onToggleWatchlist={() => toggleWatchlist.mutate()}
-                refetchIntervalMs={intradayRefetchMs}
-                initialDate={initialDate}
-                intradayMarkers={intradayMarkers}
               />
+
+              {/* 视图切换器 */}
+              <div className="flex items-center gap-1 mt-2 mb-1">
+                {(Object.keys(VIEW_LABEL) as QuantViewMode[]).map(m => (
+                  <button
+                    key={m}
+                    onClick={() => setView(m)}
+                    className={`px-3 h-7 rounded-btn text-xs cursor-pointer transition-colors ${
+                      view === m ? 'bg-accent text-white' : 'bg-elevated text-muted hover:text-foreground'
+                    }`}
+                  >
+                    {VIEW_LABEL[m]}
+                  </button>
+                ))}
+              </div>
+
+              {view === 'daily' && (
+                <StockDailyKChart
+                  symbol={symbol}
+                  height={420}
+                  dateRange={dateRange}
+                  markers={markers}
+                  ranges={ranges}
+                  priceLines={priceLines}
+                  showLimitMarkers={showLimitMarkers}
+                  showMarkerToggle={showMarkerToggle}
+                  onDateClick={(d) => setSelectedDate(d)}
+                  onDataChange={setDailyResult}
+                  visibleBars={60}
+                  extColumns={extColumns}
+                />
+              )}
+              {view === 'weekly' && (
+                <StockDailyKChart
+                  symbol={symbol}
+                  height={420}
+                  dateRange={dateRange}
+                  period="weekly"
+                  showLimitMarkers={false}
+                  showIndicatorControls={false}
+                  onDateClick={(d) => setSelectedDate(d)}
+                  onDataChange={setDailyResult}
+                  visibleBars={120}
+                  extColumns={extColumns}
+                />
+              )}
+              {view === 'minute' && selectedDate && (
+                <StockIntradayChart
+                  symbol={symbol}
+                  date={selectedDate}
+                  height={420}
+                  prevClose={prevClose}
+                  markers={intradayMarkers}
+                  refetchIntervalMs={intradayRefetchMs}
+                />
+              )}
+              {view === 'minute' && !selectedDate && (
+                <div className="h-[420px] grid place-items-center text-xs text-muted">
+                  加载中…
+                </div>
+              )}
+            </div>
+
+            {/* 加监控编辑器弹层 */}
+            <AnimatePresence>
+              {showMonitorEditor && symbol && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="absolute inset-0 z-20 flex items-start justify-center overflow-auto bg-black/40 p-4"
+                  onClick={() => setShowMonitorEditor(false)}
+                >
+                  <div className="mt-8 w-full max-w-2xl" onClick={e => e.stopPropagation()}>
+                    <RuleEditor
+                      rule={null}
+                      simple
+                      preset={{
+                        scope: 'symbols',
+                        symbols: [symbol],
+                        type: 'signal',
+                        logic: 'or',
+                      }}
+                      onClose={() => setShowMonitorEditor(false)}
+                      onSaved={() => setShowMonitorEditor(false)}
+                    />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  )
+}
 ```
 
-- [ ] **Step 4: 验证**
+- [ ] **Step 2: 验证构建**
 
 Run: `cd frontend && pnpm build`
-Expected: 通过，无类型错误（新增 props 均为可选，现有调用方不受影响）。
+Expected: 通过，无类型错误。
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add frontend/src/components/StockIntradayChart.tsx frontend/src/components/StockPanel.tsx frontend/src/components/StockPreviewDialog.tsx
-git commit -m "feat(stock): 弹窗组件链透传 initialDate/initialIntraday/intradayMarkers 可选 props"
+git add frontend/src/components/QuantTradeDialog.tsx
+git commit -m "feat(dialog): 量化专用交易弹窗 QuantTradeDialog — 单图+分钟/日线/周线切换"
 ```
 
 ---
 
-### Task 3: QuantSim 行点击弹出分析窗口
+### Task 4: QuantSim 换弹窗 + 回测替换 TradeKlineModal
 
 **Files:**
 - Modify: `frontend/src/quant/pages/QuantSim.tsx`
+- Modify: `frontend/src/pages/backtest/StrategyBacktest.tsx`
+- Delete: `frontend/src/pages/backtest/components/TradeKlineModal.tsx`
 
 **Interfaces:**
-- Consumes: `StockPreviewDialog`（Task 2，新 props `initialDate`/`initialIntraday`/`intradayMarkers`）、`IntradayMarker`（Task 1）。
+- Consumes: `QuantTradeDialog` + `QuantViewMode`（Task 3）。
 
-- [ ] **Step 1: 引入组件与类型 + 工具函数**
+- [ ] **Step 1: QuantSim 换用 QuantTradeDialog**
 
-`frontend/src/quant/pages/QuantSim.tsx` 第 7 行 import 区追加：
-
-```ts
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
-import type { IntradayMarker } from '@/components/EChartsIntraday'
-```
-
-在文件顶部工具函数区（`fmtStopLoss` 之后）追加：
+`frontend/src/quant/pages/QuantSim.tsx` 中把 `import { StockPreviewDialog } from '@/components/StockPreviewDialog'` 替换为：
 
 ```ts
-/** 从 "YYYY-MM-DD HH:MM:SS"（可省略秒）提取日期 + HH:MM，供分时标记定位 */
-function parseTradeTime(ts: unknown): { date: string; time: string } | null {
-  const s = String(ts ?? '')
-  const m = s.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})/)
-  return m ? { date: m[1], time: m[2] } : null
-}
-
-function toMarkerAction(action: unknown): IntradayMarker['action'] {
-  const a = String(action).toUpperCase()
-  if (a === 'BUY') return 'BUY'
-  if (a === 'STOP_LOSS') return 'STOP_LOSS'
-  return 'SELL'
-}
+import { QuantTradeDialog } from '@/components/QuantTradeDialog'
 ```
 
-- [ ] **Step 2: SimDetail 增加 preview state**
-
-`SimDetail` 函数内 `const [tab, setTab] = useState<...>('trades')` 附近新增：
-
-```ts
-  const [preview, setPreview] = useState<{ symbol: string; name: string; date?: string; markers: IntradayMarker[] } | null>(null)
-```
-
-- [ ] **Step 3: 持仓行点击**
-
-持仓表行（第 693 行 `<tr key={sym} className="border-t border-border/60">`）改为：
-
-```tsx
-                      <tr key={sym}
-                        onClick={() => {
-                          const t = parseTradeTime(p.entry_ts)
-                          setPreview({
-                            symbol: sym,
-                            name: p.name ?? '',
-                            markers: t && Number(p.avg_cost) > 0
-                              ? [{ date: t.date, time: t.time, price: Number(p.avg_cost), action: 'BUY' }]
-                              : [],
-                          })
-                        }}
-                        className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-```
-
-（不传 `date` → 默认今日分时；标记 date=买入日，切到买入日才显示。）
-
-- [ ] **Step 4: 成交记录行点击**
-
-成交表行（第 753 行 `<tr key={i} className="border-t border-border/60 hover:bg-elevated/60 transition-colors">`）改为：
-
-```tsx
-                    <tr key={i}
-                      onClick={() => {
-                        const parsed = parseTradeTime(t.ts)
-                        setPreview({
-                          symbol: t.code ?? '',
-                          name: t.name ?? '',
-                          date: String(t.ts ?? '').slice(0, 10),
-                          markers: parsed && typeof t.price === 'number'
-                            ? [{ date: parsed.date, time: parsed.time, price: t.price, action: toMarkerAction(t.action) }]
-                            : [],
-                        })
-                      }}
-                      className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-```
-
-- [ ] **Step 5: 渲染 StockPreviewDialog**
-
-`SimDetail` 返回 JSX 末尾、`{showDingtalkCfg && <DingtalkConfigDialog .../>}` 之前追加：
+文件末尾的渲染（`{preview && (<StockPreviewDialog .../>)}`）替换为：
 
 ```tsx
       {preview && (
-        <StockPreviewDialog
+        <QuantTradeDialog
           symbol={preview.symbol}
           name={preview.name}
+          initialView="minute"
           initialDate={preview.date}
-          initialIntraday
           intradayMarkers={preview.markers}
           onClose={() => setPreview(null)}
         />
       )}
 ```
 
-- [ ] **Step 6: 验证**
+其余（`preview` state、`parseTradeTime`/`toMarkerAction`、两表 onClick）保持不变。
 
-Run: `cd frontend && pnpm build`
-Expected: 通过，无类型错误。
+- [ ] **Step 2: StrategyBacktest 替换 TradeKlineModal**
 
-- [ ] **Step 7: Commit**
+`frontend/src/pages/backtest/StrategyBacktest.tsx`：
+
+(a) 删除第 26 行 `import { TradeKlineModal } from './components/TradeKlineModal'`，替换为：
+
+```ts
+import { QuantTradeDialog } from '@/components/QuantTradeDialog'
+import type { ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
+```
+
+（若文件已 import 这两个类型则不重复。）
+
+(b) 检查 `fmtPrice` 是否已从 `@/lib/format` 导入（`grep -n "fmtPrice" frontend/src/pages/backtest/StrategyBacktest.tsx`）；未导入则加入 `fmtPrice`（与 TradeKlineModal 原用法一致）。
+
+(c) 文件顶层（工具函数区）加：
+
+```ts
+function addDays(date: string, days: number): string {
+  const d = new Date(date)
+  d.setDate(d.getDate() + days)
+  return d.toISOString().slice(0, 10)
+}
+```
+
+(d) 在 `const [selectedTrade, setSelectedTrade] = useState<StrategyBacktestTrade | null>(null)`（约第 887 行）之后加：
+
+```ts
+  const tradeDateRange = useMemo(() => selectedTrade ? {
+    start: addDays(String(selectedTrade.entry_date).slice(0, 10), -45),
+    end: addDays(String(selectedTrade.exit_date).slice(0, 10), 20),
+  } : null, [selectedTrade])
+
+  const tradeRanges = useMemo<ChartRange[]>(() => selectedTrade ? [{
+    start: String(selectedTrade.entry_date).slice(0, 10),
+    end: String(selectedTrade.exit_date).slice(0, 10),
+    label: '持仓区间',
+    color: 'rgba(59,130,246,0.07)',
+  }] : [], [selectedTrade])
+
+  const tradePriceLines = useMemo<ChartPriceLine[]>(() => {
+    if (!selectedTrade) return []
+    const start = String(selectedTrade.entry_date).slice(0, 10)
+    const end = String(selectedTrade.exit_date).slice(0, 10)
+    return [
+      {
+        value: Number(selectedTrade.entry_price),
+        label: `买入价 ${fmtPrice(selectedTrade.entry_price)}`,
+        color: '#C74040',
+        start,
+        end,
+      },
+      {
+        value: Number(selectedTrade.exit_price),
+        label: `卖出价 ${fmtPrice(selectedTrade.exit_price)}`,
+        color: '#2D9B65',
+        start,
+        end,
+      },
+    ]
+  }, [selectedTrade])
+```
+
+(e) 文件末尾 `<TradeKlineModal trade={selectedTrade} onClose={() => setSelectedTrade(null)} />`（约第 2593 行）替换为：
+
+```tsx
+      <QuantTradeDialog
+        symbol={selectedTrade?.symbol ?? null}
+        name={selectedTrade?.name}
+        initialView="daily"
+        dateRange={tradeDateRange ?? undefined}
+        ranges={tradeRanges}
+        priceLines={tradePriceLines}
+        showLimitMarkers={false}
+        showMarkerToggle={false}
+        onClose={() => setSelectedTrade(null)}
+      />
+```
+
+- [ ] **Step 3: 删除 TradeKlineModal**
 
 ```bash
-git add frontend/src/quant/pages/QuantSim.tsx
-git commit -m "feat(sim): 持仓/成交行点击弹出分析窗口 + 分时买卖标识"
+git rm frontend/src/pages/backtest/components/TradeKlineModal.tsx
+```
+
+- [ ] **Step 4: 验证构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 通过，无类型错误（此步开始不再引用已删 props，全链路类型检查恢复完整）。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add frontend/src/quant/pages/QuantSim.tsx frontend/src/pages/backtest/StrategyBacktest.tsx frontend/src/pages/backtest/components/TradeKlineModal.tsx
+git commit -m "feat(quant): 模拟盘/回测改用 QuantTradeDialog, 移除 TradeKlineModal"
 ```
 
 ---
 
-### Task 4: 最终验证与手动冒烟
+### Task 5: 最终验证与手动冒烟
 
 **Files:** 无改动。
 
@@ -416,13 +722,13 @@ Expected: 通过。
 
 - [ ] **Step 2: 手动冒烟清单**
 
-启动 `./dev.sh`，打开 http://localhost:3011 量化模拟盘：
+启动 `./dev.sh`，打开 http://localhost:3011：
 
-1. 进入一个已有成交的分钟级模拟账户详情。
-2. 点持仓行：弹窗打开、默认显示今日分时、无标记；日K点选到买入那天 → 分时切换、出现红色 B 上三角。
-3. 点成交记录 BUY 行：弹窗自动选中交易日期、分时打开、成交时刻红色 B。
-4. 点 SELL 行：绿色 S 下三角；点 STOP_LOSS 行：橙色圆「止损」。
-5. 弹窗内切日期（点不同 K 线蜡烛 / 用日期范围）：标记只在对应交易日出现，不串日。
-6. 4/1 前的成交行：弹窗显示「暂无分钟数据」提示，无异常报错。
-7. 自选股页打开任意股票弹窗：仍默认 K 线、无标记、行为与改动前一致。
-8. 止损日志 tab 行点击无反应（不在范围内）。
+1. **量化模拟盘**：进入有成交的账户详情。
+   - 点持仓行 → 弹窗默认**分钟视图**（最新交易日分钟线），无左右分窗；点「日线」/「周线」正常渲染；切回「分钟」显示所选日分钟线。
+   - 日线视图点选买入日蜡烛 → 切「分钟」→ 出现红色 B 上三角。
+   - 点成交记录 BUY 行 → 交易当日分钟线 + 红色 B；SELL 行 → 绿色 S；STOP_LOSS 行 → 橙色「止损」。
+   - 弹窗开着点另一行 → 视图/日期正确重置。
+2. **量化回测**：跑出成交后点击某笔成交 → 弹窗日线视图含买入价/卖出价虚线与持仓区间底色，**无**涨跌停板标；切「分钟」/「周线」正常。
+3. **自选股回归**：打开弹窗 → 默认仅日K全宽；点头部「分时」→ 左右分窗出现（与改动前一致）；加自选/加监控/日期范围正常。
+4. 周线聚合目视：周K 蜡烛高低/收盘与日K 周内走势一致，周均线连续。

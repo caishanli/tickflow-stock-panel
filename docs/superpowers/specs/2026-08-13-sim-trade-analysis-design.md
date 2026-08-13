@@ -1,83 +1,90 @@
-# 量化模拟盘：持仓/成交行点击弹出分析窗口 + 分时买卖标识 — 设计
+# 量化专用交易弹窗（模拟盘/回测共用，单图 + 分钟/日线/周线）— 设计
 
-日期：2026-08-13，分支：feat/sim-trade-analysis（从 custom-main 切出）
+日期：2026-08-13，分支：feat/sim-trade-analysis
 
 ## 目标
 
-量化模拟盘详情页（`QuantSim`）现有的**持仓表**与**成交记录表**行点击无反应。本次增强：
+量化模拟盘详情页的**持仓表**与**成交记录表**行点击后，弹出**量化专用交易弹窗**（`QuantTradeDialog`）：单一图表区 + 分钟/日线/周线视图切换；分钟视图显示当天（或交易当日）分钟线并标注买入/卖出/止损点。量化回测的成交回放弹窗（`TradeKlineModal`）替换为该弹窗。
 
-1. 点击持仓行/成交记录行 → 弹出自选股同款分析窗口（`StockPreviewDialog`，含 K 线 + 分时/当天分析线 + 加自选 + 加监控 + 日期范围等全部能力）。
-2. 分时图（当天分析线）上增加**买入/卖出标识**：BUY 红色 B、SELL 绿色 S、STOP_LOSS 橙色「止损」。
+**不修改**自选股/监控等其它调用方的弹窗（`StockPreviewDialog`/`StockPanel` 恢复原状）。
 
-## 范围
+## 背景与问题
 
-- **纯前端改动**，后端零改动（成交/持仓数据已在前端内存中，`sim_trades.ts` 与持仓 `entry_ts` 均为本地时间字符串 `YYYY-MM-DD HH:MM:SS`）。
-- 止损日志 tab 行**不做**点击（与成交记录同源数据，避免范围膨胀）。
-- 不做：后端接口、分钟数据回源策略、持仓浮盈标记、账户列表页行点击。
+- 第一版实现给共享 `StockPanel`/`StockPreviewDialog` 加了 `initialDate`/`initialIntraday`/`intradayMarkers` 可选 props。模拟盘弹窗强制打开「分时」后触发了 StockPanel 的既有**左右分窗**布局（日K 左 + 分时 右），且右侧因该日无分钟数据显示「暂无分钟数据」。
+- 用户反馈：不需要左右分窗；默认应显示**当天的分钟线**，并有**分钟/日线/周线**切换按钮；成交行应显示**交易当日**的分钟线。自选股弹窗默认（分时关）也是单图，风格应统一。
 
-## 交互
+## 方案：复制专用弹窗，共享组件回滚
 
-- **持仓行点击**：弹窗打开即显示今日分时（`initialIntraday: true`），无买卖标；在日 K 上点选到买入那天时，分时切换为该日并出现红色 B 标（买入时间 `entry_ts`、价格 `avg_cost`）。标记随选中日期变化，不串日。
-- **成交记录行点击**：弹窗打开即选中交易日期（`initialDate` = `ts` 前 10 位）、显示该日分时，成交时刻直接标点——BUY 标 B、SELL 标 S、STOP_LOSS 标「止损」。
-- 弹窗内分时开关、日期范围、加自选、加监控、刷新等能力与自选股完全一致（复用组件）。
+### 1. 新组件 `frontend/src/components/QuantTradeDialog.tsx`
 
-## 组件改动（全部新增可选 props，不破坏现有调用方）
+复制 `StockPreviewDialog` 的弹窗壳（遮罩/动画/顶栏：板块标、标的、名称、半年/1年预设、日期范围、刷新、关闭）+ `StockPanel` 的信息条/财务/加自选/加监控逻辑，但图表区改为：
 
-新类型 `IntradayMarker`，定义在 `EChartsIntraday.tsx` 并导出（仿 `ChartMarker` 从 `EChartsCandlestick.tsx` 导出的先例）：
+- **视图切换器（分钟 / 日线 / 周线）+ 单一图表区**（无左右分窗）
+  - **分钟**：`StockIntradayChart`（当天分钟线 + B/S/止损标记），无选中日期时自动选中最新交易日；`prevClose` 取日K前一交易日收盘
+  - **日线**：`StockDailyKChart`（markers/ranges/priceLines/涨跌停标记在此生效）
+  - **周线**：`StockDailyKChart period="weekly"`（前端聚合，见 §3）
+- 顶栏日期范围、刷新、加自选、加监控、分时轮询偏好（`minute_intraday_refresh`）与自选股弹窗一致。
+- symbol 切换（弹窗不卸载复用）：重置视图到 `initialView`、清空选中日期、重新应用 `initialDate`。
+
+Props（全部可选，除 symbol/onClose）：
 
 ```ts
-export interface IntradayMarker {
-  date: string          // YYYY-MM-DD，标记所属交易日
-  time: string          // HH:MM，交易时刻
-  price: number         // 成交价（持仓行用 avg_cost）
-  action: 'BUY' | 'SELL' | 'STOP_LOSS'
+export type QuantViewMode = 'minute' | 'daily' | 'weekly'
+interface Props {
+  symbol: string | null
+  name?: string
+  onClose: () => void
+  initialView?: QuantViewMode          // 默认 'daily'；模拟盘传 'minute'
+  initialDate?: string                 // 分钟视图初始选中日期（成交行=交易当日）
+  dateRange?: { start: string; end: string }  // 回测传持仓区间
+  markers?: ChartMarker[]              // 日线成交标记（回测）
+  ranges?: ChartRange[]                // 日线持仓区间（回测）
+  priceLines?: ChartPriceLine[]        // 日线买入/卖出价线（回测）
+  intradayMarkers?: IntradayMarker[]   // 分钟视图买卖标记（模拟盘）
+  showLimitMarkers?: boolean           // 默认 true；回测传 false（维持原 TradeKlineModal 视觉）
+  showMarkerToggle?: boolean           // 默认 true；回测传 false
 }
 ```
 
-- `time` 与分时图 242 点全天轴（`FULL_DAY_TIMES`，本地时区 9:30~11:30、13:00~15:00）直接按 `HH:MM` 索引定位，无时区换算（`ts` 为本地时间）。
-- **date 感知**：标记只在分时图当前 `date` 与标记 `date` 相同时渲染——这是持仓行「默认今天、切到买入日才显示买入点」的关键。
+### 2. 共享组件回滚（其它弹窗恢复原状）
 
-### 1. `EChartsIntraday.tsx`
+- `StockPanel.tsx`、`StockPreviewDialog.tsx`：**恢复 44a5ae5 之前的状态**（移除 `initialDate`/`initialIntraday`/`intradayMarkers` props、`initialApplied` effect、分时重置 effect、透传）。
+- **保留**：`StockIntradayChart.markers` 与 `EChartsIntraday.markers`（含 fail-closed date 契约）——QuantTradeDialog 分钟视图使用。
 
-- 新增 prop `markers?: IntradayMarker[]`。
-- `buildOption` 中按当前 `date` 过滤标记，`HH:MM` 映射 `FULL_DAY_TIMES` 索引；该时刻分钟数据 close 为 null（停牌/无成交）时**自动过滤**，避免标在空位。
-- 渲染方式：价格序列上加 `markPoint`（`coord: [idx, price]`），或独立 scatter 层：
-  - BUY：红色（#ef4444）上三角箭头，标签「B」
-  - SELL：绿色（#22c55e）下三角箭头，标签「S」
-  - STOP_LOSS：橙色（#f59e0b）圆点，标签「止损」
+### 3. 周线聚合（纯前端，后端零改动）
 
-### 2. `StockIntradayChart.tsx`
+`StockDailyKChart` 新增可选 prop `period?: 'daily' | 'weekly'`（默认 `'daily'`，其它调用方不传 → 行为不变）：
 
-- 新增 prop `markers?: IntradayMarker[]`，透传 `EChartsIntraday`。
+- `aggregateWeekly(rows)` 导出函数：按 **ISO 周**（周一为一周首）分桶——开=周首日开、高=周内最高、低=周内最低、收=周五收（最后一根不足一周按实际）、量/额求和；周均线 ma5/10/20/60 由周收盘重算；macd/rsi/kdj/boll 置 null。
+- 周线视图下隐藏指标控制按钮（`showIndicatorControls && period !== 'weekly'`），避免 null 指标渲染异常；涨跌停标记基于**日K**构建、周线视图由调用方隐藏（`showLimitMarkers={false}`）。
+- 周K日期标签用周首日（本地日期手拼 `YYYY-MM-DD`，不用 `toISOString` 避免时区偏移）。
+- `onDataChange` 的 `rawRows` 仍为日K行（信息条/昨收/选中日期逻辑不受影响）。
 
-### 3. `StockPanel.tsx`
+### 4. 接线
 
-- 新增 prop `intradayMarkers?: IntradayMarker[]`，透传 `StockIntradayChart`。
-- 新增 prop `initialDate?: string`：挂载后 rows 就绪时，若 `initialDate` 在 rows 中则优先选中，否则回退最后一天；用 ref 标记「初始应用已执行」，防止覆盖用户后续手动点选；symbol 切换时重置 ref（复用现有 prevSymbol effect）。
-- 现有「分时开启且无选中日期 → 自动选中最新日期」effect 保持兜底，优先级低于 `initialDate`。
-
-### 4. `StockPreviewDialog.tsx`
-
-- 新增可选 props：`initialDate?: string`、`initialIntraday?: boolean`（默认 false，保持现有打开行为）、`intradayMarkers?: IntradayMarker[]`。
-- symbol 变化（含首次挂载）时 `setShowIntraday(initialIntraday)`；三者透传 `StockPanel`。
-
-### 5. `frontend/src/quant/pages/QuantSim.tsx`
-
-- 新增 state：`preview: { symbol: string; name: string; date?: string; markers: IntradayMarker[] } | null`。
-- 持仓行点击：`setPreview({ symbol: sym, name: p.name, markers: [{ date: entry_ts 前 10 位, time: entry_ts HH:MM, price: avg_cost, action: 'BUY' }] })`；`date` 不传（默认今日）；无 `entry_ts` 的旧持仓仍可点击（今日分时，无标记）。
-- 成交记录行点击：`setPreview({ symbol: t.code, name: t.name, date: ts 前 10 位, markers: [{ date: 同 date, time: ts HH:MM, price: t.price, action: t.action 映射 }] })`；action 映射：`BUY → BUY`、`SELL → SELL`、`STOP_LOSS → STOP_LOSS`。
-- 渲染：`<StockPreviewDialog symbol={preview.symbol} name={preview.name} initialDate={preview.date} initialIntraday intradayMarkers={preview.markers} onClose={() => setPreview(null)} />`。
-- 行样式加 `cursor-pointer` 与 hover 反馈（与列表页/账户列表行一致）。
+- **模拟盘** `QuantSim.tsx`：持仓/成交行点击 → `QuantTradeDialog`，`initialView="minute"`：
+  - 持仓行：不传 `initialDate` → 分钟视图自动选最新交易日；买入 B 标（date=买入日）切到买入日才显示
+  - 成交记录行：`initialDate` = 交易日期 → 直接显示交易当日分钟线 + B/S/止损标
+  - `preview` state、`parseTradeTime`/`toMarkerAction` 复用现有实现
+- **回测** `StrategyBacktest.tsx`：删除 `TradeKlineModal` 引用；成交点击 → `QuantTradeDialog`，`initialView="daily"`，传 `dateRange`（entry 前 45 天 ~ exit 后 20 天）、`ranges`（持仓区间）、`priceLines`（买入价/卖出价）、`showLimitMarkers={false}`、`showMarkerToggle={false}`；删除 `TradeKlineModal.tsx`。
 
 ## 边界情况
 
-- 4/1 前交易日期或无分钟数据日期：分时区显示现有「暂无分钟数据」提示与获取按钮，标记不渲染；不做特殊处理。
-- 停牌/非交易时刻：标记时刻 minute close 为 null 时自动过滤。
-- 成交行 SSE 增量推送后点击：直接用行内数据，无额外请求。
-- 自选股弹窗其它调用方（Watchlist/Screener 等）不传新 props → 行为完全不变。
+- 分钟视图无数据（4/1 前/停牌/未回源）：沿用现有「暂无分钟数据」+ 获取按钮提示；可切日线/周线。
+- 周线最后一根不足一周按实际交易日收。
+- 加自选/加监控在回测场景同样可用（与自选股弹窗一致）。
+- 自选股/监控/指数等其它弹窗行为与改动前完全一致。
 
 ## 验证
 
-- 前端无测试脚本：`cd frontend && pnpm lint` + `pnpm build`（`tsc -b` 类型检查）通过。
-- 手动冒烟：开一个分钟级模拟账户跑出成交 → 点持仓行/成交行验证弹窗日期、分时、B/S/止损标颜色与位置、切日期不串标、4/1 前成交显示空分时。
-- 自选股弹窗回归：确认可选 props 未影响原有打开行为（默认仍为 K 线、不选中特定日期、无标记）。
+- `cd frontend && pnpm build`（tsc + vite）通过（前端无测试框架；pnpm lint 无配置不可用，预存在）。
+- 手动冒烟：
+  1. 模拟盘持仓行点击 → 弹窗默认分钟视图（最新交易日分钟线），切 日线/周线 正常，切回分钟仍显示所选日
+  2. 成交记录 BUY/SELL/STOP_LOSS 行点击 → 交易当日分钟线 + B/S/止损标
+  3. 回测成交点击 → 日线视图含买入/卖出价线、持仓区间，无涨跌停板标；切分钟/周线正常
+  4. 自选股弹窗回归：打开/分时开关/左右分窗/加自选/加监控行为与改动前完全一致
+  5. 弹窗内切日期标记不串日；周线聚合数据目视正确
+
+## 不做（YAGNI）
+
+- 不改共享弹窗布局；不改后端；不做 5/15/30/60 分钟多周期；周线指标仅 MA（macd/rsi/kdj/boll 置 null 且隐藏控制）。
