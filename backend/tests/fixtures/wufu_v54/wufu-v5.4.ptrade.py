@@ -30,6 +30,29 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+# ==================== 日志兼容层（不同 PTrade 版本 LogEngine 方法名不一致） ====================
+def _safe_log(msg, *names):
+    """按 names 顺序尝试调用 log.<name>(msg)，均不存在则静默丢弃。"""
+    for name in names:
+        try:
+            fn = getattr(log, name)
+            fn(msg)
+            return
+        except AttributeError:
+            continue
+        except Exception:
+            return
+
+
+def _warn(msg):
+    """log.warn 在部分 PTrade 版本不存在，安全降级为 warning/error。"""
+    _safe_log(msg, 'warn', 'warning', 'error')
+
+
+def _debug(msg):
+    _safe_log(msg, 'debug')
+
+
 # ==================== 平台辅助层 ====================
 def _pt(code):
     """聚宽代码 → PTrade 代码（XSHG/XSHE → SS/SZ）"""
@@ -252,7 +275,7 @@ def _update_universe(pool=None):
             codes.append(g.defensive_etf)
         set_universe(codes)
     except Exception as e:
-        log.warn('set_universe 更新失败: %s' % e)
+        _warn('set_universe 更新失败: %s' % e)
 
 
 # ==================== 全市场基金枚举（动态池用，尽力实现+优雅降级） ====================
@@ -309,7 +332,7 @@ def _get_all_fund_codes():
             return None
         return fund_codes
     except Exception as e:
-        log.warn('枚举全市场基金失败: %s' % e)
+        _warn('枚举全市场基金失败: %s' % e)
         return None
 
 
@@ -328,11 +351,11 @@ def initialize(context):
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='ETF')
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='LOF')
     except Exception as e:
-        log.warn('设置佣金失败(仅回测有效): %s' % e)
+        _warn('设置佣金失败(仅回测有效): %s' % e)
     try:
         set_slippage(slippage=0.0002)
     except Exception as e:
-        log.warn('设置滑点失败(仅回测有效): %s' % e)
+        _warn('设置滑点失败(仅回测有效): %s' % e)
 
     # ==================== ETF池定义 ====================
     # 全球/海外ETF池（含大宗商品和海外市场ETF）
@@ -695,7 +718,7 @@ def check_positions(context):
             if obj is not None and getattr(obj, 'paused', False):
                 log.info("⚠️ %s %s 今日停牌" % (security, security_name))
     except Exception as e:
-        log.warn("【持仓检查】执行异常: %s" % e)
+        _warn("【持仓检查】执行异常: %s" % e)
 
 
 def monitor_drawdown(context):
@@ -737,18 +760,18 @@ def calculate_global_etf_threshold(context):
             log.info("全市场基金总数: %d只 (已缓存)" % len(g._cached_etf_universe))
         etf_list = g._cached_etf_universe
         if not etf_list:
-            log.warn("未找到任何场内ETF，使用保守阈值1000万")
+            _warn("未找到任何场内ETF，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
         trade_days = _last_n_trade_days(3)
         if len(trade_days) < 3:
-            log.warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
+            _warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
             g.avg_etf_money_threshold = 10000000
             return
         start_day = trade_days[0]
         money_df = _wide(get_history(3, '1d', 'money', security_list=etf_list))
         if money_df is None or money_df.empty:
-            log.warn("无成交额数据，使用保守阈值1000万")
+            _warn("无成交额数据，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
         money_df = money_df.fillna(0.0)
@@ -758,7 +781,7 @@ def calculate_global_etf_threshold(context):
             count = daily_counts.get(day, 0)
             log.info("  %s 全市场ETF总成交额: %.2f亿元 (%d只ETF有成交)" % (day.date(), money / 1e8, count))
         if len(daily_totals) < 3:
-            log.warn("仅有%d个有效交易日，使用保守阈值1000万" % len(daily_totals))
+            _warn("仅有%d个有效交易日，使用保守阈值1000万" % len(daily_totals))
             g.avg_etf_money_threshold = 10000000
             return
         avg_total_money = daily_totals.mean()
@@ -767,7 +790,7 @@ def calculate_global_etf_threshold(context):
         log.info("【全局阈值更新完成】近%d日全市场ETF日均总成交额=%.2f亿元，阈值=%.0f万元(%s元)" % (
             len(daily_totals), avg_total_money / 1e8, threshold / 1e4, format(threshold, ',.0f')))
     except Exception as e:
-        log.warn("计算全局阈值异常: %s，使用保守阈值1000万" % e)
+        _warn("计算全局阈值异常: %s，使用保守阈值1000万" % e)
         g.avg_etf_money_threshold = 10000000
 
 
@@ -786,7 +809,7 @@ def filter_global_pool_by_volume(context):
     try:
         money_df = _wide(get_history(TRADE_DAYS_COUNT, '1d', 'money', security_list=g.global_etf_pool))
         if money_df is None or money_df.empty:
-            log.warn("【全球池过滤】无成交额数据，使用原始全球池")
+            _warn("【全球池过滤】无成交额数据，使用原始全球池")
             g.filtered_global_pool = g.global_etf_pool[:]
             return
         money_df = money_df.fillna(0.0)
@@ -808,7 +831,7 @@ def filter_global_pool_by_volume(context):
         g.filtered_global_pool = new_global_pool
         log.info("【全球池过滤】保留高流动性ETF(%d只)" % len(new_global_pool))
     except Exception as e:
-        log.warn("【全球池过滤】异常: %s" % e)
+        _warn("【全球池过滤】异常: %s" % e)
         g.filtered_global_pool = g.global_etf_pool[:]
 
 
@@ -862,13 +885,13 @@ def update_sector_pool(context):
     try:
         fund_map = _ensure_fund_universe()
         if not fund_map:
-            log.warn("【动态池更新】无法枚举全市场基金，跳过动态池（降级为固定池）")
+            _warn("【动态池更新】无法枚举全市场基金，跳过动态池（降级为固定池）")
             g.dynamic_etf_pool = []
             return
         g.etf_names_dict = dict(fund_map)
         etf_list = list(fund_map.keys())
     except Exception as e:
-        log.warn("获取全市场ETF列表失败: %s" % e)
+        _warn("获取全市场ETF列表失败: %s" % e)
         g.dynamic_etf_pool = []
         return
 
@@ -942,7 +965,7 @@ def update_sector_pool(context):
     log.info("【动态池更新】普通组流动性过滤: %d→%d只" % (len(normal_etfs), len(normal_sorted)))
 
     if not normal_sorted and not special_sorted:
-        log.warn("【动态池更新】无ETF通过流动性过滤")
+        _warn("【动态池更新】无ETF通过流动性过滤")
         g.dynamic_etf_pool = []
         return
 
@@ -1034,7 +1057,7 @@ def filter_fixed_pool_by_volume(context):
     try:
         money_df = _wide(get_history(TRADE_DAYS_COUNT, '1d', 'money', security_list=g.fixed_etf_pool))
         if money_df is None or money_df.empty:
-            log.warn("【固定池过滤】无法获取成交额数据，跳过过滤")
+            _warn("【固定池过滤】无法获取成交额数据，跳过过滤")
             g.filtered_fixed_pool = g.fixed_etf_pool[:]
             return
         money_df = money_df.fillna(0.0)
@@ -1056,7 +1079,7 @@ def filter_fixed_pool_by_volume(context):
         g.filtered_fixed_pool = new_fixed_pool
         log.info("【固定池过滤】保留高流动性ETF(%d只)" % len(new_fixed_pool))
     except Exception as e:
-        log.warn("【固定池过滤】异常: %s" % e)
+        _warn("【固定池过滤】异常: %s" % e)
         g.filtered_fixed_pool = g.fixed_etf_pool[:]
 
 
@@ -1074,7 +1097,7 @@ def daily_merge_etf_pools(context):
 
 def calculate_and_log_ranked_etfs(context):
     if not hasattr(g, 'merged_etf_pool') or not g.merged_etf_pool:
-        log.warn("【动量计算】合并池为空，无法计算")
+        _warn("【动量计算】合并池为空，无法计算")
         g.ranked_etfs_result = []
         return
     final_list = get_final_ranked_etfs(context)
@@ -1156,7 +1179,7 @@ def calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, curr
             'ma_value': ma_value,
         }
     except Exception as e:
-        log.debug("【指标计算】%s %s 计算失败: %s" % (etf, etf_name, e))
+        _debug("【指标计算】%s %s 计算失败: %s" % (etf, etf_name, e))
         return None
 
 
@@ -1202,7 +1225,7 @@ def check_a_share_weak_period(context):
         df = get_history(data_lookback + 1, '1d', 'close', security_list=code)
         closes = _as_series_values(df)
         if closes is None or len(closes) < data_lookback:
-            log.warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
+            _warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
             continue
         current_price = closes[-1]
         ma_val = closes[-g.weak_period_ma_lookback:].mean()
@@ -1322,7 +1345,7 @@ def get_final_ranked_etfs(context):
     close_df = _wide(get_history(safe_lookback, '1d', 'close', security_list=etf_set, fq='pre'))
     volume_df = _wide(get_history(safe_lookback, '1d', 'volume', security_list=etf_set))
     if close_df is None or close_df.empty:
-        log.warn("【动量计算】无法获取历史价格数据")
+        _warn("【动量计算】无法获取历史价格数据")
         return []
     # 当日累计成交量：优先用一次性 get_current_data()，缺失者再回退 _get_today_volume
     today_vols = {}
@@ -1343,7 +1366,7 @@ def get_final_ranked_etfs(context):
             if obj is not None and getattr(obj, 'paused', False):
                 continue
             if is_temporarily_suspended(etf, context):
-                log.debug("%s %s 盘中临时停牌，跳过计算" % (etf, get_security_name(etf)))
+                _debug("%s %s 盘中临时停牌，跳过计算" % (etf, get_security_name(etf)))
                 continue
             if etf not in close_pivot.columns:
                 continue
@@ -1365,16 +1388,16 @@ def get_final_ranked_etfs(context):
             metrics = calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, current_price, today_vol, context)
         except RuntimeError as e:
             skipped_no_minute.append((etf, get_security_name(etf), str(e)))
-            log.warn("⚠️ %s %s 分钟数据获取失败，跳过: %s" % (etf, get_security_name(etf), e))
+            _warn("⚠️ %s %s 分钟数据获取失败，跳过: %s" % (etf, get_security_name(etf), e))
             continue
         if metrics:
             if metrics['etf'] in {m['etf'] for m in all_metrics}:
                 continue
             all_metrics.append(metrics)
     if skipped_no_minute:
-        log.warn("⚠️ 共%d只ETF因分钟数据缺失被跳过:" % len(skipped_no_minute))
+        _warn("⚠️ 共%d只ETF因分钟数据缺失被跳过:" % len(skipped_no_minute))
         for code, name, reason in skipped_no_minute:
-            log.warn("  - %s %s: %s" % (code, name, reason))
+            _warn("  - %s %s: %s" % (code, name, reason))
     for item in all_metrics:
         score = item.get('momentum_score')
         if pd.isna(score) or (isinstance(score, float) and np.isnan(score)):
@@ -1643,7 +1666,7 @@ def is_temporarily_suspended(security, context, minute_count=10):
             return True
         return False
     except Exception as e:
-        log.debug("临时停牌检测异常 %s: %s" % (security, e))
+        _debug("临时停牌检测异常 %s: %s" % (security, e))
         return False  # 异常时默认认为正常，避免误判
 
 
@@ -1721,7 +1744,7 @@ def smart_order_target_value(security, target_value, context):
                 log.info("📤 卖出 %s %s 数量%d 价格%.3f" % (security, name, abs(diff), price))
             return True
         else:
-            log.warn("下单失败: %s %s，数量%d" % (security, name, diff))
+            _warn("下单失败: %s %s，数量%d" % (security, name, diff))
             return False
     return False
 
