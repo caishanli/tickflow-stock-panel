@@ -9,7 +9,7 @@ import * as api from '../api'
 import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
 import { DingtalkConfigDialog } from './DingtalkConfigDialog'
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { QuantTradeDialog } from '@/components/QuantTradeDialog'
 import type { IntradayMarker } from '@/components/EChartsIntraday'
 
 /** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
@@ -882,11 +882,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         )}
       </div>
       {preview && (
-        <StockPreviewDialog
+        <QuantTradeDialog
           symbol={preview.symbol}
           name={preview.name}
+          initialView="minute"
           initialDate={preview.date}
-          initialIntraday
           intradayMarkers={preview.markers}
           onClose={() => setPreview(null)}
         />
