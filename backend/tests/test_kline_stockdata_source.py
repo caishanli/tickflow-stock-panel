@@ -1,9 +1,10 @@
-"""kline API data_source=stockdata 的 helper 单测（不依赖 stockdata 服务进程）。"""
-import polars as pl
-import pandas as pd
+"""kline API data_source=stockdata 的 helper 单测(不依赖 stockdata 服务进程)。"""
 from datetime import date
 
-from app.api.kline import _to_jq_code, _stockdata_frame, _stockdata_minute, _stockdata_daily
+import pandas as pd
+import polars as pl
+
+from app.api.kline import _stockdata_daily, _stockdata_frame, _stockdata_minute, _to_jq_code
 
 
 def test_to_jq_code():
@@ -34,7 +35,7 @@ def test_stockdata_minute_empty_on_client_error(monkeypatch):
 
 
 def test_stockdata_daily_converts_stock_volume_to_lots(monkeypatch):
-    """服务返回 volume 股 (×100), 股票转回手与 enriched 口径一致。"""
+    """服务返回 volume 股 (x100), 股票转回手与 enriched 口径一致。"""
     pdf = pd.DataFrame(
         {"open": [1.0], "high": [1.1], "low": [0.9], "close": [1.05],
          "volume": [100000.0], "amount": [105000.0]},
@@ -47,6 +48,8 @@ def test_stockdata_daily_converts_stock_volume_to_lots(monkeypatch):
     assert not df.is_empty()
     assert df["volume"].to_list() == [1000.0]
     assert df["symbol"].to_list() == ["000001.SZ"]
+    # date 列须为 pl.Date: 序列化后 str 与 enriched 路径一致 ("2026-08-01")
+    assert str(df["date"].to_list()[0]) == "2026-08-01"
 
 
 def test_stockdata_daily_empty_on_client_error(monkeypatch):

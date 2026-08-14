@@ -61,7 +61,7 @@ def _stockdata_minute(symbol: str, trade_date: date):
         else:
             out = client.get_minute_pool([jq], f"{trade_date} 09:30:00", f"{trade_date} 15:00:00")
         return _stockdata_frame(out, jq, "datetime")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("stockdata 服务分钟获取失败, 回退后续路径: %s %s: %s", symbol, trade_date, e)
         return pl.DataFrame()
 
@@ -77,11 +77,12 @@ def _stockdata_daily(symbol: str, start: date, end: date, is_stock: bool = True)
             return df
         if "trade_dt" in df.columns:
             df = df.drop("trade_dt")
+        df = df.with_columns(pl.col("date").cast(pl.Date))
         df = df.with_columns(pl.lit(symbol).alias("symbol"))
         if is_stock:
             df = df.with_columns((pl.col("volume") / 100).alias("volume"))
         return df
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("stockdata 服务日K获取失败, 回退后续路径: %s: %s", symbol, e)
         return pl.DataFrame()
 
@@ -306,14 +307,18 @@ def get_daily(
                 from app.tickflow.capabilities import Cap
                 if capset and capset.has(Cap.ADJ_FACTOR):
                     factors = kline_sync.fetch_adj_factor_single(symbol)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
-            enriched = compute_enriched(raw, factors=factors)
-            rows = enriched.tail(days).to_dicts()
-            rows = _maybe_inject_live_candle(request, symbol, rows, asset_type)
-            resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info,
-                    "rows": rows, "source": "stockdata"}
-            return _attach_ext(resp, repo, symbol, ext_columns)
+            try:
+                enriched = compute_enriched(raw, factors=factors)
+            except Exception as e:
+                logger.warning("stockdata 日K enriched 计算失败, 回退后续路径: %s: %s", symbol, e)
+            else:
+                rows = enriched.tail(days).to_dicts()
+                rows = _maybe_inject_live_candle(request, symbol, rows, asset_type)
+                resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                        "rows": rows, "source": "stockdata"}
+                return _attach_ext(resp, repo, symbol, ext_columns)
 
     if df.is_empty():
         try:
@@ -719,15 +724,6 @@ def get_minute(
     price_limit = _get_price_limit_info(
         repo, symbol, trade_date, asset_type, stock_name,
     )
-    if data_source == "stockdata":
-        sd_df = _stockdata_minute(symbol, trade_date)
-        if not sd_df.is_empty():
-            return {
-                "symbol": symbol, "name": stock_name, "stock_info": stock_info,
-                "date": str(trade_date), "rows": sd_df.to_dicts(),
-                "source": "stockdata", "price_limit": price_limit,
-            }
-    df = repo.get_minute(symbol, trade_date, asset_type=asset_type)
 
     # 完整交易日应有 240 条分钟K；如果是今天(盘中)，期望条数按已交易分钟估算
     expected = 240
@@ -745,6 +741,17 @@ def get_minute(
             expected = 120 + (h - 13) * 60 + m
         else:
             expected = 240
+
+    if data_source == "stockdata":
+        sd_df = _stockdata_minute(symbol, trade_date)
+        # 历史交易日要求 ≥90% 完整度, 不足走本地/TickFlow 补齐; 盘中今天按实际(实时累积)
+        if not sd_df.is_empty() and (trade_date != date.today() or len(sd_df) >= expected * 0.9):
+            return {
+                "symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                "date": str(trade_date), "rows": sd_df.to_dicts(),
+                "source": "stockdata", "price_limit": price_limit,
+            }
+    df = repo.get_minute(symbol, trade_date, asset_type=asset_type)
 
     is_complete = not df.is_empty() and len(df) >= expected * 0.9  # 允许 10% 容差
 
