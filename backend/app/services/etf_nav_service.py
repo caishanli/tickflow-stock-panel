@@ -53,27 +53,31 @@ def _fund_etf_fund_daily_em() -> pl.DataFrame:
 
 
 def _nav_date_from_columns(raw: pl.DataFrame) -> _date | None:
-    """返回 akshare 快照中**有效净值最全**的最新披露日。
+    """返回 akshare 快照中**已实质披露**的最新披露日。
 
     akshare 对当日未披露净值的基金填 ``---`` 占位：若直接取最新列名（如盘中
-    08-14 列全为占位），会过早写入空/稀疏分区且幂等永不重补。改为按"有效行数"
-    选列（并列取更晚日期），当日未披露时自然落到前一披露日，披露齐全后才推进。
-    全部无有效值返回 None（调用方跳过落盘）。
+    08-14 列全为占位），会过早写入空/稀疏分区且幂等永不重补。规则：取有效行数
+    >= 全列最大有效行数 50% 的**最新**日期列——当日未披露（占位多、有效行远低于
+    前一完整日）时自然落到前一披露日；当日披露过半（如晚间 1471/1601）则推进
+    到当日。全部无有效值返回 None（调用方跳过落盘）。
     """
-    best: _date | None = None
-    best_count = -1
+    counts: dict[_date, int] = {}
     for col in raw.columns:
         m = _NAV_DATE_COL_RE.match(str(col))
         if not m:
             continue
-        d = _date.fromisoformat(m.group(1))
         n = raw.filter(pl.col(col).cast(pl.Utf8, strict=False).str.strip_chars()
                        .str.replace("---", "", literal=True)
                        .str.contains(r"^-?\d+(\.\d+)?$", strict=False)).height
-        if n > best_count or (n == best_count and best is not None and d > best):
-            best = d
-            best_count = n
-    return best if best_count > 0 else None
+        counts[_date.fromisoformat(m.group(1))] = n
+    if not counts:
+        return None
+    max_count = max(counts.values())
+    if max_count <= 0:
+        return None
+    threshold = max_count * 0.5
+    candidates = [d for d, n in counts.items() if n >= threshold]
+    return max(candidates) if candidates else None
 
 
 def sync_etf_nav(day: _date | None = None) -> int:

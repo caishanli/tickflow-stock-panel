@@ -74,6 +74,20 @@ def test_nav_date_picks_latest_column_with_data():
         "2026-08-14-单位净值": [4.8, 3.6],
     })
     assert svc._nav_date_from_columns(raw2) == date(2026, 8, 14)
+    # 当日披露过半（08-14 6 行 >= 最大 10 行的 50%）→ 推进到当日
+    raw_partial = pl.DataFrame({
+        "基金代码": [str(i) for i in range(10)],
+        "2026-08-13-单位净值": ["1.0"] * 10,
+        "2026-08-14-单位净值": ["1.0"] * 6 + ["---"] * 4,
+    })
+    assert svc._nav_date_from_columns(raw_partial) == date(2026, 8, 14)
+    # 当日披露稀疏（08-14 2 行 < 50%）→ 回落前一日，避免过早写稀疏分区
+    raw_sparse = pl.DataFrame({
+        "基金代码": [str(i) for i in range(10)],
+        "2026-08-13-单位净值": ["1.0"] * 10,
+        "2026-08-14-单位净值": ["1.0"] * 2 + ["---"] * 8,
+    })
+    assert svc._nav_date_from_columns(raw_sparse) == date(2026, 8, 13)
     # 全部无有效值 → None（调用方跳过落盘）
     raw3 = pl.DataFrame({
         "基金代码": ["510300", "159915"],
