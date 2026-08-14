@@ -88,3 +88,37 @@ interface Props {
 ## 不做（YAGNI）
 
 - 不改共享弹窗布局；不改后端；不做 5/15/30/60 分钟多周期；周线指标仅 MA（macd/rsi/kdj/boll 置 null 且隐藏控制）。
+
+## 数据源：弹窗优先本地 stockdata 服务（2026-08-13 追加）
+
+**仅量化模拟盘/回测弹窗（QuantTradeDialog）**的数据请求走本地 stockdata 服务；其它页面（自选股等）数据路径完全不变。
+
+### 回退链
+
+- **分钟**（`/api/kline/minute?data_source=stockdata`）：**stockdata 服务（首位）** → DuckDB 本地分区 → TickFlow 兜底。
+  - 服务能力（`StockDataClient`）：历史日期 `get_minute_pool` 读本地分区（`data/kline_minute` + `data/kline_etf_minute`，即本地回源数据）；**盘中今天走 `current_snapshot`**（触发服务端当日分钟内存库 + mootdx 按需回源，零 TickFlow）。
+  - 服务异常/空 → 现有本地读取与 TickFlow 路径（`fetch_minute_single`）原样兜底。
+- **日K**（`/api/kline/daily?data_source=stockdata`）：本地 enriched（服务日线的加工产物：前复权+指标+信号）→ stockdata 服务原始日K + `compute_enriched` → TickFlow 兜底。
+  - 服务 `get_price(frequency="daily")` 返回原始日K（volume 股，股票 ÷100 转手与 enriched 口径一致）→ `compute_enriched(raw, factors)`（股票因子仍走 `kline_sync.fetch_adj_factor_single`，服务仅 ETF 因子）→ 注入实时蜡烛照旧。
+  - 服务异常/空 → 现有 TickFlow 路径（`sync_daily_batch`）原样兜底。
+- 本地 enriched 优先而非服务 raw 优先的原因：enriched 含涨停/炸板等信号与换手率（服务 raw 无），且同一底层数据（服务落盘的 kline_daily）。
+
+### 实现要点
+
+- 后端 `/api/kline/minute`、`/api/kline/daily` 加可选 query `data_source: str = "default"`；`"default"` 完全不可见（其余页面零影响）。
+- 惰性单例 `StockDataClient`（TCP 127.0.0.1:3322，`_request` 自带重试）；每次调用 try/except 包裹：服务未启动/`STOCKDATA_ENABLED=0`/连接失败/超时 → warning 日志 + 回退后续路径，**不报错**。
+- pandas 边界：`_stockdata_frame` 把客户端 pandas 响应（DatetimeIndex）还原为 `datetime`/`date` 列并 `pl.from_pandas` 即刻转回 polars。
+- 响应 `source` 新增 `"stockdata"` 值（前端只判断 `=== 'none'`，不受影响）。
+- 前端：`api.ts` `klineMinute`/`klineDaily` 加可选 `dataSource?: 'default'|'stockdata'`；`QK.kline`/`QK.klineMinute` query key 纳入；`StockDailyKChart`/`StockIntradayChart` 加可选 prop `dataSource`（默认 `'default'`，其它调用方不变）；`QuantTradeDialog` 两图固定传 `dataSource="stockdata"`。
+
+### 边界
+
+- ETF 分钟：服务读 `kline_etf_minute` 分区，支持；指数分钟服务不覆盖 → 空 → 回退 TickFlow。
+- 北交所 920xxx：mootdx 无数据，服务空 → 回退 TickFlow。
+- 非交易时段 `current_snapshot` 只读内存库+当日分区不触网（服务端设计），空则回退。
+- 收盘后 15:35 增量同步前今天分钟可能为空 → 回退 TickFlow（与现状一致）。
+
+### 验证（追加）
+
+- 后端：`cd backend && uv run --extra dev pytest`（新增 helper 单测 + 既有用例不回归）+ ruff/mypy。
+- 手动冒烟：弹窗分钟视图盘中显示今日分钟（后端日志确认走 stockdata 服务而非 TickFlow）；历史交易日分钟正常；**停掉 stockdata 服务后弹窗仍可用**（回退 TickFlow 有 warning 日志）；自选股弹窗数据路径不变。

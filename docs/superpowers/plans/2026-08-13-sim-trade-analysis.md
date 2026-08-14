@@ -732,3 +732,401 @@ Expected: 通过。
 2. **量化回测**：跑出成交后点击某笔成交 → 弹窗日线视图含买入价/卖出价虚线与持仓区间底色，**无**涨跌停板标；切「分钟」/「周线」正常。
 3. **自选股回归**：打开弹窗 → 默认仅日K全宽；点头部「分时」→ 左右分窗出现（与改动前一致）；加自选/加监控/日期范围正常。
 4. 周线聚合目视：周K 蜡烛高低/收盘与日K 周内走势一致，周均线连续。
+
+---
+
+### Task 6: 后端 kline 端点 `data_source=stockdata`（弹窗优先本地 stockdata 服务）
+
+**Files:**
+- Modify: `backend/app/api/kline.py`
+- Test: `backend/tests/test_kline_stockdata_source.py`（新建）
+
+**Interfaces:**
+- Produces: `/api/kline/minute`、`/api/kline/daily` 新增可选 query `data_source: str = "default"`；`"stockdata"` 时按「stockdata 服务 → 本地 → TickFlow」链取数；响应 `source` 可为 `"stockdata"`。
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `backend/tests/test_kline_stockdata_source.py`：
+
+```python
+"""kline API data_source=stockdata 的 helper 单测（不依赖 stockdata 服务进程）。"""
+import polars as pl
+import pandas as pd
+from datetime import date
+
+from app.api.kline import _to_jq_code, _stockdata_frame, _stockdata_minute, _stockdata_daily
+
+
+def test_to_jq_code():
+    assert _to_jq_code("000001.SZ") == "000001.XSHE"
+    assert _to_jq_code("600000.SH") == "600000.XSHG"
+    assert _to_jq_code("600000.XSHG") == "600000.XSHG"
+    assert _to_jq_code("920001.BJ") == "920001.XSHE"  # 未知后缀按深市
+
+
+def test_stockdata_frame_restores_datetime_index():
+    pdf = pd.DataFrame(
+        {"open": [1.0, 2.0], "close": [1.1, 2.1]},
+        index=pd.to_datetime(["2026-08-01 09:30:00", "2026-08-01 09:31:00"]),
+    )
+    out = {"600000.XSHG": pdf}
+    df = _stockdata_frame(out, "600000.XSHG", "datetime")
+    assert isinstance(df, pl.DataFrame)
+    assert df.columns == ["datetime", "open", "close"]
+    assert df["datetime"].cast(pl.Utf8).to_list()[0].startswith("2026-08-01")
+
+
+def test_stockdata_minute_empty_on_client_error(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("service down")
+    monkeypatch.setattr("app.api.kline._get_stockdata_client", boom)
+    df = _stockdata_minute("000001.SZ", date(2026, 8, 1))
+    assert df.is_empty()
+
+
+def test_stockdata_daily_converts_stock_volume_to_lots(monkeypatch):
+    """服务返回 volume 股 (×100), 股票转回手与 enriched 口径一致。"""
+    pdf = pd.DataFrame(
+        {"open": [1.0], "high": [1.1], "low": [0.9], "close": [1.05],
+         "volume": [100000.0], "amount": [105000.0]},
+        index=pd.to_datetime(["2026-08-01"]),
+    )
+    out = {"000001.XSHE": pdf}
+    monkeypatch.setattr("app.api.kline._get_stockdata_client",
+                        lambda: type("C", (), {"get_price": lambda self, *a, **k: out})())
+    df = _stockdata_daily("000001.SZ", date(2026, 8, 1), date(2026, 8, 1), is_stock=True)
+    assert not df.is_empty()
+    assert df["volume"].to_list() == [1000.0]
+    assert df["symbol"].to_list() == ["000001.SZ"]
+
+
+def test_stockdata_daily_empty_on_client_error(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("service down")
+    monkeypatch.setattr("app.api.kline._get_stockdata_client", boom)
+    df = _stockdata_daily("000001.SZ", date(2026, 8, 1), date(2026, 8, 1), is_stock=True)
+    assert df.is_empty()
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run（backend/ 下）: `uv run --extra dev pytest tests/test_kline_stockdata_source.py -q`
+Expected: FAIL（ImportError: cannot import name `_to_jq_code` from `app.api.kline`）。
+
+- [ ] **Step 3: 实现 helper**
+
+`backend/app/api/kline.py` 在 `router = APIRouter(...)` 之后追加：
+
+```python
+# ---- 本地 stockdata 服务取数 (仅弹窗 data_source="stockdata" 请求使用) ----
+
+_STOCKDATA_CLIENT = None
+
+
+def _get_stockdata_client():
+    """惰性单例: 主后端 → 本地 stockdata 服务 (TCP)。连接/超时由调用方兜底回退。"""
+    global _STOCKDATA_CLIENT
+    if _STOCKDATA_CLIENT is None:
+        from app.quant.datasource.network_client import StockDataClient
+        _STOCKDATA_CLIENT = StockDataClient()
+    return _STOCKDATA_CLIENT
+
+
+def _to_jq_code(symbol: str) -> str:
+    """000001.SZ → 000001.XSHE; 600000.SH → 600000.XSHG; 未知后缀按深市。"""
+    pure, _, suf = symbol.rpartition(".")
+    if not pure:
+        return symbol
+    return pure + (".XSHG" if suf in ("SH", "XSHG") else ".XSHE")
+
+
+def _stockdata_frame(out: dict, jq: str, index_col: str):
+    """StockDataClient 响应 (pandas DatetimeIndex df) → polars, index 还原为 index_col 列。"""
+    import polars as pl
+    pdf = out.get(jq)
+    if pdf is None or pdf.empty:
+        return pl.DataFrame()
+    pdf = pdf.reset_index()
+    pdf = pdf.rename(columns={pdf.columns[0]: index_col})
+    return pl.from_pandas(pdf)
+
+
+def _stockdata_minute(symbol: str, trade_date: date):
+    """本地 stockdata 服务取分钟: 盘中今天走 current_snapshot(按需回源), 历史读分区。失败返回空 df。"""
+    import polars as pl
+    try:
+        jq = _to_jq_code(symbol)
+        client = _get_stockdata_client()
+        if trade_date == date.today():
+            out = client.current_snapshot([jq])
+        else:
+            out = client.get_minute_pool([jq], f"{trade_date} 09:30:00", f"{trade_date} 15:00:00")
+        return _stockdata_frame(out, jq, "datetime")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stockdata 服务分钟获取失败, 回退后续路径: %s %s: %s", symbol, trade_date, e)
+        return pl.DataFrame()
+
+
+def _stockdata_daily(symbol: str, start: date, end: date, is_stock: bool = True):
+    """本地 stockdata 服务取原始日K (无复权/无指标)。股票 volume 股→手 与 enriched 口径一致。失败返回空 df。"""
+    import polars as pl
+    try:
+        jq = _to_jq_code(symbol)
+        out = _get_stockdata_client().get_price(jq, start_date=start, end_date=end, frequency="daily")
+        df = _stockdata_frame(out, jq, "date")
+        if df.is_empty():
+            return df
+        if "trade_dt" in df.columns:
+            df = df.drop("trade_dt")
+        df = df.with_columns(pl.lit(symbol).alias("symbol"))
+        if is_stock:
+            df = df.with_columns((pl.col("volume") / 100).alias("volume"))
+        return df
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stockdata 服务日K获取失败, 回退后续路径: %s: %s", symbol, e)
+        return pl.DataFrame()
+```
+
+- [ ] **Step 4: 接入分钟端点**
+
+`get_minute` 中，`trade_date` 解析与「本地无任何分钟K」分支完成后（即第 629 行 `return {...source: "live"...}` 块之后、`price_limit = _get_price_limit_info(...)` 之前），追加：
+
+```python
+    if data_source == "stockdata":
+        sd_df = _stockdata_minute(symbol, trade_date)
+        if not sd_df.is_empty():
+            return {
+                "symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                "date": str(trade_date), "rows": sd_df.to_dicts(),
+                "source": "stockdata", "price_limit": price_limit,
+            }
+```
+
+（此时 `trade_date` 已非 None；服务空/失败则继续走下方 repo.get_minute 本地 → TickFlow 现有逻辑。）
+
+函数签名加参数：
+
+```python
+def get_minute(
+    request: Request,
+    symbol: str = Query(..., description="标的代码"),
+    trade_date: date | None = Query(None, alias="date", description="交易日期, 默认最新"),
+    data_source: str = Query("default", description="default=现状; stockdata=弹窗专用, 本地 stockdata 服务优先"),
+):
+```
+
+- [ ] **Step 5: 接入日K端点**
+
+`get_daily` 函数签名加参数：
+
+```python
+def get_daily(
+    request: Request,
+    symbol: str = Query(..., description="标的代码,如 000001.SZ"),
+    days: int = Query(120, ge=10, le=2000),
+    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD, 优先于 days"),
+    end_date: Optional[str] = Query(None, description="截止日期 YYYY-MM-DD, 默认今天"),
+    ext_columns: Optional[str] = Query(None, description="逗号分隔的 ext 列: config_id.field_name"),
+    data_source: str = Query("default", description="default=现状; stockdata=弹窗专用, 本地 stockdata 服务优先"),
+):
+```
+
+在 `df = repo.get_daily_asset(asset_type, symbol, start, end)` 与 `if df.is_empty():` 之间插入（即「本地 enriched 为空时优先 stockdata 服务，空/失败才落 TickFlow」）：
+
+```python
+    if data_source == "stockdata" and df.is_empty():
+        raw = _stockdata_daily(symbol, start, end, is_stock=asset_type == "stock")
+        if not raw.is_empty():
+            factors = pl.DataFrame()
+            capset = getattr(request.app.state, "capabilities", None)
+            try:
+                from app.tickflow.capabilities import Cap
+                if capset and capset.has(Cap.ADJ_FACTOR):
+                    factors = kline_sync.fetch_adj_factor_single(symbol)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
+            enriched = compute_enriched(raw, factors=factors)
+            rows = enriched.tail(days).to_dicts()
+            rows = _maybe_inject_live_candle(request, symbol, rows, asset_type)
+            resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                    "rows": rows, "source": "stockdata"}
+            return _attach_ext(resp, repo, symbol, ext_columns)
+```
+
+- [ ] **Step 6: 跑测试确认通过**
+
+Run（backend/ 下）: `uv run --extra dev pytest tests/test_kline_stockdata_source.py -q`
+Expected: 5 passed。
+
+- [ ] **Step 7: 全量回归 + lint**
+
+Run（backend/ 下）:
+- `uv run --extra dev pytest -q`（全量，无新失败）
+- `uv run --extra dev ruff check app/api/kline.py tests/test_kline_stockdata_source.py`
+- `uv run --extra dev mypy app/api/kline.py`
+
+Expected: 全部通过（既有 pre-existing 失败不计）。
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add backend/app/api/kline.py backend/tests/test_kline_stockdata_source.py
+git commit -m "feat(kline): data_source=stockdata — 弹窗分钟/日K优先本地 stockdata 服务, 失败回退 TickFlow"
+```
+
+---
+
+### Task 7: 前端 api.ts + 共享图表组件 dataSource prop 透传
+
+**Files:**
+- Modify: `frontend/src/lib/api.ts`
+- Modify: `frontend/src/lib/queryKeys.ts`
+- Modify: `frontend/src/components/StockDailyKChart.tsx`
+- Modify: `frontend/src/components/StockIntradayChart.tsx`
+
+**Interfaces:**
+- Consumes: 后端 `data_source` query 参数（Task 6）。
+- Produces: `api.klineDaily(symbol, days, dateRange?, extColumns?, dataSource?)`、`api.klineMinute(symbol, date?, dataSource?)`；`StockDailyKChart`/`StockIntradayChart` 新增可选 prop `dataSource?: 'default' | 'stockdata'`（默认 `'default'`，其它调用方行为不变）。
+
+- [ ] **Step 1: api.ts 加 dataSource 参数**
+
+`klineDaily`（约 1248 行）签名与 URL 拼接改为：
+
+```ts
+  klineDaily: (symbol: string, days = 120, dateRange?: { start: string; end: string }, extColumns?: string, dataSource?: 'default' | 'stockdata') =>
+    request<{
+      symbol: string
+      name?: string
+      stock_info?: { name?: string; total_shares?: number; float_shares?: number; ext?: Record<string, unknown> }
+      rows: KlineRow[]
+      source?: string
+    }>(
+      (dateRange
+        ? `/api/kline/daily?symbol=${encodeURIComponent(symbol)}&start_date=${dateRange.start}&end_date=${dateRange.end}`
+        : `/api/kline/daily?symbol=${encodeURIComponent(symbol)}&days=${days}`)
+      + (extColumns ? `&ext_columns=${encodeURIComponent(extColumns)}` : '')
+      + (dataSource && dataSource !== 'default' ? `&data_source=${dataSource}` : ''),
+    ),
+```
+
+`klineMinute`（约 1282 行）签名、类型与 URL 改为：
+
+```ts
+  klineMinute: (symbol: string, date?: string, dataSource?: 'default' | 'stockdata') =>
+    request<{
+      symbol: string
+      name?: string
+      stock_info?: { name?: string; total_shares?: number; float_shares?: number }
+      date: string | null
+      rows: MinuteKlineRow[]
+      source?: 'local' | 'live' | 'none' | 'stockdata'
+      price_limit?: PriceLimitInfo | null
+    }>(
+      `/api/kline/minute?symbol=${encodeURIComponent(symbol)}${date ? `&date=${date}` : ''}${dataSource && dataSource !== 'default' ? `&data_source=${dataSource}` : ''}`,
+    ),
+```
+
+- [ ] **Step 2: queryKeys 纳入 dataSource**
+
+`frontend/src/lib/queryKeys.ts` 中两处改为：
+
+```ts
+  kline:                (symbol: string, start: string, end: string, extColumns?: string, dataSource?: string) =>
+                           ['kline', symbol, start, end, extColumns ?? '', dataSource ?? 'default'] as const,
+```
+```ts
+  klineMinute:          (symbol: string, date: string, dataSource?: string) =>
+                             ['kline-minute', symbol, date, dataSource ?? 'default'] as const,
+```
+
+- [ ] **Step 3: StockDailyKChart 加 prop**
+
+`Props` interface 加 `dataSource?: 'default' | 'stockdata'`；解构加 `dataSource`；query 改为：
+
+```ts
+  const kline = useQuery({
+    queryKey: QK.kline(symbol, dateRange.start, dateRange.end, extColumns, dataSource),
+    queryFn: () => api.klineDaily(symbol, days, dateRange, extColumns, dataSource),
+    enabled: !!symbol,
+    placeholderData: (prev) => prev,
+  })
+```
+
+- [ ] **Step 4: StockIntradayChart 加 prop**
+
+`Props` interface 加 `dataSource?: 'default' | 'stockdata'`；解构加 `dataSource`；query 改为：
+
+```ts
+  const minute = useQuery({
+    queryKey: QK.klineMinute(symbol, date ?? '', dataSource),
+    queryFn: () => api.klineMinute(symbol, date ?? undefined, dataSource),
+    enabled: !!symbol && !!date,
+    refetchInterval: refetchIntervalMs,
+  })
+```
+
+- [ ] **Step 5: 验证构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 通过，无类型错误。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add frontend/src/lib/api.ts frontend/src/lib/queryKeys.ts frontend/src/components/StockDailyKChart.tsx frontend/src/components/StockIntradayChart.tsx
+git commit -m "feat(kline): 前端 klineDaily/klineMinute 支持 dataSource=stockdata 可选参数"
+```
+
+---
+
+### Task 8: QuantTradeDialog 固定传 dataSource="stockdata"
+
+**Files:**
+- Modify: `frontend/src/components/QuantTradeDialog.tsx`
+
+**Interfaces:**
+- Consumes: `StockDailyKChart`/`StockIntradayChart` 的 `dataSource` prop（Task 7）。
+
+- [ ] **Step 1: 两图固定传参**
+
+`StockDailyKChart` 调用（始终挂载的那一个）加 `dataSource="stockdata"`；`StockIntradayChart` 调用加 `dataSource="stockdata"`。
+
+- [ ] **Step 2: 验证构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 通过。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add frontend/src/components/QuantTradeDialog.tsx
+git commit -m "feat(dialog): QuantTradeDialog 数据源固定走本地 stockdata 服务"
+```
+
+---
+
+### Task 9: 最终验证与手动冒烟
+
+**Files:** 无改动。
+
+- [ ] **Step 1: 后端回归**
+
+Run（backend/ 下）: `uv run --extra dev pytest -q` + `uv run --extra dev ruff check app` + `uv run --extra dev mypy app`
+Expected: 通过（既有 pre-existing 失败不计）。
+
+- [ ] **Step 2: 前端构建**
+
+Run: `cd frontend && pnpm build`
+Expected: 通过。
+
+- [ ] **Step 3: 手动冒烟清单**
+
+启动 `./dev.sh`（含 stockdata 服务），打开 http://localhost:3011：
+
+1. **模拟盘点持仓行** → 弹窗默认分钟视图：
+   - 盘中：分钟线为今日实时（后端日志显示走 stockdata 服务 `current_snapshot`，无 TickFlow 分钟拉取）
+   - 历史：分钟线读本地分区（`source:"stockdata"`）
+2. **成交记录行** → 交易当日分钟线 + B/S 标正常。
+3. **日K视图**：enriched 本地有 → 无服务请求；删除某标的 enriched 分区（或本地无数据标的）→ 走 stockdata 服务（日志）→ 收盘价线/涨跌幅正常。
+4. **停掉 stockdata 服务**（kill 服务进程或 `STOCKDATA_ENABLED=0`）→ 弹窗分钟/日K 仍可用（回退 TickFlow，后端有 warning 日志）。
+5. **自选股弹窗回归**：数据路径不变（后端日志无 stockdata 请求）。
