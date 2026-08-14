@@ -53,15 +53,27 @@ def _fund_etf_fund_daily_em() -> pl.DataFrame:
 
 
 def _nav_date_from_columns(raw: pl.DataFrame) -> _date | None:
-    """从 akshare 列名解析最新净值披露日期（``YYYY-MM-DD-单位净值``）。"""
+    """返回 akshare 快照中**有效净值最全**的最新披露日。
+
+    akshare 对当日未披露净值的基金填 ``---`` 占位：若直接取最新列名（如盘中
+    08-14 列全为占位），会过早写入空/稀疏分区且幂等永不重补。改为按"有效行数"
+    选列（并列取更晚日期），当日未披露时自然落到前一披露日，披露齐全后才推进。
+    全部无有效值返回 None（调用方跳过落盘）。
+    """
     best: _date | None = None
+    best_count = -1
     for col in raw.columns:
         m = _NAV_DATE_COL_RE.match(str(col))
-        if m:
-            d = _date.fromisoformat(m.group(1))
-            if best is None or d > best:
-                best = d
-    return best
+        if not m:
+            continue
+        d = _date.fromisoformat(m.group(1))
+        n = raw.filter(pl.col(col).cast(pl.Utf8, strict=False).str.strip_chars()
+                       .str.replace("---", "", literal=True)
+                       .str.contains(r"^-?\d+(\.\d+)?$", strict=False)).height
+        if n > best_count or (n == best_count and best is not None and d > best):
+            best = d
+            best_count = n
+    return best if best_count > 0 else None
 
 
 def sync_etf_nav(day: _date | None = None) -> int:
@@ -78,20 +90,14 @@ def sync_etf_nav(day: _date | None = None) -> int:
         return 0
     nav_date = _nav_date_from_columns(raw)
     if nav_date is None:
-        nav_date = fallback
-        unit_col = "单位净值"
-        logger.warning(
-            "etf_nav_service: 无法从 akshare 列名解析净值披露日期，按 %s 落盘", nav_date)
-    else:
-        unit_col = f"{nav_date.isoformat()}-单位净值"
+        # akshare 快照无任何有效净值（如盘初/数据源异常）：不落盘，留给后续重试
+        from app.services.mootdx_service import _append_failure
+        _append_failure(f"etf_nav:{fallback}", "no_valid_nav")
+        return 0
+    unit_col = f"{nav_date.isoformat()}-单位净值"
     if unit_col not in raw.columns:
         from app.services.mootdx_service import _append_failure
         _append_failure(f"etf_nav:{nav_date}", "no_nav_column")
-        return 0
-    pdir = ETF_NAV_ROOT / f"date={nav_date}"
-    part = pdir / "part.parquet"
-    if part.exists():
-        logger.info("etf_nav_service: %s 已存在，跳过", nav_date)
         return 0
     df = raw.select(pl.col("基金代码"), pl.col(unit_col)).rename(
         {unit_col: "单位净值"})
@@ -110,6 +116,23 @@ def sync_etf_nav(day: _date | None = None) -> int:
                           .alias("unit_nav"),
         pl.lit(nav_date.isoformat()).alias("date"),
     ).filter(pl.col("_valid")).drop("_valid").select(["symbol", "unit_nav", "date"])
+    if df.is_empty():
+        # 有效净值 0 行：不写空/稀疏分区
+        logger.warning("etf_nav_service: %s 有效净值 0 行，跳过落盘", nav_date)
+        return 0
+    pdir = ETF_NAV_ROOT / f"date={nav_date}"
+    part = pdir / "part.parquet"
+    if part.exists():
+        try:
+            n_existing = pl.read_parquet(part, columns=["symbol"]).height
+        except Exception:  # noqa: BLE001
+            n_existing = 0
+        # 已有分区不稀疏（不比本次快照少）→ 幂等跳过；稀疏（过早写入的占位）→ 覆盖重写
+        if n_existing > 0 and n_existing >= df.height:
+            logger.info("etf_nav_service: %s 已存在（%d 行），跳过", nav_date, n_existing)
+            return 0
+        logger.warning("etf_nav_service: %s 分区稀疏（%d 行 < 本次 %d 行），覆盖重写",
+                       nav_date, n_existing, df.height)
     pdir.mkdir(parents=True, exist_ok=True)
     tmp = pdir / "part.tmp"
     df.sort("symbol").write_parquet(tmp)
@@ -131,6 +154,27 @@ def _market_closed(now: _dt.datetime | None = None) -> bool:
     return _mc(now)
 
 
+def _latest_valid_nav_date() -> _date | None:
+    """最新"有效"净值分区日期：分区 parquet 存在且行数 > 0。
+
+    空/稀疏分区（过早写入的占位数据）不视为已覆盖，否则会掩盖真实缺失。
+    """
+    latest: _date | None = None
+    for ds in _partition_dates():
+        part = ETF_NAV_ROOT / f"date={ds}" / "part.parquet"
+        if not part.exists():
+            continue
+        try:
+            n = pl.read_parquet(part, columns=["symbol"]).height
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n > 0:
+            d = _date.fromisoformat(ds)
+            if latest is None or d > latest:
+                latest = d
+    return latest
+
+
 def _missing_etf_nav_days(now: _dt.datetime | None = None) -> list[_date]:
     """返回需回源的净值交易日：**最多一个**（最新缺失日，历史不补）。
 
@@ -141,10 +185,9 @@ def _missing_etf_nav_days(now: _dt.datetime | None = None) -> list[_date]:
       → 候选 = 前一交易日（00:00 巡检即落此分支）；
     - 收盘后（≥15:00）当日净值已披露 → 候选 = 最新交易日；
     - 非交易日（周末/节假日）→ 候选 = 最近一个交易日；
-    - 已有分区日期 >= 候选 → 无需回源。
+    - 已有**有效**分区日期 >= 候选 → 无需回源（空/稀疏分区不算覆盖）。
     """
     from app.services.mootdx_service import _trade_days_up_to
-    existing = _partition_dates()
     now = now or _dt.datetime.now()
     today = now.date()
     recent = _trade_days_up_to(today)
@@ -156,6 +199,7 @@ def _missing_etf_nav_days(now: _dt.datetime | None = None) -> list[_date]:
         candidate = recent[-2] if len(recent) >= 2 else latest_td
     else:
         candidate = latest_td
-    if existing and _date.fromisoformat(existing[-1]) >= candidate:
+    covered = _latest_valid_nav_date()
+    if covered is not None and covered >= candidate:
         return []
     return [candidate]

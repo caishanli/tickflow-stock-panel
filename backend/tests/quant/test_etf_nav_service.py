@@ -59,6 +59,67 @@ def test_sync_drops_dash_values(tmp_path, monkeypatch):
     assert df["unit_nav"].dtype == pl.Float64
 
 
+def test_nav_date_picks_latest_column_with_data():
+    """当日未披露（全 --- 占位）时选前一披露日，而非最新列名（避免写空分区）。"""
+    raw = pl.DataFrame({
+        "基金代码": ["510300", "159915"],
+        "2026-08-13-单位净值": [4.7, 3.5],
+        "2026-08-14-单位净值": ["---", "---"],
+    })
+    assert svc._nav_date_from_columns(raw) == date(2026, 8, 13)
+    # 披露齐全后（08-14 有值）→ 推进到 08-14
+    raw2 = pl.DataFrame({
+        "基金代码": ["510300", "159915"],
+        "2026-08-13-单位净值": [4.7, 3.5],
+        "2026-08-14-单位净值": [4.8, 3.6],
+    })
+    assert svc._nav_date_from_columns(raw2) == date(2026, 8, 14)
+    # 全部无有效值 → None（调用方跳过落盘）
+    raw3 = pl.DataFrame({
+        "基金代码": ["510300", "159915"],
+        "2026-08-14-单位净值": ["---", "---"],
+    })
+    assert svc._nav_date_from_columns(raw3) is None
+
+
+def test_sync_rewrites_sparse_partition(tmp_path, monkeypatch):
+    """已存在但稀疏的分区（过早写入的占位）→ 覆盖重写为全量快照。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+
+    def fake_fund_etf_fund_daily_em():
+        return pl.DataFrame({
+            "基金代码": ["510300", "159915", "518880"],
+            "2026-08-13-单位净值": ["4.7", "3.5", "5.0"],
+        })
+
+    monkeypatch.setattr(svc, "_fund_etf_fund_daily_em", fake_fund_etf_fund_daily_em)
+    part = tmp_path / "etf_nav" / "date=2026-08-13" / "part.parquet"
+    part.parent.mkdir(parents=True)
+    pl.DataFrame({"symbol": ["510300.XSHG"], "unit_nav": [4.7],
+                  "date": ["2026-08-13"]}).write_parquet(part)  # 旧版稀疏占位
+    n = svc.sync_etf_nav()
+    assert n == 3
+    assert pl.read_parquet(part).height == 3
+
+
+def test_missing_nav_days_sparse_partition_not_covered(tmp_path, monkeypatch):
+    """空/稀疏分区不掩盖缺失：_latest_valid_nav_date 只看有数据的分区。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    _patch_trade_days(monkeypatch)
+    # 08-06 有数据，08-07 只有空目录 → 最新有效 = 08-06 < 候选 08-07 → 仍缺失
+    (tmp_path / "etf_nav" / "date=2026-08-06").mkdir(parents=True)
+    pl.DataFrame({"symbol": ["510300.XSHG"], "unit_nav": [4.7],
+                  "date": ["2026-08-06"]}).write_parquet(
+        tmp_path / "etf_nav" / "date=2026-08-06" / "part.parquet")
+    (tmp_path / "etf_nav" / "date=2026-08-07").mkdir(parents=True)
+    assert svc._latest_valid_nav_date() == date(2026, 8, 6)
+    assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30)) == [_dt.date(2026, 8, 7)]
+
+
 def test_symbol_market_mapping():
     # 5/6/9 开头 → 沪市 XSHG；0/1/2/3 开头 → 深市 XSHE
     assert svc._jq_symbol("510300") == "510300.XSHG"
@@ -83,8 +144,12 @@ def test_missing_nav_days_respects_market_close(tmp_path, monkeypatch):
     # 收盘后当日净值已披露 → 候选 = 最新交易日
     missing = svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30))
     assert missing == [_dt.date(2026, 8, 7)]
-    # 已有当日分区 → 不再缺失
+    # 已有空分区（无有效数据，如过早写入的占位）→ 仍视为缺失
     (tmp_path / "etf_nav" / "date=2026-08-07").mkdir(parents=True)
+    assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30)) == [_dt.date(2026, 8, 7)]
+    # 已有含数据的当日分区 → 不再缺失
+    part = tmp_path / "etf_nav" / "date=2026-08-07" / "part.parquet"
+    pl.DataFrame({"symbol": ["510300.XSHG"], "unit_nav": [4.7], "date": ["2026-08-07"]}).write_parquet(part)
     assert svc._missing_etf_nav_days(now=_dt.datetime(2026, 8, 7, 15, 30)) == []
 
 

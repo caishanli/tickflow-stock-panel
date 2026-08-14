@@ -1413,8 +1413,18 @@ def backfill_to_now() -> dict[str, Any]:
     etf_daily_days    = _partition_dates(ETF_DAILY_ROOT)
     index_daily_days  = _partition_dates(INDEX_DAILY_ROOT)
     etf_minute_days   = _partition_dates(ETF_MINUTE_ROOT)
+    stock_minute_days = _partition_dates(STOCK_MINUTE_ROOT)
     etf_nav_days      = etf_nav_service._partition_dates()
     missing_nav_days  = etf_nav_service._missing_etf_nav_days()
+    # 因子表最新交易日（all.parquet 的 max trade_date；缺失/损坏时 None）
+    adj_factor_latest = None
+    if ADJ_FACTOR_PATH.exists():
+        try:
+            _df = pl.read_parquet(ADJ_FACTOR_PATH, columns=["trade_date"])
+            if not _df.is_empty():
+                adj_factor_latest = str(_df["trade_date"].max())
+        except Exception:  # noqa: BLE001
+            pass
 
     result["missing"] = {
         "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
@@ -1428,9 +1438,10 @@ def backfill_to_now() -> dict[str, Any]:
                                "segment_missing": _safe_universe_segment_missing()},
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
-        "kline_minute":       {"latest": None, "empty": not _partition_dates(STOCK_MINUTE_ROOT),
-                               "missing": bool(_incomplete_stock_minute_days())},
-        "adj_factor_etf":     {"latest": None, "empty": not ADJ_FACTOR_PATH.exists(), "missing": _adj_factor_stale()},
+        "kline_minute":       {"latest": stock_minute_days[-1] if stock_minute_days else None,
+                               "empty": not stock_minute_days, "missing": bool(_incomplete_stock_minute_days())},
+        "adj_factor_etf":     {"latest": adj_factor_latest, "empty": not ADJ_FACTOR_PATH.exists(),
+                               "missing": _adj_factor_stale()},
         "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
                                "empty": not etf_nav_days, "missing": bool(missing_nav_days)},
     }
