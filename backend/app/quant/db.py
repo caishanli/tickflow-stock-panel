@@ -446,8 +446,10 @@ def read_sim_state(account_id):
     with get_conn() as c:
         row = c.execute("SELECT * FROM sim_state WHERE account_id=?", (account_id,)).fetchone()
     state = dict(row) if row else {
-        "cash": 0.0, "positions_json": "{}", "net_value": 0.0, "pnl": 0.0,
-        "start_cash": 0.0, "stop_loss_log_json": "[]", "dt": None,
+        # 无状态行（如重置后）用 None 而非伪造 0.0：net_value=0/start_cash=0 会让前端
+        # baseNV 兜底成 1 → 收益率 0/1-1=-100% 误显示。
+        "cash": None, "positions_json": "{}", "net_value": None, "pnl": None,
+        "start_cash": None, "stop_loss_log_json": "[]", "dt": None,
     }
     state["positions"] = _json_or(state.get("positions_json"), {})
     state["stop_loss_log"] = _json_or(state.get("stop_loss_log_json"), [])

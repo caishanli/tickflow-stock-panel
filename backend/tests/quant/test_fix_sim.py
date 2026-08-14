@@ -82,6 +82,20 @@ def test_m1_read_sim_state_bad_json_falls_back(tmp_quant):
     assert db.read_sim_state("a_none")["positions"] == {}
 
 
+def test_m1_read_sim_state_no_row_is_null_not_zero(tmp_quant):
+    """无状态行（如重置后）的 net_value/start_cash 应为 None 而非伪造 0.0。
+
+    回归：重置账户后前端"收益率"变 -100%——read_sim_state 对无状态行返回
+    net_value=0.0/start_cash=0.0，前端 baseNV 兜底成 1 → 0/1-1 = -1 显示 -100.00%。
+    """
+    st = db.read_sim_state("a_none2")
+    assert st["net_value"] is None
+    assert st["start_cash"] is None
+    assert st["cash"] is None
+    assert st["pnl"] is None
+    assert st["positions"] == {}
+
+
 def test_m1_protocol_roundtrip_keeps_positions(tmp_quant):
     db.insert_sim_account("a_rt", "a", 100000.0, 0.03, "created")
     state = _mk_state()

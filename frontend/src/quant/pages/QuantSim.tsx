@@ -412,10 +412,10 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     }
     return w
   }, [daily, firstOfDay, rangeDays])
-  // 收益基准：账户初始资金（缺失时兜底首日净值）
+  // 收益基准：账户初始资金（缺失时兜底首日净值）；两者皆无（如重置后无状态）→ null
   const baseNV = useMemo(
     () => Number(st?.state?.start_cash ?? st?.start_cash) ||
-      (daily.length > 0 ? Number(daily[0].net_value) : 1),
+      (daily.length > 0 ? Number(daily[0].net_value) : null),
     [st, daily],
   )
   const winFirst = windowed.length > 0 ? windowed[0] : null
@@ -437,7 +437,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     const benchColor = '#f59e0b'
     const data: any[] = windowed
     // 策略收益率(%)：相对初始资金累计（首日即反映当天盈亏）
-    const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / baseNV) - 1) * 100).toFixed(2)))
+    const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / (baseNV ?? 1)) - 1) * 100).toFixed(2)))
     const benchPct = data.map((d) => Number(d.benchmark_pct ?? 0))
     // 直接显示实际累计收益：策略相对初始资金，基准用后端原始累计值（不归一到 0）
     const stratWin = stratPct
