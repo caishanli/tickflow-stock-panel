@@ -53,6 +53,8 @@ interface Props {
   onDataChange?: (result: StockDailyKChartResult) => void
   /** 扩展数据列参数（逗号分隔 config_id.field_name），透传给 klineDaily 接口 */
   extColumns?: string
+  /** 聚合周期: daily=日K(默认) / weekly=按ISO周聚合 */
+  period?: 'daily' | 'weekly'
 }
 
 function isValidRow(r: any): boolean {
@@ -101,6 +103,47 @@ function buildLimitUpMarkers(rows: KlineRow[]): ChartMarker[] {
   return markers
 }
 
+/** 日K行按 ISO 周(周一为首)聚合为周K: 开=周首开/高=周内最高/低=周内最低/收=周末收(不足一周按实际)/量额求和, 周均线重算, 副图指标置 null */
+export function aggregateWeekly(rows: KlineRow[]): KlineRow[] {
+  const weeks = new Map<string, KlineRow>()
+  for (const r of rows) {
+    const date = typeof r.date === 'string' ? r.date.slice(0, 10) : String(r.date)
+    const d = new Date(`${date}T00:00:00`)
+    if (Number.isNaN(d.getTime())) continue
+    const dow = (d.getDay() + 6) % 7 // Mon=0
+    const start = new Date(d)
+    start.setDate(d.getDate() - dow)
+    // 本地日期手拼 (toISOString 会因时区偏一天)
+    const key = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`
+    const cur = weeks.get(key)
+    if (!cur) {
+      weeks.set(key, {
+        ...r, date: key,
+        open: r.open, high: r.high, low: r.low, close: r.close,
+        volume: r.volume ?? 0, amount: r.amount ?? 0,
+      })
+    } else {
+      cur.high = Math.max(Number(cur.high), Number(r.high))
+      cur.low = Math.min(Number(cur.low), Number(r.low))
+      cur.close = r.close
+      cur.volume = Number(cur.volume ?? 0) + Number(r.volume ?? 0)
+      cur.amount = Number(cur.amount ?? 0) + Number(r.amount ?? 0)
+    }
+  }
+  const sorted = Array.from(weeks.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)))
+  const closes = sorted.map((r) => Number(r.close))
+  const ma = (n: number, i: number) =>
+    i + 1 < n ? null : closes.slice(i + 1 - n, i + 1).reduce((s, v) => s + v, 0) / n
+  return sorted.map((r, i) => ({
+    ...r,
+    ma5: ma(5, i), ma10: ma(10, i), ma20: ma(20, i), ma60: ma(60, i),
+    macd_dif: null, macd_dea: null, macd_hist: null,
+    rsi_6: null, rsi_14: null, rsi_24: null,
+    kdj_k: null, kdj_d: null, kdj_j: null,
+    boll_upper: null, boll_lower: null,
+  }))
+}
+
 export function getDefaultRange(): { start: string; end: string } {
   const now = new Date()
   const end = now.toISOString().slice(0, 10)
@@ -134,6 +177,7 @@ export function StockDailyKChart({
   onDateClick,
   onDataChange,
   extColumns,
+  period = 'daily',
 }: Props) {
   const [activeIndicators, setActiveIndicators] = useState<string[]>(['vol'])
   const [showMarkers, setShowMarkers] = useState(true)
@@ -151,9 +195,14 @@ export function StockDailyKChart({
     placeholderData: (prev) => prev,
   })
 
-  const rows = useMemo(() => toOHLC(kline.data?.rows ?? []), [kline.data?.rows])
+  const dailyRows = kline.data?.rows ?? []
+  const displayRows = useMemo(
+    () => period === 'weekly' ? aggregateWeekly(dailyRows) : dailyRows,
+    [period, dailyRows],
+  )
+  const rows = useMemo(() => toOHLC(displayRows), [displayRows])
   const stockInfo = kline.data?.stock_info
-  const limitMarkers = useMemo(() => buildLimitUpMarkers(kline.data?.rows ?? []), [kline.data?.rows])
+  const limitMarkers = useMemo(() => buildLimitUpMarkers(dailyRows), [dailyRows])
   const allMarkers = useMemo(() => [
     ...(markers ?? []),
     ...(showLimitMarkers ? limitMarkers : []),
@@ -187,7 +236,7 @@ export function StockDailyKChart({
 
   return (
     <div className={className} style={{ minHeight: chartHeight }}>
-      {showIndicatorControls && rows.length > 0 && (
+      {showIndicatorControls && period !== 'weekly' && rows.length > 0 && (
         <div className="flex items-center gap-1.5 px-1 pb-0.5">
           {SUB_CHARTS.map(ind => (
             <button
