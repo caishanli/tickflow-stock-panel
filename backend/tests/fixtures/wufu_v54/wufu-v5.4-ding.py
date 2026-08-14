@@ -390,6 +390,26 @@ def monitor_drawdown(context):
         log.error(f"【回撤监控】计算异常: {e}")
 
 
+def _anomalous_etf_days(daily_totals, daily_counts):
+    """返回 3 日全市场 ETF 成交额中明显偏低的异常日（只数或金额 < 另两天较大者 50%）。
+
+    数据回源不完整（如 08-13 仅 225 只、1469 亿，正常 ~1658 只、~4000 亿）时，只数与
+    金额同时掉到正常 1/3 以下；正常日只数波动 <2%。返回 [] 表示无异常。
+    """
+    days = list(daily_totals.index)
+    anomaly = []
+    for day in days:
+        others = [d for d in days if d != day]
+        max_other_count = max(daily_counts.get(d, 0) for d in others)
+        max_other_money = max(daily_totals[d] for d in others)
+        count = daily_counts.get(day, 0)
+        money = daily_totals[day]
+        if (max_other_count and count < max_other_count * 0.5) \
+                or (max_other_money and money < max_other_money * 0.5):
+            anomaly.append(day)
+    return anomaly
+
+
 def calculate_global_etf_threshold(context):
     log.info("【全局阈值更新】开始计算全市场ETF流动性门槛")
     try:
@@ -421,6 +441,27 @@ def calculate_global_etf_threshold(context):
         if len(daily_totals) < 3:
             log.warning(f"仅有{len(daily_totals)}个有效交易日，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
+            return
+        anomaly_days = _anomalous_etf_days(daily_totals, daily_counts)
+        if anomaly_days:
+            for day in anomaly_days:
+                money = daily_totals[day]
+                count = daily_counts.get(day, 0)
+                msg = (f"🚨【成交额异常】{day.date()} 全市场ETF总成交额 {money/1e8:.2f}亿元 "
+                       f"({count}只ETF有成交)，明显低于其他两天，疑似数据回源不完整，"
+                       f"已剔除该日计算阈值")
+                log.error(msg)
+                log.notify(msg)
+            good = [d for d in daily_totals.index if d not in anomaly_days]
+            if len(good) < 2:
+                log.warning("剔除异常日后不足2个正常交易日，使用保守阈值1000万")
+                g.avg_etf_money_threshold = 10000000
+                return
+            avg_total_money = daily_totals[good].mean()
+            threshold = avg_total_money / g.global_threshold_divisor
+            g.avg_etf_money_threshold = threshold
+            log.info(f"【全局阈值更新完成】(已剔除异常日) 近{len(good)}日全市场ETF日均总成交额="
+                     f"{avg_total_money/1e8:.2f}亿元，阈值={threshold/1e4:.0f}万元({threshold:,.0f}元)")
             return
         avg_total_money = daily_totals.mean()
         threshold = avg_total_money / g.global_threshold_divisor

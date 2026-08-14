@@ -5,6 +5,9 @@ import types
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+import pytest
+
 STRATEGY = Path(__file__).parent.parent / "fixtures" / "wufu_v54" / "wufu-v5.4-ding.py"
 
 
@@ -30,14 +33,25 @@ def test_strategy_has_no_rebalance_notify():
 
 
 class _FakeLog:
-    """桩 log：记录 notify/info 调用（引擎 LogProxy 的最小替身）。"""
+    """桩 log：记录 notify/info/error/warning 调用（引擎 LogProxy 的最小替身）。"""
 
     def __init__(self):
         self.notifies = []
         self.infos = []
+        self.errors = []
+        self.warnings = []
 
     def info(self, msg):
         self.infos.append(msg)
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+    def warning(self, msg):
+        self.warnings.append(msg)
+
+    def error(self, msg):
+        self.errors.append(msg)
 
     def notify(self, msg):
         self.notifies.append(msg)
@@ -88,3 +102,75 @@ def test_notify_trade_buy_format():
     assert ns["log"].notifies, "买入应产生 notify"
     msg = ns["log"].notifies[-1]
     assert "📥 买入 豆粕ETF华夏(159985.XSHE) 数量46800 价格2.132" in msg
+
+
+# ---- ETF 成交额异常日判定 ----
+
+def test_anomalous_etf_days_detects_low_count():
+    ns = _load_strategy()
+    idx = pd.DatetimeIndex(["2026-08-11", "2026-08-12", "2026-08-13"])
+    totals = pd.Series([4e11, 4.2e11, 1.5e11], index=idx)          # 08-13 金额仅 ~36%
+    counts = pd.Series([1658, 1657, 225], index=idx)               # 08-13 只数仅 ~13.6%
+    assert ns["_anomalous_etf_days"](totals, counts) == [idx[2]]
+
+
+def test_anomalous_etf_days_no_false_positive():
+    ns = _load_strategy()
+    idx = pd.DatetimeIndex(["2026-08-11", "2026-08-12", "2026-08-13"])
+    totals = pd.Series([4e11, 4.2e11, 4.6e11], index=idx)
+    counts = pd.Series([1658, 1657, 1658], index=idx)
+    assert ns["_anomalous_etf_days"](totals, counts) == []
+
+
+def test_anomalous_etf_days_exactly_50pct_is_ok():
+    ns = _load_strategy()
+    idx = pd.DatetimeIndex(["2026-08-11", "2026-08-12", "2026-08-13"])
+    totals = pd.Series([4e11, 4e11, 2e11], index=idx)              # 恰好 50%
+    counts = pd.Series([1658, 1658, 829], index=idx)               # 恰好 50%
+    assert ns["_anomalous_etf_days"](totals, counts) == []
+
+
+def test_anomalous_etf_days_detects_low_money():
+    ns = _load_strategy()
+    idx = pd.DatetimeIndex(["2026-08-11", "2026-08-12", "2026-08-13"])
+    totals = pd.Series([4e11, 4.2e11, 1.9e11], index=idx)          # ~45%，低于 50%
+    counts = pd.Series([1658, 1657, 1650], index=idx)              # 只数正常
+    assert ns["_anomalous_etf_days"](totals, counts) == [idx[2]]
+
+
+# ---- calculate_global_etf_threshold 接入异常自检 ----
+
+def _threshold_ctx(prev_day=date(2026, 8, 13)):
+    c = types.SimpleNamespace()
+    c.previous_date = prev_day
+    c.current_dt = types.SimpleNamespace()
+    c.current_dt.date = lambda: prev_day
+    return c
+
+
+def _money_df():
+    return pd.DataFrame({
+        "code": ["510300.XSHG"] * 3 + ["511880.XSHG"] * 3,
+        "time": pd.DatetimeIndex(["2026-08-11", "2026-08-12", "2026-08-13"] * 2),
+        "money": [2e11, 2.1e11, 0.75e11, 2.2e11, 2.0e11, 0.75e11],
+    })
+
+
+def test_threshold_excludes_anomaly_and_notifies(monkeypatch):
+    """异常天被剔除，阈值用正常两天均值；log.error 进异常标签、log.notify 推钉钉。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    fake_dm = types.SimpleNamespace(
+        get_daily_money_cached=lambda *a, **k: _money_df())
+    monkeypatch.setattr(mgr_mod, "get_data_manager", lambda: fake_dm)
+    ns = _load_strategy()
+    ns["g"]._cached_etf_universe = ["510300.XSHG", "511880.XSHG"]
+    ns["g"].global_threshold_divisor = 20000
+    ns["get_trade_days"] = lambda end_date=None, count=0: [
+        date(2026, 8, 11), date(2026, 8, 12), date(2026, 8, 13)]
+    ns["calculate_global_etf_threshold"](_threshold_ctx())
+    # daily_totals：08-11=4.2e11, 08-12=4.1e11, 08-13=1.5e11（< 4.2e11*0.5=2.1e11 → 异常）
+    # 剔除 08-13 后均值 = (4.2e11+4.1e11)/2 = 4.15e11；阈值 = 4.15e11 / 20000
+    assert ns["g"].avg_etf_money_threshold == pytest.approx(4.15e11 / 20000)
+    assert any("成交额异常" in m for m in ns["log"].errors)
+    assert any("成交额异常" in m for m in ns["log"].notifies)
