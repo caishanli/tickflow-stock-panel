@@ -301,6 +301,7 @@ export function QuantTradeDialog({
               </div>
 
               <StockDailyKChart
+                dataSource="stockdata"
                 symbol={symbol}
                 height={420}
                 className={view === 'minute' ? 'hidden' : undefined}
@@ -319,6 +320,7 @@ export function QuantTradeDialog({
               />
               {view === 'minute' && selectedDate && (
                 <StockIntradayChart
+                  dataSource="stockdata"
                   symbol={symbol}
                   date={selectedDate}
                   height={420}
