@@ -83,7 +83,11 @@ def _stockdata_frame(out: dict, jq: str, index_col: str):
 
 
 def _stockdata_minute(symbol: str, trade_date: date):
-    """本地 stockdata 服务取分钟: 盘中今天走 current_snapshot(按需回源), 历史读分区。失败返回空 df。"""
+    """本地 stockdata 服务取分钟: 盘中今天走 current_snapshot(按需回源), 历史读分区。失败返回空 df。
+
+    服务分区/内存库 datetime 为北京时 naive, 而前端分时轴契约与 TickFlow 实时路径
+    (_normalize_minute 的 epoch→naive) 均为 UTC naive → 返回前统一 -8h 折算。
+    """
     import polars as pl
     try:
         jq = _to_jq_code(symbol)
@@ -92,7 +96,11 @@ def _stockdata_minute(symbol: str, trade_date: date):
             out = client.current_snapshot([jq])
         else:
             out = client.get_minute_pool([jq], f"{trade_date} 09:30:00", f"{trade_date} 15:00:00")
-        return _stockdata_frame(out, jq, "datetime")
+        df = _stockdata_frame(out, jq, "datetime")
+        if df.is_empty():
+            return df
+        return df.with_columns(
+            (pl.col("datetime") - pl.duration(hours=8)).alias("datetime"))
     except Exception as e:
         logger.warning("stockdata 服务分钟获取失败, 回退后续路径: %s %s: %s", symbol, trade_date, e)
         return pl.DataFrame()

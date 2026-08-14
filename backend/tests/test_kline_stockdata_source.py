@@ -79,3 +79,18 @@ def test_stockdata_is_etf(monkeypatch):
     assert _stockdata_is_etf("513360.XSHG")
     assert _stockdata_is_etf("159227.XSHE")
     assert not _stockdata_is_etf("000001.XSHE")
+
+
+def test_stockdata_minute_converts_beijing_to_utc(monkeypatch):
+    """服务返回北京时 naive datetime (09:31), 前端分时契约为 UTC naive → -8h 折算 (01:31)。"""
+    import datetime as _dt
+    pdf = pd.DataFrame(
+        {"open": [1.0], "close": [1.1]},
+        index=pd.to_datetime([_dt.datetime(2026, 8, 13, 9, 31)]),
+    )
+    out = {"000001.XSHE": pdf}
+    monkeypatch.setattr("app.api.kline._get_stockdata_client",
+                        lambda: type("C", (), {"get_minute_pool": lambda self, *a, **k: out})())
+    df = _stockdata_minute("000001.XSHE", date(2026, 8, 13))
+    assert not df.is_empty()
+    assert df["datetime"].dt.strftime("%H:%M").to_list() == ["01:31"]
