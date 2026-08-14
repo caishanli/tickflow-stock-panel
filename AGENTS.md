@@ -8,7 +8,10 @@ A 股「选股 + 监控 + 回测」量化工作台。后端 FastAPI + Polars/Duc
   - 改端口：`BACKEND_PORT=8000 ./dev.sh` / `FRONTEND_PORT=5173 ./dev.sh`。
   - 老 CPU（无 AVX2/FMA）：根 `.env` 设 `BACKEND_EXTRAS=legacy-cpu`（dev.sh 与 Docker 都会读取）。
   - `./dev.sh` 会 `kill` 掉已占用端口的进程，注意别误杀。
-- 后台运行：`nohup ./dev.sh > /tmp/tickflow-dev.log 2>&1 &`
+- 后台运行：**一律用 `setsid` 脱离**——在 agent/bash 会话里后台拉起（裸 `nohup ... &` 或 `&` 会让工具/父 shell 等待 dev.sh 的 stdout 管道直到超时）：
+  `setsid ./dev.sh > /tmp/tickflow-dev.log 2>&1 </dev/null & disown`
+  启动后**另起一个命令**验证端口（`ss -tlnp | grep -E ":3018|:3011|:3322"`），不要在同一个调用里 `sleep`/轮询（会连带超时）。确认存活后再操作。
+- 若后端 `:3018` 卡死不响应：多为 uvicorn `--reload`（改代码触发）与 stockdata guardian 重拉子进程的竞态，kill 掉 3018/3011/3322 端口的进程后用上面 setsid 命令重启即可。
 - 首次启动需 `cp .env.example .env`（留空 `TICKFLOW_API_KEY` = None/Free 模式，仅历史日 K）。`AUTH_PASSWORD` 仅首次初始化生效，改密码用页面 UI。
 
 ## 验证命令（易踩坑）
