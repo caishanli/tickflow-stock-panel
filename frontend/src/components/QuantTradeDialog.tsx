@@ -101,6 +101,11 @@ export function QuantTradeDialog({
     initialApplied.current = false
   }, [symbol, initialView])
 
+  // 外部 dateRange 变化时同步 (回测切换成交时窗口跟随持仓区间)
+  useEffect(() => {
+    setDateRange(externalDateRange ?? getDefaultRange())
+  }, [externalDateRange])
+
   // 加自选
   const watchlist = useQuery({ queryKey: QK.watchlist, queryFn: api.watchlistList, enabled: !!symbol })
   const inWatchlist = (watchlist.data?.symbols ?? []).some((s: any) => s.symbol === symbol)
@@ -295,36 +300,23 @@ export function QuantTradeDialog({
                 ))}
               </div>
 
-              {view === 'daily' && (
-                <StockDailyKChart
-                  symbol={symbol}
-                  height={420}
-                  dateRange={dateRange}
-                  markers={markers}
-                  ranges={ranges}
-                  priceLines={priceLines}
-                  showLimitMarkers={showLimitMarkers}
-                  showMarkerToggle={showMarkerToggle}
-                  onDateClick={(d) => setSelectedDate(d)}
-                  onDataChange={setDailyResult}
-                  visibleBars={60}
-                  extColumns={extColumns}
-                />
-              )}
-              {view === 'weekly' && (
-                <StockDailyKChart
-                  symbol={symbol}
-                  height={420}
-                  dateRange={dateRange}
-                  period="weekly"
-                  showLimitMarkers={false}
-                  showIndicatorControls={false}
-                  onDateClick={(d) => setSelectedDate(d)}
-                  onDataChange={setDailyResult}
-                  visibleBars={120}
-                  extColumns={extColumns}
-                />
-              )}
+              <StockDailyKChart
+                symbol={symbol}
+                height={420}
+                className={view === 'minute' ? 'hidden' : undefined}
+                dateRange={dateRange}
+                period={view === 'weekly' ? 'weekly' : 'daily'}
+                markers={view === 'daily' ? markers : undefined}
+                ranges={view === 'daily' ? ranges : undefined}
+                priceLines={view === 'daily' ? priceLines : undefined}
+                showLimitMarkers={view === 'daily' ? showLimitMarkers : false}
+                showMarkerToggle={view === 'daily' ? showMarkerToggle : false}
+                showIndicatorControls={view !== 'weekly'}
+                onDateClick={(d) => setSelectedDate(d)}
+                onDataChange={setDailyResult}
+                visibleBars={view === 'weekly' ? 120 : 60}
+                extColumns={extColumns}
+              />
               {view === 'minute' && selectedDate && (
                 <StockIntradayChart
                   symbol={symbol}

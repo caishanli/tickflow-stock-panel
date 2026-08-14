@@ -107,6 +107,7 @@ function buildLimitUpMarkers(rows: KlineRow[]): ChartMarker[] {
 export function aggregateWeekly(rows: KlineRow[]): KlineRow[] {
   const weeks = new Map<string, KlineRow>()
   for (const r of rows) {
+    if (!isValidRow(r)) continue
     const date = typeof r.date === 'string' ? r.date.slice(0, 10) : String(r.date)
     const d = new Date(`${date}T00:00:00`)
     if (Number.isNaN(d.getTime())) continue
