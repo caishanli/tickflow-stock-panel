@@ -4,7 +4,14 @@ from datetime import date
 import pandas as pd
 import polars as pl
 
-from app.api.kline import _stockdata_daily, _stockdata_frame, _stockdata_minute, _to_jq_code
+from app.api.kline import (
+    _stockdata_daily,
+    _stockdata_frame,
+    _stockdata_is_etf,
+    _stockdata_minute,
+    _to_jq_code,
+    _to_partition_symbol,
+)
 
 
 def test_to_jq_code():
@@ -58,3 +65,17 @@ def test_stockdata_daily_empty_on_client_error(monkeypatch):
     monkeypatch.setattr("app.api.kline._get_stockdata_client", boom)
     df = _stockdata_daily("000001.SZ", date(2026, 8, 1), date(2026, 8, 1), is_stock=True)
     assert df.is_empty()
+
+
+def test_to_partition_symbol():
+    assert _to_partition_symbol("513360.XSHG") == "513360.SH"
+    assert _to_partition_symbol("159227.XSHE") == "159227.SZ"
+    assert _to_partition_symbol("513360.SH") == "513360.SH"
+    assert _to_partition_symbol("920001.BJ") == "920001.SZ"
+
+
+def test_stockdata_is_etf(monkeypatch):
+    monkeypatch.setattr("app.api.kline._stockdata_etf_set", lambda: {"513360.SH", "159227.SZ"})
+    assert _stockdata_is_etf("513360.XSHG")
+    assert _stockdata_is_etf("159227.XSHE")
+    assert not _stockdata_is_etf("000001.XSHE")

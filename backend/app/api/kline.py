@@ -39,6 +39,38 @@ def _to_jq_code(symbol: str) -> str:
     return pure + (".XSHG" if suf in ("SH", "XSHG") else ".XSHE")
 
 
+def _to_partition_symbol(symbol: str) -> str:
+    """513360.XSHG → 513360.SH; 000001.XSHE → 000001.SZ; 其余原样 (与 stockdata 服务 _tf_symbol 一致)。"""
+    pure, _, suf = symbol.rpartition(".")
+    if not pure:
+        return symbol
+    return pure + (".SH" if suf in ("XSHG", "SH") else ".SZ")
+
+
+_STOCKDATA_ETF_SET_CACHE: set[str] | None = None
+
+
+def _stockdata_etf_set() -> set[str]:
+    """服务端 ETF 集合 (由 kline_etf_daily 分区推导, .SH 格式)。
+
+    repo.get_etf_symbol_set 依赖 instruments_etf 分区(曾为空导致 ETF 判成股票),
+    弹窗 stockdata 路径以此为准。进程级缓存, 失败重试。
+    """
+    global _STOCKDATA_ETF_SET_CACHE
+    if _STOCKDATA_ETF_SET_CACHE is None:
+        try:
+            df = _get_stockdata_client().get_all_securities(types=["etf"])
+            _STOCKDATA_ETF_SET_CACHE = set(df["symbol"].astype(str)) if df is not None and not df.empty else set()
+        except Exception as e:
+            logger.warning("stockdata 服务 ETF 集合获取失败: %s", e)
+            _STOCKDATA_ETF_SET_CACHE = set()
+    return _STOCKDATA_ETF_SET_CACHE
+
+
+def _stockdata_is_etf(symbol: str) -> bool:
+    return _to_partition_symbol(symbol) in _stockdata_etf_set()
+
+
 def _stockdata_frame(out: dict, jq: str, index_col: str):
     """StockDataClient 响应 (pandas DatetimeIndex df) → polars, index 还原为 index_col 列。"""
     import polars as pl
@@ -298,27 +330,33 @@ def get_daily(
     # 从 enriched 表读取 (已含前复权 OHLCV + 技术指标 + 信号); ETF/指数走独立存储
     df = repo.get_daily_asset(asset_type, symbol, start, end)
 
-    if data_source == "stockdata" and df.is_empty():
-        raw = _stockdata_daily(symbol, start, end, is_stock=asset_type == "stock")
-        if not raw.is_empty():
-            factors = pl.DataFrame()
-            capset = getattr(request.app.state, "capabilities", None)
-            try:
-                from app.tickflow.capabilities import Cap
-                if capset and capset.has(Cap.ADJ_FACTOR):
-                    factors = kline_sync.fetch_adj_factor_single(symbol)
-            except Exception as e:
-                logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
-            try:
-                enriched = compute_enriched(raw, factors=factors)
-            except Exception as e:
-                logger.warning("stockdata 日K enriched 计算失败, 回退后续路径: %s: %s", symbol, e)
-            else:
-                rows = enriched.tail(days).to_dicts()
-                rows = _maybe_inject_live_candle(request, symbol, rows, asset_type)
-                resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info,
-                        "rows": rows, "source": "stockdata"}
-                return _attach_ext(resp, repo, symbol, ext_columns)
+    # 弹窗专用 stockdata 模式: 用服务端 ETF 集合判定 (repo instruments_etf 曾为空,
+    # ETF 会被误判成 stock 走 enriched 周频坏数据)。ETF 直接服务优先; 股票 enriched
+    # 数据正常, 仅空时回退服务。
+    if data_source == "stockdata":
+        sd_is_etf = _stockdata_is_etf(symbol)
+        if sd_is_etf or df.is_empty():
+            raw = _stockdata_daily(symbol, start, end, is_stock=not sd_is_etf)
+            if not raw.is_empty():
+                factors = pl.DataFrame()
+                capset = getattr(request.app.state, "capabilities", None)
+                try:
+                    from app.tickflow.capabilities import Cap
+                    if capset and capset.has(Cap.ADJ_FACTOR):
+                        factors = kline_sync.fetch_adj_factor_single(symbol)
+                except Exception as e:
+                    logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
+                try:
+                    enriched = compute_enriched(raw, factors=factors)
+                except Exception as e:
+                    logger.warning("stockdata 日K enriched 计算失败, 回退后续路径: %s: %s", symbol, e)
+                else:
+                    rows = enriched.tail(days).to_dicts()
+                    rows = _maybe_inject_live_candle(
+                        request, symbol, rows, "etf" if sd_is_etf else asset_type)
+                    resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                            "rows": rows, "source": "stockdata"}
+                    return _attach_ext(resp, repo, symbol, ext_columns)
 
     if df.is_empty():
         try:
