@@ -16,6 +16,8 @@ interface Props {
   refetchIntervalMs?: number
   /** 分时图买卖标记 (date 感知) */
   markers?: IntradayMarker[]
+  /** 数据源: default=默认 / stockdata=本地 stockdata 服务 */
+  dataSource?: 'default' | 'stockdata'
 }
 
 export function StockIntradayChart({
@@ -27,13 +29,14 @@ export function StockIntradayChart({
   onPriceHover,
   refetchIntervalMs,
   markers,
+  dataSource,
 }: Props) {
   const qc = useQueryClient()
   const [minuteDismissed, setMinuteDismissed] = useState(false)
 
   const minute = useQuery({
-    queryKey: QK.klineMinute(symbol, date ?? ''),
-    queryFn: () => api.klineMinute(symbol, date ?? undefined),
+    queryKey: QK.klineMinute(symbol, date ?? '', dataSource),
+    queryFn: () => api.klineMinute(symbol, date ?? undefined, dataSource),
     enabled: !!symbol && !!date,
     refetchInterval: refetchIntervalMs,
   })

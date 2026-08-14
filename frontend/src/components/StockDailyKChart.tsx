@@ -55,6 +55,8 @@ interface Props {
   extColumns?: string
   /** 聚合周期: daily=日K(默认) / weekly=按ISO周聚合 */
   period?: 'daily' | 'weekly'
+  /** 数据源: default=默认(DuckDB 直读共享数据) / stockdata=本地 stockdata 服务 */
+  dataSource?: 'default' | 'stockdata'
 }
 
 function isValidRow(r: any): boolean {
@@ -179,6 +181,7 @@ export function StockDailyKChart({
   onDataChange,
   extColumns,
   period = 'daily',
+  dataSource,
 }: Props) {
   const [activeIndicators, setActiveIndicators] = useState<string[]>(['vol'])
   const [showMarkers, setShowMarkers] = useState(true)
@@ -190,8 +193,8 @@ export function StockDailyKChart({
 
   // extColumns 纳入 query key：勾选/取消扩展字段时需重新请求（带 ext_columns 参数）
   const kline = useQuery({
-    queryKey: QK.kline(symbol, dateRange.start, dateRange.end, extColumns),
-    queryFn: () => api.klineDaily(symbol, days, dateRange, extColumns),
+    queryKey: QK.kline(symbol, dateRange.start, dateRange.end, extColumns, dataSource),
+    queryFn: () => api.klineDaily(symbol, days, dateRange, extColumns, dataSource),
     enabled: !!symbol,
     placeholderData: (prev) => prev,
   })
