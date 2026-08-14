@@ -200,6 +200,7 @@ class DataManager:
         self._minute_empty = set()  # 已知无分钟数据的标的，避免重复网络请求
         self._daily_mem = {}
         self._daily_preloaded = False  # preload_daily 幂等标志（分区数据已载入）
+        self._daily_preloaded_asof = None  # 上次 preload 的 asof（新交易日据此重载）
         # _daily_mem 数据版本号：每次写入/删除递增，money memo 键含版本据此失效
         self._daily_ver = 0
         self._money_memo = {}  # (codes_tuple, daily_ver) -> 全量成交额明细 DataFrame
@@ -435,12 +436,19 @@ class DataManager:
         print(f"[preload] 分钟线: {count}/{len(codes)} 只")
 
     def preload_daily(self, force: bool = False):
-        if getattr(self, "_daily_preloaded", False) and not force:
+        # 按 asof 判幂等：asof = 今日-1（最新已完成交易日）。模拟盘补跑当日重启
+        # （asof=前一日）进入实时后，次日盘前 preload 必须重新预载，否则 _daily_mem
+        # 停留在上次 asof，策略"全市场ETF总成交额"最新交易日只有被零星刷新的子集
+        # 有数据（日志 "08-13 ... (225只ETF有成交)"），3 日均值/流动性阈值失真。
+        asof = pd.Timestamp.now().normalize().date() - pd.Timedelta(days=1)
+        if (getattr(self, "_daily_preloaded", False)
+                and getattr(self, "_daily_preloaded_asof", None) == asof
+                and not force):
             return
         try:
             from_part = self.client.preload_daily(
                 lookback_days=self._DAILY_LOOKBACK_DAYS,
-                asof=pd.Timestamp.now().normalize().date() - pd.Timedelta(days=1))
+                asof=asof)
             if from_part:
                 for jq, df in from_part.items():
                     df = _ensure_money_yuan(df, "network")
@@ -448,6 +456,7 @@ class DataManager:
                     self._daily_mem[f"get_daily_{jq}"] = df
                 self._daily_ver += 1
                 self._daily_preloaded = True
+                self._daily_preloaded_asof = asof
                 return
         except Exception as e:
             logger.warning("[DataManager] preload_daily 网络取数失败: %s", e)

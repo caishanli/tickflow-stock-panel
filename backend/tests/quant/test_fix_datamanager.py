@@ -236,6 +236,91 @@ def test_money_filter_excludes_placeholder_amount(tmp_path):
     assert "510300.XSHG" in set(res["code"])
 
 
+# ---------------- preload_daily：新交易日（asof 前移）必须重新预载 ----------------
+
+def _daily_through(ends, money=1e6):
+    """构建截至 ``ends``（date）的合成日线帧（trade_date 列 + amount）。"""
+    idx = pd.bdate_range("2026-07-01", ends)
+    n = len(idx)
+    return pd.DataFrame({
+        "trade_date": [d.strftime("%Y-%m-%d") for d in idx],
+        "open": [1.0] * n,
+        "high": [1.0] * n,
+        "low": [1.0] * n,
+        "close": [1.0] * n,
+        "volume": [100.0] * n,
+        "amount": [float(money)] * n,
+    })
+
+
+class _PreloadAdvanceClient:
+    """模拟 stockdata 服务：preload_daily 按 asof 返回截至该日的全量日线帧。"""
+
+    def __init__(self, codes):
+        self.codes = codes
+        self.preload_asofs = []
+
+    def preload_daily(self, lookback_days=400, asof=None):
+        self.preload_asofs.append(asof)
+        return {c: _daily_through(asof) for c in self.codes}
+
+    def get_price(self, security, start_date=None, end_date=None,
+                  frequency="daily", fields=None):
+        hi = pd.Timestamp(end_date).date() if end_date else pd.Timestamp.today().date()
+        codes = [security] if isinstance(security, str) else list(security)
+        return {c: _daily_through(hi) for c in codes if c in self.codes}
+
+
+def test_preload_daily_reloads_when_asof_advances(tmp_path, monkeypatch):
+    """preload_daily 幂等标志不得按进程生命周期锁死：新交易日到来（asof 前移）
+    盘前必须重新预载，让日线帧延伸到最新已完成交易日。
+
+    回归：模拟盘 08-13 22:39 重启后补跑（preload asof=08-12），进入实时次日
+    08-14 盘前 _pre_market 的 preload_daily() 因 ``_daily_preloaded=True`` 直接
+    跳过，``_daily_mem`` 停留在 08-12；09:31 策略算"全市场ETF总成交额"时最新
+    交易日 08-13 只有被零星刷新的子集有数据 → 日志出现 "2026-08-13 ... 
+    (225只ETF有成交)"，3 日均值/流动性阈值被拉低。修复：按 asof 判幂等，新
+    交易日自动重载。
+    """
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    codes = ["510300.XSHG", "511880.XSHG", "159915.XSHE"]
+    client = _PreloadAdvanceClient(codes)
+    dm = DataManager(token="", cache=DataCache(root=str(tmp_path)), client=client)
+    dm._offline = False
+
+    # 08-13 22:39 重启：盘前 preload asof=08-12
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-13 22:40:00")))
+    dm.preload_daily()
+    assert dm._daily_preloaded_asof == pd.Timestamp("2026-08-12").date()
+    assert client.preload_asofs == [pd.Timestamp("2026-08-12").date()]
+    for c in codes:
+        assert str(dm._daily_mem[f"get_daily_{c}"]["trade_date"].max()) == "2026-08-12"
+
+    # 次日 08-14 盘前：asof 前移到 08-13，必须重新预载
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-14 09:25:00")))
+    dm.preload_daily()
+    assert dm._daily_preloaded_asof == pd.Timestamp("2026-08-13").date()
+    assert client.preload_asofs[-1] == pd.Timestamp("2026-08-13").date()
+    for c in codes:
+        assert str(dm._daily_mem[f"get_daily_{c}"]["trade_date"].max()) == "2026-08-13"
+
+    # 同日再次调用幂等（asof 不变，不重复预载）
+    n = len(client.preload_asofs)
+    dm.preload_daily()
+    assert len(client.preload_asofs) == n
+
+    # 修复后完整性：09:31 算最新交易日成交额，全量标的都含 08-13
+    out = dm.get_daily_money_cached(codes, end_date="2026-08-13", count=3)
+    days = sorted({str(t.date()) for t in out["time"]})
+    assert days[-1] == "2026-08-13"
+    for c in codes:
+        sub = out[out["code"] == c]
+        assert {str(t.date()) for t in sub["time"]} == {"2026-08-11", "2026-08-12", "2026-08-13"}
+
+
 # ---------------- H6b：merged 结果裁剪到请求窗口 [lo, hi] ----------------
 
 def test_merged_clipped_to_window_and_real_only(tmp_path):
