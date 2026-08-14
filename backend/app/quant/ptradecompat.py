@@ -17,10 +17,10 @@ import pandas as pd
 
 logger = logging.getLogger("ptradecompat")
 
-_DAILY_AT = {}          # (hour, minute) -> [func]（同一时刻按注册顺序触发）
-_EVERY_BAR_CALLBACKS = []
-_UNIVERSE = []          # JQ 码（get_history 缺省 security_list 时用）
-_NAMES = {}             # JQ 码 -> name
+_DAILY_AT: dict[tuple[int, int], list] = {}   # (hour, minute) -> [func]（同一时刻按注册顺序触发）
+_EVERY_BAR_CALLBACKS: list = []
+_UNIVERSE: list = []                          # JQ 码（get_history 缺省 security_list 时用）
+_NAMES: dict = {}                             # JQ 码 -> name
 _BENCHMARK = "510300.SS"
 
 
@@ -232,46 +232,154 @@ def _patch_rqalpha_objects():
 
 
 # ---------------------------------------------------------------------------
-# 以下 API 在后续 Task 实现（当前占位，避免 install 时 NameError）
+# 订单 / 持仓 / 交易日 / 停牌 / 名称 / 市场枚举
 # ---------------------------------------------------------------------------
+def _position_view(pos, pt_code):
+    """包装 rqalpha 持仓为 PTrade 字段视图（空仓返回 0 占位）。"""
+    return types.SimpleNamespace(
+        amount=float(getattr(pos, "amount", 0) or 0),
+        enable_amount=float(getattr(pos, "enable_amount", 0) or 0),
+        cost_basis=float(getattr(pos, "cost_basis", 0) or 0),
+        last_sale_price=float(getattr(pos, "last_sale_price", 0) or 0),
+        sid=pt_code, security=pt_code)
+
+
 def order(code, amount):
-    raise NotImplementedError
+    from rqalpha.api import order as rq_order
+    return rq_order(_to_jq(code), int(amount))
+
+
+def _pos_fields(pos):
+    return types.SimpleNamespace(
+        amount=getattr(pos, "amount", 0) or 0,
+        enable_amount=getattr(pos, "enable_amount", 0) or 0,
+        cost_basis=getattr(pos, "cost_basis", 0) or 0,
+        last_sale_price=getattr(pos, "last_sale_price", 0) or 0)
 
 
 def get_position(code):
-    raise NotImplementedError
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    jq = _to_jq(code)
+    try:
+        pos = env.portfolio.get_position(jq)
+    except Exception:  # noqa: BLE001
+        pos = None
+    if pos is None:
+        return _position_view(None, code)
+    return _position_view(_pos_fields(pos), code)
 
 
 def get_positions():
-    raise NotImplementedError
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    out = {}
+    try:
+        items = list(env.portfolio.positions.items())
+    except Exception:  # noqa: BLE001
+        items = []
+    for jq, pos in items:
+        amount = float(getattr(pos, "amount", 0) or 0)
+        if amount > 0:
+            out[_to_pt(jq)] = _position_view(_pos_fields(pos), _to_pt(jq))
+    return out
+
+
+def _prev_trading_day(date):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    try:
+        return pd.Timestamp(env.data_proxy.get_previous_trading_date(date))
+    except Exception:  # noqa: BLE001
+        return pd.Timestamp(date) - pd.Timedelta(days=1)
 
 
 def get_trading_day(count=-1):
-    raise NotImplementedError
+    """PTrade get_trading_day(count)：count=-1 返回前一交易日。"""
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    today = pd.Timestamp(getattr(env, "trading_dt", None) or pd.Timestamp.now())
+    if count == -1:
+        return _prev_trading_day(today.date())
+    if count == 1:
+        return today.normalize()
+    if count > 1:
+        try:
+            cal = env.data_proxy.get_trading_calendar()
+            idx = cal.searchsorted(today.normalize())
+            return list(cal[max(0, idx - count + 1):idx + 1])[-1]
+        except Exception:  # noqa: BLE001
+            return today.normalize()
+    return today.normalize()
 
 
 def get_trade_days(start_date=None, end_date=None, count=None):
-    raise NotImplementedError
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    cal = env.data_proxy.get_trading_calendar()
+    if end_date is not None:
+        cal = cal[cal <= pd.Timestamp(end_date)]
+    if start_date is not None:
+        cal = cal[cal >= pd.Timestamp(start_date)]
+    if count is not None:
+        cal = cal[-int(count):]
+    return list(cal)
 
 
 def set_universe(codes):
-    raise NotImplementedError
+    from rqalpha.api import update_universe
+    if isinstance(codes, str):
+        codes = [codes]
+    update_universe([_to_jq(c) for c in codes])
 
 
 def get_stock_status(codes, query_type="HALT", query_date=None):
-    raise NotImplementedError
+    """停牌检测：HALT → {PTrade码: 是否停牌}。失败返回空（策略容错为不判定）。"""
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    if isinstance(codes, str):
+        codes = [codes]
+    out = {}
+    for c in codes:
+        try:
+            out[c] = bool(env.data_proxy.is_suspended(_to_jq(c), query_date))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 def get_stock_name(code):
-    raise NotImplementedError
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    try:
+        instr = env.data_proxy.instruments(_to_jq(code))
+        return {code: getattr(instr, "symbol", None) or code}
+    except Exception:  # noqa: BLE001
+        return {code: code}
 
 
 def get_market_list():
-    raise NotImplementedError
+    """PTrade get_market_list：单行 'ALL' 市场（配合 get_market_detail 全市场枚举）。"""
+    return pd.DataFrame([{"finance_mic": "ALL"}])
 
 
 def get_market_detail(mic):
-    raise NotImplementedError
+    """全市场基金表：rqalpha all_instruments(type='etf') → prod_code(PTrade)/prod_name。"""
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    rows = []
+    try:
+        df = env.data_proxy.all_instruments(type="etf")
+    except Exception:  # noqa: BLE001
+        df = None
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+    for _, r in df.iterrows():
+        jq = str(r.get("order_book_id", ""))
+        if not jq:
+            continue
+        rows.append({"prod_code": _to_pt(jq), "prod_name": str(r.get("symbol", "") or jq)})
+    return pd.DataFrame(rows)
 
 
 def set_benchmark(code):

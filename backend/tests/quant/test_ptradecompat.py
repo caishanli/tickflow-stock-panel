@@ -12,6 +12,7 @@ import pytest
 def _fake_rqalpha(monkeypatch):
     """最小 rqalpha 桩：让 import 与 register_api 可用。"""
     rq = types.ModuleType("rqalpha")
+    rq.__path__ = []  # namespace package，允许 from rqalpha.xxx import
     rq.api = types.ModuleType("rqalpha.api")
     rq.api.register_api = lambda *a, **k: None
     rq.core = types.ModuleType("rqalpha.core")
@@ -27,6 +28,12 @@ def _fake_rqalpha(monkeypatch):
     rq.model.instrument = types.ModuleType("rqalpha.model.instrument")
     rq.model.instrument.Instrument = object
     monkeypatch.setitem(sys.modules, "rqalpha", rq)
+    for _name, _mod in (
+            ("rqalpha.api", rq.api), ("rqalpha.core", rq.core),
+            ("rqalpha.core.events", rq.core.events), ("rqalpha.const", rq.const),
+            ("rqalpha.environment", rq.environment), ("rqalpha.interface", rq.interface),
+            ("rqalpha.model", rq.model), ("rqalpha.model.instrument", rq.model.instrument)):
+        monkeypatch.setitem(sys.modules, _name, _mod)
     import app.quant.ptradecompat as pc
     return pc
 
@@ -73,3 +80,39 @@ def test_adapt_bar_dict(_fake_rqalpha):
     assert "510300.SS" in out
     assert out["510300.SS"].money == pytest.approx(1.1e5)
     assert out["510300.SS"].price == pytest.approx(1.1)
+
+
+def test_code_conversion_more(_fake_rqalpha):
+    pc = _fake_rqalpha
+    assert pc._to_jq("511880.SS") == "511880.XSHG"
+    assert pc._to_pt("511880.XSHG") == "511880.SS"
+
+
+def test_position_objects_ptrade_fields(_fake_rqalpha):
+    pc = _fake_rqalpha
+    from types import SimpleNamespace
+    # 模拟 rqalpha PositionProxy 补丁后字段
+    proxy = SimpleNamespace(amount=100, enable_amount=100, cost_basis=3.0, last_sale_price=3.1)
+    pos = pc._position_view(proxy, "510300.SS")
+    assert pos.amount == 100
+    assert pos.enable_amount == 100
+    assert pos.cost_basis == 3.0
+    assert pos.last_sale_price == 3.1
+
+
+def test_get_trading_day_prev(_fake_rqalpha, monkeypatch):
+    pc = _fake_rqalpha
+    calls = {}
+
+    def fake_prev(date):
+        calls["d"] = date
+        return pd.Timestamp("2026-07-17")
+
+    monkeypatch.setattr(pc, "_prev_trading_day", fake_prev)
+    assert pc.get_trading_day(-1).strftime("%Y-%m-%d") == "2026-07-17"
+
+
+def test_set_benchmark_stored(_fake_rqalpha):
+    pc = _fake_rqalpha
+    pc.set_benchmark("510300.SS")
+    assert pc._BENCHMARK == "510300.SS"
