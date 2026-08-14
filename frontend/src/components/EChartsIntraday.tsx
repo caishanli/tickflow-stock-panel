@@ -35,6 +35,8 @@ interface Props {
   showLimitLines?: boolean
   showAvgLine?: boolean
   markers?: IntradayMarker[]
+  /** 允许「涨跌停」±10% 纵轴模式 (默认 true; 量化弹窗传 false 锁定自适应放大) */
+  allowLimitMode?: boolean
 }
 
 function fmtTime(dt: string): string {
@@ -447,7 +449,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
   }
 }
 
-export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimit, onPriceHover, showLimitLines = true, showAvgLine = true, markers }: Props) {
+export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimit, onPriceHover, showLimitLines = true, showAvgLine = true, markers, allowLimitMode = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<ECharts | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
@@ -461,6 +463,8 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
 
   const [infoIdx, setInfoIdx] = useState(data.length - 1)
   const [yMode, setYMode] = useState<YMode>('adaptive')
+  // allowLimitMode=false (量化弹窗) 时锁定自适应: ±10% 涨跌停模式会压平低波动标的分时线
+  const effectiveYMode: YMode = allowLimitMode ? yMode : 'adaptive'
   const ct = useChartTheme()
   const avgPrices = useMemo(() => computeAvgPrice(data), [data])
 
@@ -536,11 +540,11 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
       }
       fullDayToDataIdx.current = mapping
 
-      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), true)
+      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), true)
     } else {
       chart.clear()
     }
-  }, [data, prevClose, height, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers])
+  }, [data, prevClose, height, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers])
 
   useEffect(() => {
     return () => {
@@ -564,13 +568,13 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
 
   return (
     <div className="w-full">
-      {/* 按钮行: 切换式按钮组, 居右 */}
-      {showLimitLines && <div className="flex items-center justify-end px-1 pb-0.5">
+      {/* 按钮行: 切换式按钮组, 居右 (量化弹窗 allowLimitMode=false 隐藏涨跌停, 锁定自适应) */}
+      {showLimitLines && allowLimitMode && <div className="flex items-center justify-end px-1 pb-0.5">
         <div className="inline-flex items-center rounded bg-elevated overflow-hidden">
           <button
             onClick={() => setYMode('adaptive')}
             className={`px-2.5 py-0.5 text-[10px] font-mono cursor-pointer transition-colors ${
-              yMode === 'adaptive'
+              effectiveYMode === 'adaptive'
                 ? 'bg-accent/20 text-accent'
                 : 'text-muted hover:text-secondary'
             }`}
@@ -581,7 +585,7 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
           <button
             onClick={() => setYMode('limit')}
             className={`px-2.5 py-0.5 text-[10px] font-mono cursor-pointer transition-colors ${
-              yMode === 'limit'
+              effectiveYMode === 'limit'
                 ? 'bg-accent/20 text-accent'
                 : 'text-muted hover:text-secondary'
             }`}

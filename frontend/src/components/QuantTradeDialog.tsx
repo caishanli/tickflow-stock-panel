@@ -327,6 +327,7 @@ export function QuantTradeDialog({
                   prevClose={prevClose}
                   markers={intradayMarkers}
                   refetchIntervalMs={intradayRefetchMs}
+                  allowLimitMode={false}
                 />
               )}
               {view === 'minute' && !selectedDate && (
