@@ -267,17 +267,15 @@ def _emit_eod_notify(account_id, ctx, state, aux, now) -> None:
     total_pct = total_pnl / start_cash if start_cash else 0.0
     holdings = len(ctx.portfolio.positions)
     aux["prev_close_net"] = net
-    day = str(now)[:10]
     if aux.get("replay_mode"):
-        notifies = list(_replay_day_notifies)
+        # 补跑不发日常钉钉：长补跑逐日汇总会刷屏；异常告警（🚨【成交额异常】）已在
+        # _replay_log_sink 即时推送，不经此汇总。攒批通知直接丢弃。
         _replay_day_notifies.clear()
-        msg = _build_daily_summary(day, notifies, net, day_pnl, day_pct,
-                                   total_pnl, total_pct, holdings)
-        _dispatch_dingtalk(account_id, msg, ts=str(now))
-    else:
-        msg = _build_daily_pnl(day, net, day_pnl, day_pct,
-                               total_pnl, total_pct, holdings)
-        _dispatch_dingtalk(account_id, msg, ts=str(now))
+        return
+    day = str(now)[:10]
+    msg = _build_daily_pnl(day, net, day_pnl, day_pct,
+                           total_pnl, total_pct, holdings)
+    _dispatch_dingtalk(account_id, msg, ts=str(now))
 
 
 def _load_engine():
@@ -852,6 +850,11 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
         yesterday = today - datetime.timedelta(days=1)
         # 含今天：完整交易日回放到昨日；今天既已开市（盘前/盘中/收盘）则也回放到当前时刻
         days = _trade_days_between(dm, start_date, today)
+        # 今天是否交易日：_trade_days_between 以指数日线判交易日，盘中今日指数日线
+        # 尚未落盘会被漏掉 → 用 _is_trading_day（对近期日期走 weekday 兜底）补齐。
+        # 否则盘中重启/重置时今天不参与补跑，主循环进实时后把今天所有已到点的
+        # run_daily（晨间/早盘/午盘流水线）一次性集中触发，成交价错位。
+        today_is_trading = today in days or _is_trading_day(dm, today)
         full_days = [d for d in days if d != today]
         # 钉住整个补跑区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源
         _pin_replay_minute_window(dm, ctx, start_date, today)
@@ -859,7 +862,7 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                     if days else now)
         _emit_log(account_id, "info",
                   f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日"
-                  + (f"，今日 {now.strftime('%H:%M')} 前已回放" if today in days else ""),
+                  + (f"，今日 {now.strftime('%H:%M')} 前已回放" if today_is_trading else ""),
                   ts=str(first_ts))
         for day in full_days:
             if is_paused(account_id):
@@ -876,7 +879,7 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                       ts=str(datetime.datetime.combine(day, datetime.time(15, 5))))
         # 今天若已是交易日，把已走过（<= 当前时间）的 bar 也回补进来；
         # 今天不跑 _eod，剩余 bar / 收盘由主循环实时接管（last_bar 已推进避免重复触发）
-        if today in days and not is_paused(account_id):
+        if today_is_trading and not is_paused(account_id):
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
                         datetime.datetime.combine(today, datetime.time(9, 25)), aux)
             for bar in _session_minutes(today):
@@ -1074,8 +1077,12 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
             aux.setdefault("batch_logs", []).append(
                 (account_id, str(ts)[:19], level, msg))
             if level == "notify":
-                # 补跑不逐笔推钉钉：累积当日通知，收盘由 _emit_eod_notify 汇总成一条
-                _replay_day_notifies.append((str(ts)[11:16], msg))
+                if msg.startswith("🚨【成交额异常】"):
+                    # 异常告警例外：补跑期间也即时推钉钉（数据残缺需人工关注）
+                    _dispatch_dingtalk(account_id, msg, ts=str(ts))
+                else:
+                    # 补跑不逐笔推钉钉：累积当日通知（汇总已不再推送，仅留档）
+                    _replay_day_notifies.append((str(ts)[11:16], msg))
         else:
             _emit_log(account_id, level, msg)
     jq_api._state["log_sink"] = _replay_log_sink

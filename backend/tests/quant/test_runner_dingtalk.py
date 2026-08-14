@@ -184,8 +184,11 @@ def test_build_daily_pnl_format():
     assert "总资产: 105,432.10 | 持仓: 1只" in msg
 
 
-def test_emit_eod_notify_replay_summary():
-    """补跑收盘推送当日汇总表格：取用当日累积、清空、推进 prev_close_net。"""
+def test_emit_eod_notify_replay_no_dingtalk():
+    """补跑不发日常钉钉：_emit_eod_notify 在 replay_mode 不推汇总，仅清空攒批、推进 prev_close_net。
+
+    异常告警（🚨【成交额异常】）已在 _replay_log_sink 即时推送，不经此汇总。
+    """
     from app.quant.simulate import runner
     p = _fresh_db()
     db.insert_sim_account("a1", "acc", 100000.0, 0.03, "created")
@@ -199,10 +202,7 @@ def test_emit_eod_notify_replay_summary():
         now = datetime.datetime(2026, 7, 21, 15, 5)
         with patch("app.quant.simulate.runner._dispatch_dingtalk") as mock_d:
             runner._emit_eod_notify("a1", ctx, state, aux, now)
-        mock_d.assert_called_once()
-        msg = mock_d.call_args[0][1]
-        assert "### 📊 模拟盘回放 2026-07-21" in msg
-        assert "📈 当日 +1,000.00 (+1.00%)" in msg
+        mock_d.assert_not_called()
         assert runner._replay_day_notifies == []
         assert aux["prev_close_net"] == 101000.0
     finally:

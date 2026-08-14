@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -167,11 +168,13 @@ def test_strategy_loop_new_bar_refires(tmp_quant, monkeypatch):
 def test_strategy_loop_restores_positions(tmp_quant, monkeypatch):
     save_strategy("s2", "s", STRATEGY_NOOP)
     aid = service.account_create("acct2", 100000.0, 0.03, "s2")
+    # dt 用未来时间 → 不触发补跑，直接实时 tick 验证持仓恢复（旧值 2026-07-17 属过去
+    # 日期会走补跑路径，盘中今天也会被补跑 → 依赖无今天价格的 stub DM 产生退化行为）
     protocol.save_state(aid, {
         "cash": 50000.0, "start_cash": 100000.0, "net_value": 95000.0, "pnl": -5000.0,
         "positions": {"510300.XSHG": {"amount": 5000.0, "avg_cost": 9.0,
                                       "price": 9.0, "today_amount": 0.0}},
-        "stop_loss_log": [], "dt": "2026-07-17 09:31",
+        "stop_loss_log": [], "dt": str(datetime.date.today() + datetime.timedelta(days=1)) + " 09:31",
     })
     _patch_one_loop(monkeypatch)
     runner.run_loop(aid, dm=_StubDM(), feed=_feed_factory(10.0), matcher=Matcher(0.03))
@@ -190,7 +193,7 @@ def test_strategy_loop_stop_loss_sells(tmp_quant, monkeypatch):
         "cash": 0.0, "start_cash": 50000.0, "net_value": 50000.0, "pnl": 0.0,
         "positions": {"510300.XSHG": {"amount": 5000.0, "avg_cost": 10.0,
                                       "price": 10.0, "today_amount": 0.0}},
-        "stop_loss_log": [], "dt": "2026-07-17 09:31",
+        "stop_loss_log": [], "dt": str(datetime.date.today() + datetime.timedelta(days=1)) + " 09:31",
     })
     _patch_one_loop(monkeypatch)
     # 不传 matcher：分派器按账户 stop_loss 自建并带 account_id（止损落库依赖它）
@@ -348,7 +351,10 @@ def _replay_dm_cls(days):
             raise RuntimeError("stub: no data")
 
         def get_minute_price_at(self, code, dt):
-            if pd.Timestamp(dt).date() in self.DAYS:
+            # 覆盖整个补跑区间（含今天）：盘中重启时今天也会补跑，缺失今天价会让
+            # _hist_feed 退化成 current_snapshot 兜底价（测试 fake 为 1.0）→ 误触发
+            # 止损/异常换仓。
+            if pd.Timestamp(dt).date() >= self.DAYS[0]:
                 return 10.0
             return None
 
@@ -439,6 +445,42 @@ def test_strategy_loop_replays_today_intraday_bars(tmp_quant, monkeypatch):
     times = sorted(s["dt"][11:16] for s in today_snaps)
     assert "09:31" in times and "10:30" in times
     assert snaps[-1]["dt"].startswith(str(today))
+    logs = db.get_sim_logs(aid)
+    assert any("今日" in l["message"] and "回补" in l["message"] for l in logs)
+
+
+def test_replays_today_even_if_index_daily_missing(tmp_quant, monkeypatch):
+    """盘中重启/重置时指数日线尚未落盘（_trade_days_between 漏掉今天），今天也必须
+    按 _is_trading_day 的 weekday 兜底参与补跑到当前时刻；否则今天已到点的 run_daily
+    （晨间/早盘/午盘流水线）全部迟到，在进实时后的第一个 bar 一次性集中触发，成交价错位。
+
+    回归：d092ad90 08-14 14:42 重置，补跑只回放到 08-13（08-14 指数日线盘中未落盘，
+    today 不在 _trade_days_between 结果），进实时后 09:31/09:40/13:10 三条流水线全在
+    14:45 触发，午盘买入用 14:45 价格而非 13:10。
+    """
+    class _FixedNow(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 8, 6, 10, 30, 0)
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+    today = datetime.date(2026, 8, 6)
+    # 指数日线（_trade_days_between 数据源）只返回到昨日——模拟盘中今天指数日线尚未生成
+    days = [datetime.date(2026, 8, 3), datetime.date(2026, 8, 4),
+            datetime.date(2026, 8, 5)]
+    save_strategy("s_rpt_miss", "s", STRATEGY_BUY)
+    aid = service.account_create("acct_rpt_miss", 100000.0, 0.03, "s_rpt_miss", str(days[0]))
+    # _is_trading_day 对今天（近期日期）按 weekday 兜底为 True（_patch_one_loop 已注入）
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+
+    snaps = db.get_sim_snapshots(aid)
+    today_snaps = [s for s in snaps if s["dt"].startswith(str(today))]
+    # 今天（不在指数日线列表）也必须回补到 10:30（09:31~10:30 共 60 根 bar）
+    assert len(today_snaps) == 60, len(today_snaps)
+    times = sorted(s["dt"][11:16] for s in today_snaps)
+    assert "09:31" in times and "10:30" in times
     logs = db.get_sim_logs(aid)
     assert any("今日" in l["message"] and "回补" in l["message"] for l in logs)
 
@@ -577,3 +619,57 @@ def test_api_account_frequency_validation(tmp_quant, api_client):
                         json={"name": "a", "capital": 10000, "frequency": "daily"})
     assert r.status_code == 200
     assert r.json()["data"]["frequency"] == "daily"
+
+
+# ---- 补跑不发日常钉钉：_emit_eod_notify 在 replay_mode 不推 ----
+def _eod_fake_ctx():
+    return SimpleNamespace(portfolio=SimpleNamespace(positions={}))
+
+
+def test_eod_notify_suppressed_during_replay(tmp_quant, monkeypatch):
+    """补跑期间 _emit_eod_notify 不推钉钉（长补跑逐日汇总刷屏）。"""
+    calls = []
+    monkeypatch.setattr(runner, "_dispatch_dingtalk",
+                        lambda aid, msg, ts=None: calls.append(msg))
+    aux = {"replay_mode": True, "start_cash": 100000.0, "prev_close_net": None}
+    runner._emit_eod_notify("aid", _eod_fake_ctx(), {"net_value": 100000.0, "pnl": 0.0},
+                            aux, datetime.datetime(2026, 8, 14, 15, 5))
+    assert calls == []
+
+
+def test_eod_notify_dispatches_live(tmp_quant, monkeypatch):
+    """实时收盘 EOD 仍推钉钉。"""
+    calls = []
+    monkeypatch.setattr(runner, "_dispatch_dingtalk",
+                        lambda aid, msg, ts=None: calls.append(msg))
+    aux = {"replay_mode": False, "start_cash": 100000.0, "prev_close_net": None}
+    runner._emit_eod_notify("aid", _eod_fake_ctx(), {"net_value": 100000.0, "pnl": 0.0},
+                            aux, datetime.datetime(2026, 8, 14, 15, 5))
+    assert len(calls) == 1
+
+
+# ---- 补跑期间成交额异常 notify 即时推钉钉 ----
+STRATEGY_ANOMALY = '''
+def init(context):
+    context.universe = ["510300.XSHG"]
+
+def morning(context):
+    log.notify("🚨【成交额异常】2026-08-13 全市场ETF总成交额 1469.57亿元 (225只ETF有成交)，明显低于其他两天，疑似数据回源不完整，已剔除该日计算阈值")
+
+run_daily(morning, "09:31")
+'''
+
+
+def test_replay_anomaly_notify_pushes_dingtalk(tmp_quant, monkeypatch):
+    """补跑期间成交额异常 notify 必须即时推钉钉（不攒批）。"""
+    calls = []
+    monkeypatch.setattr(runner, "_dispatch_dingtalk",
+                        lambda aid, msg, ts=None: calls.append(msg))
+    today = datetime.date.today()
+    days = [today - datetime.timedelta(days=n) for n in (3, 2, 1)]
+    save_strategy("s_anom", "s", STRATEGY_ANOMALY)
+    aid = service.account_create("acct_anom", 100000.0, 0.03, "s_anom", str(days[0]))
+    _patch_one_loop(monkeypatch, pause_checks_before_loop=len(days))
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+    assert any("成交额异常" in m for m in calls), calls
