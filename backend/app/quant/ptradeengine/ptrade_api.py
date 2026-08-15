@@ -315,6 +315,59 @@ def get_stock_status(codes, query_type="HALT", query_date=None):
     return out
 
 
+# ---- 交易日历（DataManager 指数日线推导） ----
+_A_SHARE_CALENDAR = None
+
+
+def _get_calendar():
+    global _A_SHARE_CALENDAR
+    if _A_SHARE_CALENDAR is not None:
+        return _A_SHARE_CALENDAR
+    mgr = _state.get("manager")
+    if mgr:
+        try:
+            df = mgr.fetch("get_daily", "000300.XSHG", "20000101", "20300101")
+            if df is not None and not (hasattr(df, "empty") and df.empty):
+                _A_SHARE_CALENDAR = pd.DatetimeIndex(sorted(df.index.normalize()))
+                return _A_SHARE_CALENDAR
+        except Exception:
+            pass
+    _A_SHARE_CALENDAR = pd.bdate_range("2000-01-01", "2030-12-31")
+    return _A_SHARE_CALENDAR
+
+
+def _now_ts():
+    ctx = _state.get("ctx")
+    if ctx is not None and ctx.current_dt is not None:
+        return pd.Timestamp(ctx.current_dt).normalize()
+    return pd.Timestamp.now().normalize()
+
+
+def get_trading_day(count=-1):
+    """PTrade get_trading_day(count)：count=-1 返回前一交易日（date）。"""
+    cal = _get_calendar()
+    idx = int(cal.searchsorted(_now_ts()))
+    if count == -1:
+        return cal[max(0, idx - 1)].to_pydatetime() if idx > 0 else cal[0].to_pydatetime()
+    if count == 1:
+        return cal[idx].to_pydatetime() if idx < len(cal) else cal[-1].to_pydatetime()
+    if count > 1:
+        return cal[max(0, idx - count + 1):idx + 1][-1].to_pydatetime()
+    return cal[idx].to_pydatetime() if idx < len(cal) else cal[-1].to_pydatetime()
+
+
+def get_trade_days(start_date=None, end_date=None, count=None):
+    """PTrade get_trade_days：返回区间内交易日（date 列表）。"""
+    cal = _get_calendar()
+    if end_date is not None:
+        cal = cal[cal <= pd.Timestamp(end_date)]
+    if start_date is not None:
+        cal = cal[cal >= pd.Timestamp(start_date)]
+    if count is not None:
+        cal = cal[-int(count):]
+    return [d.to_pydatetime() for d in cal]
+
+
 def get_stock_name(code):
     name = _resolve_name(code)
     return {code: name}

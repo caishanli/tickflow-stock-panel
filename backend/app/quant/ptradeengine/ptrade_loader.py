@@ -64,10 +64,9 @@ def _make_refresh(ns, ctx):
     set_last_data = ns["_set_last_data"]
 
     def refresh(_ctx):
-        try:
+        from contextlib import suppress
+        with suppress(Exception):
             set_last_data(ptrade_api.build_data_snapshot(_ctx), _ctx)
-        except Exception:  # noqa: BLE001
-            pass
 
     return refresh
 
@@ -91,6 +90,8 @@ def load_strategy(code, manager, fee, slippage, cash):
         "get_stock_name": ptrade_api.get_stock_name,
         "get_market_list": ptrade_api.get_market_list,
         "get_market_detail": ptrade_api.get_market_detail,
+        "get_trading_day": ptrade_api.get_trading_day,
+        "get_trade_days": ptrade_api.get_trade_days,
         "set_benchmark": ptrade_api.set_benchmark,
         "set_commission": ptrade_api.set_commission,
         "set_slippage": ptrade_api.set_slippage,
