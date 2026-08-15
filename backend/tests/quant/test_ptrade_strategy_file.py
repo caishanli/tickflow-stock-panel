@@ -49,6 +49,21 @@ def test_no_fstring_log():
         assert not re.search(r"\bf([\"'])", line), f"策略不应使用 f-string: {line}"
 
 
+def test_no_log_warn():
+    """PTrade LogEngine 无 warn 方法（只有 warning），不得使用 log.warn。"""
+    src = STRATEGY.read_text(encoding="utf-8")
+    assert "log.warn(" not in src
+    assert "log.warning(" in src
+
+
+def test_capture_bars_guards_non_dict_data():
+    """before_trading_start 的 data 是 StrategyUniverse（无 __len__/无行情），_capture_bars 必须跳过而非 or {}。"""
+    src = STRATEGY.read_text(encoding="utf-8")
+    assert "data.items()" in src
+    assert "data or {}" not in src
+    assert "no __len__" in src or "StrategyUniverse" in src
+
+
 _CONV_LAYER = ["_pt(", "_cd(", "_cd_field", "_set_last_data", "_BarUnit", "_safe_log",
                "_warn(", "_debug(", "_wide(", "_as_series_values", "_positions_map",
                "_get_position(", "_pos_amount", "_pos_avail", "_pos_cost", "_pos_price",

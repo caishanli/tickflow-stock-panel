@@ -26,7 +26,7 @@
 #   - 现金/总资产：context.portfolio.cash / .portfolio_value（PTrade 无 get_cash）
 #   - 动态 ETF 池：用 get_market_list()/get_market_detail() 枚举全市场基金，取不到时优雅降级为固定池；
 #     全市场 6000+ 标的的成交额查询按 200 只分块（_get_money_avg_series），阈值按实际可交易池估算，避免回测挂起
-#   - record()/log.set_level/set_option 等聚宽独有 API 已移除；日志用 log.info/warn/error/debug
+#   - record()/log.set_level/set_option 等聚宽独有 API 已移除；日志用 log.info/warning/error/debug
 # ============================================================
 
 import numpy as np
@@ -54,8 +54,42 @@ def _today(context):
 
 
 def _capture_bars(data):
+    """捕获 handle_data 传入的最新行情快照（dict: code -> SecurityUnitData）。
+    before_trading_start 的 data 参数是 StrategyUniverse（标的集合，无行情、无 __len__），
+    此处仅接受 dict 形态（items 为 (code, 行情对象) 对），否则忽略。"""
     global _BARS
-    _BARS = data or {}
+    if data is None:
+        return
+    try:
+        items = data.items()
+    except Exception:
+        return
+    out = {}
+    try:
+        for k, v in items:
+            out[k] = v
+    except Exception:
+        return
+    _BARS = out
+
+
+def _series_last(df, security, field):
+    """从 get_history 结果取最后一个值（兼容单标的字段列 / 宽表标的码列）。"""
+    if df is None or not hasattr(df, 'columns') or len(df) == 0:
+        return None
+    if field in df.columns:
+        arr = df[field]
+    elif security in df.columns:
+        arr = df[security]
+    elif df.shape[1] >= 1:
+        arr = df.iloc[:, 0]
+    else:
+        return None
+    try:
+        v = float(arr.values[-1])
+    except Exception:
+        return None
+    return v if v == v else None  # not NaN
 
 
 def _price(security, context):
@@ -66,16 +100,16 @@ def _price(security, context):
         return float(p)
     try:
         mdf = get_history(1, '1m', 'close', security_list=security, include=True)
-        if mdf is not None and security in mdf.columns and len(mdf):
-            val = float(mdf[security].values[-1])
-            if val == val:  # not NaN
-                return val
+        val = _series_last(mdf, security, 'close')
+        if val:
+            return val
     except Exception:
         pass
     try:
         ddf = get_history(1, '1d', 'close', security_list=security, include=True)
-        if ddf is not None and security in ddf.columns and len(ddf):
-            return float(ddf[security].values[-1])
+        val = _series_last(ddf, security, 'close')
+        if val:
+            return val
     except Exception:
         pass
     return 0
@@ -257,7 +291,7 @@ def _get_all_fund_codes():
             return None
         return fund_codes
     except Exception as e:
-        log.warn('枚举全市场基金失败: %s' % e)
+        log.warning('枚举全市场基金失败: %s' % e)
         return None
 
 
@@ -276,11 +310,11 @@ def initialize(context):
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='ETF')
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='LOF')
     except Exception as e:
-        log.warn('设置佣金失败(仅回测有效): %s' % e)
+        log.warning('设置佣金失败(仅回测有效): %s' % e)
     try:
         set_slippage(slippage=0.0002)
     except Exception as e:
-        log.warn('设置滑点失败(仅回测有效): %s' % e)
+        log.warning('设置滑点失败(仅回测有效): %s' % e)
 
     # ==================== ETF池定义 ====================
     # 全球/海外ETF池（含大宗商品和海外市场ETF）
@@ -616,7 +650,7 @@ def afternoon_routine(context):
     try:
         set_universe(list(g.merged_etf_pool) + [g.defensive_etf])
     except Exception as e:
-        log.warn('set_universe 更新失败: %s' % e)
+        log.warning('set_universe 更新失败: %s' % e)
     log.info("【动量计算】计算ETF动量得分与排序...")
     calculate_and_log_ranked_etfs(context)
     log.info("⏸️ 【午盘流水线】执行完毕！")
@@ -652,7 +686,7 @@ def check_positions(context):
             if _is_halted(security, context):
                 log.info("⚠️ %s %s 今日停牌" % (security, security_name))
     except Exception as e:
-        log.warn("【持仓检查】执行异常: %s" % e)
+        log.warning("【持仓检查】执行异常: %s" % e)
 
 
 def monitor_drawdown(context):
@@ -695,17 +729,17 @@ def calculate_global_etf_threshold(context):
         # 阈值基于全市场基金（与聚宽口径一致：全市场总成交额 / 除数）。
         etf_list = list(g._cached_etf_universe)
         if not etf_list:
-            log.warn("未找到任何场内ETF，使用保守阈值1000万")
+            log.warning("未找到任何场内ETF，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
         trade_days = get_trade_days(end_date=get_trading_day(-1), count=3)
         if len(trade_days) < 3:
-            log.warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
+            log.warning("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
             g.avg_etf_money_threshold = 10000000
             return
         avg_daily_money = _get_money_avg_series(etf_list, 3, context, field='money_corrected')
         if avg_daily_money.empty:
-            log.warn("无成交额数据，使用保守阈值1000万")
+            log.warning("无成交额数据，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
         # 分日汇总用于日志展示
@@ -719,7 +753,7 @@ def calculate_global_etf_threshold(context):
         log.info("【全局阈值更新完成】近3日样本池日均总成交额=%.2f亿元，阈值=%.0f万元(%s元)" % (
             avg_total_money / 1e8, threshold / 1e4, format(threshold, ',.0f')))
     except Exception as e:
-        log.warn("计算全局阈值异常: %s，使用保守阈值1000万" % e)
+        log.warning("计算全局阈值异常: %s，使用保守阈值1000万" % e)
         g.avg_etf_money_threshold = 10000000
 
 
@@ -738,7 +772,7 @@ def filter_global_pool_by_volume(context):
     try:
         avg_daily_money = _get_money_avg_series(g.global_etf_pool, TRADE_DAYS_COUNT, context)
         if avg_daily_money.empty:
-            log.warn("【全球池过滤】无成交额数据，使用原始全球池")
+            log.warning("【全球池过滤】无成交额数据，使用原始全球池")
             g.filtered_global_pool = g.global_etf_pool[:]
             return
         qualified = avg_daily_money[avg_daily_money > dynamic_threshold]
@@ -757,7 +791,7 @@ def filter_global_pool_by_volume(context):
         g.filtered_global_pool = new_global_pool
         log.info("【全球池过滤】保留高流动性ETF(%d只)" % len(new_global_pool))
     except Exception as e:
-        log.warn("【全球池过滤】异常: %s" % e)
+        log.warning("【全球池过滤】异常: %s" % e)
         g.filtered_global_pool = g.global_etf_pool[:]
 
 
@@ -811,13 +845,13 @@ def update_sector_pool(context):
     try:
         fund_map = _ensure_fund_universe()
         if not fund_map:
-            log.warn("【动态池更新】无法枚举全市场基金，跳过动态池（降级为固定池）")
+            log.warning("【动态池更新】无法枚举全市场基金，跳过动态池（降级为固定池）")
             g.dynamic_etf_pool = []
             return
         g.etf_names_dict = dict(fund_map)
         etf_list = list(fund_map.keys())
     except Exception as e:
-        log.warn("获取全市场ETF列表失败: %s" % e)
+        log.warning("获取全市场ETF列表失败: %s" % e)
         g.dynamic_etf_pool = []
         return
 
@@ -888,7 +922,7 @@ def update_sector_pool(context):
     log.info("【动态池更新】普通组流动性过滤: %d→%d只" % (len(normal_etfs), len(normal_sorted)))
 
     if not normal_sorted and not special_sorted:
-        log.warn("【动态池更新】无ETF通过流动性过滤")
+        log.warning("【动态池更新】无ETF通过流动性过滤")
         g.dynamic_etf_pool = []
         return
 
@@ -980,7 +1014,7 @@ def filter_fixed_pool_by_volume(context):
     try:
         avg_daily_money = _get_money_avg_series(g.fixed_etf_pool, TRADE_DAYS_COUNT, context)
         if avg_daily_money.empty:
-            log.warn("【固定池过滤】无法获取成交额数据，跳过过滤")
+            log.warning("【固定池过滤】无法获取成交额数据，跳过过滤")
             g.filtered_fixed_pool = g.fixed_etf_pool[:]
             return
         qualified = avg_daily_money[avg_daily_money > dynamic_threshold]
@@ -999,7 +1033,7 @@ def filter_fixed_pool_by_volume(context):
         g.filtered_fixed_pool = new_fixed_pool
         log.info("【固定池过滤】保留高流动性ETF(%d只)" % len(new_fixed_pool))
     except Exception as e:
-        log.warn("【固定池过滤】异常: %s" % e)
+        log.warning("【固定池过滤】异常: %s" % e)
         g.filtered_fixed_pool = g.fixed_etf_pool[:]
 
 
@@ -1015,12 +1049,12 @@ def daily_merge_etf_pools(context):
     try:
         set_universe(list(g.merged_etf_pool) + [g.defensive_etf])
     except Exception as e:
-        log.warn('set_universe 更新失败: %s' % e)
+        log.warning('set_universe 更新失败: %s' % e)
 
 
 def calculate_and_log_ranked_etfs(context):
     if not hasattr(g, 'merged_etf_pool') or not g.merged_etf_pool:
-        log.warn("【动量计算】合并池为空，无法计算")
+        log.warning("【动量计算】合并池为空，无法计算")
         g.ranked_etfs_result = []
         return
     final_list = get_final_ranked_etfs(context)
@@ -1147,11 +1181,11 @@ def check_a_share_weak_period(context):
     for name, code in indexes.items():
         df = get_history(data_lookback + 1, '1d', 'close', security_list=code)
         if df is None or df.empty or code not in df.columns:
-            log.warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
+            log.warning("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
             continue
         closes = df[code].values
         if closes is None or len(closes) < data_lookback:
-            log.warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
+            log.warning("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
             continue
         current_price = closes[-1]
         ma_val = closes[-g.weak_period_ma_lookback:].mean()
@@ -1244,7 +1278,7 @@ def get_final_ranked_etfs(context):
     close_df = get_history(safe_lookback, '1d', 'close', security_list=etf_set, fq='pre')
     volume_df = get_history(safe_lookback, '1d', 'volume', security_list=etf_set)
     if close_df is None or close_df.empty:
-        log.warn("【动量计算】无法获取历史价格数据")
+        log.warning("【动量计算】无法获取历史价格数据")
         return []
     # 当日累计成交量：批量分钟线求和（PTrade 快照 volume 为单根分钟量，不可直接累计）
     today_vols = _get_today_volumes(context, etf_set)
@@ -1280,16 +1314,16 @@ def get_final_ranked_etfs(context):
             metrics = calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, current_price, today_vol, context)
         except RuntimeError as e:
             skipped_no_minute.append((etf, get_security_name(etf), str(e)))
-            log.warn("⚠️ %s %s 分钟数据获取失败，跳过: %s" % (etf, get_security_name(etf), e))
+            log.warning("⚠️ %s %s 分钟数据获取失败，跳过: %s" % (etf, get_security_name(etf), e))
             continue
         if metrics:
             if metrics['etf'] in {m['etf'] for m in all_metrics}:
                 continue
             all_metrics.append(metrics)
     if skipped_no_minute:
-        log.warn("⚠️ 共%d只ETF因分钟数据缺失被跳过:" % len(skipped_no_minute))
+        log.warning("⚠️ 共%d只ETF因分钟数据缺失被跳过:" % len(skipped_no_minute))
         for code, name, reason in skipped_no_minute:
-            log.warn("  - %s %s: %s" % (code, name, reason))
+            log.warning("  - %s %s: %s" % (code, name, reason))
     for item in all_metrics:
         score = item.get('momentum_score')
         if pd.isna(score) or (isinstance(score, float) and np.isnan(score)):
@@ -1687,7 +1721,7 @@ def smart_order_target_value(security, target_value, context):
                 log.info("📤 卖出 %s %s 数量%d 价格%.3f" % (security, name, abs(diff), price))
             return True
         else:
-            log.warn("下单失败: %s %s，数量%d" % (security, name, diff))
+            log.warning("下单失败: %s %s，数量%d" % (security, name, diff))
             return False
     return False
 

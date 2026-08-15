@@ -161,18 +161,21 @@ class _BarUnit(object):
 
 
 def _set_last_data(data, context):
-    """由 handle_data / before_trading_start 调用，捕获最新行情快照。"""
+    """由 handle_data 捕获最新行情快照；before_trading_start 的 data 是 StrategyUniverse（无 __len__/无行情），忽略。"""
     global _LAST_DATA, _LAST_CTX
     _LAST_CTX = context
-    if not data:
+    if data is None:
         return
     out = {}
     try:
-        items = data.items() if hasattr(data, 'items') else []
+        items = data.items()
+    except Exception:
+        return
+    try:
         for code, unit in items:
             out[code] = _BarUnit(code, unit)
     except Exception:
-        pass
+        return
     if out:
         _LAST_DATA = out
 
