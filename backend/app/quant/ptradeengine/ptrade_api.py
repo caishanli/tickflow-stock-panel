@@ -376,19 +376,27 @@ def get_stock_name(code):
 
 
 def _name_map():
-    """{6位代码: 名称}，来源 network 源 get_stock_names（进程内缓存）。"""
+    """{6位代码: 名称}，与本地 jq 引擎同源（聚宽名快照优先，回退通达信名）。"""
     cache = _state.setdefault("_name_map_cache", {})
     if cache:
         return cache
     mgr = _state.get("manager")
+    try:
+        from app.quant.jqengine.engine.jq.api import _name_source
+        if _name_source() == "jq":
+            from app.quant.jqengine.engine.jq.jq_names import load_jq_names
+            for jq_code, name in (load_jq_names() or {}).items():
+                if name:
+                    cache.setdefault(jq_code.split(".")[0], str(name))
+    except Exception:
+        pass
     if mgr:
         try:
             src = getattr(mgr, "sources", {}).get("network")
             if src is not None and hasattr(src, "get_stock_names"):
-                raw = src.get_stock_names() or {}
-                for pure, name in raw.items():
+                for pure, name in (src.get_stock_names() or {}).items():
                     if name:
-                        cache[str(pure)] = str(name)
+                        cache.setdefault(str(pure), str(name))
         except Exception:
             pass
     return cache
