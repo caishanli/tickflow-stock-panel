@@ -119,7 +119,6 @@ def test_set_benchmark_stored(_fake_rqalpha):
 
 def test_get_history_single_code_wide(monkeypatch):
     """单标的 get_history 返回宽表（非 Series），列名=标的码，可 df[code] 取值。"""
-    from datetime import datetime
     import numpy as np
     import pandas as pd
 

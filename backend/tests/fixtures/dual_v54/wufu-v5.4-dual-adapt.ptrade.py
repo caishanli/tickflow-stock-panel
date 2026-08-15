@@ -32,7 +32,7 @@
 import numpy as np
 import math
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -614,7 +614,7 @@ def afternoon_routine(context):
     else:
         log.info("🟢 【大A正常期】使用合并池，共%d只" % len(g.merged_etf_pool))
     try:
-        set_universe(g.merged_etf_pool)
+        set_universe(list(g.merged_etf_pool) + [g.defensive_etf])
     except Exception as e:
         log.warn('set_universe 更新失败: %s' % e)
     log.info("【动量计算】计算ETF动量得分与排序...")
@@ -1013,7 +1013,7 @@ def daily_merge_etf_pools(context):
         len(g.filtered_fixed_pool), len(g.dynamic_etf_pool), len(merged)))
     g.merged_etf_pool = merged
     try:
-        set_universe(g.merged_etf_pool)
+        set_universe(list(g.merged_etf_pool) + [g.defensive_etf])
     except Exception as e:
         log.warn('set_universe 更新失败: %s' % e)
 
@@ -1146,6 +1146,9 @@ def check_a_share_weak_period(context):
     exit_above_count = 0
     for name, code in indexes.items():
         df = get_history(data_lookback + 1, '1d', 'close', security_list=code)
+        if df is None or df.empty or code not in df.columns:
+            log.warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
+            continue
         closes = df[code].values
         if closes is None or len(closes) < data_lookback:
             log.warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
@@ -1596,6 +1599,8 @@ def is_temporarily_suspended(security, context, minute_count=10):
     try:
         # 获取最近N分钟的分钟线数据
         minute_data = get_history(minute_count, '1m', 'volume', security_list=security, include=True)
+        if minute_data is None or minute_data.empty or security not in minute_data.columns:
+            return True
         vals = minute_data[security].values
         # 无数据或数据为空，视为停牌
         if vals is None or len(vals) == 0:

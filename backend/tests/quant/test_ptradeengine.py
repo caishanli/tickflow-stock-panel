@@ -124,19 +124,22 @@ def test_loader_bundle_hooks_and_conv():
 
 def test_get_history_single_code_wide_local():
     """本地引擎 ptrade_api.get_history 单标的返回宽表，列名=标的码。"""
+    from datetime import datetime
+
     import pandas as pd
+
     from app.quant.ptradeengine import ptrade_api
 
     class _Fake:
-        _daily_mem = {}
-        _minute_mem = {}
-        sources = {}
+        def __init__(self):
+            self._daily_mem = {}
+            self._minute_mem = {}
+            self.sources = {}
 
         def fetch(self, name, *a, **kw):  # noqa: N802
             idx = pd.date_range("2026-07-01", periods=6, freq="D")
             return pd.DataFrame({"close": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]}, index=idx)
 
-    from datetime import datetime
     ptrade_api._reset(_Fake(), 0.0001, 0.0001, 100000.0)
     ptrade_api._state["ctx"].current_dt = datetime(2026, 7, 4, 10, 0)
     df = ptrade_api.get_history(3, "1d", "close", security_list="510300.SS")
