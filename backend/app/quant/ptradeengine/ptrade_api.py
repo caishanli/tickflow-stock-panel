@@ -226,6 +226,22 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
     engine_codes = [to_engine(c) for c in codes]
     col = "total_turnover" if field == "money" else field
     now = pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None
+    # money_corrected：修正后的元成交额（对齐聚宽 get_daily_money_cached 口径，
+    # 本地日线 money 列单位经 _ensure_money_yuan 修正，history_bars 的
+    # total_turnover=close×volume 在部分 ETF 上被放大）
+    if field == "money_corrected":
+        try:
+            df = mgr.get_daily_money_cached(engine_codes,
+                                            str(now.date()) if now is not None else None,
+                                            int(count))
+            if df is not None and not df.empty:
+                wide = df.pivot_table(index="time", columns="code", values="money")
+                wide.columns = [to_pt(c) for c in wide.columns]
+                return wide.sort_index()
+        except Exception:
+            pass
+        field = "money"
+        col = "total_turnover"
     out = {}
     # 批量路径：多标的 + 已预加载内存缓存，直接切片（镜像 jq api，避免逐只 fetch/回源）
     if len(engine_codes) > 1:
@@ -304,30 +320,29 @@ def get_stock_name(code):
     return {code: name}
 
 
-def _resolve_name(code):
-    """标的名称：优先 etf 名录（manager.get_etf_list，进程内缓存），失败回退代码。"""
+def _name_map():
+    """{6位代码: 名称}，来源 network 源 get_stock_names（进程内缓存）。"""
+    cache = _state.setdefault("_name_map_cache", {})
+    if cache:
+        return cache
     mgr = _state.get("manager")
-    if mgr is None:
-        return code
-    cache = _state.setdefault("_etf_name_cache", {})
-    if code in cache:
-        return cache[code]
-    pure = code.split(".")[0]
-    if not _state.get("_etf_list_loaded"):
+    if mgr:
         try:
-            etfs = mgr.fetch("get_etf_list") or []
-            for item in etfs:
-                if isinstance(item, dict):
-                    ts = str(item.get("ts_code", ""))
-                    n = str(item.get("name", "") or "")
-                    if "." in ts and n:
-                        cache.setdefault(ts.split(".")[0], n)
-            _state["_etf_list_loaded"] = True
+            src = getattr(mgr, "sources", {}).get("network")
+            if src is not None and hasattr(src, "get_stock_names"):
+                raw = src.get_stock_names() or {}
+                for pure, name in raw.items():
+                    if name:
+                        cache[str(pure)] = str(name)
         except Exception:
             pass
-    name = cache.get(pure, code)
-    cache[code] = name
-    return name
+    return cache
+
+
+def _resolve_name(code):
+    """标的名称：优先网络名称映射，失败回退代码。"""
+    pure = code.split(".")[0]
+    return _name_map().get(pure, code)
 
 
 def get_market_list():
@@ -335,19 +350,28 @@ def get_market_list():
 
 
 def get_market_detail(mic):
-    """全市场基金表：prod_code(PTrade)/prod_name。DataManager etf 名录。"""
+    """全市场基金表：prod_code(PTrade)/prod_name。DataManager etf 名录（字符串或 dict）。
+    prod_name 用网络名称映射（对齐 jq get_all_securities），缺失回退代码。"""
     mgr = _state.get("manager")
+    names = _name_map()
     rows = []
     if mgr:
         try:
-            etfs = mgr.fetch("get_etf_list")
-            for item in etfs or []:
-                if isinstance(item, dict):
+            etfs = mgr.fetch("get_etf_list") or []
+            for item in etfs:
+                if isinstance(item, str):
+                    ts = item
+                    name = names.get(item.split(".")[0], item)
+                elif isinstance(item, dict):
                     ts = str(item.get("ts_code", ""))
-                    if "." not in ts:
-                        continue
-                    rows.append({"prod_code": to_pt(ts),
-                                 "prod_name": str(item.get("name", "") or ts)})
+                    name = names.get(ts.split(".")[0], str(item.get("name", "") or ts))
+                else:
+                    continue
+                if "." not in ts:
+                    continue
+                # ts 为 SH/SZ 格式 → 先转 JQ 再转 PTrade（SH→SS）
+                jq = str(ts).replace(".SH", ".XSHG").replace(".SZ", ".XSHE")
+                rows.append({"prod_code": to_pt(jq), "prod_name": name})
         except Exception:
             pass
     return pd.DataFrame(rows)
