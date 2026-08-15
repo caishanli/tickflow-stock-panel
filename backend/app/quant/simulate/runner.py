@@ -505,6 +505,11 @@ def _fire_session(account_id: str, bundle, ctx, bar_dt, fired: set, jq_api,
     force_all（日频账户）：忽略任务设定时刻，全部 run_daily 任务在本次唯一
     tick 各触发一次。
     """
+    # ptrade bundle：run_daily 前先刷新策略 _LAST_DATA 快照到当前 bar
+    # （handle_data 在其后才触发，否则 run_daily 读到上一根 bar 的价）
+    refresh = getattr(bundle, "refresh_snapshot", None)
+    if refresh is not None:
+        refresh(ctx)
     calls = []
     for func, t in bundle.daily:
         ts = str(t)

@@ -25,6 +25,14 @@ class StrategyBundle:
         self.after_trading_end = ns.get("after_trading_end")
         self._code_conv = getattr(ctx, "_code_conv", None) \
             or (ptrade_api.to_engine, ptrade_api.to_pt)
+        # run_daily 触发前刷新策略 _LAST_DATA 快照到当前 bar：
+        # runner 先触发 run_daily、后触发 handle_data（handle_data 才调 _set_last_data），
+        # 若不提前刷新，13:10 回调读到的是上一根 bar 的价（与 jq 引擎读 minute_prices
+        # 当前价差 1 tick → 股数错位）。jq bundle 无此方法，runner 跳过。
+        if "_set_last_data" in ns and callable(ns.get("_set_last_data")):
+            self.refresh_snapshot = _make_refresh(ns, ctx)
+        else:
+            self.refresh_snapshot = None
 
     @property
     def conv(self):
@@ -49,6 +57,19 @@ def _wrap_with_data(fn):
         return fn(ctx, data)
 
     return wrapped
+
+
+def _make_refresh(ns, ctx):
+    """构造 run_daily 前刷新策略 _LAST_DATA 快照的函数。"""
+    set_last_data = ns["_set_last_data"]
+
+    def refresh(_ctx):
+        try:
+            set_last_data(ptrade_api.build_data_snapshot(_ctx), _ctx)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return refresh
 
 
 def load_strategy(code, manager, fee, slippage, cash):
