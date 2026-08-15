@@ -13,19 +13,20 @@
 #   买入按 target_weights 槽位目标市值分配。13:10 调度对齐模拟盘口径。
 #
 # 平台差异适配说明（聚宽 → PTrade / 国金版本）：
-#   - 代码格式：.XSHG → .SS  /  .XSHE → .SZ（策略内用 _pt() 自动转换）
+#   - 代码格式：.SS / .SZ（策略内直接用 PTrade 码，无转换函数）
 #   - 全局状态 g.* ：PTrade 同样支持并自动持久化
 #   - 调度：晨间 → before_trading_start；盘中 09:40/13:10/13:10/13:10 → run_daily；
 #           收盘重置 → after_trading_end；分钟止损 → handle_data
-#   - 日线历史：get_history(count, '1d', field, security_list, fq='pre')；多标的返回格式随内置 Python 版本而异（_wide 兼容）
-#   - 盘中数据：PTrade 无 get_current_data()，由 handle_data 的 data 参数捕获快照（_set_last_data/_cd），
-#             SecurityUnitData 仅含 dt/open/high/low/close/price/volume/money；
+#   - 日线历史：get_history(count, '1d', field, security_list, fq='pre')，返回宽表
+#             （index=时间, columns=代码），单标的也返回 DataFrame，可用 df[code] 取列
+#   - 盘中数据：PTrade 无 get_current_data()，由 handle_data 的 data 参数捕获到 _BARS；
+#             SecurityUnitData 含 dt/open/high/low/close/price/volume/money；
 #             停牌用 get_stock_status(query_type='HALT')（_is_halted），涨跌停价用日线 high_limit/low_limit 字段（_limit_prices）
 #   - 持仓：get_position(sec) 返回 Position（amount / enable_amount / cost_basis / last_sale_price）
 #   - 现金/总资产：context.portfolio.cash / .portfolio_value（PTrade 无 get_cash）
 #   - 动态 ETF 池：用 get_market_list()/get_market_detail() 枚举全市场基金，取不到时优雅降级为固定池；
 #     全市场 6000+ 标的的成交额查询按 200 只分块（_get_money_avg_series），阈值按实际可交易池估算，避免回测挂起
-#   - record()/log.set_level/set_option 等聚宽独有 API 已移除；log 无 warn 方法（_warn 降级 warning/error）
+#   - record()/log.set_level/set_option 等聚宽独有 API 已移除；日志用 log.info/warn/error/debug
 # ============================================================
 
 import numpy as np
@@ -37,37 +38,11 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-# ==================== 日志兼容层（不同 PTrade 版本 LogEngine 方法名不一致） ====================
-def _safe_log(msg, *names):
-    """按 names 顺序尝试调用 log.<name>(msg)，均不存在则静默丢弃。"""
-    for name in names:
-        try:
-            fn = getattr(log, name)
-            fn(msg)
-            return
-        except AttributeError:
-            continue
-        except Exception:
-            return
-
-
-def _warn(msg):
-    """log.warn 在部分 PTrade 版本不存在，安全降级为 warning/error。"""
-    _safe_log(msg, 'warn', 'warning', 'error')
-
-
-def _debug(msg):
-    _safe_log(msg, 'debug')
-
-
-# ==================== 平台辅助层 ====================
-def _pt(code):
-    """聚宽代码 → PTrade 代码（XSHG/XSHE → SS/SZ）"""
-    return str(code).replace('.XSHG', '.SS').replace('.XSHE', '.SZ')
+# ==================== 平台辅助层（原生 PTrade API） ====================
+_BARS = {}  # 最新行情快照 {code: SecurityUnitData}，由 handle_data/before_trading_start 捕获
 
 
 def _current_dt(context):
-    """当前策略时间（PTrade 回测/实盘均为 context.blotter.current_dt）"""
     try:
         return context.blotter.current_dt
     except Exception:
@@ -78,125 +53,35 @@ def _today(context):
     return _current_dt(context).date()
 
 
-def _previous_trading_day():
-    """前一交易日（datetime.date）"""
+def _capture_bars(data):
+    global _BARS
+    _BARS = data or {}
+
+
+def _price(security, context):
+    """当前价：快照 close/price → 当日最新分钟收盘 → 最近日线收盘。"""
+    obj = _BARS.get(security)
+    p = (getattr(obj, 'close', 0) or getattr(obj, 'price', 0) or 0) if obj else 0
+    if p:
+        return float(p)
     try:
-        return get_trading_day(-1)
-    except Exception:
-        return date.today()
-
-
-def _last_n_trade_days(count):
-    try:
-        days = get_trade_days(end_date=_previous_trading_day(), count=count)
-        return list(days)
-    except Exception:
-        return []
-
-
-# ==================== 实时行情快照（PTrade 无 get_current_data，改由 handle_data 捕获 data 参数） ====================
-_LAST_DATA = {}
-_LAST_CTX = None
-
-
-class _BarUnit(object):
-    """把 handle_data 传入的 SecurityUnitData 包装为策略统一访问的行情单元。
-    PTrade 的 SecurityUnitData 仅含 dt/open/high/low/close/price/volume/money，
-    paused/涨跌停价需通过 get_stock_status/get_history 另行获取（见 _is_halted/_limit_prices）。"""
-
-    def __init__(self, code, raw):
-        self._code = code
-        self._raw = raw
-
-    def _field(self, *names):
-        r = self._raw
-        if r is None:
-            return None
-        for n in names:
-            try:
-                v = getattr(r, n, None)
-                if v is not None:
-                    return v
-            except Exception:
-                pass
-        return None
-
-    @property
-    def lastPrice(self):
-        v = self._field('price', 'close')
-        return v if v is not None else 0
-
-    @property
-    def price(self):
-        return self.lastPrice
-
-    @property
-    def close(self):
-        return self.lastPrice
-
-    @property
-    def volume(self):
-        v = self._field('volume')
-        return v if v is not None else 0
-
-    @property
-    def money(self):
-        v = self._field('money')
-        return v if v is not None else 0
-
-    @property
-    def paused(self):
-        return False
-
-    @property
-    def highLimit(self):
-        return None
-
-    @property
-    def lowLimit(self):
-        return None
-
-    @property
-    def name(self):
-        return None
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-
-def _set_last_data(data, context):
-    """由 handle_data / before_trading_start 调用，捕获最新行情快照。"""
-    global _LAST_DATA, _LAST_CTX
-    _LAST_CTX = context
-    if not data:
-        return
-    out = {}
-    try:
-        items = data.items() if hasattr(data, 'items') else []
-        for code, unit in items:
-            out[code] = _BarUnit(code, unit)
+        mdf = get_history(1, '1m', 'close', security_list=security, include=True)
+        if mdf is not None and security in mdf.columns and len(mdf):
+            val = float(mdf[security].values[-1])
+            if val == val:  # not NaN
+                return val
     except Exception:
         pass
-    if out:
-        _LAST_DATA = out
-
-
-def _cd():
-    """返回最近一次捕获的行情快照（dict：code -> _BarUnit），无快照时返回 {}。"""
-    return _LAST_DATA or {}
-
-
-def _cd_field(security, attr, default=None):
     try:
-        obj = _cd().get(security)
-        if obj is None:
-            return default
-        return getattr(obj, attr, default)
+        ddf = get_history(1, '1d', 'close', security_list=security, include=True)
+        if ddf is not None and security in ddf.columns and len(ddf):
+            return float(ddf[security].values[-1])
     except Exception:
-        return default
+        pass
+    return 0
 
 
-# ==================== 停牌 / 涨跌停价（回测经 get_stock_status / 日线字段获取，按日缓存） ====================
+# ==================== 停牌 / 涨跌停价（get_stock_status / 日线字段，按日缓存） ====================
 _HALT_CACHE = {}
 _LIMIT_CACHE = {}
 
@@ -206,12 +91,10 @@ def _refresh_halt_status(codes, context):
     today = _today(context).strftime('%Y%m%d')
     if today not in _HALT_CACHE:
         result = {}
-        codes = list(codes)
         CHUNK = 100
         for i in range(0, len(codes), CHUNK):
-            chunk = codes[i:i + CHUNK]
             try:
-                res = get_stock_status(chunk, query_type='HALT', query_date=today)
+                res = get_stock_status(list(codes)[i:i + CHUNK], query_type='HALT', query_date=today)
                 if res:
                     result.update(res)
             except Exception:
@@ -231,221 +114,61 @@ def _is_halted(code, context):
         return False
 
 
-def _single_daily_value(code, field, context):
+def _single_daily(code, field, context):
+    """单标的最近日线字段值（get_history 宽表取列）。"""
     try:
         df = get_history(1, '1d', field, security_list=code, include=True)
-        v = _as_series_values(df)
-        if v is not None and len(v) > 0:
-            return float(v[-1])
+        if df is not None and code in df.columns and len(df):
+            return float(df[code].values[-1])
     except Exception:
         pass
     return None
 
 
-def _current_price(security, context):
-    """当前价：优先快照 lastPrice，其次当日最新分钟收盘，最后最近日线收盘。
-
-    与聚宽实时行情口径对齐（新选出的标的可能不在 handle_data 快照内，需按真实
-    分钟价回退而非昨收日线，否则买入股数/动量得分偏差）。"""
-    obj = _cd().get(security)
-    p = (getattr(obj, 'lastPrice', 0) or 0) if obj else 0
-    if p:
-        return p
-    try:
-        mdf = get_history(1, '1m', 'close', security_list=security, include=True)
-        v = _as_series_values(mdf)
-        if v is not None and len(v) > 0:
-            val = float(v[-1])
-            if val == val:  # not NaN
-                return val
-    except Exception:
-        pass
-    return _single_daily_value(security, 'close', context) or 0
-
-
 def _limit_prices(code, context):
-    """当日涨跌停价 (high, low)。回测经日线 high_limit/low_limit 字段获取，失败返回 (None, None) 由调用方跳过限制判断。"""
+    """当日涨跌停价 (high, low)。失败返回 (None, None) 由调用方跳过限制判断。"""
     today = _today(context).strftime('%Y%m%d')
     key = (today, code)
     if key in _LIMIT_CACHE:
         return _LIMIT_CACHE[key]
-    high = _single_daily_value(code, 'high_limit', context)
-    low = _single_daily_value(code, 'low_limit', context)
+    high = _single_daily(code, 'high_limit', context)
+    low = _single_daily(code, 'low_limit', context)
     _LIMIT_CACHE[key] = (high, low)
     return (high, low)
 
 
-def _get_total_value(context):
-    """总资产（context.portfolio.portfolio_value，PTrade 无 get_cash）"""
-    try:
-        return float(context.portfolio.portfolio_value)
-    except Exception:
-        pass
-    try:
-        return float(context.portfolio.cash)
-    except Exception:
-        return 0.0
-
-
-def _get_available_cash(context):
-    """当前可用现金（context.portfolio.cash）"""
-    try:
-        return float(context.portfolio.cash)
-    except Exception:
-        pass
-    try:
-        return float(context.portfolio.portfolio_value)
-    except Exception:
-        return 0.0
-
-
-def _get_position(security):
-    try:
-        return get_position(security)
-    except Exception:
-        return None
-
-
-def _positions_map():
-    """返回 {security: Position}，仅含持仓数量>0 的标的。
-    PTrade get_positions() 返回 dict {code: Position}（个别版本为 list），此处双兼容。"""
-    result = {}
-    try:
-        ps = get_positions()
-        if ps is None:
-            return result
-        if isinstance(ps, dict):
-            items = list(ps.items())
-        else:
-            items = [(getattr(p, 'sid', None) or getattr(p, 'security', None), p) for p in ps]
-        for sec, pos in items:
-            if not sec:
-                continue
-            sec = _pt(sec)
-            if _pos_amount(pos) > 0:
-                result[sec] = pos
-    except Exception:
-        pass
-    return result
-
-
-def _pos_amount(pos):
-    if pos is None:
-        return 0
-    return float(getattr(pos, 'amount', None) or getattr(pos, 'quantity', None) or 0)
-
-
-def _pos_avail(pos):
-    if pos is None:
-        return 0
-    return float(getattr(pos, 'enable_amount', None) or getattr(pos, 'avail_amount', None)
-                 or getattr(pos, 'available_amount', None) or 0)
-
-
-def _pos_cost(pos):
-    if pos is None:
-        return 0.0
-    return float(getattr(pos, 'cost_basis', None) or getattr(pos, 'cost', None)
-                 or getattr(pos, 'cost_price', None) or 0.0)
-
-
-def _pos_price(pos):
-    if pos is None:
-        return 0.0
-    return float(getattr(pos, 'last_sale_price', None) or getattr(pos, 'last_price', None)
-                 or getattr(pos, 'price', None) or 0.0)
-
-
-def _as_series_values(obj):
-    """把单只标的的 get_history/get_price 结果规整为一维 numpy 数组（兼容不同版本返回结构）"""
-    if obj is None:
-        return None
-    if isinstance(obj, pd.Series):
-        return np.asarray(obj, dtype=float)
-    if isinstance(obj, pd.DataFrame):
-        for col in ('close', 'volume', 'money'):
-            if col in obj.columns:
-                return np.asarray(obj[col], dtype=float)
-        if obj.shape[1] >= 1:
-            return np.asarray(obj.iloc[:, 0], dtype=float)
-        return None
-    if isinstance(obj, dict):
-        for k in ('close', 'volume', 'money'):
-            if k in obj:
-                return np.asarray(obj[k], dtype=float)
-        for k, v in obj.items():
-            if isinstance(v, (list, tuple, np.ndarray)):
-                return np.asarray(v, dtype=float)
-        return None
-    return None
-
-
-def _wide(df, value_col=None):
-    """把多标的 get_history 结果规整为宽表（index=时间，columns=代码）。
-    PTrade 多标的+单字段返回 DataFrame(columns=代码)；个别版本返回带 code 列的长表，此处兜底 pivot。"""
-    if df is None:
-        return None
-    if isinstance(df, pd.DataFrame) and 'code' in df.columns:
-        vcol = value_col
-        if vcol is None:
-            for c in ('close', 'volume', 'money'):
-                if c in df.columns:
-                    vcol = c
-                    break
-        if vcol:
-            try:
-                return df.pivot_table(index=df.index, columns='code', values=vcol)
-            except Exception:
-                return df
-    return df
-
-
 def get_security_name(security):
+    """标的名称：动态池名称缓存 → get_stock_name → 代码兜底。"""
     try:
         if getattr(g, 'etf_names_dict', {}) and security in g.etf_names_dict:
             return g.etf_names_dict[security]
-        try:
-            d = get_stock_name(security)
-            if d and d.get(security):
-                return d.get(security)
-        except Exception:
-            pass
-        obj = _cd().get(security)
-        if obj is not None:
-            n = getattr(obj, 'name', None)
-            if n:
-                return n
-        return security
+        d = get_stock_name(security)
+        if d and d.get(security):
+            return d.get(security)
     except Exception:
-        return security
+        pass
+    return security
 
 
 def _get_today_volumes(context, codes):
-    """批量取当日累计成交量（分钟线求和，分块避免超大查询挂起）。失败返回 {}。"""
+    """当日累计成交量（分钟线求和，分块避免超大查询挂起）。失败返回 {}。"""
     out = {}
     today = _today(context)
-    codes = list(codes)
     CHUNK = 100
     for i in range(0, len(codes), CHUNK):
-        chunk = codes[i:i + CHUNK]
+        chunk = list(codes)[i:i + CHUNK]
         try:
             mdf = get_history(241, '1m', 'volume', security_list=chunk, include=True)
-            if mdf is None:
+            if mdf is None or mdf.empty:
                 continue
-            if isinstance(mdf, pd.DataFrame) and 'code' in mdf.columns:
-                for code, gdf in mdf.groupby('code'):
-                    s = gdf['volume']
-                    if hasattr(gdf.index, 'date'):
-                        s = s[gdf.index.date == today]
-                    s = pd.to_numeric(s, errors='coerce').dropna()
-                    out[str(code)] = float(s.sum())
-            elif isinstance(mdf, pd.DataFrame):
-                for code in mdf.columns:
-                    s = mdf[code]
-                    if hasattr(mdf.index, 'date'):
-                        s = s[mdf.index.date == today]
-                    s = pd.to_numeric(s, errors='coerce').dropna()
-                    out[str(code)] = float(s.sum())
+            for code in chunk:
+                if code not in mdf.columns:
+                    continue
+                s = mdf[code]
+                if hasattr(mdf.index, 'date'):
+                    s = s[mdf.index.date == today]
+                s = pd.to_numeric(s, errors='coerce').dropna()
+                out[code] = float(s.sum())
         except Exception:
             continue
     return out
@@ -457,20 +180,18 @@ def _get_money_avg_series(codes, count, context, field='money'):
     field='money_corrected'：返回引擎修正后的元成交额（对齐聚宽 get_daily_money_cached
     口径，用于流动性阈值）；真 PTrade 无该字段，get_history 回退 'money'。"""
     result = pd.Series(dtype=float)
-    codes = list(codes)
     CHUNK = 200
     for i in range(0, len(codes), CHUNK):
-        chunk = codes[i:i + CHUNK]
+        chunk = list(codes)[i:i + CHUNK]
         try:
-            df = _wide(get_history(count, '1d', field, security_list=chunk))
+            df = get_history(count, '1d', field, security_list=chunk)
             if df is None or df.empty:
                 continue
             df = df.fillna(0.0)
-            total = df.sum(axis=0)
-            avg = total / count
-            for code, v in avg.items():
-                if code in chunk:
-                    result[str(code)] = float(v)
+            avg = df.sum(axis=0) / count
+            for code in chunk:
+                if code in avg.index:
+                    result[code] = float(avg[code])
         except Exception:
             continue
     return result
@@ -479,12 +200,11 @@ def _get_money_avg_series(codes, count, context, field='money'):
 def _get_money_daily_totals(codes, context):
     """按日汇总样本池成交额，返回 {日期: (总成交额, 有成交只数)}，失败返回 None。"""
     try:
-        codes = list(codes)
         CHUNK = 200
         totals = {}
         for i in range(0, len(codes), CHUNK):
-            chunk = codes[i:i + CHUNK]
-            df = _wide(get_history(3, '1d', 'money', security_list=chunk))
+            chunk = list(codes)[i:i + CHUNK]
+            df = get_history(3, '1d', 'money', security_list=chunk)
             if df is None or df.empty:
                 continue
             df = df.fillna(0.0)
@@ -497,51 +217,27 @@ def _get_money_daily_totals(codes, context):
         return None
 
 
-def _update_universe(pool=None):
-    """刷新 PTrade 股票池（保证 order() 的标的全在 universe 内）"""
-    try:
-        codes = []
-        if pool:
-            codes.extend(pool)
-        if getattr(g, 'defensive_etf', None) and g.defensive_etf not in codes:
-            codes.append(g.defensive_etf)
-        set_universe(codes)
-    except Exception as e:
-        _warn('set_universe 更新失败: %s' % e)
-
-
 # ==================== 全市场基金枚举（动态池用，尽力实现+优雅降级） ====================
 def _get_all_fund_codes():
     """枚举全市场基金代码/名称 {code: name}。
-    通过 get_market_list() 遍历所有市场，get_market_detail(mic) 拉取产品，
-    按基金代码前缀（SH 5xxxxx / SZ 15xxxx 16xxxx）过滤。失败返回 None（调用方降级）。"""
+    通过 get_market_list() 遍历所有市场，get_market_detail(mic) 拉取产品。
+    失败返回 None（调用方降级）。"""
     try:
         ml = get_market_list()
         if ml is None:
             return None
-        rows = []
-        if hasattr(ml, 'iterrows'):
-            rows = list(ml.iterrows())
-        elif isinstance(ml, (list, tuple)):
-            rows = [(None, r) for r in ml]
-        elif isinstance(ml, dict):
-            rows = [(None, ml)]
         fund_codes = {}
-        for _, r in rows:
-            if r is None:
-                continue
-            mic = r.get('finance_mic') if hasattr(r, 'get') else None
-            if not mic:
-                mic = r.get('market_code') or r.get('code') or r.get('market')
+        for _, r in ml.iterrows():
+            mic = r.get('finance_mic') or r.get('market_code') or r.get('code') or r.get('market')
             if not mic:
                 continue
             try:
                 detail = get_market_detail(mic)
             except Exception:
                 continue
-            if detail is None:
+            if detail is None or detail.empty:
                 continue
-            cols = list(detail.columns) if hasattr(detail, 'columns') else []
+            cols = list(detail.columns)
             pc_col = 'prod_code' if 'prod_code' in cols else ('code' if 'code' in cols else None)
             pn_col = 'prod_name' if 'prod_name' in cols else ('name' if 'name' in cols else None)
             if not pc_col:
@@ -554,15 +250,14 @@ def _get_all_fund_codes():
                     base = pc.split('.')[0]
                     if not (len(base) == 6 and base.isdigit()):
                         continue
-                    pn = str(drow[pn_col]) if pn_col else pc
-                    fund_codes[pc] = pn
+                    fund_codes[pc] = str(drow[pn_col]) if pn_col else pc
                 except Exception:
                     continue
         if not fund_codes:
             return None
         return fund_codes
     except Exception as e:
-        _warn('枚举全市场基金失败: %s' % e)
+        log.warn('枚举全市场基金失败: %s' % e)
         return None
 
 
@@ -581,140 +276,138 @@ def initialize(context):
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='ETF')
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='LOF')
     except Exception as e:
-        _warn('设置佣金失败(仅回测有效): %s' % e)
+        log.warn('设置佣金失败(仅回测有效): %s' % e)
     try:
         set_slippage(slippage=0.0002)
     except Exception as e:
-        _warn('设置滑点失败(仅回测有效): %s' % e)
+        log.warn('设置滑点失败(仅回测有效): %s' % e)
 
     # ==================== ETF池定义 ====================
     # 全球/海外ETF池（含大宗商品和海外市场ETF）
     g.global_etf_pool = [
         # 大宗商品ETF：
-        '518880.XSHG',  # (黄金ETF) [ETF]-日均成交额：51.35亿元-上市日期：2013-07-29
-        '501018.XSHG',  # (南方原油) [LOF]-日均成交额：24.38亿元-上市日期：2016-06-28
-        '161226.XSHE',  # (国投白银LOF) [LOF]-日均成交额：5.44亿元-上市日期：2015-08-17
-        '159985.XSHE',  # (豆粕ETF华夏) [ETF]-日均成交额：4.63亿元-上市日期：2019-12-05
-        '159980.XSHE',  # (有色ETF大成) [ETF]-日均成交额：3.84亿元-上市日期：2019-12-24
+        '518880.SS',  # (黄金ETF) [ETF]-日均成交额：51.35亿元-上市日期：2013-07-29
+        '501018.SS',  # (南方原油) [LOF]-日均成交额：24.38亿元-上市日期：2016-06-28
+        '161226.SZ',  # (国投白银LOF) [LOF]-日均成交额：5.44亿元-上市日期：2015-08-17
+        '159985.SZ',  # (豆粕ETF华夏) [ETF]-日均成交额：4.63亿元-上市日期：2019-12-05
+        '159980.SZ',  # (有色ETF大成) [ETF]-日均成交额：3.84亿元-上市日期：2019-12-24
         # 海外ETF：
-        '513310.XSHG',  # (中韩芯片) [ETF]-日均成交额：59.37亿元-上市日期：2022-12-22
-        '159518.XSHE',  # (标普油气ETF嘉实) [ETF]-日均成交额：27.93亿元-上市日期：2023-11-15
-        '159509.XSHE',  # (纳指科技ETF景顺) [ETF]-日均成交额：7.24亿元-上市日期：2023-08-08
-        '513100.XSHG',  # (纳指ETF) [ETF]-日均成交额：5.02亿元-上市日期：2013-05-15
-        '513520.XSHG',  # (日经ETF) [ETF]-日均成交额：3.72亿元-上市日期：2019-06-25
-        '513500.XSHG',  # (标普500) [ETF]-日均成交额：2.89亿元-上市日期：2014-01-15
-        '159502.XSHE',  # (标普生物科技ETF嘉实) [ETF]-日均成交额：1.80亿元-上市日期：2024-01-10
-        '513400.XSHG',  # (道琼斯) [ETF]-日均成交额：1.70亿元-上市日期：2024-02-02
-        '513030.XSHG',  # (德国ETF) [ETF]-日均成交额：0.95亿元-上市日期：2014-09-05
-        '513290.XSHG',  # (纳指生物) [ETF]-日均成交额：0.78亿元-上市日期：2022-08-29
-        '520830.XSHG',  # (沙特ETF) [ETF]-日均成交额：0.62亿元-上市日期：2024-07-16
-        '159529.XSHE',  # (标普消费ETF景顺) [ETF]-日均成交额：0.50亿元-上市日期：2024-02-02
+        '513310.SS',  # (中韩芯片) [ETF]-日均成交额：59.37亿元-上市日期：2022-12-22
+        '159518.SZ',  # (标普油气ETF嘉实) [ETF]-日均成交额：27.93亿元-上市日期：2023-11-15
+        '159509.SZ',  # (纳指科技ETF景顺) [ETF]-日均成交额：7.24亿元-上市日期：2023-08-08
+        '513100.SS',  # (纳指ETF) [ETF]-日均成交额：5.02亿元-上市日期：2013-05-15
+        '513520.SS',  # (日经ETF) [ETF]-日均成交额：3.72亿元-上市日期：2019-06-25
+        '513500.SS',  # (标普500) [ETF]-日均成交额：2.89亿元-上市日期：2014-01-15
+        '159502.SZ',  # (标普生物科技ETF嘉实) [ETF]-日均成交额：1.80亿元-上市日期：2024-01-10
+        '513400.SS',  # (道琼斯) [ETF]-日均成交额：1.70亿元-上市日期：2024-02-02
+        '513030.SS',  # (德国ETF) [ETF]-日均成交额：0.95亿元-上市日期：2014-09-05
+        '513290.SS',  # (纳指生物) [ETF]-日均成交额：0.78亿元-上市日期：2022-08-29
+        '520830.SS',  # (沙特ETF) [ETF]-日均成交额：0.62亿元-上市日期：2024-07-16
+        '159529.SZ',  # (标普消费ETF景顺) [ETF]-日均成交额：0.50亿元-上市日期：2024-02-02
     ]
-    g.global_etf_pool = [_pt(c) for c in g.global_etf_pool]
     # 中国ETF池（含港股、指数、行业ETF）
     g.china_etf_pool = [
         # 港股ETF：
-        '513090.XSHG',  # (香港证券) [ETF]-日均成交额：54.24亿元-上市日期：2020-03-26
-        '513120.XSHG',  # (HK创新药) [ETF]-日均成交额：52.34亿元-上市日期：2022-07-12
-        '513180.XSHG',  # (恒指科技) [ETF]-日均成交额：36.66亿元-上市日期：2021-05-25
-        '513330.XSHG',  # (恒生互联) [ETF]-日均成交额：20.45亿元-上市日期：2021-02-08
-        '513750.XSHG',  # (港股非银) [ETF]-日均成交额：9.55亿元-上市日期：2023-11-27
-        '159892.XSHE',  # (恒生医药ETF华夏) [ETF]-日均成交额：7.90亿元-上市日期：2021-10-19
-        '513190.XSHG',  # (H股金融) [ETF]-日均成交额：3.74亿元-上市日期：2023-10-11
-        '159605.XSHE',  # (中概互联ETF广发) [ETF]-日均成交额：3.19亿元-上市日期：2021-12-02
-        '513630.XSHG',  # (香港红利) [ETF]-日均成交额：2.84亿元-上市日期：2023-12-08
-        '159323.XSHE',  # (港股通汽车ETF华夏) [ETF]-日均成交额：1.98亿元-上市日期：2025-01-08
-        '510900.XSHG',  # (恒生中国) [ETF]-日均成交额：1.46亿元-上市日期：2012-10-22
-        '513920.XSHG',  # (央企40) [ETF]-日均成交额：1.38亿元-上市日期：2024-01-05
-        '513970.XSHG',  # (恒生消费) [ETF]-日均成交额：0.82亿元-上市日期：2023-04-21
+        '513090.SS',  # (香港证券) [ETF]-日均成交额：54.24亿元-上市日期：2020-03-26
+        '513120.SS',  # (HK创新药) [ETF]-日均成交额：52.34亿元-上市日期：2022-07-12
+        '513180.SS',  # (恒指科技) [ETF]-日均成交额：36.66亿元-上市日期：2021-05-25
+        '513330.SS',  # (恒生互联) [ETF]-日均成交额：20.45亿元-上市日期：2021-02-08
+        '513750.SS',  # (港股非银) [ETF]-日均成交额：9.55亿元-上市日期：2023-11-27
+        '159892.SZ',  # (恒生医药ETF华夏) [ETF]-日均成交额：7.90亿元-上市日期：2021-10-19
+        '513190.SS',  # (H股金融) [ETF]-日均成交额：3.74亿元-上市日期：2023-10-11
+        '159605.SZ',  # (中概互联ETF广发) [ETF]-日均成交额：3.19亿元-上市日期：2021-12-02
+        '513630.SS',  # (香港红利) [ETF]-日均成交额：2.84亿元-上市日期：2023-12-08
+        '159323.SZ',  # (港股通汽车ETF华夏) [ETF]-日均成交额：1.98亿元-上市日期：2025-01-08
+        '510900.SS',  # (恒生中国) [ETF]-日均成交额：1.46亿元-上市日期：2012-10-22
+        '513920.SS',  # (央企40) [ETF]-日均成交额：1.38亿元-上市日期：2024-01-05
+        '513970.SS',  # (恒生消费) [ETF]-日均成交额：0.82亿元-上市日期：2023-04-21
         # 指数ETF：
-        '511380.XSHG',  # (转债ETF) [ETF]-日均成交额：115.92亿元-上市日期：2020-04-07
-        '512050.XSHG',  # (A500E) [ETF]-日均成交额：48.05亿元-上市日期：2024-11-15
-        '510500.XSHG',  # (500ETF) [ETF]-日均成交额：45.45亿元-上市日期：2013-03-15
-        '159915.XSHE',  # (创业板ETF易方达) [ETF]-日均成交额：43.55亿元-上市日期：2011-12-09
-        '510300.XSHG',  # (300ETF) [ETF]-日均成交额：34.60亿元-上市日期：2012-05-28
-        '512100.XSHG',  # (1000ETF) [ETF]-日均成交额：25.26亿元-上市日期：2016-11-04
-        '159949.XSHE',  # (创业板50ETF华安) [ETF]-日均成交额：16.52亿元-上市日期：2016-07-22
-        '588080.XSHG',  # (科创板50) [ETF]-日均成交额：13.32亿元-上市日期：2020-11-16
-        '159967.XSHE',  # (创业板成长ETF华夏) [ETF]-日均成交额：5.29亿元-上市日期：2019-07-15
-        '588220.XSHG',  # (科创100F) [ETF]-日均成交额：5.01亿元-上市日期：2023-09-15
-        '563300.XSHG',  # (中证2000) [ETF]-日均成交额：4.13亿元-上市日期：2023-09-14
-        '510760.XSHG',  # (上证ETF) [ETF]-日均成交额：1.45亿元-上市日期：2020-09-09
+        '511380.SS',  # (转债ETF) [ETF]-日均成交额：115.92亿元-上市日期：2020-04-07
+        '512050.SS',  # (A500E) [ETF]-日均成交额：48.05亿元-上市日期：2024-11-15
+        '510500.SS',  # (500ETF) [ETF]-日均成交额：45.45亿元-上市日期：2013-03-15
+        '159915.SZ',  # (创业板ETF易方达) [ETF]-日均成交额：43.55亿元-上市日期：2011-12-09
+        '510300.SS',  # (300ETF) [ETF]-日均成交额：34.60亿元-上市日期：2012-05-28
+        '512100.SS',  # (1000ETF) [ETF]-日均成交额：25.26亿元-上市日期：2016-11-04
+        '159949.SZ',  # (创业板50ETF华安) [ETF]-日均成交额：16.52亿元-上市日期：2016-07-22
+        '588080.SS',  # (科创板50) [ETF]-日均成交额：13.32亿元-上市日期：2020-11-16
+        '159967.SZ',  # (创业板成长ETF华夏) [ETF]-日均成交额：5.29亿元-上市日期：2019-07-15
+        '588220.SS',  # (科创100F) [ETF]-日均成交额：5.01亿元-上市日期：2023-09-15
+        '563300.SS',  # (中证2000) [ETF]-日均成交额：4.13亿元-上市日期：2023-09-14
+        '510760.SS',  # (上证ETF) [ETF]-日均成交额：1.45亿元-上市日期：2020-09-09
         # 行业ETF：
-        '588200.XSHG',  # (科创芯片) [ETF]-日均成交额：28.07亿元-上市日期：2022-10-26
-        '515880.XSHG',  # (通信ETF) [ETF]-日均成交额：22.39亿元-上市日期：2019-09-06
-        '159981.XSHE',  # (能源化工ETF建信) [ETF]-日均成交额：21.63亿元-上市日期：2020-01-17
-        '512880.XSHG',  # (证券ETF) [ETF]-日均成交额：16.21亿元-上市日期：2016-08-08
-        '513350.XSHG',  # (油气ETF) [ETF]-日均成交额：15.66亿元-上市日期：2023-11-28
-        '159326.XSHE',  # (电网设备ETF华夏) [ETF]-日均成交额：14.86亿元-上市日期：2024-09-09
-        '159516.XSHE',  # (半导体设备ETF国泰) [ETF]-日均成交额：14.23亿元-上市日期：2023-07-27
-        '159206.XSHE',  # (卫星ETF永赢) [ETF]-日均成交额：13.87亿元-上市日期：2025-03-14
-        '512480.XSHG',  # (半导体) [ETF]-日均成交额：13.07亿元-上市日期：2019-06-12
-        '159363.XSHE',  # (创业板人工智能ETF华宝) [ETF]-日均成交额：10.50亿元-上市日期：2024-12-16
-        '159870.XSHE',  # (化工ETF鹏华) [ETF]-日均成交额：10.03亿元-上市日期：2021-03-03
-        '512400.XSHG',  # (有色ETF) [ETF]-日均成交额：9.97亿元-上市日期：2017-09-01
-        '159755.XSHE',  # (电池ETF广发) [ETF]-日均成交额：8.58亿元-上市日期：2021-06-24
-        '588170.XSHG',  # (科创半导) [ETF]-日均成交额：7.74亿元-上市日期：2025-04-08
-        '159992.XSHE',  # (创新药ETF银华) [ETF]-日均成交额：7.59亿元-上市日期：2020-04-10
-        '159995.XSHE',  # (芯片ETF华夏) [ETF]-日均成交额：7.51亿元-上市日期：2020-02-10
-        '512890.XSHG',  # (红利低波) [ETF]-日均成交额：6.79亿元-上市日期：2019-01-18
-        '515220.XSHG',  # (煤炭ETF) [ETF]-日均成交额：6.44亿元-上市日期：2020-03-02
-        '159566.XSHE',  # (储能电池ETF易方达) [ETF]-日均成交额：6.31亿元-上市日期：2024-02-08
-        '159819.XSHE',  # (人工智能ETF易方达) [ETF]-日均成交额：6.26亿元-上市日期：2020-09-23
-        '512800.XSHG',  # (银行ETF) [ETF]-日均成交额：6.13亿元-上市日期：2017-08-03
-        '512690.XSHG',  # (酒ETF) [ETF]-日均成交额：5.99亿元-上市日期：2019-05-06
-        '515050.XSHG',  # (5GETF) [ETF]-日均成交额：5.93亿元-上市日期：2019-10-16
-        '562500.XSHG',  # (机器人) [ETF]-日均成交额：5.83亿元-上市日期：2021-12-29
-        '512170.XSHG',  # (医疗ETF) [ETF]-日均成交额：5.63亿元-上市日期：2019-06-17
-        '517520.XSHG',  # (黄金股) [ETF]-日均成交额：5.01亿元-上市日期：2023-11-01
-        '159869.XSHE',  # (游戏ETF华夏) [ETF]-日均成交额：4.77亿元-上市日期：2021-03-05
-        '512070.XSHG',  # (证券保险) [ETF]-日均成交额：4.61亿元-上市日期：2014-07-18
-        '159611.XSHE',  # (电力ETF广发) [ETF]-日均成交额：4.42亿元-上市日期：2022-01-07
-        '562800.XSHG',  # (稀有金属) [ETF]-日均成交额：4.39亿元-上市日期：2021-09-27
-        '515120.XSHG',  # (创新药) [ETF]-日均成交额：4.34亿元-上市日期：2021-01-04
-        '512010.XSHG',  # (医药ETF) [ETF]-日均成交额：4.27亿元-上市日期：2013-10-28
-        '510880.XSHG',  # (红利ETF) [ETF]-日均成交额：3.97亿元-上市日期：2007-01-18
-        '515790.XSHG',  # (光伏ETF) [ETF]-日均成交额：3.87亿元-上市日期：2020-12-18
-        '515980.XSHG',  # (人工智能) [ETF]-日均成交额：3.78亿元-上市日期：2020-02-10
-        '512660.XSHG',  # (军工ETF) [ETF]-日均成交额：3.75亿元-上市日期：2016-08-08
-        '159928.XSHE',  # (消费ETF汇添富) [ETF]-日均成交额：3.66亿元-上市日期：2013-09-16
-        '512710.XSHG',  # (军工龙头) [ETF]-日均成交额：3.60亿元-上市日期：2019-08-26
-        '560860.XSHG',  # (工业有色) [ETF]-日均成交额：3.57亿元-上市日期：2023-03-13
-        '515030.XSHG',  # (新汽车) [ETF]-日均成交额：3.33亿元-上市日期：2020-03-04
-        '159766.XSHE',  # (旅游ETF富国) [ETF]-日均成交额：3.30亿元-上市日期：2021-07-23
-        '159218.XSHE',  # (卫星ETF招商) [ETF]-日均成交额：3.21亿元-上市日期：2025-05-22
-        '159852.XSHE',  # (软件ETF嘉实) [ETF]-日均成交额：3.19亿元-上市日期：2021-02-09
-        '516160.XSHG',  # (新能源) [ETF]-日均成交额：3.07亿元-上市日期：2021-02-04
-        '516150.XSHG',  # (稀土基金) [ETF]-日均成交额：3.03亿元-上市日期：2021-03-17
-        '159227.XSHE',  # (航空航天ETF华夏) [ETF]-日均成交额：2.98亿元-上市日期：2025-05-16
-        '159583.XSHE',  # (通信ETF富国) [ETF]-日均成交额：2.93亿元-上市日期：2024-07-08
-        '588790.XSHG',  # (科创智能) [ETF]-日均成交额：2.62亿元-上市日期：2025-01-09
-        '159865.XSHE',  # (养殖ETF国泰) [ETF]-日均成交额：2.44亿元-上市日期：2021-03-08
-        '512980.XSHG',  # (传媒ETF) [ETF]-日均成交额：2.43亿元-上市日期：2018-01-19
-        '159851.XSHE',  # (金融科技ETF华宝) [ETF]-日均成交额：2.27亿元-上市日期：2021-03-19
-        '561360.XSHG',  # (石油ETF) [ETF]-日均成交额：2.04亿元-上市日期：2023-10-31
-        '561980.XSHG',  # (芯片设备) [ETF]-日均成交额：2.01亿元-上市日期：2023-09-01
-        '562590.XSHG',  # (半导材料) [ETF]-日均成交额：1.76亿元-上市日期：2023-10-18
-        '512200.XSHG',  # (地产ETF) [ETF]-日均成交额：1.71亿元-上市日期：2017-09-25
-        '159732.XSHE',  # (消费电子ETF华夏) [ETF]-日均成交额：1.62亿元-上市日期：2021-08-23
-        '159667.XSHE',  # (工业母机ETF国泰) [ETF]-日均成交额：1.58亿元-上市日期：2022-10-26
-        '516510.XSHG',  # (云计算) [ETF]-日均成交额：1.49亿元-上市日期：2021-04-07
-        '159840.XSHE',  # (锂电池ETF工银) [ETF]-日均成交额：1.42亿元-上市日期：2021-08-20
-        '159998.XSHE',  # (计算机ETF天弘) [ETF]-日均成交额：1.30亿元-上市日期：2020-04-13
-        '159825.XSHE',  # (农业ETF富国) [ETF]-日均成交额：1.15亿元-上市日期：2020-12-29
-        '512670.XSHG',  # (国防ETF) [ETF]-日均成交额：1.12亿元-上市日期：2019-08-01
-        '159883.XSHE',  # (医疗器械ETF永赢) [ETF]-日均成交额：1.05亿元-上市日期：2021-04-30
-        '515210.XSHG',  # (钢铁ETF) [ETF]-日均成交额：1.01亿元-上市日期：2020-03-02
-        '515400.XSHG',  # (大数据) [ETF]-日均成交额：0.94亿元-上市日期：2021-01-20
-        '159256.XSHE',  # (创业板软件ETF华夏) [ETF]-日均成交额：0.83亿元-上市日期：2025-08-04
-        '561330.XSHG',  # (矿业ETF) [ETF]-日均成交额：0.83亿元-上市日期：2022-11-01
-        '515170.XSHG',  # (食品饮料) [ETF]-日均成交额：0.67亿元-上市日期：2021-01-13
-        '159638.XSHE',  # (高端装备ETF嘉实) [ETF]-日均成交额：0.56亿元-上市日期：2022-08-12
-        '516520.XSHG',  # (智能驾驶) [ETF]-日均成交额：0.47亿元-上市日期：2021-03-01
-        '513360.XSHG',  # (教育ETF) [ETF]-日均成交额：0.43亿元-上市日期：2021-06-17
-        '516190.XSHG',  # (文娱ETF) [ETF]-日均成交额：0.18亿元-上市日期：2021-09-17
+        '588200.SS',  # (科创芯片) [ETF]-日均成交额：28.07亿元-上市日期：2022-10-26
+        '515880.SS',  # (通信ETF) [ETF]-日均成交额：22.39亿元-上市日期：2019-09-06
+        '159981.SZ',  # (能源化工ETF建信) [ETF]-日均成交额：21.63亿元-上市日期：2020-01-17
+        '512880.SS',  # (证券ETF) [ETF]-日均成交额：16.21亿元-上市日期：2016-08-08
+        '513350.SS',  # (油气ETF) [ETF]-日均成交额：15.66亿元-上市日期：2023-11-28
+        '159326.SZ',  # (电网设备ETF华夏) [ETF]-日均成交额：14.86亿元-上市日期：2024-09-09
+        '159516.SZ',  # (半导体设备ETF国泰) [ETF]-日均成交额：14.23亿元-上市日期：2023-07-27
+        '159206.SZ',  # (卫星ETF永赢) [ETF]-日均成交额：13.87亿元-上市日期：2025-03-14
+        '512480.SS',  # (半导体) [ETF]-日均成交额：13.07亿元-上市日期：2019-06-12
+        '159363.SZ',  # (创业板人工智能ETF华宝) [ETF]-日均成交额：10.50亿元-上市日期：2024-12-16
+        '159870.SZ',  # (化工ETF鹏华) [ETF]-日均成交额：10.03亿元-上市日期：2021-03-03
+        '512400.SS',  # (有色ETF) [ETF]-日均成交额：9.97亿元-上市日期：2017-09-01
+        '159755.SZ',  # (电池ETF广发) [ETF]-日均成交额：8.58亿元-上市日期：2021-06-24
+        '588170.SS',  # (科创半导) [ETF]-日均成交额：7.74亿元-上市日期：2025-04-08
+        '159992.SZ',  # (创新药ETF银华) [ETF]-日均成交额：7.59亿元-上市日期：2020-04-10
+        '159995.SZ',  # (芯片ETF华夏) [ETF]-日均成交额：7.51亿元-上市日期：2020-02-10
+        '512890.SS',  # (红利低波) [ETF]-日均成交额：6.79亿元-上市日期：2019-01-18
+        '515220.SS',  # (煤炭ETF) [ETF]-日均成交额：6.44亿元-上市日期：2020-03-02
+        '159566.SZ',  # (储能电池ETF易方达) [ETF]-日均成交额：6.31亿元-上市日期：2024-02-08
+        '159819.SZ',  # (人工智能ETF易方达) [ETF]-日均成交额：6.26亿元-上市日期：2020-09-23
+        '512800.SS',  # (银行ETF) [ETF]-日均成交额：6.13亿元-上市日期：2017-08-03
+        '512690.SS',  # (酒ETF) [ETF]-日均成交额：5.99亿元-上市日期：2019-05-06
+        '515050.SS',  # (5GETF) [ETF]-日均成交额：5.93亿元-上市日期：2019-10-16
+        '562500.SS',  # (机器人) [ETF]-日均成交额：5.83亿元-上市日期：2021-12-29
+        '512170.SS',  # (医疗ETF) [ETF]-日均成交额：5.63亿元-上市日期：2019-06-17
+        '517520.SS',  # (黄金股) [ETF]-日均成交额：5.01亿元-上市日期：2023-11-01
+        '159869.SZ',  # (游戏ETF华夏) [ETF]-日均成交额：4.77亿元-上市日期：2021-03-05
+        '512070.SS',  # (证券保险) [ETF]-日均成交额：4.61亿元-上市日期：2014-07-18
+        '159611.SZ',  # (电力ETF广发) [ETF]-日均成交额：4.42亿元-上市日期：2022-01-07
+        '562800.SS',  # (稀有金属) [ETF]-日均成交额：4.39亿元-上市日期：2021-09-27
+        '515120.SS',  # (创新药) [ETF]-日均成交额：4.34亿元-上市日期：2021-01-04
+        '512010.SS',  # (医药ETF) [ETF]-日均成交额：4.27亿元-上市日期：2013-10-28
+        '510880.SS',  # (红利ETF) [ETF]-日均成交额：3.97亿元-上市日期：2007-01-18
+        '515790.SS',  # (光伏ETF) [ETF]-日均成交额：3.87亿元-上市日期：2020-12-18
+        '515980.SS',  # (人工智能) [ETF]-日均成交额：3.78亿元-上市日期：2020-02-10
+        '512660.SS',  # (军工ETF) [ETF]-日均成交额：3.75亿元-上市日期：2016-08-08
+        '159928.SZ',  # (消费ETF汇添富) [ETF]-日均成交额：3.66亿元-上市日期：2013-09-16
+        '512710.SS',  # (军工龙头) [ETF]-日均成交额：3.60亿元-上市日期：2019-08-26
+        '560860.SS',  # (工业有色) [ETF]-日均成交额：3.57亿元-上市日期：2023-03-13
+        '515030.SS',  # (新汽车) [ETF]-日均成交额：3.33亿元-上市日期：2020-03-04
+        '159766.SZ',  # (旅游ETF富国) [ETF]-日均成交额：3.30亿元-上市日期：2021-07-23
+        '159218.SZ',  # (卫星ETF招商) [ETF]-日均成交额：3.21亿元-上市日期：2025-05-22
+        '159852.SZ',  # (软件ETF嘉实) [ETF]-日均成交额：3.19亿元-上市日期：2021-02-09
+        '516160.SS',  # (新能源) [ETF]-日均成交额：3.07亿元-上市日期：2021-02-04
+        '516150.SS',  # (稀土基金) [ETF]-日均成交额：3.03亿元-上市日期：2021-03-17
+        '159227.SZ',  # (航空航天ETF华夏) [ETF]-日均成交额：2.98亿元-上市日期：2025-05-16
+        '159583.SZ',  # (通信ETF富国) [ETF]-日均成交额：2.93亿元-上市日期：2024-07-08
+        '588790.SS',  # (科创智能) [ETF]-日均成交额：2.62亿元-上市日期：2025-01-09
+        '159865.SZ',  # (养殖ETF国泰) [ETF]-日均成交额：2.44亿元-上市日期：2021-03-08
+        '512980.SS',  # (传媒ETF) [ETF]-日均成交额：2.43亿元-上市日期：2018-01-19
+        '159851.SZ',  # (金融科技ETF华宝) [ETF]-日均成交额：2.27亿元-上市日期：2021-03-19
+        '561360.SS',  # (石油ETF) [ETF]-日均成交额：2.04亿元-上市日期：2023-10-31
+        '561980.SS',  # (芯片设备) [ETF]-日均成交额：2.01亿元-上市日期：2023-09-01
+        '562590.SS',  # (半导材料) [ETF]-日均成交额：1.76亿元-上市日期：2023-10-18
+        '512200.SS',  # (地产ETF) [ETF]-日均成交额：1.71亿元-上市日期：2017-09-25
+        '159732.SZ',  # (消费电子ETF华夏) [ETF]-日均成交额：1.62亿元-上市日期：2021-08-23
+        '159667.SZ',  # (工业母机ETF国泰) [ETF]-日均成交额：1.58亿元-上市日期：2022-10-26
+        '516510.SS',  # (云计算) [ETF]-日均成交额：1.49亿元-上市日期：2021-04-07
+        '159840.SZ',  # (锂电池ETF工银) [ETF]-日均成交额：1.42亿元-上市日期：2021-08-20
+        '159998.SZ',  # (计算机ETF天弘) [ETF]-日均成交额：1.30亿元-上市日期：2020-04-13
+        '159825.SZ',  # (农业ETF富国) [ETF]-日均成交额：1.15亿元-上市日期：2020-12-29
+        '512670.SS',  # (国防ETF) [ETF]-日均成交额：1.12亿元-上市日期：2019-08-01
+        '159883.SZ',  # (医疗器械ETF永赢) [ETF]-日均成交额：1.05亿元-上市日期：2021-04-30
+        '515210.SS',  # (钢铁ETF) [ETF]-日均成交额：1.01亿元-上市日期：2020-03-02
+        '515400.SS',  # (大数据) [ETF]-日均成交额：0.94亿元-上市日期：2021-01-20
+        '159256.SZ',  # (创业板软件ETF华夏) [ETF]-日均成交额：0.83亿元-上市日期：2025-08-04
+        '561330.SS',  # (矿业ETF) [ETF]-日均成交额：0.83亿元-上市日期：2022-11-01
+        '515170.SS',  # (食品饮料) [ETF]-日均成交额：0.67亿元-上市日期：2021-01-13
+        '159638.SZ',  # (高端装备ETF嘉实) [ETF]-日均成交额：0.56亿元-上市日期：2022-08-12
+        '516520.SS',  # (智能驾驶) [ETF]-日均成交额：0.47亿元-上市日期：2021-03-01
+        '513360.SS',  # (教育ETF) [ETF]-日均成交额：0.43亿元-上市日期：2021-06-17
+        '516190.SS',  # (文娱ETF) [ETF]-日均成交额：0.18亿元-上市日期：2021-09-17
     ]
-    g.china_etf_pool = [_pt(c) for c in g.china_etf_pool]
     # 固定ETF池 = 全球池 + 中国池（正常期使用）
     g.fixed_etf_pool = g.global_etf_pool + g.china_etf_pool
 
@@ -738,7 +431,7 @@ def initialize(context):
     g.cross_adaptive = True            # 自适应权重：强腿多得
     g.cross_weight_cap = 0.85          # slot0 权重上限
     g.target_weights = [0.5, 0.5]      # 默认双持仓等权（select_cross_asset_dual 会覆盖）
-    g.defensive_etf = _pt("511880.XSHG")  # 银华日利 货币ETF
+    g.defensive_etf = "511880.SS"  # 银华日利 货币ETF
     g.min_money = 10
     g.target_etfs_list = []
     g.etf_names_dict = {}
@@ -794,7 +487,7 @@ def initialize(context):
     # 分钟级固定止损：在 handle_data 中执行
 
     # 初始化股票池（PTrade 要求交易标的存在于 universe 内）
-    _update_universe(g.fixed_etf_pool)
+    set_universe(list(g.fixed_etf_pool) + [g.defensive_etf])
 
     log.info("【五福闹新春】v5.4（双持仓自适应版）(PTrade 移植版)！")
 
@@ -857,7 +550,7 @@ def initialize(context):
 
 def before_trading_start(context, data):
     """PTrade 晨间钩子：替代聚宽 09:00 定时任务"""
-    _set_last_data(data, context)
+    _capture_bars(data)
     morning_routine(context)
 
 
@@ -868,7 +561,7 @@ def after_trading_end(context):
 
 def handle_data(context, data):
     """盘中每分钟调用（策略回测/实盘频率需设为分钟级）：分钟级固定止损"""
-    _set_last_data(data, context)
+    _capture_bars(data)
     minute_level_stop_loss(context)
 
 
@@ -920,7 +613,10 @@ def afternoon_routine(context):
         log.info("🔴 【大A走弱期】使用过滤后全球/海外ETF池，共%d只" % len(g.merged_etf_pool))
     else:
         log.info("🟢 【大A正常期】使用合并池，共%d只" % len(g.merged_etf_pool))
-    _update_universe(g.merged_etf_pool)
+    try:
+        set_universe(g.merged_etf_pool)
+    except Exception as e:
+        log.warn('set_universe 更新失败: %s' % e)
     log.info("【动量计算】计算ETF动量得分与排序...")
     calculate_and_log_ranked_etfs(context)
     log.info("⏸️ 【午盘流水线】执行完毕！")
@@ -948,21 +644,20 @@ def reset_daily_flags(context):
 
 def check_positions(context):
     try:
-        current_data = _cd()
-        for security, position in _positions_map().items():
+        for security, position in get_positions().items():
             security_name = get_security_name(security)
             log.info("📊 【持仓检查】%s %s, 数量: %d, 成本: %.3f, 当前价: %.3f" % (
                 security, security_name,
-                int(_pos_amount(position)), _pos_cost(position), _pos_price(position)))
+                int(position.amount), position.cost_basis, position.last_sale_price))
             if _is_halted(security, context):
                 log.info("⚠️ %s %s 今日停牌" % (security, security_name))
     except Exception as e:
-        _warn("【持仓检查】执行异常: %s" % e)
+        log.warn("【持仓检查】执行异常: %s" % e)
 
 
 def monitor_drawdown(context):
     try:
-        current_value = _get_total_value(context)
+        current_value = context.portfolio.portfolio_value
         if current_value > g.max_portfolio_value:
             g.max_portfolio_value = current_value
         if g.max_portfolio_value > 0:
@@ -976,9 +671,9 @@ def monitor_drawdown(context):
                     'is_weak': g.is_a_share_weak
                 }
                 positions_info = []
-                for security, position in _positions_map().items():
+                for security, position in get_positions().items():
                     security_name = get_security_name(security)
-                    positions_info.append("%s:%d股" % (security_name, int(_pos_amount(position))))
+                    positions_info.append("%s:%d股" % (security_name, int(position.amount)))
                 record['positions'] = positions_info
                 g.drawdown_records.append(record)
                 log.info("【回撤预警】回撤达到 %.2f%% (阈值: %.0f%%)" % (current_drawdown * 100, g.drawdown_threshold * 100))
@@ -1000,17 +695,17 @@ def calculate_global_etf_threshold(context):
         # 阈值基于全市场基金（与聚宽口径一致：全市场总成交额 / 除数）。
         etf_list = list(g._cached_etf_universe)
         if not etf_list:
-            _warn("未找到任何场内ETF，使用保守阈值1000万")
+            log.warn("未找到任何场内ETF，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
-        trade_days = _last_n_trade_days(3)
+        trade_days = get_trade_days(end_date=get_trading_day(-1), count=3)
         if len(trade_days) < 3:
-            _warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
+            log.warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
             g.avg_etf_money_threshold = 10000000
             return
         avg_daily_money = _get_money_avg_series(etf_list, 3, context, field='money_corrected')
         if avg_daily_money.empty:
-            _warn("无成交额数据，使用保守阈值1000万")
+            log.warn("无成交额数据，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
         # 分日汇总用于日志展示
@@ -1024,7 +719,7 @@ def calculate_global_etf_threshold(context):
         log.info("【全局阈值更新完成】近3日样本池日均总成交额=%.2f亿元，阈值=%.0f万元(%s元)" % (
             avg_total_money / 1e8, threshold / 1e4, format(threshold, ',.0f')))
     except Exception as e:
-        _warn("计算全局阈值异常: %s，使用保守阈值1000万" % e)
+        log.warn("计算全局阈值异常: %s，使用保守阈值1000万" % e)
         g.avg_etf_money_threshold = 10000000
 
 
@@ -1043,7 +738,7 @@ def filter_global_pool_by_volume(context):
     try:
         avg_daily_money = _get_money_avg_series(g.global_etf_pool, TRADE_DAYS_COUNT, context)
         if avg_daily_money.empty:
-            _warn("【全球池过滤】无成交额数据，使用原始全球池")
+            log.warn("【全球池过滤】无成交额数据，使用原始全球池")
             g.filtered_global_pool = g.global_etf_pool[:]
             return
         qualified = avg_daily_money[avg_daily_money > dynamic_threshold]
@@ -1062,7 +757,7 @@ def filter_global_pool_by_volume(context):
         g.filtered_global_pool = new_global_pool
         log.info("【全球池过滤】保留高流动性ETF(%d只)" % len(new_global_pool))
     except Exception as e:
-        _warn("【全球池过滤】异常: %s" % e)
+        log.warn("【全球池过滤】异常: %s" % e)
         g.filtered_global_pool = g.global_etf_pool[:]
 
 
@@ -1116,13 +811,13 @@ def update_sector_pool(context):
     try:
         fund_map = _ensure_fund_universe()
         if not fund_map:
-            _warn("【动态池更新】无法枚举全市场基金，跳过动态池（降级为固定池）")
+            log.warn("【动态池更新】无法枚举全市场基金，跳过动态池（降级为固定池）")
             g.dynamic_etf_pool = []
             return
         g.etf_names_dict = dict(fund_map)
         etf_list = list(fund_map.keys())
     except Exception as e:
-        _warn("获取全市场ETF列表失败: %s" % e)
+        log.warn("获取全市场ETF列表失败: %s" % e)
         g.dynamic_etf_pool = []
         return
 
@@ -1193,7 +888,7 @@ def update_sector_pool(context):
     log.info("【动态池更新】普通组流动性过滤: %d→%d只" % (len(normal_etfs), len(normal_sorted)))
 
     if not normal_sorted and not special_sorted:
-        _warn("【动态池更新】无ETF通过流动性过滤")
+        log.warn("【动态池更新】无ETF通过流动性过滤")
         g.dynamic_etf_pool = []
         return
 
@@ -1285,7 +980,7 @@ def filter_fixed_pool_by_volume(context):
     try:
         avg_daily_money = _get_money_avg_series(g.fixed_etf_pool, TRADE_DAYS_COUNT, context)
         if avg_daily_money.empty:
-            _warn("【固定池过滤】无法获取成交额数据，跳过过滤")
+            log.warn("【固定池过滤】无法获取成交额数据，跳过过滤")
             g.filtered_fixed_pool = g.fixed_etf_pool[:]
             return
         qualified = avg_daily_money[avg_daily_money > dynamic_threshold]
@@ -1304,7 +999,7 @@ def filter_fixed_pool_by_volume(context):
         g.filtered_fixed_pool = new_fixed_pool
         log.info("【固定池过滤】保留高流动性ETF(%d只)" % len(new_fixed_pool))
     except Exception as e:
-        _warn("【固定池过滤】异常: %s" % e)
+        log.warn("【固定池过滤】异常: %s" % e)
         g.filtered_fixed_pool = g.fixed_etf_pool[:]
 
 
@@ -1317,12 +1012,15 @@ def daily_merge_etf_pools(context):
     log.info("【合并池统计】固定池: %d只, 动态池: %d只, 合并后: %d只" % (
         len(g.filtered_fixed_pool), len(g.dynamic_etf_pool), len(merged)))
     g.merged_etf_pool = merged
-    _update_universe(g.merged_etf_pool)
+    try:
+        set_universe(g.merged_etf_pool)
+    except Exception as e:
+        log.warn('set_universe 更新失败: %s' % e)
 
 
 def calculate_and_log_ranked_etfs(context):
     if not hasattr(g, 'merged_etf_pool') or not g.merged_etf_pool:
-        _warn("【动量计算】合并池为空，无法计算")
+        log.warn("【动量计算】合并池为空，无法计算")
         g.ranked_etfs_result = []
         return
     final_list = get_final_ranked_etfs(context)
@@ -1404,7 +1102,7 @@ def calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, curr
             'ma_value': ma_value,
         }
     except Exception as e:
-        _debug("【指标计算】%s %s 计算失败: %s" % (etf, etf_name, e))
+        log.debug("【指标计算】%s %s 计算失败: %s" % (etf, etf_name, e))
         return None
 
 
@@ -1448,9 +1146,9 @@ def check_a_share_weak_period(context):
     exit_above_count = 0
     for name, code in indexes.items():
         df = get_history(data_lookback + 1, '1d', 'close', security_list=code)
-        closes = _as_series_values(df)
+        closes = df[code].values
         if closes is None or len(closes) < data_lookback:
-            _warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
+            log.warn("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
             continue
         current_price = closes[-1]
         ma_val = closes[-g.weak_period_ma_lookback:].mean()
@@ -1532,24 +1230,6 @@ def apply_filters(metrics_list):
     return filtered
 
 
-def _get_today_volume(context, security):
-    """当日累计成交量（分钟线求和；PTrade 快照 volume 为单根分钟量，不能直接用）"""
-    try:
-        mdf = get_history(241, '1m', 'volume', security_list=security, include=True)
-        vals = _as_series_values(mdf)
-        if vals is None or len(vals) == 0:
-            return 0.0
-        # 只保留今天
-        today = _today(context)
-        mask = np.array([d.date() == today for d in mdf.index])
-        if mask.any():
-            vals = vals[mask]
-        vals = vals[~np.isnan(vals)]
-        return float(vals.sum()) if len(vals) else 0.0
-    except Exception:
-        return 0.0
-
-
 def get_final_ranked_etfs(context):
     all_metrics = []
     etf_set = list(g.merged_etf_pool)
@@ -1557,12 +1237,11 @@ def get_final_ranked_etfs(context):
     log.info("【当前状态】%s" % ('🔴 大A走弱期' if g.is_a_share_weak else '🟢 大A正常期'))
     lookback = max(g.lookback_days, g.volume_lookback, g.ma_lookback) + 20
     today = _today(context)
-    current_data = _cd()
     safe_lookback = lookback + 20
-    close_df = _wide(get_history(safe_lookback, '1d', 'close', security_list=etf_set, fq='pre'))
-    volume_df = _wide(get_history(safe_lookback, '1d', 'volume', security_list=etf_set))
+    close_df = get_history(safe_lookback, '1d', 'close', security_list=etf_set, fq='pre')
+    volume_df = get_history(safe_lookback, '1d', 'volume', security_list=etf_set)
     if close_df is None or close_df.empty:
-        _warn("【动量计算】无法获取历史价格数据")
+        log.warn("【动量计算】无法获取历史价格数据")
         return []
     # 当日累计成交量：批量分钟线求和（PTrade 快照 volume 为单根分钟量，不可直接累计）
     today_vols = _get_today_volumes(context, etf_set)
@@ -1573,11 +1252,10 @@ def get_final_ranked_etfs(context):
     _refresh_halt_status(etf_set, context)
     for etf in etf_set:
         try:
-            obj = current_data.get(etf)
             if _is_halted(etf, context):
                 continue
             if is_temporarily_suspended(etf, context):
-                _debug("%s %s 盘中临时停牌，跳过计算" % (etf, get_security_name(etf)))
+                log.debug("%s %s 盘中临时停牌，跳过计算" % (etf, get_security_name(etf)))
                 continue
             if etf not in close_pivot.columns:
                 continue
@@ -1594,21 +1272,21 @@ def get_final_ranked_etfs(context):
             if len(hist_closes) < g.lookback_days:
                 continue
             etf_name = get_security_name(etf)
-            current_price = _current_price(etf, context)
+            current_price = _price(etf, context)
             today_vol = today_vols.get(etf, 0)
             metrics = calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, current_price, today_vol, context)
         except RuntimeError as e:
             skipped_no_minute.append((etf, get_security_name(etf), str(e)))
-            _warn("⚠️ %s %s 分钟数据获取失败，跳过: %s" % (etf, get_security_name(etf), e))
+            log.warn("⚠️ %s %s 分钟数据获取失败，跳过: %s" % (etf, get_security_name(etf), e))
             continue
         if metrics:
             if metrics['etf'] in {m['etf'] for m in all_metrics}:
                 continue
             all_metrics.append(metrics)
     if skipped_no_minute:
-        _warn("⚠️ 共%d只ETF因分钟数据缺失被跳过:" % len(skipped_no_minute))
+        log.warn("⚠️ 共%d只ETF因分钟数据缺失被跳过:" % len(skipped_no_minute))
         for code, name, reason in skipped_no_minute:
-            _warn("  - %s %s: %s" % (code, name, reason))
+            log.warn("  - %s %s: %s" % (code, name, reason))
     for item in all_metrics:
         score = item.get('momentum_score')
         if pd.isna(score) or (isinstance(score, float) and np.isnan(score)):
@@ -1704,7 +1382,7 @@ def get_final_ranked_etfs(context):
     # ========== 第四步：跨资产双持仓选择 ==========
     log_buffer.append("")
     log_buffer.append(">>> 第四步：跨资产双持仓选择 <<<")
-    current_holdings = list(_positions_map().keys())
+    current_holdings = list(get_positions().keys())
     log_buffer.append("当前持仓ETF：%s" % current_holdings)
     final_result = select_cross_asset_dual(
         current_holdings, filtered_list, score_key, log_buffer)
@@ -1814,12 +1492,12 @@ def execute_sell_trades(context):
             target_etfs = []
 
     g.target_etfs_list = target_etfs
-    current_positions = _positions_map()
+    current_positions = get_positions()
     target_set = set(target_etfs)
     sell_count = 0
 
     for security, position in current_positions.items():
-        if _pos_amount(position) > 0 and security not in target_set:
+        if position.amount > 0 and security not in target_set:
             security_name = get_security_name(security)
             success = smart_order_target_value(security, 0, context)
             if success:
@@ -1839,7 +1517,7 @@ def execute_buy_trades(context):
         log.info("========== 买入操作完成 ==========")
         return
 
-    current_positions = _positions_map()
+    current_positions = get_positions()
     etfs_to_buy = [etf for etf in target_etfs if etf not in current_positions]
     actual_holding_count = len(current_positions)
     max_buy_count = max(0, g.holdings_num - actual_holding_count)
@@ -1861,7 +1539,7 @@ def execute_buy_trades(context):
 
     # 修复：动态分配资金，避免可用现金为负
     for i in range(num_etfs_to_buy):
-        remaining_cash = _get_available_cash(context)
+        remaining_cash = context.portfolio.cash
         if remaining_cash < g.min_money:
             log.info("可用现金 %.2f 不足最小交易额 %.2f，停止买入" % (remaining_cash, g.min_money))
             break
@@ -1870,7 +1548,7 @@ def execute_buy_trades(context):
         # 槽位加权分配：新买入槽位目标市值 = 总资产 × 槽位权重(target_weights);
         # 单持仓退化 weights=[1.0] -> 全仓。最后一笔用剩余现金消化余量。
         slot = actual_holding_count + i
-        total_value = _get_total_value(context)
+        total_value = context.portfolio.portfolio_value
         _weights = getattr(g, 'target_weights', None)
         if i == num_etfs_to_buy - 1:
             target_value_for_this_etf = remaining_cash
@@ -1918,7 +1596,7 @@ def is_temporarily_suspended(security, context, minute_count=10):
     try:
         # 获取最近N分钟的分钟线数据
         minute_data = get_history(minute_count, '1m', 'volume', security_list=security, include=True)
-        vals = _as_series_values(minute_data)
+        vals = minute_data[security].values
         # 无数据或数据为空，视为停牌
         if vals is None or len(vals) == 0:
             return True
@@ -1930,7 +1608,7 @@ def is_temporarily_suspended(security, context, minute_count=10):
             return True
         return False
     except Exception as e:
-        _debug("临时停牌检测异常 %s: %s" % (security, e))
+        log.debug("临时停牌检测异常 %s: %s" % (security, e))
         return False  # 异常时默认认为正常，避免误判
 
 
@@ -1939,7 +1617,7 @@ def smart_order_target_value(security, target_value, context):
     智能下单：根据目标市值调整持仓，处理停牌、涨跌停、最小交易金额、T+1
     """
     name = get_security_name(security)
-    price = _current_price(security, context)
+    price = _price(security, context)
     if not price:
         log.info("%s %s 无实时行情数据，跳过交易" % (security, name))
         return False
@@ -1962,7 +1640,7 @@ def smart_order_target_value(security, target_value, context):
         if target_amount <= 0:
             target_amount = 100
         # 二次校验：用实时可用现金和预估成交价(含佣金+滑点)严格限制（兜底）
-        max_shares = int(_get_available_cash(context) / estimated_price)
+        max_shares = int(context.portfolio.cash / estimated_price)
         max_shares = (max_shares // 100) * 100
         if max_shares < target_amount:
             target_amount = max_shares
@@ -1971,8 +1649,8 @@ def smart_order_target_value(security, target_value, context):
             return False
     else:
         target_amount = 0
-    cur_pos = _get_position(security)
-    cur_amount = _pos_amount(cur_pos)
+    cur_pos = get_position(security)
+    cur_amount = cur_pos.amount
     diff = target_amount - cur_amount
     # ========== 4. 涨跌停检测（统一：涨停跌停都不交易；回测经日线字段获取，拿不到则跳过） ==========
     high_limit, low_limit = _limit_prices(security, context)
@@ -1988,7 +1666,7 @@ def smart_order_target_value(security, target_value, context):
         return False
     # ========== 5. T+1检查（仅卖出时） ==========
     if diff < 0:
-        closeable = _pos_avail(cur_pos)
+        closeable = cur_pos.enable_amount
         if closeable == 0:
             log.info("%s %s 当天买入不可卖出(T+1)" % (security, name))
             return False
@@ -2004,7 +1682,7 @@ def smart_order_target_value(security, target_value, context):
                 log.info("📤 卖出 %s %s 数量%d 价格%.3f" % (security, name, abs(diff), price))
             return True
         else:
-            _warn("下单失败: %s %s，数量%d" % (security, name, diff))
+            log.warn("下单失败: %s %s，数量%d" % (security, name, diff))
             return False
     return False
 
@@ -2015,17 +1693,17 @@ def minute_level_stop_loss(context):
     current_time = _current_dt(context).strftime('%H:%M')
     if not (('09:40' < current_time < '10:29') or ('10:40' < current_time < '11:30') or ('13:00' < current_time < '14:57')):
         return
-    for security, position in _positions_map().items():
-        if _pos_amount(position) <= 0 or _pos_avail(position) <= 0:
+    for security, position in get_positions().items():
+        if position.amount <= 0 or position.enable_amount <= 0:
             if security in g._profit_protected:
                 del g._profit_protected[security]
             if security in g._peak_price:
                 del g._peak_price[security]
             continue
-        current_price = _current_price(security, context)
+        current_price = _price(security, context)
         if current_price <= 0:
             continue
-        cost_price = _pos_cost(position)
+        cost_price = position.cost_basis
         if cost_price <= 0:
             continue
         stop_threshold = g.fixedStopLossThreshold
@@ -2058,12 +1736,11 @@ def minute_level_stop_loss(context):
 
 
 def check_defensive_etf_available(context):
-    current_data = _cd()
     defensive_etf = g.defensive_etf
-    obj = current_data.get(defensive_etf)
+    obj = _BARS.get(defensive_etf)
     if obj is None:
         return False
-    price = getattr(obj, 'lastPrice', 0) or 0
+    price = getattr(obj, 'close', 0) or getattr(obj, 'price', 0) or 0
     if price == 0:
         return False
     if _is_halted(defensive_etf, context):
