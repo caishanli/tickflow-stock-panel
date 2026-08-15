@@ -117,8 +117,8 @@ def test_set_benchmark_stored(_fake_rqalpha):
     assert pc._BENCHMARK == "510300.SS"
 
 
-def test_get_history_single_code_wide(monkeypatch):
-    """单标的 get_history 返回宽表（非 Series），列名=标的码，可 df[code] 取值。"""
+def test_get_history_single_code_field_column(monkeypatch):
+    """官方格式：单标的 get_history（str security_list）列=行情字段（df['close']）。"""
     import numpy as np
     import pandas as pd
 
@@ -136,5 +136,5 @@ def test_get_history_single_code_wide(monkeypatch):
     monkeypatch.setattr(pc, "_history_bars_batch", _fake_batch)
     df = pc.get_history(5, "1d", "close", security_list="510300.SS")
     assert isinstance(df, pd.DataFrame), "单标的必须返回 DataFrame"
-    assert "510300.SS" in df.columns, "列名必须是标的码"
-    assert len(df[df["510300.SS"] > 0]) > 0
+    assert "close" in df.columns, "单标的列名必须是行情字段（官方 get_history）"
+    assert len(df[df["close"] > 0]) > 0

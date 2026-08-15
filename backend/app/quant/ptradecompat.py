@@ -26,6 +26,10 @@ _BENCHMARK = "510300.SS"
 _ACTIVE = False                              # 本进程是否处于 ptrade 回测模式（quantbridge 路由用）
 _NATIVE_ORDER = None                         # rqalpha 原生 order（注册 ptrade order 前捕获，防自递归）
 
+# 官方 get_history 输出字段（用于单标的列名判定）
+_PT_FIELDS = ("open", "high", "low", "close", "volume", "money", "price",
+              "is_open", "preclose", "high_limit", "low_limit", "unlimited")
+
 
 # ---------------------------------------------------------------------------
 # 代码域转换（PTrade .SS/.SZ <-> rqalpha/JQ .XSHG/.XSHE）
@@ -133,6 +137,13 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
     df = _build_history_wide(bars, jq_codes, field)
     if include and not df.empty:
         df = df[df.index <= pd.Timestamp(end_dt)]
+    # 官方 get_history 返回格式：单标的（str）列=行情字段（py3.5/3.11 均如此），
+    # 多标的（list）py3.11 长表（含 code 列）/ py3.5 宽表（代码列）。
+    # 本地引擎多标的统一宽表（=官方 py3.5 变体）；单标的按官方把列名设为字段名，
+    # 使策略可用 df[field] 取列（与真 PTrade 一致）。
+    if len(codes) == 1 and not df.empty and len(df.columns) == 1 \
+            and df.columns[0] not in _PT_FIELDS:
+        df.columns = [field]
     return df
 
 

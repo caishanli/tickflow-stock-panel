@@ -65,7 +65,7 @@ def test_capture_bars_guards_non_dict_data():
 
 
 _CONV_LAYER = ["_pt(", "_cd(", "_cd_field", "_set_last_data", "_BarUnit", "_safe_log",
-               "_warn(", "_debug(", "_wide(", "_as_series_values", "_positions_map",
+               "_warn(", "_debug(", "_as_series_values", "_positions_map",
                "_get_position(", "_pos_amount", "_pos_avail", "_pos_cost", "_pos_price",
                "_get_total_value", "_get_available_cash", "_update_universe", "_current_price(",
                "_get_today_volume("]

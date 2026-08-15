@@ -23,6 +23,10 @@ from .context import PtradeContext, PtradePortfolio, PtradePosition, ptrade_code
 
 DEFAULT_STAMP_TAX = 0.0005  # 卖出印花税（A股 0.05%，ETF 免征）
 
+# 官方 get_history 输出字段（用于单标的列名判定）
+_PT_FIELDS = ("open", "high", "low", "close", "volume", "money", "price",
+              "is_open", "preclose", "high_limit", "low_limit", "unlimited")
+
 _state = {
     "ctx": None,
     "manager": None,
@@ -303,7 +307,12 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
             continue
     if not out:
         return pd.DataFrame()
-    return pd.DataFrame(out).sort_index()
+    df = pd.DataFrame(out).sort_index()
+    # 官方 get_history 单标的（str）列=行情字段；多标的宽表（代码列）=官方 py3.5 变体。
+    # 单标的把列名设为字段名，使策略可用 df[field] 取列（与真 PTrade 一致）。
+    if len(codes) == 1 and len(df.columns) == 1 and df.columns[0] not in _PT_FIELDS:
+        df.columns = [col]
+    return df
 
 
 def get_stock_status(codes, query_type="HALT", query_date=None):

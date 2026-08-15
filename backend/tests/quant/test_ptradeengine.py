@@ -122,8 +122,8 @@ def test_loader_bundle_hooks_and_conv():
     assert len(b.daily) == 1 and b.daily[0][1] == "13:10"
 
 
-def test_get_history_single_code_wide_local():
-    """本地引擎 ptrade_api.get_history 单标的返回宽表，列名=标的码。"""
+def test_get_history_single_code_field_column_local():
+    """官方格式：本地引擎 ptrade_api.get_history 单标的列=行情字段（df['close']）。"""
     from datetime import datetime
 
     import pandas as pd
@@ -144,4 +144,4 @@ def test_get_history_single_code_wide_local():
     ptrade_api._state["ctx"].current_dt = datetime(2026, 7, 4, 10, 0)
     df = ptrade_api.get_history(3, "1d", "close", security_list="510300.SS")
     assert isinstance(df, pd.DataFrame)
-    assert "510300.SS" in df.columns
+    assert "close" in df.columns, "单标的列名必须是行情字段（官方 get_history）"

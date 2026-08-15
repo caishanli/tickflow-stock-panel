@@ -12,21 +12,26 @@
 #   （slot0=全池动量第一大权重，slot1=另一资产大类动量第一弱腿，自适应权重 0.5~0.85）；
 #   买入按 target_weights 槽位目标市值分配。13:10 调度对齐模拟盘口径。
 #
-# 平台差异适配说明（聚宽 → PTrade / 国金版本）：
+# 平台差异适配说明（聚宽 → PTrade / 国金版本，按国金 PTrade 官方 API 文档对齐）：
 #   - 代码格式：.SS / .SZ（策略内直接用 PTrade 码，无转换函数）
 #   - 全局状态 g.* ：PTrade 同样支持并自动持久化
-#   - 调度：晨间 → before_trading_start；盘中 09:40/13:10/13:10/13:10 → run_daily；
-#           收盘重置 → after_trading_end；分钟止损 → handle_data
-#   - 日线历史：get_history(count, '1d', field, security_list, fq='pre')，返回宽表
-#             （index=时间, columns=代码），单标的也返回 DataFrame，可用 df[code] 取列
+#   - 调度：晨间 → before_trading_start(context, data)；盘中 09:40/13:10/13:10/13:10 → run_daily(context, func, time)；
+#           收盘 → after_trading_end(context, data)；分钟止损 → handle_data(context, data)
+#   - 日线历史：get_history(count, '1d', field, security_list, fq='pre')；官方返回格式：
+#             单标的（str security_list）列=行情字段（如 df['close']）；多标的（list）py3.11 长表（含 code 列）/
+#             py3.5 宽表（代码列）。策略用 _series_values/_series_last（单标的）与 _wide（多标的）归一化。
 #   - 盘中数据：PTrade 无 get_current_data()，由 handle_data 的 data 参数捕获到 _BARS；
-#             SecurityUnitData 含 dt/open/high/low/close/price/volume/money；
-#             停牌用 get_stock_status(query_type='HALT')（_is_halted），涨跌停价用日线 high_limit/low_limit 字段（_limit_prices）
-#   - 持仓：get_position(sec) 返回 Position（amount / enable_amount / cost_basis / last_sale_price）
+#             data[code] 为 BarData 对象，含 open/high/low/close/price/volume/money/preclose/high_limit/low_limit；
+#             停牌用 get_stock_status(stocks, query_type='HALT', query_date='YYYYmmdd')（_is_halted），
+#             涨跌停价用日线 high_limit/low_limit 字段（_limit_prices）
+#   - 持仓：get_position(sec) 返回 Position（amount / enable_amount / cost_basis / last_sale_price）；
+#           get_positions() 返回 dict{code: Position}
 #   - 现金/总资产：context.portfolio.cash / .portfolio_value（PTrade 无 get_cash）
-#   - 动态 ETF 池：用 get_market_list()/get_market_detail() 枚举全市场基金，取不到时优雅降级为固定池；
-#     全市场 6000+ 标的的成交额查询按 200 只分块（_get_money_avg_series），阈值按实际可交易池估算，避免回测挂起
-#   - record()/log.set_level/set_option 等聚宽独有 API 已移除；日志用 log.info/warning/error/debug
+#   - 动态 ETF 池：get_market_list()/get_market_detail() 枚举全市场基金（官方仅限 before_trading_start/after_trading_end 内调用，
+#     _MARKET_ENUM_OK 守卫），取不到时优雅降级为固定池；全市场 6000+ 标的成交额查询按 200 只分块（_get_money_avg_series）
+#   - 日志：log.debug/info/warning/error/critical（无 log.warn）；set_benchmark/set_commission/set_slippage 仅回测可用，
+#     真 PTrade 交易时 try/except 静默跳过
+#   - record()/log.set_level/set_option 等聚宽独有 API 已移除
 # ============================================================
 
 import numpy as np
@@ -73,8 +78,9 @@ def _capture_bars(data):
     _BARS = out
 
 
-def _series_last(df, security, field):
-    """从 get_history 结果取最后一个值（兼容单标的字段列 / 宽表标的码列）。"""
+def _series_values(df, security, field):
+    """从单标的 get_history 结果取 field 一维数组（官方单标的列=字段名；
+    本地引擎/宽表兜底列=标的码）。返回 np.ndarray(float) 或 None。"""
     if df is None or not hasattr(df, 'columns') or len(df) == 0:
         return None
     if field in df.columns:
@@ -86,10 +92,42 @@ def _series_last(df, security, field):
     else:
         return None
     try:
-        v = float(arr.values[-1])
+        return np.asarray(pd.to_numeric(arr, errors='coerce'), dtype=float)
+    except Exception:
+        return None
+
+
+def _series_last(df, security, field):
+    """从 get_history 结果取最后一个值（兼容单标的字段列 / 宽表标的码列）。"""
+    vals = _series_values(df, security, field)
+    if vals is None or len(vals) == 0:
+        return None
+    try:
+        v = float(vals[-1])
     except Exception:
         return None
     return v if v == v else None  # not NaN
+
+
+def _wide(df, value_col=None):
+    """多标的 get_history 规整为宽表（index=时间, columns=代码）。
+
+    官方返回格式：python3.11 长表（含 code 列，多标的统一格式）→ pivot 成宽表；
+    python3.5 / 本地引擎宽表（代码列）→ 直接返回。"""
+    if df is None or not isinstance(df, pd.DataFrame) or 'code' not in df.columns:
+        return df
+    vcol = value_col
+    if vcol is None:
+        for c in ('close', 'volume', 'money'):
+            if c in df.columns:
+                vcol = c
+                break
+    if vcol:
+        try:
+            return df.pivot_table(index=df.index, columns='code', values=vcol)
+        except Exception:
+            pass
+    return df
 
 
 def _price(security, context):
@@ -149,11 +187,12 @@ def _is_halted(code, context):
 
 
 def _single_daily(code, field, context):
-    """单标的最近日线字段值（get_history 宽表取列）。"""
+    """单标的最近日线字段值（官方单标的 get_history 列=字段名）。"""
     try:
         df = get_history(1, '1d', field, security_list=code, include=True)
-        if df is not None and code in df.columns and len(df):
-            return float(df[code].values[-1])
+        v = _series_last(df, code, field)
+        if v is not None:
+            return v
     except Exception:
         pass
     return None
@@ -192,7 +231,7 @@ def _get_today_volumes(context, codes):
     for i in range(0, len(codes), CHUNK):
         chunk = list(codes)[i:i + CHUNK]
         try:
-            mdf = get_history(241, '1m', 'volume', security_list=chunk, include=True)
+            mdf = _wide(get_history(241, '1m', 'volume', security_list=chunk, include=True), 'volume')
             if mdf is None or mdf.empty:
                 continue
             for code in chunk:
@@ -218,7 +257,7 @@ def _get_money_avg_series(codes, count, context, field='money'):
     for i in range(0, len(codes), CHUNK):
         chunk = list(codes)[i:i + CHUNK]
         try:
-            df = get_history(count, '1d', field, security_list=chunk)
+            df = _wide(get_history(count, '1d', field, security_list=chunk), field)
             if df is None or df.empty:
                 continue
             df = df.fillna(0.0)
@@ -238,7 +277,7 @@ def _get_money_daily_totals(codes, context):
         totals = {}
         for i in range(0, len(codes), CHUNK):
             chunk = list(codes)[i:i + CHUNK]
-            df = get_history(3, '1d', 'money', security_list=chunk)
+            df = _wide(get_history(3, '1d', 'money', security_list=chunk), 'money')
             if df is None or df.empty:
                 continue
             df = df.fillna(0.0)
@@ -252,10 +291,16 @@ def _get_money_daily_totals(codes, context):
 
 
 # ==================== 全市场基金枚举（动态池用，尽力实现+优雅降级） ====================
+_MARKET_ENUM_OK = False  # 官方限制：get_market_list/get_market_detail 仅限 before/after_trading_end 内调用
+
+
 def _get_all_fund_codes():
     """枚举全市场基金代码/名称 {code: name}。
     通过 get_market_list() 遍历所有市场，get_market_detail(mic) 拉取产品。
+    官方限制：仅限 before_trading_start / after_trading_end 内调用，否则直接返回 None（调用方降级）。
     失败返回 None（调用方降级）。"""
+    if not _MARKET_ENUM_OK:
+        return None
     try:
         ml = get_market_list()
         if ml is None:
@@ -305,7 +350,10 @@ def _ensure_fund_universe():
 
 # ==================== 定时任务 ====================
 def initialize(context):
-    set_benchmark('510300.SS')
+    try:
+        set_benchmark('510300.SS')
+    except Exception as e:
+        log.warning('设置基准失败(仅回测有效): %s' % e)
     try:
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='ETF')
         set_commission(commission_ratio=0.0001, min_commission=5.0, type='LOF')
@@ -584,17 +632,23 @@ def initialize(context):
 
 def before_trading_start(context, data):
     """PTrade 晨间钩子：替代聚宽 09:00 定时任务"""
+    global _MARKET_ENUM_OK
+    _MARKET_ENUM_OK = True
     _capture_bars(data)
     morning_routine(context)
 
 
-def after_trading_end(context):
-    """PTrade 收盘钩子：替代聚宽 15:10 定时任务"""
+def after_trading_end(context, data):
+    """PTrade 收盘钩子（官方签名 after_trading_end(context, data)）：替代聚宽 15:10 定时任务"""
+    global _MARKET_ENUM_OK
+    _MARKET_ENUM_OK = True
     reset_daily_flags(context)
 
 
 def handle_data(context, data):
     """盘中每分钟调用（策略回测/实盘频率需设为分钟级）：分钟级固定止损"""
+    global _MARKET_ENUM_OK
+    _MARKET_ENUM_OK = False
     _capture_bars(data)
     minute_level_stop_loss(context)
 
@@ -1180,10 +1234,7 @@ def check_a_share_weak_period(context):
     exit_above_count = 0
     for name, code in indexes.items():
         df = get_history(data_lookback + 1, '1d', 'close', security_list=code)
-        if df is None or df.empty or code not in df.columns:
-            log.warning("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
-            continue
-        closes = df[code].values
+        closes = _series_values(df, code, 'close')
         if closes is None or len(closes) < data_lookback:
             log.warning("📊 【走弱期判断】%s(%s)数据不足，跳过该指数" % (name, code))
             continue
@@ -1275,8 +1326,8 @@ def get_final_ranked_etfs(context):
     lookback = max(g.lookback_days, g.volume_lookback, g.ma_lookback) + 20
     today = _today(context)
     safe_lookback = lookback + 20
-    close_df = get_history(safe_lookback, '1d', 'close', security_list=etf_set, fq='pre')
-    volume_df = get_history(safe_lookback, '1d', 'volume', security_list=etf_set)
+    close_df = _wide(get_history(safe_lookback, '1d', 'close', security_list=etf_set, fq='pre'), 'close')
+    volume_df = _wide(get_history(safe_lookback, '1d', 'volume', security_list=etf_set), 'volume')
     if close_df is None or close_df.empty:
         log.warning("【动量计算】无法获取历史价格数据")
         return []
@@ -1633,9 +1684,7 @@ def is_temporarily_suspended(security, context, minute_count=10):
     try:
         # 获取最近N分钟的分钟线数据
         minute_data = get_history(minute_count, '1m', 'volume', security_list=security, include=True)
-        if minute_data is None or minute_data.empty or security not in minute_data.columns:
-            return True
-        vals = minute_data[security].values
+        vals = _series_values(minute_data, security, 'volume')
         # 无数据或数据为空，视为停牌
         if vals is None or len(vals) == 0:
             return True
