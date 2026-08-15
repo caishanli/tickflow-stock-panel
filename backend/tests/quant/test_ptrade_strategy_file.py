@@ -1,7 +1,6 @@
 """ptrade 双持仓策略文件验证：编译 + API 清单（无聚宽独有调用）+ 双持仓配置。"""
-import re
-
 import py_compile
+import re
 from pathlib import Path
 
 STRATEGY = Path(__file__).parent.parent / "fixtures" / "dual_v54" / "wufu-v5.4-dual-adapt.ptrade.py"
@@ -47,4 +46,4 @@ def test_dual_position_config():
 def test_no_fstring_log():
     """PTrade 日志用 % 格式化，不引入 f-string（\bf['"] 只匹配字符串前缀 f）。"""
     for line in _code_lines():
-        assert not re.search(r"\bf([\"'])", line), "策略不应使用 f-string: %s" % line
+        assert not re.search(r"\bf([\"'])", line), f"策略不应使用 f-string: {line}"

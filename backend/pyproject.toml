@@ -104,6 +104,10 @@ ignore = ["E501"]   # 长行交给 fmt
 "tests/quant/test_baostock_backfill.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 "app/quant/ptradecompat.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 "app/quant/ptradeengine/*" = ["RUF001", "RUF002", "RUF003", "RUF100"]
+"tests/quant/test_ptrade_strategy_file.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
+"tests/quant/test_ptradecompat.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
+"tests/quant/test_ptradeengine.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
+"tests/quant/test_ptrade_vs_jq_alignment.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 
 # quant extra 的 mootdx==0.11.7 硬锁 httpx<0.26，与基础依赖 httpx>=0.27 冲突。
 # 用 override 强制 httpx>=0.27（mootdx 仅作多源降级备用，内部 httpx 用法兼容）。

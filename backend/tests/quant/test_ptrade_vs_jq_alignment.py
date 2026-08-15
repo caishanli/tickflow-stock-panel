@@ -44,4 +44,4 @@ def test_full_window_alignment(tmp_path):
     m = pd.merge(jq_eq, pt_eq, on="date", suffixes=("_jq", "_pt"))
     assert len(m) > 20
     diff = (m["value_pt"] - m["value_jq"]).abs()
-    assert diff.max() == 0.0, "逐日净值存在差异: max=%.6f" % diff.max()
+    assert diff.max() == 0.0, f"逐日净值存在差异: max={diff.max():.6f}"
