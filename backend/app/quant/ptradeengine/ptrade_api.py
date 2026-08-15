@@ -15,6 +15,7 @@ no_buy / no_sell）统一 PTrade 码；仅在与 DataManager（JQ 码 .XSHG/.XSH
 from __future__ import annotations
 
 import types
+from typing import ClassVar
 
 import pandas as pd
 
