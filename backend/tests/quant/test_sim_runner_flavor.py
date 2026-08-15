@@ -1,4 +1,4 @@
-"""simulate/runner ptrade flavor 路由：策略代码含 .SS/.SZ 则用 ptradeengine。"""
+"""simulate/runner ptrade flavor 路由: 策略代码含 .SS/.SZ 则用 ptradeengine。"""
 
 from app.quant.simulate.runner import _is_ptrade_strategy, _load_engine
 
