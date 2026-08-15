@@ -224,29 +224,59 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
         return pd.DataFrame()
     freq = _norm_freq(frequency)
     engine_codes = [to_engine(c) for c in codes]
+    col = "total_turnover" if field == "money" else field
+    now = pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None
     out = {}
+    # 批量路径：多标的 + 已预加载内存缓存，直接切片（镜像 jq api，避免逐只 fetch/回源）
+    if len(engine_codes) > 1:
+        mem = mgr._daily_mem if freq == "1d" else mgr._minute_mem
+        if mem:
+            for pt_code, ec in zip(codes, engine_codes, strict=False):
+                try:
+                    raw = mem.get(f"get_daily_{ec}") if freq == "1d" else mem.get(ec)
+                    if raw is None or (hasattr(raw, "empty") and raw.empty):
+                        continue
+                    if col not in raw.columns:
+                        continue
+                    sub = raw[col]
+                    if isinstance(raw.index, pd.DatetimeIndex) and now is not None:
+                        if freq == "1d":
+                            if now.hour < 15:
+                                sub = sub[raw.index.normalize() < now.normalize()]
+                        else:
+                            sub = sub[raw.index <= now]
+                    if count and len(sub) > count:
+                        sub = sub.iloc[-int(count):]
+                    if sub.empty:
+                        continue
+                    out[pt_code] = pd.to_numeric(sub, errors="coerce")
+                except Exception:
+                    continue
+            if out:
+                return pd.DataFrame(out).sort_index()
+    # 逐只路径（单标的 get_history 走这里；优先读内存缓存避免回源）
     for pt_code, ec in zip(codes, engine_codes, strict=False):
         try:
+            raw = None
             if freq == "1m":
-                raw = mgr.get_minute(ec, str(ctx.current_dt)[:10], None)
+                raw = getattr(mgr, "_minute_mem", {}).get(ec)
+                if raw is None or (hasattr(raw, "empty") and raw.empty):
+                    raw = mgr.get_minute(ec, str(now.date())[:10] if now is not None else None, None)
             else:
                 raw = mgr.fetch("get_daily", ec, "20000101", "20300101")
             if raw is None or (hasattr(raw, "empty") and raw.empty):
                 continue
             sub = raw
-            if isinstance(raw.index, pd.DatetimeIndex) and ctx and ctx.current_dt is not None:
+            if isinstance(raw.index, pd.DatetimeIndex) and now is not None:
                 if freq == "1d":
-                    # 日线盘中（<15:00）不含当日（防前视），与 jq 口径一致
-                    now = pd.Timestamp(ctx.current_dt)
                     if now.hour < 15:
                         sub = raw[raw.index.normalize() < now.normalize()]
                 else:
-                    sub = raw[raw.index <= pd.Timestamp(ctx.current_dt)]
+                    sub = raw[raw.index <= now]
             if count and len(sub) > count:
                 sub = sub.iloc[-int(count):]
             if sub.empty:
                 continue
-            col = "total_turnover" if field == "money" else field
             if col not in sub.columns:
                 continue
             s = pd.to_numeric(sub[col], errors="coerce")
