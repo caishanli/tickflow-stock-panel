@@ -47,3 +47,17 @@ def test_no_fstring_log():
     """PTrade 日志用 % 格式化，不引入 f-string（\bf['"] 只匹配字符串前缀 f）。"""
     for line in _code_lines():
         assert not re.search(r"\bf([\"'])", line), f"策略不应使用 f-string: {line}"
+
+
+_CONV_LAYER = ["_pt(", "_cd(", "_cd_field", "_set_last_data", "_BarUnit", "_safe_log",
+               "_warn(", "_debug(", "_wide(", "_as_series_values", "_positions_map",
+               "_get_position(", "_pos_amount", "_pos_avail", "_pos_cost", "_pos_price",
+               "_get_total_value", "_get_available_cash", "_update_universe", "_current_price(",
+               "_get_today_volume("]
+
+
+def test_no_conversion_layer():
+    """jq→ptrade 转换层已删除：可执行代码不得出现任何转换函数调用。"""
+    for line in _code_lines():
+        for kw in _CONV_LAYER:
+            assert kw not in line, kw
