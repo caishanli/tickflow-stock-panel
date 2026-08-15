@@ -48,6 +48,11 @@ def _looks_like_jq(code: str) -> bool:
     return False
 
 
+def _looks_like_ptrade(code: str) -> bool:
+    """PTrade 策略用 .SS/.SZ 代码 + run_daily(context, func, time)，走 ptradecompat 引擎。"""
+    return bool(code) and (".SS" in code or ".SZ" in code)
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: run_quant_backtest.py <run_id>", file=sys.stderr)
@@ -67,7 +72,18 @@ def main():
         code = params.get("strategy_code", "")
     _progress(run_id, "回测子进程已启动，策略代码就绪，正在初始化数据与引擎…")
 
-    if _looks_like_jq(code):
+    if _looks_like_ptrade(code):
+        # PTrade 策略（.SS/.SZ + run_daily(context, func, time)）走 ptradecompat 引擎
+        _progress(run_id, "检测到 PTrade 策略，路由到 ptradecompat 引擎（1m 逐 bar）")
+        from app.quant.rqalpha_bridge import run_ptrade_backtest
+        tmp = os.path.join(CONFIG.runtime_dir, f"ptradestrat_{run_id}.py")
+        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(code)
+        params = dict(params, run_id=run_id, strategy_id=strategy_id or "ptrade",
+                      name=params.get("name", ""), out_dir=os.path.join(CONFIG.runtime_dir, "ptradewufu"))
+        run_ptrade_backtest(tmp, params, db_path=CONFIG.db_path)
+    elif _looks_like_jq(code):
         # 聚宽(jq)策略走 jqcompat 引擎（正确的日志/成交捕获与 ETF 池解析）
         _progress(run_id, "检测到聚宽式策略，路由到 jqcompat 引擎（1m 逐 bar）")
         from app.quant.rqalpha_bridge import run_jq_backtest
