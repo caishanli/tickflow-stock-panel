@@ -1,7 +1,6 @@
 """ptradecompat 纯逻辑单测：代码转换、get_history 宽表组装、调度注册、bar_dict 适配。"""
 import sys
 import types
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
