@@ -18,19 +18,21 @@ class StrategyBundle:
         self.init_fn = init_fn      # 用户 initialize(context)
         self.ctx = ctx
         ns = ns or {}
-        # PTrade 钩子：handle_data/before_trading_start 需 (context, data) 快照，
-        # runner 只传 (context)，这里包装为单参并注入 build_data_snapshot。
+        # PTrade 钩子：handle_data/before_trading_start/after_trading_end 需
+        # (context, data) 签名（官方 API），runner 只传 (context)，这里包装并注入
+        # build_data_snapshot 快照（after_trading_end 的 data 为保留字段，注入空快照即可）。
         self.handle_data = _wrap_with_data(ns.get("handle_data"))
         self.before_trading_start = _wrap_with_data(ns.get("before_trading_start"))
-        self.after_trading_end = ns.get("after_trading_end")
+        self.after_trading_end = _wrap_with_data(ns.get("after_trading_end"))
         self._code_conv = getattr(ctx, "_code_conv", None) \
             or (ptrade_api.to_engine, ptrade_api.to_pt)
-        # run_daily 触发前刷新策略 _LAST_DATA 快照到当前 bar：
-        # runner 先触发 run_daily、后触发 handle_data（handle_data 才调 _set_last_data），
+        # run_daily 触发前刷新策略 _BARS 快照到当前 bar：
+        # runner 先触发 run_daily、后触发 handle_data（handle_data 才调 _capture_bars），
         # 若不提前刷新，13:10 回调读到的是上一根 bar 的价（与 jq 引擎读 minute_prices
         # 当前价差 1 tick → 股数错位）。jq bundle 无此方法，runner 跳过。
-        if "_set_last_data" in ns and callable(ns.get("_set_last_data")):
-            self.refresh_snapshot = _make_refresh(ns, ctx)
+        capture = ns.get("_capture_bars") or ns.get("_set_last_data")
+        if capture is not None and callable(capture):
+            self.refresh_snapshot = _make_refresh(capture)
         else:
             self.refresh_snapshot = None
 
@@ -59,14 +61,13 @@ def _wrap_with_data(fn):
     return wrapped
 
 
-def _make_refresh(ns, ctx):
-    """构造 run_daily 前刷新策略 _LAST_DATA 快照的函数。"""
-    set_last_data = ns["_set_last_data"]
+def _make_refresh(capture):
+    """构造 run_daily 前刷新策略 _BARS 快照的函数（capture 为策略 _capture_bars/_set_last_data）。"""
 
     def refresh(_ctx):
         from contextlib import suppress
         with suppress(Exception):
-            set_last_data(ptrade_api.build_data_snapshot(_ctx), _ctx)
+            capture(ptrade_api.build_data_snapshot(_ctx))
 
     return refresh
 

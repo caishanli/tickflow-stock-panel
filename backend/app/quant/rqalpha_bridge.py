@@ -1748,7 +1748,7 @@ def _ptrade_rewrite_source(strategy_text: str) -> str:
         "\ndef handle_bar(context, bar_dict):\n"
         "    handle_data(context, _ptrade_adapt_bar_dict(bar_dict))\n"
         "\ndef after_trading(context):\n"
-        "    after_trading_end(context)\n"
+        "    after_trading_end(context, None)\n"
     )
     if not _re.search(r"def before_trading\s*\(", strategy_code):
         strategy_code += bridge
