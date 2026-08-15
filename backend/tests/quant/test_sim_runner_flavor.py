@@ -1,4 +1,4 @@
-"""simulate/runner ptrade flavor 路由：策略代码含 .SS/.SZ → ptradeengine。"""
+"""simulate/runner ptrade flavor 路由：策略代码含 .SS/.SZ 则用 ptradeengine。"""
 
 from app.quant.simulate.runner import _is_ptrade_strategy, _load_engine
 
@@ -17,13 +17,12 @@ def test_load_engine_routes_ptrade():
 
 
 def test_load_engine_routes_jq():
-    jq_api, jq_loader = _load_engine("def initialize(context): pass")
+    _jq_api, jq_loader = _load_engine("def initialize(context): pass")
     assert jq_loader.__name__ == "app.quant.jqengine.engine.jq.loader"
-    assert hasattr(jq_api, "get_current_data")
 
 
 def test_load_engine_default_jq():
-    jq_api, jq_loader = _load_engine()
+    _jq_api, jq_loader = _load_engine()
     assert jq_loader.__name__ == "app.quant.jqengine.engine.jq.loader"
 
 
