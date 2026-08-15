@@ -224,7 +224,9 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
         return pd.DataFrame()
     freq = _norm_freq(frequency)
     engine_codes = [to_engine(c) for c in codes]
-    col = "total_turnover" if field == "money" else field
+    # 本地 DataManager 日线列为 money（原始成交额，与 jq get_price 口径一致），
+    # 非 rqalpha recarray 的 total_turnover。
+    col = "money" if field == "money" else field
     now = pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None
     # money_corrected：修正后的元成交额（对齐聚宽 get_daily_money_cached 口径，
     # 本地日线 money 列单位经 _ensure_money_yuan 修正，history_bars 的
@@ -241,7 +243,7 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
         except Exception:
             pass
         field = "money"
-        col = "total_turnover"
+        col = "money"
     out = {}
     # 批量路径：多标的 + 已预加载内存缓存，直接切片（镜像 jq api，避免逐只 fetch/回源）
     if len(engine_codes) > 1:
