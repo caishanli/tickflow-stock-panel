@@ -305,21 +305,29 @@ def get_stock_name(code):
 
 
 def _resolve_name(code):
-    """标的名称：优先 etf 名录（manager.get_etf_list），失败回退代码。"""
+    """标的名称：优先 etf 名录（manager.get_etf_list，进程内缓存），失败回退代码。"""
     mgr = _state.get("manager")
-    if mgr:
+    if mgr is None:
+        return code
+    cache = _state.setdefault("_etf_name_cache", {})
+    if code in cache:
+        return cache[code]
+    pure = code.split(".")[0]
+    if not _state.get("_etf_list_loaded"):
         try:
-            etfs = mgr.fetch("get_etf_list")
-            if etfs:
-                pure = code.split(".")[0]
-                for item in etfs:
-                    if isinstance(item, dict):
-                        ts = str(item.get("ts_code", ""))
-                        if ts.split(".")[0] == pure:
-                            return str(item.get("name", "") or code)
+            etfs = mgr.fetch("get_etf_list") or []
+            for item in etfs:
+                if isinstance(item, dict):
+                    ts = str(item.get("ts_code", ""))
+                    n = str(item.get("name", "") or "")
+                    if "." in ts and n:
+                        cache.setdefault(ts.split(".")[0], n)
+            _state["_etf_list_loaded"] = True
         except Exception:
             pass
-    return code
+    name = cache.get(pure, code)
+    cache[code] = name
+    return name
 
 
 def get_market_list():
@@ -433,7 +441,7 @@ def build_data_snapshot(ctx):
             code=code, dt=getattr(ctx, "current_dt", None),
             open=0.0, high=0.0, low=0.0,
             close=float(price or 0.0), price=float(price or 0.0),
-            volume=0, money=0.0, name=_resolve_name(code), paused=False,
+            volume=0, money=0.0, name=None, paused=False,
             highLimit=None, lowLimit=None,
         )
     return out
