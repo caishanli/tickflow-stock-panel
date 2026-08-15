@@ -242,6 +242,27 @@ def _single_daily_value(code, field, context):
     return None
 
 
+def _current_price(security, context):
+    """当前价：优先快照 lastPrice，其次当日最新分钟收盘，最后最近日线收盘。
+
+    与聚宽实时行情口径对齐（新选出的标的可能不在 handle_data 快照内，需按真实
+    分钟价回退而非昨收日线，否则买入股数/动量得分偏差）。"""
+    obj = _cd().get(security)
+    p = (getattr(obj, 'lastPrice', 0) or 0) if obj else 0
+    if p:
+        return p
+    try:
+        mdf = get_history(1, '1m', 'close', security_list=security, include=True)
+        v = _as_series_values(mdf)
+        if v is not None and len(v) > 0:
+            val = float(v[-1])
+            if val == val:  # not NaN
+                return val
+    except Exception:
+        pass
+    return _single_daily_value(security, 'close', context) or 0
+
+
 def _limit_prices(code, context):
     """当日涨跌停价 (high, low)。回测经日线 high_limit/low_limit 字段获取，失败返回 (None, None) 由调用方跳过限制判断。"""
     today = _today(context).strftime('%Y%m%d')
@@ -430,16 +451,18 @@ def _get_today_volumes(context, codes):
     return out
 
 
-def _get_money_avg_series(codes, count, context):
+def _get_money_avg_series(codes, count, context, field='money'):
     """分块 get_history 拉取成交额并计算日均，返回 pd.Series(code -> 日均成交额)。
-    避免对上千只标的单次 get_history 查询导致回测挂起。"""
+    避免对上千只标的单次 get_history 查询导致回测挂起。
+    field='money_corrected'：返回引擎修正后的元成交额（对齐聚宽 get_daily_money_cached
+    口径，用于流动性阈值）；真 PTrade 无该字段，get_history 回退 'money'。"""
     result = pd.Series(dtype=float)
     codes = list(codes)
     CHUNK = 200
     for i in range(0, len(codes), CHUNK):
         chunk = codes[i:i + CHUNK]
         try:
-            df = _wide(get_history(count, '1d', 'money', security_list=chunk))
+            df = _wide(get_history(count, '1d', field, security_list=chunk))
             if df is None or df.empty:
                 continue
             df = df.fillna(0.0)
@@ -530,8 +553,6 @@ def _get_all_fund_codes():
                         continue
                     base = pc.split('.')[0]
                     if not (len(base) == 6 and base.isdigit()):
-                        continue
-                    if not (base[0] == '5' or base.startswith(('15', '16'))):
                         continue
                     pn = str(drow[pn_col]) if pn_col else pc
                     fund_codes[pc] = pn
@@ -976,13 +997,8 @@ def calculate_global_etf_threshold(context):
             fund_map = _ensure_fund_universe()
             g._cached_etf_universe = list(fund_map.keys()) if fund_map else []
             log.info("全市场基金总数: %d只 (已缓存)" % len(g._cached_etf_universe))
-        # 阈值基于实际可交易池（固定池+动态池）估算，避免对 6000+ 全市场基金做单次 get_history 挂起
-        base_codes = list(getattr(g, 'fixed_etf_pool', []) or [])
-        dynamic = list(getattr(g, 'dynamic_etf_pool', []) or [])
-        etf_list = []
-        for c in base_codes + dynamic:
-            if c not in etf_list:
-                etf_list.append(c)
+        # 阈值基于全市场基金（与聚宽口径一致：全市场总成交额 / 除数）。
+        etf_list = list(g._cached_etf_universe)
         if not etf_list:
             _warn("未找到任何场内ETF，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
@@ -992,7 +1008,7 @@ def calculate_global_etf_threshold(context):
             _warn("仅有%d个有效交易日，使用保守阈值1000万" % len(trade_days))
             g.avg_etf_money_threshold = 10000000
             return
-        avg_daily_money = _get_money_avg_series(etf_list, 3, context)
+        avg_daily_money = _get_money_avg_series(etf_list, 3, context, field='money_corrected')
         if avg_daily_money.empty:
             _warn("无成交额数据，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
@@ -1578,10 +1594,7 @@ def get_final_ranked_etfs(context):
             if len(hist_closes) < g.lookback_days:
                 continue
             etf_name = get_security_name(etf)
-            current_price = getattr(obj, 'lastPrice', 0) if obj else 0
-            if not current_price:
-                # 快照缺失（最近一分钟无成交/未进快照）时回退最近日线收盘价，避免误跳过
-                current_price = _single_daily_value(etf, 'close', context) or 0
+            current_price = _current_price(etf, context)
             today_vol = today_vols.get(etf, 0)
             metrics = calculate_all_metrics_for_etf(etf, etf_name, hist_closes, hist_volumes, current_price, today_vol, context)
         except RuntimeError as e:
@@ -1925,13 +1938,8 @@ def smart_order_target_value(security, target_value, context):
     """
     智能下单：根据目标市值调整持仓，处理停牌、涨跌停、最小交易金额、T+1
     """
-    data = _cd()
     name = get_security_name(security)
-    obj = data.get(security)
-    price = (getattr(obj, 'lastPrice', 0) or 0) if obj else 0
-    if not price:
-        # 快照缺失（如标的最近一分钟无成交）时回退最近日线收盘价
-        price = _single_daily_value(security, 'close', context) or 0
+    price = _current_price(security, context)
     if not price:
         log.info("%s %s 无实时行情数据，跳过交易" % (security, name))
         return False
@@ -2007,7 +2015,6 @@ def minute_level_stop_loss(context):
     current_time = _current_dt(context).strftime('%H:%M')
     if not (('09:40' < current_time < '10:29') or ('10:40' < current_time < '11:30') or ('13:00' < current_time < '14:57')):
         return
-    current_data = _cd()
     for security, position in _positions_map().items():
         if _pos_amount(position) <= 0 or _pos_avail(position) <= 0:
             if security in g._profit_protected:
@@ -2015,10 +2022,7 @@ def minute_level_stop_loss(context):
             if security in g._peak_price:
                 del g._peak_price[security]
             continue
-        obj = current_data.get(security)
-        if obj is None:
-            continue
-        current_price = getattr(obj, 'lastPrice', 0) or 0
+        current_price = _current_price(security, context)
         if current_price <= 0:
             continue
         cost_price = _pos_cost(position)
