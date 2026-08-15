@@ -115,3 +115,27 @@ def test_set_benchmark_stored(_fake_rqalpha):
     pc = _fake_rqalpha
     pc.set_benchmark("510300.SS")
     assert pc._BENCHMARK == "510300.SS"
+
+
+def test_get_history_single_code_wide(monkeypatch):
+    """单标的 get_history 返回宽表（非 Series），列名=标的码，可 df[code] 取值。"""
+    from datetime import datetime
+    import numpy as np
+    import pandas as pd
+
+    def _fake_batch(codes, count, freq, fields, end_dt):
+        out = {}
+        for c in codes:
+            arr = np.zeros(count, dtype=np.dtype([("datetime", "S14"), ("close", "f8")]))
+            for i in range(count):
+                arr["datetime"][i] = "20260701093000"
+                arr["close"][i] = 1.0 + i
+            out[c] = arr
+        return out
+
+    import app.quant.ptradecompat as pc
+    monkeypatch.setattr(pc, "_history_bars_batch", _fake_batch)
+    df = pc.get_history(5, "1d", "close", security_list="510300.SS")
+    assert isinstance(df, pd.DataFrame), "单标的必须返回 DataFrame"
+    assert "510300.SS" in df.columns, "列名必须是标的码"
+    assert len(df[df["510300.SS"] > 0]) > 0
