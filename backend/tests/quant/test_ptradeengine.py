@@ -91,3 +91,32 @@ def test_api_get_positions_ptrade_keys():
     api._state["minute_mode"] = True
     api.order("510300.SS", 1000)
     assert "510300.SS" in api.get_positions()
+
+
+# ---- ptrade_loader ----
+
+def test_loader_bundle_hooks_and_conv():
+    from app.quant.ptradeengine import ptrade_loader
+    code = (
+        "def initialize(context):\n"
+        "    g.holdings_num = 2\n"
+        "    run_daily(context, after, time='13:10')\n"
+        "def after(context):\n"
+        "    pass\n"
+        "def handle_data(context, data):\n"
+        "    pass\n"
+        "def before_trading_start(context, data):\n"
+        "    pass\n"
+        "def after_trading_end(context):\n"
+        "    pass\n"
+    )
+    b = ptrade_loader.load_strategy(code, None, 0.0001, 0.0001, 100000.0)
+    assert b.before_trading_start is not None
+    assert b.after_trading_end is not None
+    assert b.handle_data is not None
+    to_engine, to_pt = b.conv
+    assert to_engine("510300.SS") == "510300.XSHG"
+    assert to_pt("510300.XSHG") == "510300.SS"
+    b.init_fn(b.ctx)  # initialize 内注册 run_daily
+    assert b.ctx.g.holdings_num == 2
+    assert len(b.daily) == 1 and b.daily[0][1] == "13:10"
