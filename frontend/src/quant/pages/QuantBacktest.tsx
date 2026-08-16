@@ -318,6 +318,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         frequency: form.frequency,
         fee: +form.fee, slippage: +form.slippage, capital: +form.capital,
       }
+      if (short) payload.record = false
       if (start) payload.start = start
       if (end) payload.end = end
       return api.runBacktest(payload)
