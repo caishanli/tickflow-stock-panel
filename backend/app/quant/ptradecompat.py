@@ -427,22 +427,27 @@ def get_stock_status(codes, query_type="HALT", query_date=None):
     return out
 
 
-def get_stock_name(code):
-    jq = _to_jq(code)
-    if jq in _NAMES:
-        return {code: _NAMES[jq]}
-    from rqalpha.environment import Environment
-    env = Environment.get_instance()
-    try:
-        instr = env.data_proxy.get_instrument(jq)
-        return {code: getattr(instr, "symbol", None) or code}
-    except Exception:  # noqa: BLE001
-        return {code: code}
+def get_stock_name(stocks):
+    """官方 get_stock_name(stocks)：单/多标的，返回 {code: name}。
+    名称源与 get_market_detail 一致（_NAMES 优先，缺失回退代码，避免池分类漂移）。"""
+    if isinstance(stocks, str):
+        codes = [stocks]
+    else:
+        codes = list(stocks)
+    out = {}
+    for code in codes:
+        jq = _to_jq(code)
+        out[code] = _NAMES.get(jq) or code
+    return out
 
 
 def get_market_list():
-    """PTrade get_market_list：单行 'ALL' 市场（配合 get_market_detail 全市场枚举）。"""
     return pd.DataFrame([{"finance_mic": "ALL"}])
+
+
+def get_etf_list():
+    """官方 get_etf_list：返回全部 ETF 代码列表（PTrade 码 .SS/.SZ，与聚宽 get_all_securities(['etf']) 同性质）。"""
+    return [_to_pt(c) for c in _MARKET_CODES]
 
 
 def get_market_detail(mic):
@@ -535,6 +540,7 @@ def _register_ptrade_apis():
     register_api("get_stock_status", get_stock_status)
     register_api("get_stock_name", get_stock_name)
     register_api("get_market_list", get_market_list)
+    register_api("get_etf_list", get_etf_list)
     register_api("get_market_detail", get_market_detail)
     register_api("set_benchmark", set_benchmark)
     register_api("set_commission", set_commission)

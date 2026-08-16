@@ -90,6 +90,7 @@ def load_strategy(code, manager, fee, slippage, cash):
         "get_stock_status": ptrade_api.get_stock_status,
         "get_stock_name": ptrade_api.get_stock_name,
         "get_market_list": ptrade_api.get_market_list,
+        "get_etf_list": ptrade_api.get_etf_list,
         "get_market_detail": ptrade_api.get_market_detail,
         "get_trading_day": ptrade_api.get_trading_day,
         "get_trade_days": ptrade_api.get_trade_days,

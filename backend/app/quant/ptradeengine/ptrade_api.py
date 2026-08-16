@@ -379,9 +379,13 @@ def get_trade_days(start_date=None, end_date=None, count=None):
     return [d.to_pydatetime() for d in cal]
 
 
-def get_stock_name(code):
-    name = _resolve_name(code)
-    return {code: name}
+def get_stock_name(stocks):
+    """官方 get_stock_name(stocks)：单/多标的，返回 {code: name}。"""
+    if isinstance(stocks, str):
+        codes = [stocks]
+    else:
+        codes = list(stocks)
+    return {c: _resolve_name(c) for c in codes}
 
 
 def _name_map():
@@ -419,6 +423,27 @@ def _resolve_name(code):
 
 def get_market_list():
     return pd.DataFrame([{"finance_mic": "ALL"}])
+
+
+def get_etf_list():
+    """官方 get_etf_list：返回全部 ETF 代码列表（PTrade 码 .SS/.SZ，与聚宽 get_all_securities(['etf']) 同性质）。"""
+    mgr = _state.get("manager")
+    out = []
+    if mgr:
+        try:
+            etfs = mgr.fetch("get_etf_list") or []
+            for item in etfs:
+                if isinstance(item, str):
+                    jq = str(item).replace(".SH", ".XSHG").replace(".SZ", ".XSHE")
+                    out.append(to_pt(jq))
+                elif isinstance(item, dict):
+                    ts = str(item.get("ts_code", ""))
+                    jq = ts.replace(".SH", ".XSHG").replace(".SZ", ".XSHE")
+                    if ".X" in jq:
+                        out.append(to_pt(jq))
+        except Exception:
+            pass
+    return out
 
 
 def get_market_detail(mic):

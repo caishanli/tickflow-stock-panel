@@ -271,13 +271,13 @@ def _get_today_volumes(context, codes):
     return out
 
 
-_REAL_PTRADE = False     # 真机（国金 PTrade）：get_market_list 返回 SS/SZ 等；本地引擎返回 "ALL"
+# 真机判定见 _is_real_ptrade()（money_corrected 探测），不再用 get_market_list mic 判断
 _MONEY_CACHE = {}        # (day, count, field) -> pd.Series(code->日均成交额)，全市场；当日复用避免真机反复全市场查询
 
 
 def _resolve_money_field(field):
     """money_corrected 是本地引擎专用字段（对齐聚宽口径），真机无此字段，统一回退官方 'money'。"""
-    if field == 'money_corrected' and _REAL_PTRADE:
+    if field == 'money_corrected' and _is_real_ptrade():
         return 'money'
     return field
 
@@ -345,13 +345,55 @@ def _get_money_daily_totals(codes, context):
 _MARKET_ENUM_OK = False  # 官方限制：get_market_list/get_market_detail 仅限 before/after_trading_end 内调用
 
 
+_REAL_PTRADE = None  # None=未判定；真机=True，本地引擎=False
+
+
+def _is_real_ptrade():
+    """真机判定：本地引擎 get_market_list 返回 finance_mic='ALL'；真机返回 SS/SZ/CSI/XBHS。"""
+    global _REAL_PTRADE
+    if _REAL_PTRADE is None:
+        try:
+            ml = get_market_list()
+            if ml is not None:
+                for _, r in ml.iterrows():
+                    mic = r.get('finance_mic') or ''
+                    _REAL_PTRADE = mic != 'ALL'
+                    break
+            if _REAL_PTRADE is None:
+                _REAL_PTRADE = False
+        except Exception:
+            _REAL_PTRADE = False
+    return _REAL_PTRADE
+
+
 def _get_all_fund_codes():
-    """枚举全市场基金代码/名称 {code: name}。
-    通过 get_market_list() 遍历所有市场，get_market_detail(mic) 拉取产品。
-    官方限制：仅限 before_trading_start / after_trading_end 内调用，否则直接返回 None（调用方降级）。
-    失败返回 None（调用方降级）。"""
+    """枚举全市场 ETF 代码/名称 {code: name}。
+    优先官方 get_etf_list()（纯 ETF 清单，与聚宽获取ETF清单同性质，~1500 只），
+    名称用 get_stock_name() 批量获取；不可用时降级 get_market_detail 按 ETF 代码段过滤。
+    官方限制：get_market_list/get_market_detail 仅限 before_trading_start / after_trading_end 内调用
+    （_MARKET_ENUM_OK 守卫）。失败返回 None（调用方降级）。"""
     if not _MARKET_ENUM_OK:
         return None
+    # 1) 官方 get_etf_list（真机/本地均返回纯 ETF 代码，无需过滤）
+    try:
+        codes = get_etf_list()
+        if codes:
+            codes = [str(c) for c in codes]
+            names = {}
+            try:
+                names = get_stock_name(codes) or {}
+            except Exception:
+                pass
+            fund_codes = {}
+            for c in codes:
+                base = c.split('.')[0]
+                if len(base) == 6 and base.isdigit():
+                    fund_codes[c] = str(names.get(c, c))
+            if fund_codes:
+                return fund_codes
+    except Exception:
+        pass
+    # 2) 降级：get_market_detail 按 ETF 代码段过滤（沪 51/56/588xxxx、深 159xxx）
     try:
         ml = get_market_list()
         if ml is None:
@@ -361,10 +403,6 @@ def _get_all_fund_codes():
             mic = r.get('finance_mic') or r.get('market_code') or r.get('code') or r.get('market')
             if not mic:
                 continue
-            # 真机判定：本地引擎 get_market_list 返回 finance_mic='ALL'；真机返回 SS/SZ/CSI/XBHS。
-            if mic != 'ALL':
-                global _REAL_PTRADE
-                _REAL_PTRADE = True
             try:
                 detail = get_market_detail(mic)
             except Exception:
@@ -384,11 +422,9 @@ def _get_all_fund_codes():
                     base = pc.split('.')[0]
                     if not (len(base) == 6 and base.isdigit()):
                         continue
-                    # 基金代码段过滤：真机 get_market_detail 返回全市场产品（含股票/债券/指数），
-                    # 只保留场内基金（沪 5xxxxx、深 15/16xxxx），否则动态池会膨胀到 4 万+ 只导致卡死。
-                    if not base.startswith(('5', '15', '16')):
+                    # 只保留 ETF 代码段（沪 51/56/588xxxx、深 159xxx），排除 LOF/货币/其他产品
+                    if not base.startswith(('51', '56', '588', '159')):
                         continue
-                    # 真机 prod_code 为无尾缀 6 位，按市场补尾缀（官方代码尾缀：SS/SZ）；指数/板块跳过。
                     if '.' not in pc:
                         if mic in ('SS', 'XSHG'):
                             pc = base + '.SS'
@@ -849,7 +885,7 @@ def calculate_global_etf_threshold(context):
             log.info("全市场基金总数: %d只 (已缓存)" % len(g._cached_etf_universe))
         # 阈值口径：本地引擎用全市场基金（与聚宽一致：全市场总成交额 / 除数）；
         # 真机 get_history 全市场成交额查询过慢，改用策略自有固定池（114 只）估算，保证能跑完。
-        if _REAL_PTRADE:
+        if _is_real_ptrade():
             etf_list = list(g.fixed_etf_pool)
             log.info("真机模式：阈值基于固定池 %d 只估算（避免全市场成交额查询）" % len(etf_list))
         else:
@@ -869,7 +905,7 @@ def calculate_global_etf_threshold(context):
             g.avg_etf_money_threshold = 10000000
             return
         # 分日汇总用于日志展示（真机为减少全市场查询量，跳过；本地保留）
-        if not _REAL_PTRADE:
+        if not _is_real_ptrade():
             daily_totals = _get_money_daily_totals(etf_list, context)
             if daily_totals is not None:
                 for day, (money, count) in daily_totals.items():
@@ -927,7 +963,7 @@ def update_sector_pool(context):
     if g.avg_etf_money_threshold is None:
         log.info("【动态池更新】阈值未初始化，立即计算")
         calculate_global_etf_threshold(context)
-    if _REAL_PTRADE:
+    if _is_real_ptrade():
         # 真机 get_history 全市场成交额查询过慢，跳过全市场动态池（只保留固定池）
         log.warning("真机模式：跳过全市场动态池（全市场成交额查询过慢），仅用固定池")
         g.dynamic_etf_pool = []
