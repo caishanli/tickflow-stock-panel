@@ -25,10 +25,13 @@
 #             停牌用 get_stock_status(stocks, query_type='HALT', query_date='YYYYmmdd')（_is_halted），
 #             涨跌停价用日线 high_limit/low_limit 字段（_limit_prices）
 #   - 持仓：get_position(sec) 返回 Position（amount / enable_amount / cost_basis / last_sale_price）；
-#           get_positions() 返回 dict{code: Position}
+#           get_positions() 返回 dict{code: Position}，键可能为 .XSHG/.XSHE（官方文档确认），
+#           策略用 _positions() 归一为 .SS/.SZ 再与池子代码比较
 #   - 现金/总资产：context.portfolio.cash / .portfolio_value（PTrade 无 get_cash）
 #   - 动态 ETF 池：get_market_list()/get_market_detail() 枚举全市场基金（官方仅限 before_trading_start/after_trading_end 内调用，
-#     _MARKET_ENUM_OK 守卫），取不到时优雅降级为固定池；全市场 6000+ 标的成交额查询按 200 只分块（_get_money_avg_series）
+#     _MARKET_ENUM_OK 守卫）；真机 get_market_detail 返回全市场产品，_get_all_fund_codes 按基金代码段
+#     （SH 5xxxxx / SZ 15/16xxxx）过滤；取不到时优雅降级为固定池；成交额查询按 200 只分块
+#     （_get_money_avg_series，money_corrected 真机无此字段自动回退官方 money）
 #   - 日志：log.debug/info/warning/error/critical（无 log.warn）；set_benchmark/set_commission/set_slippage 仅回测可用，
 #     真 PTrade 交易时 try/except 静默跳过
 #   - record()/log.set_level/set_option 等聚宽独有 API 已移除
@@ -128,6 +131,24 @@ def _wide(df, value_col=None):
         except Exception:
             pass
     return df
+
+
+def _positions():
+    """{PTrade码(.SS/.SZ): Position}，仅含数量>0。
+
+    真机 get_positions() 返回键为 .XSHG/.XSHE（官方文档确认两种尾缀皆可作为键），
+    归一为 .SS/.SZ 以便与策略代码（池子/目标均为 .SS/.SZ）比较。"""
+    out = {}
+    try:
+        for code, pos in (get_positions() or {}).items():
+            if not code:
+                continue
+            code = str(code).replace('.XSHG', '.SS').replace('.XSHE', '.SZ')
+            if getattr(pos, 'amount', 0) > 0:
+                out[code] = pos
+    except Exception:
+        pass
+    return out
 
 
 def _price(security, context):
@@ -250,8 +271,8 @@ def _get_today_volumes(context, codes):
 def _get_money_avg_series(codes, count, context, field='money'):
     """分块 get_history 拉取成交额并计算日均，返回 pd.Series(code -> 日均成交额)。
     避免对上千只标的单次 get_history 查询导致回测挂起。
-    field='money_corrected'：返回引擎修正后的元成交额（对齐聚宽 get_daily_money_cached
-    口径，用于流动性阈值）；真 PTrade 无该字段，get_history 回退 'money'。"""
+    field='money_corrected'：本地引擎返回修正后的元成交额（对齐聚宽口径）；真机无该字段，
+    get_history 返回空，自动回退官方字段 'money'。"""
     result = pd.Series(dtype=float)
     CHUNK = 200
     for i in range(0, len(codes), CHUNK):
@@ -267,6 +288,9 @@ def _get_money_avg_series(codes, count, context, field='money'):
                     result[code] = float(avg[code])
         except Exception:
             continue
+    if result.empty and field == 'money_corrected':
+        # 真机无 money_corrected 字段 → 用官方 money 字段重试
+        return _get_money_avg_series(codes, count, context, field='money')
     return result
 
 
@@ -329,6 +353,18 @@ def _get_all_fund_codes():
                     base = pc.split('.')[0]
                     if not (len(base) == 6 and base.isdigit()):
                         continue
+                    # 基金代码段过滤：真机 get_market_detail 返回全市场产品（含股票/债券/指数），
+                    # 只保留场内基金（沪 5xxxxx、深 15/16xxxx），否则动态池会膨胀到 4 万+ 只导致卡死。
+                    if not base.startswith(('5', '15', '16')):
+                        continue
+                    # 真机 prod_code 为无尾缀 6 位，按市场补尾缀（官方代码尾缀：SS/SZ）；指数/板块跳过。
+                    if '.' not in pc:
+                        if mic in ('SS', 'XSHG'):
+                            pc = base + '.SS'
+                        elif mic in ('SZ', 'XSHE'):
+                            pc = base + '.SZ'
+                        else:
+                            continue
                     fund_codes[pc] = str(drow[pn_col]) if pn_col else pc
                 except Exception:
                     continue
@@ -732,7 +768,7 @@ def reset_daily_flags(context):
 
 def check_positions(context):
     try:
-        for security, position in get_positions().items():
+        for security, position in _positions().items():
             security_name = get_security_name(security)
             log.info("📊 【持仓检查】%s %s, 数量: %d, 成本: %.3f, 当前价: %.3f" % (
                 security, security_name,
@@ -759,7 +795,7 @@ def monitor_drawdown(context):
                     'is_weak': g.is_a_share_weak
                 }
                 positions_info = []
-                for security, position in get_positions().items():
+                for security, position in _positions().items():
                     security_name = get_security_name(security)
                     positions_info.append("%s:%d股" % (security_name, int(position.amount)))
                 record['positions'] = positions_info
@@ -1470,7 +1506,7 @@ def get_final_ranked_etfs(context):
     # ========== 第四步：跨资产双持仓选择 ==========
     log_buffer.append("")
     log_buffer.append(">>> 第四步：跨资产双持仓选择 <<<")
-    current_holdings = list(get_positions().keys())
+    current_holdings = list(_positions().keys())
     log_buffer.append("当前持仓ETF：%s" % current_holdings)
     final_result = select_cross_asset_dual(
         current_holdings, filtered_list, score_key, log_buffer)
@@ -1580,7 +1616,7 @@ def execute_sell_trades(context):
             target_etfs = []
 
     g.target_etfs_list = target_etfs
-    current_positions = get_positions()
+    current_positions = _positions()
     target_set = set(target_etfs)
     sell_count = 0
 
@@ -1605,7 +1641,7 @@ def execute_buy_trades(context):
         log.info("========== 买入操作完成 ==========")
         return
 
-    current_positions = get_positions()
+    current_positions = _positions()
     etfs_to_buy = [etf for etf in target_etfs if etf not in current_positions]
     actual_holding_count = len(current_positions)
     max_buy_count = max(0, g.holdings_num - actual_holding_count)
@@ -1781,7 +1817,7 @@ def minute_level_stop_loss(context):
     current_time = _current_dt(context).strftime('%H:%M')
     if not (('09:40' < current_time < '10:29') or ('10:40' < current_time < '11:30') or ('13:00' < current_time < '14:57')):
         return
-    for security, position in get_positions().items():
+    for security, position in _positions().items():
         if position.amount <= 0 or position.enable_amount <= 0:
             if security in g._profit_protected:
                 del g._profit_protected[security]
