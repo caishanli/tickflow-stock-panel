@@ -297,7 +297,7 @@ def _get_money_avg_series(codes, count, context, field='money'):
         if len(sel) >= len(codes):
             return sel
     result = pd.Series(dtype=float)
-    CHUNK = 1000
+    CHUNK = 500
     chunks = list(range(0, len(codes), CHUNK))
     for ci, i in enumerate(chunks):
         chunk = list(codes)[i:i + CHUNK]
@@ -885,11 +885,9 @@ def calculate_global_etf_threshold(context):
             log.info("全市场基金总数: %d只 (已缓存)" % len(g._cached_etf_universe))
         # 阈值口径：本地引擎用全市场基金（与聚宽一致：全市场总成交额 / 除数）；
         # 真机 get_history 全市场成交额查询过慢，改用策略自有固定池（114 只）估算，保证能跑完。
+        etf_list = list(g._cached_etf_universe)
         if _is_real_ptrade():
-            etf_list = list(g.fixed_etf_pool)
-            log.info("真机模式：阈值基于固定池 %d 只估算（避免全市场成交额查询）" % len(etf_list))
-        else:
-            etf_list = list(g._cached_etf_universe)
+            log.info("真机模式：阈值基于全市场 ETF %d 只（get_etf_list 修正后 ~1500，分块 200）" % len(etf_list))
         if not etf_list:
             log.warning("未找到任何场内ETF，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
@@ -964,11 +962,7 @@ def update_sector_pool(context):
         log.info("【动态池更新】阈值未初始化，立即计算")
         calculate_global_etf_threshold(context)
     if _is_real_ptrade():
-        # 真机 get_history 全市场成交额查询过慢，跳过全市场动态池（只保留固定池）
-        log.warning("真机模式：跳过全市场动态池（全市场成交额查询过慢），仅用固定池")
-        g.dynamic_etf_pool = []
-        return
-
+        log.info("真机模式：全市场动态池按 ETF 宇宙 %d 只运行（分块 200 防 1000 块卡死）" % len(g._cached_etf_universe))
     FUND_COMPANIES = sorted(list(set([
         '易方达', '广发', '华夏', '华安', '嘉实', '富国', '招商', '鹏华', '南方', '汇添富', '国泰', '平安',
         '银华', '天弘', '建信', '工银', '华泰柏瑞', '博时', '景顺长城', '景顺', '华宝', '申万菱信', '万家', '中欧',
