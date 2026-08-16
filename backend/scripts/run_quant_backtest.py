@@ -16,6 +16,7 @@ load_dotenv()
 from app.quant import db
 from app.quant.config import CONFIG
 from app.quant.datasource.manager import QuantDataProvider
+from app.quant.rqalpha_bridge import run_backtest, run_jq_backtest
 from app.quant.strategies.store import get_strategy
 
 
@@ -70,7 +71,6 @@ def main():
     if _looks_like_jq(code):
         # 聚宽(jq)策略走 jqcompat 引擎（正确的日志/成交捕获与 ETF 池解析）
         _progress(run_id, "检测到聚宽式策略，路由到 jqcompat 引擎（1m 逐 bar）")
-        from app.quant.rqalpha_bridge import run_jq_backtest
         # run_jq_backtest 需要 strategy 文本；通过临时文件传入（与 scripts/
         # run_jq_rqalpha.py 同口径），避免把整段代码塞进 params 造成歧义。
         tmp = os.path.join(CONFIG.runtime_dir, f"jqstrat_{run_id}.py")
@@ -79,11 +79,10 @@ def main():
             f.write(code)
         params = dict(params, run_id=run_id, strategy_id=strategy_id or "jq",
                       name=params.get("name", ""), out_dir=os.path.join(CONFIG.runtime_dir, "jqwufu"))
-        run_jq_backtest(tmp, params, db_path=CONFIG.db_path)
+        run_jq_backtest(tmp, params, db_path=db.routed_db_path(run_id))
     else:
-        from app.quant.rqalpha_bridge import run_backtest
         provider = QuantDataProvider()
-        run_backtest(code, params, provider=provider, db_path=CONFIG.db_path)
+        run_backtest(code, params, provider=provider, db_path=db.routed_db_path(run_id))
 
 
 if __name__ == "__main__":

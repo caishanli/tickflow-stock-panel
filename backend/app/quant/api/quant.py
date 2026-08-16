@@ -40,6 +40,7 @@ class BacktestIn(BaseModel):
     capital: float = 100000.0
     fee: float = 0.0003
     slippage: float = 0.001
+    record: bool = True
 
 
 class AccountIn(BaseModel):
@@ -102,12 +103,14 @@ def import_one_strategy(body: StrategyIn):
 @router.post("/backtest/run")
 def run_backtest(body: BacktestIn):
     params = body.model_dump()
+    # record 仅控制落库位置（compile → /tmp 独立库），不下发 worker、不写 params_json
+    params.pop("record")
     # 空日期不下发（前端「编译运行」可不选日期）：键存在但为空串会让
     # 原生 rqalpha 路径把 "" 当日期解析，桥接层拿不到键时才会走默认窗口
     params = {k: v for k, v in params.items() if k not in ("start", "end") or str(v).strip()}
     # frequency 显式透传给桥接层（rqalpha_bridge 侧消费，按其支持的取值执行）
     params["frequency"] = body.frequency or "daily"
-    run_id = submit_backtest(params)
+    run_id = submit_backtest(params, compile_mode=not body.record)
     return {"data": {"run_id": run_id, "status": "queued"}}
 
 
