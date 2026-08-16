@@ -248,7 +248,7 @@ def _get_today_volumes(context, codes):
     """当日累计成交量（分钟线求和，分块避免超大查询挂起）。失败返回 {}。"""
     out = {}
     today = _today(context)
-    CHUNK = 100
+    CHUNK = 500
     for i in range(0, len(codes), CHUNK):
         chunk = list(codes)[i:i + CHUNK]
         try:
@@ -268,13 +268,33 @@ def _get_today_volumes(context, codes):
     return out
 
 
+_REAL_PTRADE = False     # 真机（国金 PTrade）：get_market_list 返回 SS/SZ 等；本地引擎返回 "ALL"
+_MONEY_CACHE = {}        # (day, count, field) -> pd.Series(code->日均成交额)，全市场；当日复用避免真机反复全市场查询
+
+
+def _resolve_money_field(field):
+    """money_corrected 是本地引擎专用字段（对齐聚宽口径），真机无此字段，统一回退官方 'money'。"""
+    if field == 'money_corrected' and _REAL_PTRADE:
+        return 'money'
+    return field
+
+
 def _get_money_avg_series(codes, count, context, field='money'):
     """分块 get_history 拉取成交额并计算日均，返回 pd.Series(code -> 日均成交额)。
     避免对上千只标的单次 get_history 查询导致回测挂起。
     field='money_corrected'：本地引擎返回修正后的元成交额（对齐聚宽口径）；真机无该字段，
-    get_history 返回空，自动回退官方字段 'money'。"""
+    经 _resolve_money_field 自动回退官方 'money'。当日全市场结果缓存复用（真机 get_history
+    逐块查询慢，阈值与池过滤共享同一份全市场成交额，避免重复查询）。"""
+    field = _resolve_money_field(field)
+    day = _today(context)
+    key = (day, count, field)
+    cached = _MONEY_CACHE.get(key)
+    if cached is not None:
+        sel = cached.reindex([c for c in codes if c in cached.index])
+        if len(sel) >= len(codes):
+            return sel
     result = pd.Series(dtype=float)
-    CHUNK = 200
+    CHUNK = 1000
     for i in range(0, len(codes), CHUNK):
         chunk = list(codes)[i:i + CHUNK]
         try:
@@ -288,9 +308,8 @@ def _get_money_avg_series(codes, count, context, field='money'):
                     result[code] = float(avg[code])
         except Exception:
             continue
-    if result.empty and field == 'money_corrected':
-        # 真机无 money_corrected 字段 → 用官方 money 字段重试
-        return _get_money_avg_series(codes, count, context, field='money')
+    if cached is None or len(result) >= len(cached):
+        _MONEY_CACHE[key] = result
     return result
 
 
@@ -334,6 +353,10 @@ def _get_all_fund_codes():
             mic = r.get('finance_mic') or r.get('market_code') or r.get('code') or r.get('market')
             if not mic:
                 continue
+            # 真机判定：本地引擎 get_market_list 返回 finance_mic='ALL'；真机返回 SS/SZ/CSI/XBHS。
+            if mic != 'ALL':
+                global _REAL_PTRADE
+                _REAL_PTRADE = True
             try:
                 detail = get_market_detail(mic)
             except Exception:
@@ -832,11 +855,12 @@ def calculate_global_etf_threshold(context):
             log.warning("无成交额数据，使用保守阈值1000万")
             g.avg_etf_money_threshold = 10000000
             return
-        # 分日汇总用于日志展示
-        daily_totals = _get_money_daily_totals(etf_list, context)
-        if daily_totals is not None:
-            for day, (money, count) in daily_totals.items():
-                log.info("  %s 样本池ETF总成交额: %.2f亿元 (%d只ETF有成交)" % (day, money / 1e8, count))
+        # 分日汇总用于日志展示（真机为减少全市场查询量，跳过；本地保留）
+        if not _REAL_PTRADE:
+            daily_totals = _get_money_daily_totals(etf_list, context)
+            if daily_totals is not None:
+                for day, (money, count) in daily_totals.items():
+                    log.info("  %s 样本池ETF总成交额: %.2f亿元 (%d只ETF有成交)" % (day, money / 1e8, count))
         avg_total_money = avg_daily_money.sum()
         threshold = avg_total_money / g.global_threshold_divisor
         g.avg_etf_money_threshold = threshold
