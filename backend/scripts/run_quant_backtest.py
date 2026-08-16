@@ -16,8 +16,19 @@ load_dotenv()
 from app.quant import db
 from app.quant.config import CONFIG
 from app.quant.datasource.manager import QuantDataProvider
-from app.quant.rqalpha_bridge import run_backtest, run_jq_backtest
 from app.quant.strategies.store import get_strategy
+
+try:
+    from app.quant.rqalpha_bridge import run_backtest, run_jq_backtest
+except Exception as _bridge_import_err:
+    # rqalpha 是可选依赖（quant/backtest extras）。bridge 导入失败不能在这里中止：
+    # 模块加载早于 __main__ 的 try/except，直接抛会让 run 永远卡在 queued。
+    # 留 None + 错误，由 main() 检查并抛错，__main__ 兜底把 run 置 failed。
+    run_backtest = None
+    run_jq_backtest = None
+    _BRIDGE_IMPORT_ERROR = _bridge_import_err
+else:
+    _BRIDGE_IMPORT_ERROR = None
 
 
 def _now() -> str:
@@ -67,6 +78,12 @@ def main():
     if not code:
         code = params.get("strategy_code", "")
     _progress(run_id, "回测子进程已启动，策略代码就绪，正在初始化数据与引擎…")
+
+    if run_backtest is None or run_jq_backtest is None:
+        raise RuntimeError(
+            "rqalpha bridge 不可用（quant/backtest 可选依赖未安装？）："
+            f"{_BRIDGE_IMPORT_ERROR}"
+        )
 
     if _looks_like_jq(code):
         # 聚宽(jq)策略走 jqcompat 引擎（正确的日志/成交捕获与 ETF 池解析）

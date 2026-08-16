@@ -76,7 +76,12 @@ def submit_backtest(params: dict, compile_mode: bool = False) -> str:
 def _sweep_compile_stale(max_age_days: int = 7) -> None:
     """清扫 7 天前的编译库 .db 文件与编译 bundle 目录（quant_bundle/c_*）。"""
     cutoff = time.time() - max_age_days * 86400
-    for f in glob.glob(os.path.join(db.compile_dir(), "*.db")):
+    compile_dir = db.compile_dir()
+    for f in (
+        *glob.glob(os.path.join(compile_dir, "*.db")),
+        *glob.glob(os.path.join(compile_dir, "*.db-wal")),
+        *glob.glob(os.path.join(compile_dir, "*.db-shm")),
+    ):
         try:
             if os.path.getmtime(f) < cutoff:
                 os.unlink(f)

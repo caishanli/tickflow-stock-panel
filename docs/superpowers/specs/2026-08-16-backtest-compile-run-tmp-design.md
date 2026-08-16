@@ -21,12 +21,12 @@
 ### 编译库文件
 
 - 路径：`Path(tempfile.gettempdir()) / "quant_compile" / f"{run_id}.db"`（跨平台，macOS/Linux 均为 /tmp）。
-- Schema：`backtest_runs`（含 pid 列）/ `backtest_equity` / `backtest_trades` / `backtest_logs` 四表，与主库一致。
+- Schema：编译库经 worker 侧 `db.init_db(db_path)` 初始化，实际含**主库完整 schema**（`backtest_runs`/`backtest_equity`/`backtest_trades`/`backtest_logs` 四个回测表，以及 strategies/sim_*/quant_settings 等主库同款空表）；编译运行实际用到的是前四张回测表。
 - 首次连接懒创建（`CREATE TABLE IF NOT EXISTS` + 目录 mkdir）。
 
 ### worker / SSE / 前端路由
 
-- worker（run_quant_backtest.py / rqalpha_bridge.py）**零改动**：所有 db 读写都带 run_id，自动路由到编译库。
+- worker（run_quant_backtest.py / rqalpha_bridge.py）：主库直读函数带 run_id 自动路由，唯一显式改动是 worker 侧桥接落库路径改为 `db.routed_db_path(run_id)`（`run_jq_backtest` / `run_backtest` 的 `db_path` 参数）——compile run 的 `c_` 前缀使其落到编译库文件。
 - SSE 增量推送：rowid 偏移在单文件内单调，协议不受影响。
 - 历史查询（`list_runs` / `list_strategies_with_latest`）只读主库 → compile 天然不可见。
 

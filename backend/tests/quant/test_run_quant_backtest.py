@@ -85,3 +85,45 @@ def test_valid_run_resolves_strategy_and_calls_run_backtest(monkeypatch):
     assert captured["params"]["strategy_id"] == "strat1"
     assert captured["provider"] is not None
     assert captured["db_path"] is not None
+
+
+def test_bridge_import_failure_marks_run_failed(monkeypatch):
+    rb = _load_script()
+
+    params = {
+        "strategy_id": "strat1",
+        "run_id": "runX",
+        "start": "2020-01-01",
+        "end": "2020-02-01",
+        "symbols": ["600000.XSHG"],
+    }
+    run_row = {"params_json": json.dumps(params)}
+
+    monkeypatch.setattr(rb.db, "get_run", lambda run_id: run_row)
+    monkeypatch.setattr(rb, "get_strategy", lambda sid: {"code": "STRATEGY_CODE_BODY"})
+    monkeypatch.setattr(rb, "run_backtest", None)
+    monkeypatch.setattr(rb, "run_jq_backtest", None)
+    monkeypatch.setattr(rb, "_BRIDGE_IMPORT_ERROR", RuntimeError("no rqalpha"))
+
+    updates = []
+    monkeypatch.setattr(
+        rb.db, "update_run",
+        lambda run_id, status, error=None, **kw: updates.append((status, error)),
+    )
+
+    old = sys.argv
+    sys.argv = ["run_quant_backtest.py", "runX"]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            try:
+                rb.main()
+            except Exception as e:  # 模拟 __main__ 兜底
+                rb.db.update_run("runX", "failed", error=str(e)[:500])
+                raise SystemExit(1) from None
+        assert exc.value.code == 1
+    finally:
+        sys.argv = old
+
+    assert updates, "db.update_run was not called"
+    assert updates[0][0] == "failed"
+    assert "rqalpha" in updates[0][1]
