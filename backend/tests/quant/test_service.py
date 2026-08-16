@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import time
 
 import pytest
 
@@ -88,3 +89,35 @@ def subprocess_module():
     import subprocess
 
     return subprocess
+
+
+def test_submit_backtest_compile_mode(tmp_quant, tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "_COMPILE_DIR", str(tmp_path / "compile"))
+    monkeypatch.setattr(subprocess_module(), "Popen", lambda *a, **k: None)
+    params = {"strategy_id": "", "symbols": ["600000.XSHG"], "start": "2024-01-02",
+              "end": "2024-01-04", "frequency": "daily"}
+    run_id = service.submit_backtest(params, compile_mode=True)
+    assert run_id.startswith("c_")
+    assert db.get_run(run_id)["status"] == "queued"
+    with db.get_conn() as c:
+        n = c.execute("SELECT COUNT(*) AS n FROM backtest_runs").fetchone()["n"]
+        assert n == 0, "主库不应有 compile 行"
+    rid2 = service.submit_backtest(params)
+    assert not rid2.startswith("c_")
+    with db.get_conn() as c:
+        n = c.execute("SELECT COUNT(*) AS n FROM backtest_runs").fetchone()["n"]
+        assert n == 1
+
+
+def test_sweep_compile_stale(tmp_quant, tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "_COMPILE_DIR", str(tmp_path / "compile"))
+    d = db.compile_dir()
+    os.makedirs(d, exist_ok=True)
+    old = os.path.join(d, "c_00000001.db")
+    new = os.path.join(d, "c_00000002.db")
+    open(old, "w").close()
+    open(new, "w").close()
+    os.utime(old, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+    service._sweep_compile_stale()
+    assert not os.path.exists(old)
+    assert os.path.exists(new)

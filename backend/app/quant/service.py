@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import datetime
+import glob
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 
 from . import db
@@ -38,8 +41,12 @@ def kill_process_group(pid) -> bool:
         return False
 
 
-def submit_backtest(params: dict) -> str:
-    run_id = params.get("run_id") or uuid.uuid4().hex[:8]
+def submit_backtest(params: dict, compile_mode: bool = False) -> str:
+    if compile_mode:
+        run_id = f"c_{uuid.uuid4().hex[:8]}"
+        _sweep_compile_stale()
+    else:
+        run_id = params.get("run_id") or uuid.uuid4().hex[:8]
     params = dict(params, run_id=run_id)
     db.insert_run(
         run_id,
@@ -64,6 +71,23 @@ def submit_backtest(params: dict) -> str:
     if pid:
         db.set_run_pid(run_id, pid)
     return run_id
+
+
+def _sweep_compile_stale(max_age_days: int = 7) -> None:
+    """清扫 7 天前的编译库 .db 文件与编译 bundle 目录（quant_bundle/c_*）。"""
+    cutoff = time.time() - max_age_days * 86400
+    for f in glob.glob(os.path.join(db.compile_dir(), "*.db")):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                os.unlink(f)
+        except OSError:
+            pass
+    for d in glob.glob(os.path.join(CONFIG.bundle_dir, "c_*")):
+        try:
+            if os.path.getmtime(d) < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def terminate_backtest(run_id: str) -> None:
