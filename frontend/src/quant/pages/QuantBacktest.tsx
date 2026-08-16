@@ -449,6 +449,19 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         </button>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="策略名称"
           className="h-9 w-44 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+        <span className="text-xs text-muted font-mono cursor-pointer hover:text-accent transition-colors"
+          title="点击复制策略ID"
+          onClick={() => {
+            const ta = document.createElement('textarea')
+            ta.value = strategyId
+            ta.style.position = 'fixed'
+            ta.style.left = '-9999px'
+            document.body.appendChild(ta)
+            ta.select()
+            try { document.execCommand('copy'); toast('策略ID已复制', 'success', 'top') }
+            catch { toast('复制失败', 'error') }
+            document.body.removeChild(ta)
+          }}>{strategyId}</span>
         <button onClick={saveStrategy} disabled={!name.trim()}
           className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
           <Save className="h-3.5 w-3.5" />保存策略
