@@ -145,6 +145,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                   <input type="checkbox" checked={allPageSelected} onChange={togglePage}
                     className="accent-accent cursor-pointer align-middle" />
                 </th>
+                <th className="px-3 py-2 font-normal">编号</th>
                 <th className="px-3 py-2 font-normal">策略名称</th>
                 <th className="px-3 py-2 font-normal">最新回测周期</th>
                 <th className="px-3 py-2 font-normal text-right">收益率</th>
@@ -156,7 +157,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </thead>
             <tbody className="text-foreground">
               {pageItems.length === 0 && (
-                <tr><td colSpan={9} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
+                <tr><td colSpan={10} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
               )}
               {pageItems.map((s, i) => {
                 const m = pickMetrics(s.latest?.metrics_json)
@@ -170,6 +171,27 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                     <td className="px-3 py-2 text-center" onClick={e => e.stopPropagation()}>
                       <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
                         className="accent-accent cursor-pointer align-middle" />
+                    </td>
+                    <td className="px-3 py-2 text-muted font-mono" onClick={(e) => {
+                      const target = e.target as HTMLElement
+                      if (target.closest('.copy-id')) return
+                      onOpen(s.id)
+                    }}>
+                      <span className="copy-id inline-flex items-center gap-1 cursor-pointer hover:text-accent transition-colors"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          const ta = document.createElement('textarea')
+                          ta.value = s.id
+                          ta.style.position = 'fixed'
+                          ta.style.left = '-9999px'
+                          document.body.appendChild(ta)
+                          ta.select()
+                          try { document.execCommand('copy'); toast('已复制', 'success', 'top') }
+                          catch { toast('复制失败', 'error') }
+                          document.body.removeChild(ta)
+                        }}>
+                        {s.id}
+                      </span>
                     </td>
                     <td className="px-3 py-2 font-medium">{s.name}</td>
                     <td className="px-3 py-2 text-muted num">{period}</td>
