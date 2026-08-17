@@ -116,3 +116,40 @@ def test_sim_trade_name_column_migration_on_old_db():
     assert "name" in trades[0]
     assert trades[0]["name"] is None
     os.unlink(p)
+
+
+def test_compile_run_routing(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "_COMPILE_DIR", str(tmp_path / "compile"))
+    p = _fresh()
+    db.insert_run("c_12345678", "s1", "", '{"a":1}', "queued")
+    db.insert_run("main1234", "s1", "", '{"a":1}', "queued")
+    assert db.get_run("c_12345678")["status"] == "queued"
+    assert db.get_run("main1234")["status"] == "queued"
+    with db.get_conn() as c:
+        ids = [x["id"] for x in c.execute("SELECT id FROM backtest_runs").fetchall()]
+    assert ids == ["main1234"]
+    assert db.routed_db_path("c_12345678").endswith("compile/c_12345678.db")
+    assert not db.is_compile_run("main1234")
+    assert db.is_compile_run("c_12345678")
+
+
+def test_compile_run_lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "_COMPILE_DIR", str(tmp_path / "compile"))
+    p = _fresh()
+    rid = "c_12345678"
+    db.insert_run(rid, "s1", "", "{}", "queued")
+    db.bulk_insert_equity(rid, [("2024-01-02", 1.0, 1.0, 0.9, 0.1)])
+    db.insert_trade(rid, "2024-01-02 09:30", "600000.XSHG", "BUY", 10.0, 100, 0.0, 0.0, 0.0)
+    db.insert_log(rid, "2024-01-02 09:30", "INFO", "start")
+    db.update_run(rid, "done", metrics_json='{"sharpe":1.2}')
+    assert len(db.get_equity(rid)) == 1
+    assert len(db.get_trades(rid)) == 1
+    assert len(db.get_logs(rid)) == 1
+    assert db.get_max_log_id(rid) == 1
+    assert len(db.get_logs_after(rid, 0)) == 1
+    with db.get_conn() as c:
+        for t in ("backtest_runs", "backtest_equity", "backtest_trades", "backtest_logs"):
+            n = c.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            assert n == 0, f"主库 {t} 应零残留"
+    db.delete_run(rid)
+    assert db.get_run(rid) is None

@@ -6,11 +6,14 @@ account_start 以避免真实 rqalpha 子进程，并验证各端点返回 200/4
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from app.quant import db
 
 
 @pytest.fixture()
@@ -27,17 +30,18 @@ def client(tmp_path, monkeypatch):
     # 不写真实库 / 不 spawn worker（显式指向临时库，隔离 import 顺序影响）
     config.CONFIG.db_path = str(tmp_path / "quant.db")
     db.init_db()
+    db._COMPILE_DIR = str(tmp_path / "compile")
 
     # patch 掉会派生子进程的编排函数
     monkeypatch.setattr(
         service, "submit_backtest",
-        lambda params: db.insert_run(
-            (params.get("run_id") or "run123"),
+        lambda params, compile_mode=False: db.insert_run(
+            ("c_" if compile_mode else "") + (params.get("run_id") or "run123"),
             params.get("strategy_id", ""),
             params.get("name", ""),
             __import__("json").dumps(params, ensure_ascii=False),
             "queued",
-        ) or "run123",
+        ) or ("c_" if compile_mode else "") + (params.get("run_id") or "run123"),
     )
     monkeypatch.setattr(service, "account_start", lambda aid: db.update_sim_account(
         aid, status="running", started_at="2026-01-01T00:00:00"))
@@ -156,3 +160,54 @@ def test_build_trade_days_network_failure_fallback(monkeypatch):
     days = qmod._build_trade_days(acct, [])
     assert days and days[0] == "2026-08-03"
     assert all(len(d) == 10 for d in days)
+
+
+def test_backtest_record_flag(client):
+    r = client.post("/api/quant/backtest/run",
+                    json={"name": "n", "strategy_id": "s1", "start": "2024-01-02",
+                          "end": "2024-01-03", "record": False})
+    assert r.status_code == 200
+    assert r.json()["data"]["run_id"].startswith("c_")
+    r2 = client.post("/api/quant/backtest/run",
+                     json={"name": "n", "strategy_id": "s1", "start": "2024-01-02",
+                           "end": "2024-01-03"})
+    assert r2.status_code == 200
+    assert not r2.json()["data"]["run_id"].startswith("c_")
+    rows = client.get("/api/quant/backtest/runs").json()["data"]
+    assert all(not x["id"].startswith("c_") for x in rows)
+
+
+def test_backtest_record_not_in_params_json(client):
+    r = client.post("/api/quant/backtest/run",
+                    json={"name": "n", "strategy_id": "s1", "record": False})
+    row = db.get_run(r.json()["data"]["run_id"])
+    assert "record" not in (row["params_json"] or "")
+
+
+def test_worker_routes_compile_db_path(monkeypatch, tmp_path):
+    import importlib.util
+    path = "scripts/run_quant_backtest.py"
+    spec = importlib.util.spec_from_file_location("run_quant_backtest_c", path)
+    rb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rb)
+    params = {"strategy_id": "", "run_id": "c_12345678", "start": "2020-01-01",
+              "end": "2020-02-01", "symbols": ["600000.XSHG"]}
+    captured = {}
+
+    def fake_get_run(run_id):
+        return {"params_json": __import__("json").dumps(params)}
+
+    def fake_run_backtest(code, params, provider=None, db_path=None):
+        captured["db_path"] = db_path
+        return {"run_id": "c_12345678"}
+
+    monkeypatch.setattr(rb.db, "get_run", fake_get_run)
+    monkeypatch.setattr(rb.db, "_COMPILE_DIR", str(tmp_path / "compile"))
+    monkeypatch.setattr(rb, "run_backtest", fake_run_backtest)
+    old = sys.argv
+    sys.argv = ["run_quant_backtest.py", "c_12345678"]
+    try:
+        rb.main()
+    finally:
+        sys.argv = old
+    assert captured["db_path"].endswith("c_12345678.db")

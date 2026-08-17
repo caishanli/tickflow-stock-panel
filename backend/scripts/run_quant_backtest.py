@@ -18,6 +18,18 @@ from app.quant.config import CONFIG
 from app.quant.datasource.manager import QuantDataProvider
 from app.quant.strategies.store import get_strategy
 
+try:
+    from app.quant.rqalpha_bridge import run_backtest, run_jq_backtest
+except Exception as _bridge_import_err:
+    # rqalpha 是可选依赖（quant/backtest extras）。bridge 导入失败不能在这里中止：
+    # 模块加载早于 __main__ 的 try/except，直接抛会让 run 永远卡在 queued。
+    # 留 None + 错误，由 main() 检查并抛错，__main__ 兜底把 run 置 failed。
+    run_backtest = None
+    run_jq_backtest = None
+    _BRIDGE_IMPORT_ERROR = _bridge_import_err
+else:
+    _BRIDGE_IMPORT_ERROR = None
+
 
 def _now() -> str:
     import datetime as _dt
@@ -67,10 +79,15 @@ def main():
         code = params.get("strategy_code", "")
     _progress(run_id, "回测子进程已启动，策略代码就绪，正在初始化数据与引擎…")
 
+    if run_backtest is None or run_jq_backtest is None:
+        raise RuntimeError(
+            "rqalpha bridge 不可用（quant/backtest 可选依赖未安装？）："
+            f"{_BRIDGE_IMPORT_ERROR}"
+        )
+
     if _looks_like_jq(code):
         # 聚宽(jq)策略走 jqcompat 引擎（正确的日志/成交捕获与 ETF 池解析）
         _progress(run_id, "检测到聚宽式策略，路由到 jqcompat 引擎（1m 逐 bar）")
-        from app.quant.rqalpha_bridge import run_jq_backtest
         # run_jq_backtest 需要 strategy 文本；通过临时文件传入（与 scripts/
         # run_jq_rqalpha.py 同口径），避免把整段代码塞进 params 造成歧义。
         tmp = os.path.join(CONFIG.runtime_dir, f"jqstrat_{run_id}.py")
@@ -79,11 +96,10 @@ def main():
             f.write(code)
         params = dict(params, run_id=run_id, strategy_id=strategy_id or "jq",
                       name=params.get("name", ""), out_dir=os.path.join(CONFIG.runtime_dir, "jqwufu"))
-        run_jq_backtest(tmp, params, db_path=CONFIG.db_path)
+        run_jq_backtest(tmp, params, db_path=db.routed_db_path(run_id))
     else:
-        from app.quant.rqalpha_bridge import run_backtest
         provider = QuantDataProvider()
-        run_backtest(code, params, provider=provider, db_path=CONFIG.db_path)
+        run_backtest(code, params, provider=provider, db_path=db.routed_db_path(run_id))
 
 
 if __name__ == "__main__":

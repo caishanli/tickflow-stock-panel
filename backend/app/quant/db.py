@@ -8,10 +8,28 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
+from pathlib import Path
 
 from .config import CONFIG
 
 _DB_PATH: str | None = None
+
+_COMPILE_DIR: str | None = None
+
+_COMPILE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id TEXT PRIMARY KEY, strategy_id TEXT, name TEXT, params_json TEXT, status TEXT,
+    metrics_json TEXT, created_at TEXT DEFAULT (datetime('now')),
+    finished_at TEXT, error TEXT, pid INTEGER);
+CREATE TABLE IF NOT EXISTS backtest_equity (
+    run_id TEXT, dt TEXT, value REAL, benchmark REAL, cash REAL, positions_value REAL);
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    run_id TEXT, ts TEXT, code TEXT, action TEXT, price REAL, amount REAL,
+    pnl REAL, pnl_pct REAL, commission REAL);
+CREATE TABLE IF NOT EXISTS backtest_logs (
+    run_id TEXT, ts TEXT, level TEXT, message TEXT);
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -97,9 +115,44 @@ def init_db(path: str | None = None) -> None:
         conn.close()
 
 
-def get_conn() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(_DB_PATH or CONFIG.db_path) or ".", exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH or CONFIG.db_path)
+def compile_dir() -> str:
+    if _COMPILE_DIR:
+        return _COMPILE_DIR
+    return str(Path(tempfile.gettempdir()) / "quant_compile")
+
+
+def compile_db_path(run_id: str) -> str:
+    return os.path.join(compile_dir(), f"{run_id}.db")
+
+
+def is_compile_run(run_id: str | None) -> bool:
+    return bool(run_id and run_id.startswith("c_"))
+
+
+def routed_db_path(run_id: str) -> str:
+    if is_compile_run(run_id):
+        return compile_db_path(run_id)
+    return _DB_PATH or CONFIG.db_path
+
+
+def _ensure_compile_db(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_COMPILE_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_conn(run_id: str | None = None):
+    if is_compile_run(run_id):
+        path = compile_db_path(run_id)
+        _ensure_compile_db(path)
+    else:
+        path = _DB_PATH or CONFIG.db_path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -107,7 +160,7 @@ def get_conn() -> sqlite3.Connection:
 
 # ---- 回测 ----
 def insert_run(run_id, strategy_id, name, params_json, status="queued"):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute(
             "INSERT INTO backtest_runs(id,strategy_id,name,params_json,status) VALUES(?,?,?,?,?)",
             (run_id, strategy_id, name, params_json, status),
@@ -116,7 +169,7 @@ def insert_run(run_id, strategy_id, name, params_json, status="queued"):
 
 def upsert_run(run_id, strategy_id, name, params_json, status="running"):
     """插入回测记录；若 run_id 已存在（如 API 已建 'queued' 行）则更新，避免 UNIQUE 冲突。"""
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute(
             "INSERT INTO backtest_runs(id,strategy_id,name,params_json,status) VALUES(?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET "
@@ -127,7 +180,7 @@ def upsert_run(run_id, strategy_id, name, params_json, status="running"):
 
 
 def update_run(run_id, status, metrics_json=None, error=None, finished_at=None):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute(
             "UPDATE backtest_runs SET status=?, metrics_json=?, error=?, finished_at=? WHERE id=?",
             (status, metrics_json, error, finished_at, run_id),
@@ -136,12 +189,12 @@ def update_run(run_id, status, metrics_json=None, error=None, finished_at=None):
 
 def set_run_pid(run_id, pid):
     """回测子进程 pid 落库（M5：terminate 按 pid 杀进程组）。"""
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute("UPDATE backtest_runs SET pid=? WHERE id=?", (pid, run_id))
 
 
 def get_run(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         row = c.execute("SELECT * FROM backtest_runs WHERE id=?", (run_id,)).fetchone()
     return dict(row) if row else None
 
@@ -190,7 +243,7 @@ def list_strategies_with_latest():
 
 
 def bulk_insert_equity(run_id, rows):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.executemany(
             "INSERT INTO backtest_equity(run_id,dt,value,benchmark,cash,positions_value) "
             "VALUES(?,?,?,?,?,?)",
@@ -200,7 +253,7 @@ def bulk_insert_equity(run_id, rows):
 
 def insert_equity_row(run_id, dt, value, benchmark, cash, positions_value):
     """单日收益实时写入（每日收盘钩子调用）。"""
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute(
             "INSERT INTO backtest_equity(run_id,dt,value,benchmark,cash,positions_value) "
             "VALUES(?,?,?,?,?,?)",
@@ -210,7 +263,7 @@ def insert_equity_row(run_id, dt, value, benchmark, cash, positions_value):
 
 def get_equity_after(run_id, offset=0):
     """返回 rowid > offset 的收益行（SSE 增量用）。"""
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT rowid, dt, value, benchmark, cash, positions_value "
             "FROM backtest_equity WHERE run_id=? AND rowid > ? ORDER BY rowid",
@@ -220,7 +273,7 @@ def get_equity_after(run_id, offset=0):
 
 
 def get_max_equity_id(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         row = c.execute(
             "SELECT MAX(rowid) AS m FROM backtest_equity WHERE run_id=?", (run_id,)
         ).fetchone()
@@ -228,7 +281,7 @@ def get_max_equity_id(run_id):
 
 
 def get_equity(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT dt,value,benchmark,cash,positions_value FROM backtest_equity WHERE run_id=?",
             (run_id,),
@@ -237,7 +290,7 @@ def get_equity(run_id):
 
 
 def insert_trade(run_id, ts, code, action, price, amount, pnl, pnl_pct, commission):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute(
             "INSERT INTO backtest_trades(run_id,ts,code,action,price,amount,pnl,pnl_pct,commission) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -246,7 +299,7 @@ def insert_trade(run_id, ts, code, action, price, amount, pnl, pnl_pct, commissi
 
 
 def get_trades(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT ts,code,action,price,amount,pnl,pnl_pct,commission FROM backtest_trades "
             "WHERE run_id=? ORDER BY ts", (run_id,)
@@ -256,7 +309,7 @@ def get_trades(run_id):
 
 def get_trades_after(run_id, offset=0):
     """返回 rowid > offset 的成交行（SSE 增量用）。"""
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT rowid, ts, code, action, price, amount, pnl, pnl_pct, commission "
             "FROM backtest_trades WHERE run_id=? AND rowid > ? ORDER BY rowid",
@@ -266,7 +319,7 @@ def get_trades_after(run_id, offset=0):
 
 
 def get_max_trade_id(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         row = c.execute(
             "SELECT MAX(rowid) AS m FROM backtest_trades WHERE run_id=?", (run_id,)
         ).fetchone()
@@ -274,7 +327,7 @@ def get_max_trade_id(run_id):
 
 
 def insert_log(run_id, ts, level, message):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute(
             "INSERT INTO backtest_logs(run_id,ts,level,message) VALUES(?,?,?,?)",
             (run_id, ts, level, message),
@@ -282,7 +335,7 @@ def insert_log(run_id, ts, level, message):
 
 
 def get_logs(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT ts,level,message FROM backtest_logs WHERE run_id=? ORDER BY rowid",
             (run_id,),
@@ -296,7 +349,7 @@ def get_logs_tail(run_id, limit=200):
     返回 (rows, min_rowid)：rows 为时间正序的 dict 列表（含 rowid），
     min_rowid 为这批里最小的 rowid，供前端「向上滚动加载更早」时作为游标。
     """
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT rowid, ts, level, message FROM backtest_logs "
             "WHERE run_id=? ORDER BY rowid DESC LIMIT ?",
@@ -315,7 +368,7 @@ def get_logs_before(run_id, before_rowid, limit=200):
 
     用于「向上滚动加载更早」：游标为已加载批次的最小 rowid。返回 (rows, min_rowid)。
     """
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT rowid, ts, level, message FROM backtest_logs "
             "WHERE run_id=? AND rowid < ? ORDER BY rowid DESC LIMIT ?",
@@ -328,7 +381,7 @@ def get_logs_before(run_id, before_rowid, limit=200):
 
 def get_logs_after(run_id, offset=0):
     """返回 rowid > offset 的日志行（SSE 增量用）。"""
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         rows = c.execute(
             "SELECT rowid, ts, level, message FROM backtest_logs "
             "WHERE run_id=? AND rowid > ? ORDER BY rowid",
@@ -338,7 +391,7 @@ def get_logs_after(run_id, offset=0):
 
 
 def get_max_log_id(run_id):
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         row = c.execute(
             "SELECT MAX(rowid) AS m FROM backtest_logs WHERE run_id=?", (run_id,)
         ).fetchone()
@@ -348,7 +401,7 @@ def get_max_log_id(run_id):
 def delete_run(run_id):
     import shutil
 
-    with get_conn() as c:
+    with get_conn(run_id) as c:
         c.execute("DELETE FROM backtest_runs WHERE id=?", (run_id,))
         c.execute("DELETE FROM backtest_equity WHERE run_id=?", (run_id,))
         c.execute("DELETE FROM backtest_trades WHERE run_id=?", (run_id,))
