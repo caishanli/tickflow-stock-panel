@@ -4,7 +4,7 @@
 
 ## 背景
 
-量化回测（QuantBacktest.tsx）与量化模拟盘（QuantSim.tsx）同属量化工作台，但回测页两个基础按钮（列表页「新建」、编辑器顶栏「返回」）的视觉样式与模拟盘不一致：回测页新建按钮文字颜色用 `text-base`（在 accent 背景上观感发暗）、圆角用 `rounded-btn`、带 `font-medium` 与 hover 效果；返回按钮文案为「列表」而非「返回列表」，背景用 `bg-base text-secondary` 带边框。模拟盘同款按钮为 `bg-accent text-white rounded-lg` 与 `bg-elevated text-foreground rounded-lg`。
+量化回测（QuantBacktest.tsx）与量化模拟盘（QuantSim.tsx）同属量化工作台，但回测页两个基础按钮（列表页「新建」、编辑器顶栏「返回」）的视觉样式与模拟盘不一致：回测页新建按钮同时含 `text-base`/`text-xs` 冲突字号、圆角用 `rounded-btn`、带 `font-medium` 与 hover 效果；返回按钮文案为「列表」而非「返回列表」，背景用 `bg-base text-secondary` 带边框。模拟盘同款按钮为 `bg-accent text-white rounded-lg` 与 `bg-elevated text-foreground rounded-lg`。
 
 用户要求：回测页这两个按钮与模拟盘样式、位置一致。
 
