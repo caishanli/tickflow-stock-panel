@@ -6,25 +6,28 @@
 
 量化回测（QuantBacktest.tsx）与量化模拟盘（QuantSim.tsx）同属量化工作台，但回测页两个基础按钮（列表页「新建」、编辑器顶栏「返回」）的视觉样式与模拟盘不一致：回测页新建按钮文字颜色用 `text-base`（在 accent 背景上观感发暗）、圆角用 `rounded-btn`、带 `font-medium` 与 hover 效果；返回按钮文案为「列表」而非「返回列表」，背景用 `bg-base text-secondary` 带边框。模拟盘同款按钮为 `bg-accent text-white rounded-lg` 与 `bg-elevated text-foreground rounded-lg`。
 
-用户要求：回测页这两个按钮与模拟盘样式一致。
+用户要求：回测页这两个按钮与模拟盘样式、位置一致。
 
 ## 范围
 
-- 仅前端 `frontend/src/quant/pages/QuantBacktest.tsx`，两个按钮的 className 与文案调整。
+- 仅前端 `frontend/src/quant/pages/QuantBacktest.tsx`，按钮的 className、文案与位置调整。
 - 无后端、无接口、无数据改动。
 
 ## 改动
 
-### 1. 列表页「新建」按钮（QuantBacktest.tsx:131-134，位于 PageHeader `right` 槽内，位置不变）
+### 1. 列表页「新建」按钮（QuantBacktest.tsx:131-134，原位于 PageHeader `right` 槽内 → 移到列表区左上）
 
-目标样式对齐 QuantSim.tsx:203-206「新建模拟」：
+目标样式与**位置**对齐 QuantSim.tsx:201-207（模拟盘新建按钮在列表区左上：`flex-1 overflow-auto p-4` 容器内、表格卡片前的 `<div className="flex items-center">` 行）：
 
 ```
 当前:  inline-flex items-center gap-1.5 h-9 px-3 rounded-btn bg-accent text-base text-xs font-medium hover:bg-accent/90 transition-colors
 目标:  inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent text-white text-xs
 ```
 
+- 位置：从 PageHeader `right` 槽移到列表区容器 `<div className="flex-1 p-4 overflow-auto">` 内、表格卡片之前，插入 `<div className="flex items-center">…新建按钮…</div>`；容器 className 加 `space-y-3`（按钮与卡片间距同模拟盘）。按钮仍用 `onNew` 回调，行为不变。
 - 文案保持「新建」（回测页新建的是**策略**，模拟盘「新建模拟」建的是账户，语义不同，不抄文案）。
+- 「删除选中」按钮留在 PageHeader `right` 槽内不动。
+- 空态文案「暂无策略，点击右上角新建」→「暂无策略，点击左上角新建」（按钮挪走后原提示指错位置）。
 
 ### 2. 编辑器顶栏「返回」按钮（QuantBacktest.tsx:448-449）
 
@@ -49,5 +52,5 @@
 
 ## 非目标
 
-- 不改按钮位置（回测页新建在右上 PageHeader，模拟盘在列表左上——保持各自现状）。
-- 不改其它按钮样式（保存策略/删除选中/编译运行等不在本次范围）。
+- 不改「删除选中」按钮位置（留在 PageHeader 右侧）与样式。
+- 不改其它按钮样式（保存策略/编译运行等不在本次范围）。
