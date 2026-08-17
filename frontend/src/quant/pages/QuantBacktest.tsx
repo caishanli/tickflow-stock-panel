@@ -817,8 +817,10 @@ function TradeTable({ trades }: { trades: any[] }) {
             <tr key={i} className="border-t border-border/60">
               <td className="px-2 py-1.5 text-muted">{String(t.ts ?? t.datetime ?? '')}</td>
               <td className="px-2 py-1.5">{t.code ?? t.symbol ?? ''}</td>
-              <td className={`px-2 py-1.5 ${(t.action ?? t.side) === 'BUY' || (t.action ?? t.side) === 'buy' ? 'text-bull' : 'text-bear'}`}>{t.action ?? t.side ?? ''}</td>
-              <td className="px-2 py-1.5 text-right">{t.price ?? ''}</td>
+              <td className={`px-2 py-1.5 ${/BUY/i.test(String(t.action ?? t.side ?? '')) ? 'text-bull' : 'text-bear'}`}>
+                {/BUY/i.test(String(t.action ?? t.side ?? '')) ? '买入' : '卖出'}
+              </td>
+              <td className="px-2 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
               <td className="px-2 py-1.5 text-right">{t.amount ?? t.qty ?? ''}</td>
               <td className="px-2 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
             </tr>
