@@ -861,11 +861,11 @@ function computeHoldDays(trades: any[], tradeDays: string[]): Map<number, { hold
 }
 
 function TradeTable({ trades }: { trades: any[] }) {
-  if (trades.length === 0) return <div className="text-xs text-muted">暂无成交</div>
   const isBuy = (t: any) => /BUY/i.test(String(t.action ?? t.side ?? ''))
   const sorted = useMemo(() => [...trades].sort((a: any, b: any) => String(a.ts).localeCompare(String(b.ts))), [trades])
   const holdMap = useMemo(() => computeHoldDays(sorted, []), [sorted])
   const holdOf = (origIdx: number) => holdMap.get(origIdx)
+  if (trades.length === 0) return <div className="text-xs text-muted">暂无成交</div>
   return (
     <div className="overflow-auto">
       <table className="w-full text-xs">
