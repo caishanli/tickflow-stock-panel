@@ -211,3 +211,16 @@ def test_worker_routes_compile_db_path(monkeypatch, tmp_path):
     finally:
         sys.argv = old
     assert captured["db_path"].endswith("c_12345678.db")
+
+
+def test_backtest_trades_includes_name(client):
+    db.insert_run("r1", "s1", "n1", "{}", "done")
+    db.insert_trade("r1", "2026-08-17 10:30:00", "600000.XSHG", "SIDE.BUY", 10.0, 100.0, 0.0, 0.0, 1.0)
+    r = client.get("/api/quant/backtest/r1/trades")
+    assert r.status_code == 200
+    rows = r.json()["data"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["code"] == "600000.XSHG"
+    assert "name" in row
+    assert row["name"]

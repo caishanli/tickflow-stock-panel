@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { PageHeader } from '@/components/PageHeader'
 import { Modal } from '@/components/Modal'
 import { toast } from '@/components/Toast'
@@ -797,7 +797,74 @@ function LazyLogList({ logs, loadingMore, hasMore, loaded, total }: {
   )
 }
 
+/** 交易日历查找表：tradeDays 外的日期（如实时会话跨日新增）按工作日索引兜底插补 */
+function buildDayLookup(trades: any[], tradeDays: string[]): Map<string, number> {
+  const idx = new Map<string, number>()
+  tradeDays.filter(Boolean).sort().forEach((d: string, i: number) => idx.set(d, i))
+  let next = idx.size
+  const isWeekday = (d: string) => {
+    const t = new Date(`${d}T00:00:00`)
+    const w = t.getUTCDay()
+    return !Number.isNaN(t.getTime()) && w >= 1 && w <= 5
+  }
+  for (const t of trades) {
+    const d = String(t?.ts ?? '').slice(0, 10)
+    if (d && !idx.has(d) && isWeekday(d)) idx.set(d, next++)
+  }
+  return idx
+}
+
+/** 分标的 FIFO 配对，返回每行（按 ts 排序后的下标）持仓交易日数（买入判定兼容 SIDE.BUY） */
+function computeHoldDays(trades: any[], tradeDays: string[]): Map<number, { hold: number | null; open: boolean }> {
+  const days = buildDayLookup(trades, tradeDays)
+  const out = new Map<number, { hold: number | null; open: boolean }>()
+  const acc = new Map<number, { sum: number; qty: number }>()
+  const lots: Record<string, { buyOrder: number; buyDay: number; amount: number }[]> = {}
+  const sorted = [...trades].sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
+  for (let oi = 0; oi < sorted.length; oi++) {
+    const t = sorted[oi]
+    const d = String(t.ts ?? '').slice(0, 10)
+    const day = days.get(d) ?? -1
+    const amt = Number(t.amount) || 0
+    if (/BUY/i.test(String(t.action))) {
+      (lots[String(t.code ?? '')] ??= []).push({ buyOrder: oi, buyDay: day, amount: amt })
+      const now = days.size - 1
+      out.set(oi, { hold: day >= 0 ? Math.max(0, now - day) : null, open: true })
+    } else {
+      const q = lots[String(t.code ?? '')] ?? []
+      let remaining = amt
+      let sum = 0
+      let qty = 0
+      while (remaining > 0 && q.length > 0) {
+        const lot = q[0]
+        const take = Math.min(remaining, lot.amount)
+        if (day >= 0 && lot.buyDay >= 0) {
+          const diff = day - lot.buyDay
+          sum += diff * take
+          qty += take
+          const a = acc.get(lot.buyOrder) ?? { sum: 0, qty: 0 }
+          a.sum += diff * take
+          a.qty += take
+          acc.set(lot.buyOrder, a)
+        }
+        lot.amount -= take
+        remaining -= take
+        if (lot.amount <= 0) q.shift()
+      }
+      out.set(oi, { hold: qty > 0 ? Math.round(sum / qty) : null, open: false })
+    }
+  }
+  for (const [oi, a] of acc) {
+    if (a.qty > 0) out.set(oi, { hold: Math.round(a.sum / a.qty), open: false })
+  }
+  return out
+}
+
 function TradeTable({ trades }: { trades: any[] }) {
+  const isBuy = (t: any) => /BUY/i.test(String(t.action ?? t.side ?? ''))
+  const sorted = useMemo(() => [...trades].sort((a: any, b: any) => String(a.ts).localeCompare(String(b.ts))), [trades])
+  const holdMap = useMemo(() => computeHoldDays(sorted, []), [sorted])
+  const holdOf = (origIdx: number) => holdMap.get(origIdx)
   if (trades.length === 0) return <div className="text-xs text-muted">暂无成交</div>
   return (
     <div className="overflow-auto">
@@ -805,26 +872,46 @@ function TradeTable({ trades }: { trades: any[] }) {
         <thead className="text-muted sticky top-0 bg-surface">
           <tr className="text-left">
             <th className="px-2 py-1.5 font-normal">时间</th>
-            <th className="px-2 py-1.5 font-normal">标的</th>
+            <th className="px-2 py-1.5 font-normal">名称</th>
+            <th className="px-2 py-1.5 font-normal">代码</th>
+            <th className="px-2 py-1.5 font-normal">持仓时长</th>
             <th className="px-2 py-1.5 font-normal">方向</th>
             <th className="px-2 py-1.5 font-normal text-right">价格</th>
             <th className="px-2 py-1.5 font-normal text-right">数量</th>
             <th className="px-2 py-1.5 font-normal text-right">手续费</th>
+            <th className="px-2 py-1.5 font-normal text-right">盈亏</th>
+            <th className="px-2 py-1.5 font-normal text-right">收益率</th>
           </tr>
         </thead>
         <tbody className="text-foreground">
-          {trades.map((t, i) => (
-            <tr key={i} className="border-t border-border/60">
-              <td className="px-2 py-1.5 text-muted">{String(t.ts ?? t.datetime ?? '')}</td>
-              <td className="px-2 py-1.5">{t.code ?? t.symbol ?? ''}</td>
-              <td className={`px-2 py-1.5 ${/BUY/i.test(String(t.action ?? t.side ?? '')) ? 'text-bull' : 'text-bear'}`}>
-                {/BUY/i.test(String(t.action ?? t.side ?? '')) ? '买入' : '卖出'}
-              </td>
-              <td className="px-2 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
-              <td className="px-2 py-1.5 text-right">{t.amount ?? t.qty ?? ''}</td>
-              <td className="px-2 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
-            </tr>
-          ))}
+          {[...sorted].reverse().map((t, i) => {
+            const origIdx = sorted.length - 1 - i
+            const h = holdOf(origIdx)
+            const buy = isBuy(t)
+            const holdText = buy
+              ? (h?.open
+                  ? (h?.hold == null ? '持仓中' : h.hold === 0 ? '<1天（持仓中）' : `${h.hold}个交易日（持仓中）`)
+                  : '—')
+              : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`
+            return (
+              <tr key={origIdx} className="border-t border-border/60">
+                <td className="px-2 py-1.5 text-muted">{String(t.ts ?? t.datetime ?? '')}</td>
+                <td className="px-2 py-1.5">{t.name ?? ''}</td>
+                <td className="px-2 py-1.5 text-muted">{t.code ?? t.symbol ?? ''}</td>
+                <td className={`px-2 py-1.5 num ${holdText === '—' ? 'text-muted' : ''}`}>{holdText}</td>
+                <td className={`px-2 py-1.5 ${buy ? 'text-bull' : 'text-bear'}`}>{buy ? '买入' : '卖出'}</td>
+                <td className="px-2 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
+                <td className="px-2 py-1.5 text-right">{t.amount ?? t.qty ?? ''}</td>
+                <td className="px-2 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
+                <td className={`px-2 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                  {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
+                </td>
+                <td className={`px-2 py-1.5 text-right num ${!buy && typeof t.pnl_pct === 'number' ? (t.pnl_pct >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                  {buy ? '—' : fmtPct(t.pnl_pct)}
+                </td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>

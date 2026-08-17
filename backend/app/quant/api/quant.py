@@ -19,6 +19,7 @@ from ..strategies.store import (
     export_strategy, import_strategy,
 )
 from ..datasource.manager import QuantDataProvider
+from ..simulate.names import resolve_name
 
 router = APIRouter(prefix="/api/quant", tags=["quant"])
 
@@ -129,7 +130,10 @@ def backtest_equity(run_id: str):
 
 @router.get("/backtest/{run_id}/trades")
 def backtest_trades(run_id: str):
-    return {"data": db.get_trades(run_id)}
+    rows = db.get_trades(run_id)
+    for row in rows:
+        row["name"] = resolve_name(row["code"])
+    return {"data": rows}
 
 
 @router.get("/backtest/{run_id}/logs")
@@ -192,6 +196,7 @@ async def backtest_stream(run_id: str, since_id: int | None = None,
             for row in db.get_trades_after(run_id, off_trade):
                 off_trade = row["rowid"]
                 d = {k: row[k] for k in ("ts", "code", "action", "price", "amount", "pnl", "pnl_pct", "commission")}
+                d["name"] = resolve_name(row["code"])
                 yield f"event: trade\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
             for row in db.get_logs_after(run_id, off_log):
                 off_log = row["rowid"]
