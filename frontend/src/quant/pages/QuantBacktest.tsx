@@ -128,14 +128,16 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                 <Trash2 className="h-3.5 w-3.5" />删除选中({selected.size})
               </button>
             )}
-            <button onClick={onNew}
-              className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent text-white text-xs">
-              <Plus size={14} />新建
-            </button>
           </div>
         }
       />
-      <div className="flex-1 p-4 overflow-auto">
+      <div className="flex-1 p-4 overflow-auto space-y-3">
+        <div className="flex items-center">
+          <button onClick={onNew}
+            className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent text-white text-xs">
+            <Plus size={14} />新建
+          </button>
+        </div>
         <div className="rounded-card border border-border bg-surface overflow-hidden">
           <table className="w-full text-xs">
             <thead className="text-muted bg-elevated/40">
@@ -157,7 +159,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </thead>
             <tbody className="text-foreground">
               {pageItems.length === 0 && (
-                <tr><td colSpan={10} className="px-3 py-10 text-center text-muted">暂无策略，点击右上角新建</td></tr>
+                <tr><td colSpan={10} className="px-3 py-10 text-center text-muted">暂无策略，点击左上角新建</td></tr>
               )}
               {pageItems.map((s, i) => {
                 const m = pickMetrics(s.latest?.metrics_json)
