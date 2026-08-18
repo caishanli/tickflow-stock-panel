@@ -5,11 +5,11 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from app.indicators.pipeline import ENRICHED_COLUMNS
 
@@ -51,6 +51,19 @@ _table_cache_lock = threading.Lock()
 
 _last_finished_cache: dict[str, str | None] | None = None
 _last_finished_lock = threading.Lock()
+
+# ===== 本地股市数据统计(local-market-stats) =====
+_LOCAL_MARKET_TABLES: dict[str, str] = {
+    "stock_daily": "kline_daily",
+    "stock_minute": "kline_minute",
+    "etf_daily": "kline_etf_daily",
+    "etf_minute": "kline_etf_minute",
+    "index_daily": "kline_index_daily",
+    "index_minute": "kline_index_minute",
+}
+_LOCAL_STATS_TTL = 30.0
+_local_stats_cache: dict[tuple[str, int, int], tuple[float, dict]] = {}
+_local_stats_lock = threading.Lock()
 
 
 def invalidate_data_cache(table: str | None = None) -> None:
@@ -616,6 +629,71 @@ def status(request: Request) -> dict:
         # 指标缓存就绪标志 (启动时 enriched 异步预热, 完成前为 false)
         "indicators_ready": getattr(request.app.state, "indicators_ready", True),
     }
+
+
+def _local_market_dates(data_dir: Path) -> list[date]:
+    """各表 date=* 分区目录并集, 降序。"""
+    seen: set[date] = set()
+    for sub in _LOCAL_MARKET_TABLES.values():
+        d = data_dir / sub
+        if not d.is_dir():
+            continue
+        for child in d.iterdir():
+            if not child.is_dir() or not child.name.startswith("date="):
+                continue
+            try:
+                seen.add(datetime.strptime(child.name[5:], "%Y-%m-%d").date())
+            except ValueError:
+                continue
+    return sorted(seen, reverse=True)
+
+
+def _count_partition_symbols(repo, data_dir: Path, sub: str, d: date) -> int:
+    """某表某日期的去重 symbol 数; 目录缺失/异常 → 0。"""
+    part = data_dir / sub / f"date={d.isoformat()}"
+    if not part.is_dir() or not any(part.rglob("*.parquet")):
+        return 0
+    try:
+        row = repo.execute_one(
+            f"SELECT COUNT(DISTINCT symbol) FROM read_parquet('{part.as_posix()}/**/*.parquet')"
+        )
+        return int(row[0] or 0) if row else 0
+    except Exception as e:
+        logger.debug("local-market-stats count failed %s %s: %s", sub, d, e)
+        return 0
+
+
+@router.get("/local-market-stats")
+def local_market_stats(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(15, ge=1, le=100),
+) -> dict:
+    """按日期分区统计本地各表去重标的数(服务端分页, 30s TTL)。"""
+    repo = request.app.state.repo
+    data_dir = repo.store.data_dir
+    key = (str(data_dir), page, page_size)
+    now = time.time()
+    with _local_stats_lock:
+        cached = _local_stats_cache.get(key)
+        if cached is not None and (now - cached[0]) < _LOCAL_STATS_TTL:
+            return cached[1]
+
+    dates = _local_market_dates(data_dir)
+    total = len(dates)
+    page_dates = dates[(page - 1) * page_size : page * page_size]
+
+    rows: list[dict] = []
+    for d in page_dates:
+        row: dict = {"date": d.isoformat()}
+        for key_, sub in _LOCAL_MARKET_TABLES.items():
+            row[key_] = _count_partition_symbols(repo, data_dir, sub, d)
+        rows.append(row)
+
+    result = {"total": total, "page": page, "page_size": page_size, "rows": rows}
+    with _local_stats_lock:
+        _local_stats_cache[key] = (now, result)
+    return result
 
 
 @router.post("/clear")

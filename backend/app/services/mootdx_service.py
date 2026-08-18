@@ -338,6 +338,68 @@ def _existing_minute_symbols() -> set[str]:
         return set()
 
 
+# 分区 symbol 数低于基线该数量以上视为残片（回源中断产物）。
+# 单日停牌通常 <100 只，阈值取 500 避免误伤停牌日。
+_MINUTE_FRAGMENT_THRESHOLD = 500
+# 残片检测只看最近 N 个分区：更早的历史分区可能是按需拉取的局部数据
+# （symbol 少是正常），全窗口判定会误判为残片。
+_MINUTE_FRAGMENT_LOOKBACK_DAYS = 10
+
+
+def _minute_fragment_days() -> dict[_date, list[str]]:
+    """检测最近窗口内的分钟残片分区：某交易日 symbol 数显著低于基线。
+
+    resume 只按最新分区判断"已覆盖"，回源中断留下的中间残片日会被永久
+    跳过（如 08-12 凌晨 pytdx 崩溃留下 3640/5208）。返回 {残片日: 缺失
+    symbol}，缺失 = 基线分区有、残片日没有；仅补缺失 symbol 而非全市场
+    重拉。
+
+    只检查最近 ``_MINUTE_FRAGMENT_LOOKBACK_DAYS`` 个分区：更早的历史
+    分区可能是按需拉取的局部数据（1~16 只），symbol 少是正常而非残片；
+    全窗口判定会把这些日子误判为残片、触发灾难性重拉。**最新分区跳过
+    判定**（新交易日回源未完成由 resume 增量机制负责；它若真是中断残片，
+    次日成为中间分区后自愈）。
+
+    基线取窗口内 symbol 数**最多**的分区而非最新分区：最新分区可能是
+    新交易日回源未完成（只有 1 只），不能代表全市场。
+    """
+    if not STOCK_MINUTE_ROOT.is_dir():
+        return {}
+    days = sorted(STOCK_MINUTE_ROOT.glob("date=*"))
+    if len(days) < 2:
+        return {}
+    window = days[-_MINUTE_FRAGMENT_LOOKBACK_DAYS:]
+    best_day: Path | None = None
+    best_syms: set[str] | None = None
+    for d in window:
+        part = d / "part.parquet"
+        if not part.exists():
+            continue
+        try:
+            syms = set(pl.read_parquet(part, columns=["symbol"])["symbol"].to_list())
+        except Exception:
+            continue
+        if best_syms is None or len(syms) > len(best_syms):
+            best_day, best_syms = d, syms
+    if best_day is None or best_syms is None:
+        return {}
+    fragments: dict[_date, list[str]] = {}
+    for d in window[:-1]:
+        if d == best_day:
+            continue
+        part = d / "part.parquet"
+        if not part.exists():
+            continue
+        try:
+            syms = set(pl.read_parquet(part, columns=["symbol"])["symbol"].to_list())
+        except Exception:
+            continue
+        missing = best_syms - syms
+        if len(missing) >= _MINUTE_FRAGMENT_THRESHOLD:
+            fragments[_date.fromisoformat(d.name.removeprefix("date="))] = sorted(missing)
+    return fragments
+
+
 def _listing_date_map() -> dict[str, _date]:
     """返回 {symbol: 上市日期} 映射（instruments parquet，缺失回退 4/1 起点）。
 
@@ -395,12 +457,22 @@ def sync_stock_minute(limit: int | None = None) -> int:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
         return 0
     listing = _listing_date_map()
+    # 残片自愈: 回源中断会留下中间分区 symbol 数严重不足的残片(如 08-12 凌晨
+    # pytdx 崩溃留下 3640/5208), resume 只按最新分区判断会永久跳过这些日子。
+    # 先补残片日缺失的 symbol, 再做正常增量回源。
+    fragments = _minute_fragment_days()
+    fragment_rows = 0
+    for day, missing in sorted(fragments.items()):
+        n = sync_stock_minute_day(day, symbols=missing)
+        fragment_rows += n
+        logger.info("mootdx_service: 分钟残片日 %s 补齐 %d 行 (%d 只)",
+                    day, n, len(missing))
     # resume：收集已落盘的 symbol，跳过（中断后续跑不重拉）
     done_syms = _existing_minute_symbols()
     todo = [s for s in stocks if s not in done_syms]
     if not todo:
         logger.info("mootdx_service: 股票分钟已全部覆盖（%d 只），无需回源", len(done_syms))
-        return 0
+        return fragment_rows
     if limit is not None:
         todo = todo[:limit]
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的 4/1 前
@@ -462,11 +534,13 @@ def sync_stock_minute(limit: int | None = None) -> int:
     if chunk:
         _flush_stock_minute_chunk(chunk)
     logger.info("mootdx_service: 股票分钟回源完成, 累计 %d 行", total)
-    return total
+    return total + fragment_rows
 
 
-def sync_stock_minute_day(day: _date) -> int:
-    """按缺失日补全全市场股票分钟到 ``kline_minute/date={day}``。
+def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
+    """按缺失日补全股票分钟到 ``kline_minute/date={day}``。
+
+    ``symbols``：只处理给定列表（残片日只补缺失标的）；None = 全市场。
 
     「有数据才回」：上市日晚于目标日的 symbol 跳过（该日尚未上市）；
     当日停牌/无 bar 自然跳过不落盘。逐 symbol 用 ``get_minute`` 全量拉，
@@ -478,6 +552,11 @@ def sync_stock_minute_day(day: _date) -> int:
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
         return 0
+    if symbols is not None:
+        want = set(symbols)
+        stocks = [s for s in stocks if s in want]
+        if not stocks:
+            return 0
     listing = _listing_date_map()
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
     # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过（与 sync_stock_minute 一致）。

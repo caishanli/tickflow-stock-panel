@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1276,8 +1277,24 @@ def run_pipeline(data_dir: Path | None = None,
         rebuilt_dates = set(date_buffers)
         missing_dates = existing_dates - rebuilt_dates
         if missing_dates:
-            sample = ", ".join(sorted(missing_dates)[:5])
-            raise RuntimeError(f"全量重建结果缺少已有日期分区,拒绝覆盖: {sample}")
+            # 孤儿分区: 重建源(kline_daily)中不存在对应日期, 无法重建也不该保留,
+            # 清理掉避免其永久阻塞全量重建; 仅对「daily 有数据但重建缺失」的真实
+            # 数据丢失场景保留拒绝覆盖保护。
+            daily_dates = {
+                p.name.removeprefix("date=")
+                for p in daily_dir.glob("date=*")
+                if p.is_dir()
+            }
+            orphans = missing_dates - daily_dates
+            if orphans:
+                logger.warning("全量重建清理 %d 个孤儿分区(无 daily 数据源): %s",
+                               len(orphans), ", ".join(sorted(orphans)[:5]))
+                for ds in sorted(orphans):
+                    shutil.rmtree(base / f"date={ds}", ignore_errors=True)
+                missing_dates = missing_dates - orphans
+            if missing_dates:
+                sample = ", ".join(sorted(missing_dates)[:5])
+                raise RuntimeError(f"全量重建结果缺少已有日期分区,拒绝覆盖: {sample}")
 
         base.mkdir(parents=True, exist_ok=True)
 

@@ -1529,6 +1529,8 @@ export const api = {
     ),
 
   dataStatus: () => request<DataStatus>('/api/data/status'),
+  localMarketStats: (page: number, pageSize: number) =>
+    request<LocalMarketStats>(`/api/data/local-market-stats?page=${page}&page_size=${pageSize}`),
   dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),
@@ -2269,6 +2271,23 @@ export interface DataStatus {
   last_instruments_run: string | null
   checked_at: string
   indicators_ready?: boolean
+}
+
+export interface LocalMarketStatsRow {
+  date: string
+  stock_daily: number
+  stock_minute: number
+  etf_daily: number
+  etf_minute: number
+  index_daily: number
+  index_minute: number
+}
+
+export interface LocalMarketStats {
+  total: number
+  page: number
+  page_size: number
+  rows: LocalMarketStatsRow[]
 }
 
 export interface EnrichedField {
