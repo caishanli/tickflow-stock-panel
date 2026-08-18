@@ -73,7 +73,7 @@
 
 ## 测试
 
-- 后端 pytest：新端点返回的某日各列数量与直接 `SELECT COUNT(DISTINCT symbol)` 一致；分页正确（total 与日期数一致、page 越界返回空 rows 或钳制）；无数据目录时全 0。
+- 后端 pytest：新端点返回的某日各列数量与直接 `SELECT COUNT(DISTINCT symbol)` 一致；分页正确（total 与日期数一致、page 越界返回空 rows）；无数据目录时全 0。
 - 前端无测试脚本：`pnpm lint` + `pnpm build` 验证。
 
 ## 非目标
