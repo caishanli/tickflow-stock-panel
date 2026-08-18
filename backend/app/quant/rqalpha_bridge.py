@@ -554,13 +554,20 @@ def _install_bridge_mod():
             def start_up(self, env, mod_config):
                 # 系统 mod（sys_accounts/sys_simulation 等）已在各自 start_up
                 # 用原生实现覆盖了 api 同名函数，这里兜底重新注册我们的 shim，
-                # 确保策略 `from jqdata import *` 拿到的是兼容层实现。
-                _jq._register_jq_apis()
+                # 确保策略拿到的是兼容层实现。ptrade 模式（install_ptradecompat
+                # 已置 _ACTIVE）注册 ptrade shim，否则注册聚宽 shim。
+                from app.quant import ptradecompat as _ptc
+                if getattr(_ptc, "_ACTIVE", False):
+                    _ptc._register_ptrade_apis()
+                else:
+                    _jq._register_jq_apis()
                 # UI 路径同样需要 rqalpha 对象补丁：否则策略里
                 # context.universe = [...] 抛 AttributeError（StrategyContext.universe
                 # 原生只读）；PriceBoard 补丁保证未订阅标的的定价/涨跌停可回退取数。
                 _jq._patch_rqalpha_objects()
                 _jq._patch_price_board()
+                if getattr(_ptc, "_ACTIVE", False):
+                    _ptc._patch_rqalpha_objects()
                 ds = _consume_pending_data_source()
                 if ds is not None:
                     env.set_data_source(ds)
@@ -1696,6 +1703,348 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
         logger.exception("聚宽回测失败: %s", e)
         # 失败必须落库（日志 + failed 状态）：否则 run 永远停在 queued/running，
         # 前端看不到任何运行情况（子进程 stdout/stderr 被 DEVNULL，不写库即不可见）。
+        if db_path:
+            _rid = params.get("run_id")
+            if _rid:
+                try:
+                    db.insert_log(_rid, _now(), "ERROR", str(e))
+                    db.update_run(_rid, "failed", error=str(e)[:500], finished_at=_now())
+                except Exception:  # noqa: BLE001
+                    pass
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# PTrade 策略运行入口：注入 ptradecompat + 复用 JqDataSource，跑 1m 回测
+# ---------------------------------------------------------------------------
+def _pt_to_jq(code: str) -> str:
+    """PTrade 码 -> rqalpha/JQ order_book_id（510300.SS -> 510300.XSHG）。"""
+    return str(code).replace(".SS", ".XSHG").replace(".SZ", ".XSHE")
+
+
+def _extract_ptrade_pools(strategy_text: str):
+    """从 ptrade 策略源码提取固定 ETF 池（.SS/.SZ），转为 JQ 码。"""
+    codes = _re.findall(r"\b(\d{6}\.(?:SS|SZ))\b", strategy_text)
+    seen = []
+    for c in codes:
+        jq = _pt_to_jq(c)
+        if jq not in seen:
+            seen.append(jq)
+    return seen
+
+
+def _ptrade_rewrite_source(strategy_text: str) -> str:
+    """ptrade 策略源重写：init 别名 + rqalpha 钩子桥接（bar_dict 适配）。
+
+    rqalpha 策略钩子名为 init / before_trading / handle_bar / after_trading；
+    PTrade 钩子名为 initialize / before_trading_start / handle_data / after_trading_end，
+    且 data 参数是 SecurityUnitData 快照而非 rqalpha BarDict。这里补桥接函数。"""
+    strategy_code = strategy_text
+    if not _re.search(r"def init\s*\(", strategy_code):
+        strategy_code += "\ninit = initialize\n"
+    bridge = (
+        "\ndef before_trading(context, bar_dict):\n"
+        "    before_trading_start(context, _ptrade_adapt_bar_dict(bar_dict))\n"
+        "\ndef handle_bar(context, bar_dict):\n"
+        "    handle_data(context, _ptrade_adapt_bar_dict(bar_dict))\n"
+        "\ndef after_trading(context):\n"
+        "    after_trading_end(context, None)\n"
+    )
+    if not _re.search(r"def before_trading\s*\(", strategy_code):
+        strategy_code += bridge
+    return strategy_code
+
+
+def run_ptrade_backtest(strategy_path: str, params: dict,
+                        universe=None, max_universe=None, db_path=None) -> dict:
+    """运行 PTrade 风格策略（如 wufu v5.4 双持仓 ptrade 版）。
+
+    注入 ptradecompat 兼容层与 JqDataSource，1m 频率回测，成交/净值写入
+    out_dir 下 trades.csv / equity.csv。
+    """
+    if db_path:
+        db.init_db(db_path)
+        _rid = params.get("run_id")
+        if _rid:
+            db.upsert_run(_rid, params.get("strategy_id", ""), params.get("name", ""),
+                          json.dumps(params, ensure_ascii=False), "running")
+
+    from app.quant.jqengine.datasource.manager import get_data_manager
+
+    with open(strategy_path, "r", encoding="utf-8") as f:
+        strategy_text = f.read()
+
+    m = _re.search(r"set_benchmark\(\s*['\"](\d{6}\.(?:SS|SZ))['\"]", strategy_text)
+    benchmark_pt = m.group(1) if m else "510300.SS"
+    benchmark = _pt_to_jq(benchmark_pt)
+    start = (params.get("start") or "").strip() or "2026-01-01"
+    end = (params.get("end") or "").strip() or "2026-07-08"
+    _data_start = (pd.Timestamp(start) - pd.Timedelta(days=250)).strftime("%Y-%m-%d")
+
+    dm = get_data_manager()
+    dm._use_real_minute = True
+    _log_progress(params.get("run_id"),
+                  f"加载行情缓存与 ETF 宇宙（{start} ~ {end}，此阶段耗时较长，进度会持续更新）…")
+    try:
+        _load_etf_universe(dm)
+    except Exception:
+        pass
+    try:
+        dm.preload_daily()
+    except Exception:
+        pass
+    try:
+        _refresh_codes = list(dict.fromkeys(
+            [benchmark, "511880.XSHG"] + list(_EXTRA_INDEX_CODES)
+            + list(_extract_ptrade_pools(strategy_text))
+        ))
+        _refreshed = 0
+        for _c in _refresh_codes:
+            try:
+                dm.fetch("get_daily", _c, _data_start, end)
+                _refreshed += 1
+            except Exception:
+                pass
+        if _refreshed:
+            _log_progress(params.get("run_id"),
+                          f"离线回测前补齐日线缓存: {_refreshed}/{len(_refresh_codes)} 只标的已覆盖 {start}~{end}")
+        import datetime as _dt2
+        _avail = set()
+        for _c in [benchmark] + list(_EXTRA_INDEX_CODES):
+            try:
+                _df = dm.fetch("get_daily", _c, start, end)
+                if _df is None or (hasattr(_df, "empty") and _df.empty):
+                    continue
+                _col = "trade_date" if "trade_date" in _df.columns else (
+                    "date" if "date" in _df.columns else None)
+                if not _col:
+                    continue
+                for _d in pd.to_datetime(_df[_col]).dt.date:
+                    _avail.add(_d)
+            except Exception:
+                pass
+        if _avail:
+            _days = sorted(_avail)
+            _last_str = _days[-1].strftime("%Y-%m-%d")
+            _req_end = pd.Timestamp(end).date()
+            if _days[-1] < _req_end:
+                _log_progress(params.get("run_id"),
+                              f"回测结束日 {end} 超出可用数据（最新 {_last_str}），自动收敛到 {_last_str}")
+                end = _last_str
+            _req_start = pd.Timestamp(start).date()
+            _min_start = _days[1] if len(_days) >= 2 else _days[0]
+            if _req_start < _min_start:
+                _ms = _min_start.strftime("%Y-%m-%d")
+                _log_progress(params.get("run_id"),
+                              f"回测开始日 {start} 超出基准可用数据首日（需前置 bar），自动收敛到 {_ms}")
+                start = _ms
+            elif _req_start > _days[-1]:
+                start = _last_str
+    except Exception:
+        pass
+    _prev_offline = getattr(dm, "_offline", False)
+    dm._offline = True
+    try:
+        return _run_ptrade_backtest_inner(dm, strategy_text, params, benchmark, start, end,
+                                          db_path, max_universe=max_universe,
+                                          strategy_path=strategy_path)
+    finally:
+        dm._offline = _prev_offline
+        global _LIVE_RUN_ID
+        _LIVE_RUN_ID = None
+
+
+def _run_ptrade_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
+                               max_universe=None, strategy_path=""):
+    """run_ptrade_backtest 主体（独立函数，便于上层 try/finally 恢复 dm._offline）。"""
+    from .ptradecompat import install_ptradecompat
+    from .jqcompat import JqDataSource, _is_jq_etf_code
+
+    _log_progress(params.get("run_id"), "预加载日线缓存…")
+    dm.preload_daily()
+    dm.set_minute_window(start, end)
+
+    _cov_warn = _minute_coverage_warning(start, dm.minute_coverage_start())
+    if _cov_warn:
+        _log_progress(params.get("run_id"), _cov_warn, level="WARNING")
+
+    def _is_index(p):
+        return p.startswith("000") or p.startswith("399")
+
+    etf_universe, etf_names, etf_list_dates = _load_etf_universe(dm)
+    if not etf_universe:
+        all_codes = [k.split("get_daily_", 1)[1]
+                     for k in dm._daily_mem if k.startswith("get_daily_")]
+        etf_universe = [c for c in all_codes if _is_jq_etf_code(c)]
+        etf_names = {}
+        etf_list_dates = {}
+    else:
+        etf_universe = [c for c in etf_universe if not _is_index(c.split(".")[0])]
+    if max_universe and len(etf_universe) > max_universe:
+        etf_universe = etf_universe[:max_universe]
+    print("[universe] 全市场 ETF 池: {} 只".format(len(etf_universe)))
+    _log_progress(params.get("run_id"), f"全市场 ETF 池: {len(etf_universe)} 只，构建数据源…")
+
+    fixed_pools = _extract_ptrade_pools(strategy_text)
+
+    ds_universe = list(dict.fromkeys(
+        list(etf_universe) + list(fixed_pools) + _EXTRA_INDEX_CODES
+        + [benchmark, "511880.XSHG"]
+    ))
+
+    ds = JqDataSource(dm, ds_universe, start, end, benchmark=benchmark,
+                      minute_cache_cap=int(params.get("minute_cache_cap", 800)))
+    _set_pending_data_source(ds)
+
+    valid_universe = ds_universe
+    print("[universe] 数据源覆盖标的: {} 只（含固定池+基准，惰性加载日线）".format(len(valid_universe)))
+
+    install_ptradecompat(valid_universe, names=etf_names, benchmark=benchmark,
+                         list_dates=etf_list_dates, market_codes=etf_universe)
+
+    strategy_code = _ptrade_rewrite_source(strategy_text)
+
+    config = {
+        "base": {
+            "start_date": start,
+            "end_date": end,
+            "frequency": "1m",
+            "run_type": "b",
+            "accounts": {"stock": float(params.get("capital", 100000.0))},
+            "benchmark": benchmark,
+            "data_bundle_path": params.get("bundle_dir") or _dt_dir(),
+            "matching_type": "current_bar",
+            "strategy_file": "strategy.py",
+        },
+        "mod": {
+            "sys_analyser": {"record": True, "benchmark": benchmark},
+            "sys_simulation": {
+                "slippage": float(params.get("slippage", 0.0001)),
+                "matching_type": "current_bar",
+                "price_limit": False,
+                "volume_limit": False,
+                "inactive_limit": False,
+            },
+            "sys_accounts": {
+                "auto_switch_order_value": True,
+            },
+            "sys_transaction_cost": {
+                "stock_commission_multiplier": float(params.get("fee", 0.0001)) / 0.0008,
+                "stock_min_commission": float(params.get("min_commission", 5)),
+            },
+            "quantbridge": {"enabled": True},
+            "ptradebarcache": {"enabled": True},
+            "quantlive": {"enabled": True},
+        },
+        "extra": {"log_level": params.get("log_level", "error")},
+    }
+
+    global _LIVE_RUN_ID
+    run_id = params.get("run_id") or _re.sub(r"\W+", "", strategy_path).lower()[:16]
+    _LIVE_RUN_ID = run_id
+
+    out_dir = params.get("out_dir") or os.path.join(CONFIG.runtime_dir, "ptradewufu")
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        import rqalpha.main as _rqmain
+
+        def _noop_adjust(config, data_proxy):
+            import pandas as _pd
+
+            data_root = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))), "..", "data")
+            all_dates = set()
+            for sub in ("kline_daily", "kline_etf_daily"):
+                d = os.path.join(data_root, sub)
+                if os.path.isdir(d):
+                    for name in os.listdir(d):
+                        if name.startswith("date="):
+                            all_dates.add(name[len("date="):])
+            if all_dates:
+                idx = _pd.DatetimeIndex(sorted(all_dates))
+                start_ts = _pd.Timestamp(config.base.start_date)
+                end_ts = _pd.Timestamp(config.base.end_date)
+                mask = (idx >= start_ts) & (idx <= end_ts)
+                calendar = idx[mask]
+                if len(calendar) == 0:
+                    calendar = _pd.date_range(start_ts, end_ts, freq="B")
+                config.base.trading_calendar = calendar
+                config.base.start_date = calendar[0].date()
+                config.base.end_date = calendar[-1].date()
+            else:
+                config.base.trading_calendar = _pd.date_range(
+                    config.base.start_date, config.base.end_date, freq="B")
+
+        _rqmain._adjust_start_date = _noop_adjust
+
+        from rqalpha import run as rq_run
+        _log_progress(run_id, f"初始化完成，启动 rqalpha 引擎，开始逐 bar 回测（{start} ~ {end}）…")
+        result = rq_run(config, source_code=strategy_code)
+
+        equity = _extract_equity(result, benchmark=benchmark, dm=dm, start=start, end=end)
+        trades = _extract_trades(result)
+
+        eq_path = os.path.join(out_dir, "equity.csv")
+        tr_path = os.path.join(out_dir, "trades.csv")
+        pd.DataFrame(equity, columns=["date", "value", "benchmark", "cash", "market_value"]).to_csv(eq_path, index=False)
+        pd.DataFrame(trades, columns=["dt", "code", "side", "price", "qty", "pnl", "pnl_pct", "cost"]).to_csv(tr_path, index=False)
+
+        try:
+            summary = result["sys_analyser"]["summary"]
+
+            def _num(v):
+                v = float(v if v is not None else 0.0)
+                if v != v or v in (float("inf"), float("-inf")):
+                    return None
+                return v
+
+            metrics = {
+                "total_return": _num(summary.get("total_returns")),
+                "annualized": _num(summary.get("annualized_returns")),
+                "sharpe": _num(summary.get("sharpe")),
+                "max_drawdown": _num(summary.get("max_drawdown")),
+            }
+        except Exception:
+            metrics = {}
+
+        tm = _compute_trade_metrics(trades)
+        metrics["win_rate"] = tm["win_rate"]
+        metrics["profit_loss_ratio"] = tm["profit_loss_ratio"]
+        metrics["trade_count"] = tm["trade_count"]
+        if metrics.get("sharpe") is None:
+            metrics["sharpe"] = _sharpe_from_equity(equity)
+        if metrics.get("annualized") is None and metrics.get("total_return") is not None:
+            metrics["annualized"] = metrics["total_return"]
+
+        n_trades = len(trades)
+        final_equity = equity[-1][1] if equity else float(params.get("capital", 100000.0))
+
+        if db_path:
+            if not db.get_equity(run_id):
+                db.bulk_insert_equity(run_id, equity)
+            if not db.get_trades(run_id):
+                for t in trades:
+                    db.insert_trade(run_id, *t)
+            _cur = db.get_run(run_id) or {}
+            if _cur.get("status") in ("failed", "cancelled"):
+                logger.info("run %s 已是终态 %s，跳过 done 回写", run_id, _cur.get("status"))
+            else:
+                db.update_run(run_id, "done",
+                              metrics_json=json.dumps(metrics, ensure_ascii=False),
+                              finished_at=_now())
+
+        return {
+            "trades_csv": tr_path,
+            "equity_csv": eq_path,
+            "n_trades": n_trades,
+            "final_equity": final_equity,
+            "metrics": metrics,
+            "universe_size": len(etf_universe),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("PTrade 回测失败: %s", e)
         if db_path:
             _rid = params.get("run_id")
             if _rid:

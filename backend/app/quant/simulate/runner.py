@@ -278,8 +278,16 @@ def _emit_eod_notify(account_id, ctx, state, aux, now) -> None:
     _dispatch_dingtalk(account_id, msg, ts=str(now))
 
 
-def _load_engine():
-    """惰性加载 jqengine 单机引擎（看护模式不依赖）。"""
+def _is_ptrade_strategy(code: str) -> bool:
+    """策略语言层判定：ptrade 策略用 .SS/.SZ 代码。"""
+    return bool(code) and (".SS" in code or ".SZ" in code)
+
+
+def _load_engine(code: str = ""):
+    """惰性加载单机引擎：ptrade 策略用 ptradeengine，否则 jqengine（看护模式不依赖）。"""
+    if _is_ptrade_strategy(code):
+        from ..ptradeengine import ptrade_api, ptrade_loader
+        return ptrade_api, ptrade_loader
     from ..jqengine.engine.jq import api as jq_api
     from ..jqengine.engine.jq import loader as jq_loader
     return jq_api, jq_loader
@@ -344,10 +352,12 @@ def _is_trading_day(dm, today) -> bool:
         return pd.Timestamp(today).weekday() < 5
 
 
-def _prev_close_dm(dm, code: str, today: str):
-    """昨收（涨跌停判定用）。取不到返回 None → 不判定。"""
+def _prev_close_dm(dm, code: str, today: str, conv=None):
+    """昨收（涨跌停判定用）。取不到返回 None → 不判定。conv=(to_engine, to_pt)。"""
     try:
         start = str(pd.Timestamp(today) - pd.Timedelta(days=45))[:10]
+        if conv is not None:
+            code = conv[0](code)
         df = dm.fetch("get_daily", code, start, str(today))
     except Exception:  # noqa: BLE001
         return None
@@ -388,8 +398,11 @@ def _seed_universe(ctx) -> None:
             pools.extend(val)
         elif isinstance(val, dict):
             pools.extend(val.keys())
-    # 走弱期判定用到的指数（check_a_share_weak_period 固定列表）
-    pools += ["000300.XSHG", "399101.XSHE", "399006.XSHE", "000510.XSHG"]
+    # 走弱期判定用到的指数（check_a_share_weak_period 固定列表）：
+    # ptrade 策略用 .SS/.SZ 域，统一转换到策略域（jq 策略恒等）
+    _, _to_pt = getattr(ctx, "_code_conv", None) or (lambda c: c, lambda c: c)
+    for _ic in ("000300.XSHG", "399101.XSHE", "399006.XSHE", "000510.XSHG"):
+        pools.append(_to_pt(_ic))
     codes = []
     for c in pools:
         c = str(c).strip()
@@ -492,6 +505,11 @@ def _fire_session(account_id: str, bundle, ctx, bar_dt, fired: set, jq_api,
     force_all（日频账户）：忽略任务设定时刻，全部 run_daily 任务在本次唯一
     tick 各触发一次。
     """
+    # ptrade bundle：run_daily 前先刷新策略 _LAST_DATA 快照到当前 bar
+    # （handle_data 在其后才触发，否则 run_daily 读到上一根 bar 的价）
+    refresh = getattr(bundle, "refresh_snapshot", None)
+    if refresh is not None:
+        refresh(ctx)
     calls = []
     for func, t in bundle.daily:
         ts = str(t)
@@ -602,12 +620,14 @@ def _revalue_at_close(dm, ctx, state: dict, bar_dt) -> None:
     today = pd.Timestamp(bar_dt)
     close_ts = today.replace(hour=15, minute=0, second=0, microsecond=0)
     pf = ctx.portfolio
+    conv = getattr(ctx, "_code_conv", None)
     changed = False
     for code, pos in list(pf.positions.items()):
-        price = dm.get_minute_price_at(code, close_ts)
+        engine_code = conv[0](code) if conv else code
+        price = dm.get_minute_price_at(engine_code, close_ts)
         if price is None:
             try:
-                df = dm.fetch("get_daily", code, str(today.date()), str(today.date()))
+                df = dm.fetch("get_daily", engine_code, str(today.date()), str(today.date()))
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     price = float(df["close"].iloc[-1])
             except Exception as e:  # noqa: BLE001
@@ -922,8 +942,12 @@ def _mark_to_market(feed, dm, ctx, state: dict, last_mark: dict, now) -> bool:
     pf = ctx.portfolio
     if not pf.positions:
         return False
+    conv = getattr(ctx, "_code_conv", None)
     codes = list(pf.positions.keys())
-    prices, _bar = feed(dm, codes, now, None)
+    engine_codes = [conv[0](c) for c in codes] if conv else codes
+    prices, _bar = feed(dm, engine_codes, now, None)
+    if prices and conv is not None:
+        prices = {conv[1](c): v for c, v in prices.items()}
     if not prices:
         return False
     dirty = False
@@ -959,10 +983,14 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     """
     jq_api = aux["jq_api"]
     now = now or datetime.datetime.now()
+    _to_engine, _to_pt = getattr(ctx, "_code_conv", None) or (lambda c: c, lambda c: c)
     watch = list(dict.fromkeys(
         list(getattr(ctx, "universe", None) or [])
         + list(ctx.portfolio.positions.keys())))
-    prices, bar_dt = feed(dm, watch, now, aux["fresh_frames"])
+    # 数据层用引擎码（JQ），feed 前转换；ptrade 策略域为 .SS/.SZ
+    prices, bar_dt = feed(dm, [_to_engine(c) for c in watch], now, aux["fresh_frames"])
+    if prices:
+        prices = {_to_pt(c): v for c, v in prices.items()}
     if bar_dt is None:
         # 收盘宽限期内无实时数据属正常，不报警
         t = pd.Timestamp(now).time()
@@ -990,7 +1018,7 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         cache_key = (code, today)
         prev = pc_cache.get(cache_key)
         if prev is None:
-            prev = _prev_close_dm(dm, code, today)
+            prev = _prev_close_dm(dm, code, today, conv=getattr(ctx, "_code_conv", None))
             if prev:
                 pc_cache[cache_key] = prev
         if not prev:
@@ -1030,7 +1058,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
         db.update_sim_account(account_id, status="failed")
         _emit_log(account_id, "error", f"策略不存在或代码为空: {sid}")
         return
-    jq_api, jq_loader = _load_engine()
+    jq_api, jq_loader = _load_engine(code)
     dm = dm if dm is not None else _make_dm()
     feed = feed or live_feed.refresh
     # 实时由 stock data 服务保证，feed 恒走网络客户端（无 mootdx 直连路径）。

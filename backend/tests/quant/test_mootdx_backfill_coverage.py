@@ -704,6 +704,182 @@ def test_missing_minute_guards_intraday_today(tmp_path, monkeypatch):
     assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == []
 
 
+def test_missing_minute_excludes_today_intraday_when_partition_absent(tmp_path, monkeypatch):
+    """盘中：今日分区缺失但旧分区存在 → 仍不回源今天（08-18 盘中重启回归）。
+
+    背景：原实现盘中保护只认 ``latest >= today``（今日分区已存在），当日分区
+    缺失（15:35 收盘 cron 尚未跑，latest<today）时保护失效，把今天当缺失日
+    盘中落盘半日数据（11:30 错标 13:00:00 一并污染）。盘中无论分区是否存在
+    都排除今天；收盘后才把今天算缺失。
+    """
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_etf_minute"
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", root)
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "_trade_days_up_to",
+                        lambda end: [_dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+
+    # 盘中 10:55：今日分区缺失 → 仍不应把今天当缺失日
+    assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == []
+    # 收盘后：今天算缺失，回源补全
+    assert ms._missing_minute_days(_dt.datetime(2026, 8, 5, 16, 0)) == [_dt.date(2026, 8, 5)]
+
+
+def test_missing_minute_still_backfills_past_day_intraday(tmp_path, monkeypatch):
+    """盘中：latest 之后的真实历史缺失日仍要补（只排除今天）。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_etf_minute"
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", root)
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5), _dt.date(2026, 8, 6)])
+
+    # 盘中 08-06：08-05 是真实缺失的历史交易日，应补；08-06 今天排除
+    days = ms._missing_minute_days(_dt.datetime(2026, 8, 6, 10, 55))
+    assert days == [_dt.date(2026, 8, 5)]
+
+
+def test_sync_etf_minute_normalizes_phantom_noon_bar(tmp_path, monkeypatch):
+    """mootdx 盘中把 11:30 错标 13:00:00 → 落盘归位为 11:30:00（不污染分区）。"""
+    import datetime as _dt
+    import pandas as pd
+    import polars as pl
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
+
+    class _Src:
+        def get_minute_recent(self, code, pages=1):
+            # 源返回 10:30 + 被错标成 13:00:00 的 11:30（当天走 get_minute_recent 分支）
+            idx = pd.DatetimeIndex([
+                _dt.datetime(2026, 8, 5, 10, 30), _dt.datetime(2026, 8, 5, 13, 0)])
+            idx.name = "datetime"
+            return pd.DataFrame({"open": [1.0, 2.0], "close": [1.0, 2.0],
+                                 "volume": [100.0, 200.0], "amount": [100.0, 200.0]},
+                                index=idx)
+
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _dt.date(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    n = ms.sync_etf_minute(_dt.date(2026, 8, 5))
+    part = tmp_path / "kline_etf_minute" / "date=2026-08-05" / "part.parquet"
+    assert part.exists()
+    df = pl.read_parquet(part)
+    times = sorted(str(t) for t in df["datetime"].to_list())
+    assert times == ["2026-08-05 10:30:00", "2026-08-05 11:30:00"], times
+    assert n == 2
+
+
+def test_clean_phantom_noon_partitions_relabels_etf(tmp_path, monkeypatch):
+    """既有 ETF 分区里的 13:00:00 假bar → 归位 11:30:00（无数据丢失）。"""
+    import datetime as _dt
+    import polars as pl
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_etf_minute"
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", root)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    pdir = root / "date=2026-08-05"
+    pdir.mkdir(parents=True)
+    df = pl.DataFrame({
+        "symbol": ["159518.XSHE"] * 3,
+        "datetime": [_dt.datetime(2026, 8, 5, 10, 30), _dt.datetime(2026, 8, 5, 13, 0),
+                     _dt.datetime(2026, 8, 5, 13, 1)],
+        "open": [1.0, 2.0, 3.0], "high": [1.0, 2.0, 3.0],
+        "low": [1.0, 2.0, 3.0], "close": [1.0, 2.0, 3.0],
+        "volume": [100.0, 200.0, 300.0], "amount": [100.0, 200.0, 300.0],
+    })
+    df.write_parquet(pdir / "part.parquet")
+
+    res = ms.clean_phantom_noon_partitions()
+    assert res["partitions"] == ["kline_etf_minute/date=2026-08-05"]
+    out = pl.read_parquet(pdir / "part.parquet")
+    times = sorted(str(t) for t in out["datetime"].to_list())
+    assert times == ["2026-08-05 10:30:00", "2026-08-05 11:30:00", "2026-08-05 13:01:00"]
+
+
+def test_clean_phantom_noon_partitions_keeps_real_1130(tmp_path, monkeypatch):
+    """同 symbol 已有真实 11:30 时，假bar 丢弃而非覆盖真实行。"""
+    import datetime as _dt
+    import polars as pl
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    pdir = root / "date=2026-08-05"
+    pdir.mkdir(parents=True)
+    df = pl.DataFrame({
+        "symbol": ["000063.SZ"] * 3,
+        "datetime": [_dt.datetime(2026, 8, 5, 11, 30), _dt.datetime(2026, 8, 5, 13, 0),
+                     _dt.datetime(2026, 8, 5, 13, 1)],
+        "open": [1.0, 2.0, 3.0], "high": [1.0, 2.0, 3.0],
+        "low": [1.0, 2.0, 3.0], "close": [1.0, 2.0, 3.0],
+        "volume": [111.0, 222.0, 300.0], "amount": [111.0, 222.0, 300.0],
+    })
+    df.write_parquet(pdir / "part.parquet")
+
+    ms.clean_phantom_noon_partitions()
+    out = pl.read_parquet(pdir / "part.parquet")
+    assert out.height == 2
+    row = out.filter(pl.col("datetime") == pl.lit(_dt.datetime(2026, 8, 5, 11, 30),
+                                                  pl.Datetime("us")))
+    assert row.height == 1
+    assert row["volume"].to_list() == [111.0]  # 保留真实 11:30，不用假bar 覆盖
+
+
+def test_clean_phantom_noon_partitions_recovers_swallowed_1130(tmp_path, monkeypatch):
+    """11:30 被吞的 symbol（只有 13:00:00 幻影）→ 归位补回 11:30（000838.SZ 案例）。"""
+    import datetime as _dt
+    import polars as pl
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    pdir = root / "date=2026-08-05"
+    pdir.mkdir(parents=True)
+    df = pl.DataFrame({
+        "symbol": ["000838.SZ"] * 2,
+        "datetime": [_dt.datetime(2026, 8, 5, 10, 30), _dt.datetime(2026, 8, 5, 13, 0)],
+        "open": [1.0, 2.0], "high": [1.0, 2.0],
+        "low": [1.0, 2.0], "close": [1.0, 2.0],
+        "volume": [100.0, 200.0], "amount": [100.0, 200.0],
+    })
+    df.write_parquet(pdir / "part.parquet")
+
+    ms.clean_phantom_noon_partitions()
+    out = pl.read_parquet(pdir / "part.parquet")
+    times = sorted(str(t) for t in out["datetime"].to_list())
+    assert times == ["2026-08-05 10:30:00", "2026-08-05 11:30:00"], times
+
+
+def test_stock_minute_write_funnel_relabels_phantom(tmp_path, monkeypatch):
+    """股票分钟写漏斗：新拉帧里的 13:00:00 假bar → 落盘归位 11:30:00。"""
+    import datetime as _dt
+    import polars as pl
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    chunk = [pl.DataFrame({
+        "symbol": ["000063.SZ"] * 2,
+        "datetime": [_dt.datetime(2026, 8, 5, 11, 30), _dt.datetime(2026, 8, 5, 13, 0)],
+        "open": [1.0, 2.0], "high": [1.0, 2.0],
+        "low": [1.0, 2.0], "close": [1.0, 2.0],
+        "volume": [100.0, 200.0], "amount": [100.0, 200.0],
+    })]
+    ms._flush_stock_minute_chunk(chunk)
+    out = pl.read_parquet(tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet")
+    times = sorted(str(t) for t in out["datetime"].to_list())
+    assert times == ["2026-08-05 11:30:00"], times  # 幻影归位后与真实 11:30 去重
+
+
 def test_scan_missing_partitions_reports_universe_segments(tmp_path, monkeypatch):
     """scan_missing_partitions 应报告 ETF 宇宙缺失的代码段（快照缺段的回归）。
 

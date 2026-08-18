@@ -19,13 +19,14 @@ from app.quant.datasource.manager import QuantDataProvider
 from app.quant.strategies.store import get_strategy
 
 try:
-    from app.quant.rqalpha_bridge import run_backtest, run_jq_backtest
+    from app.quant.rqalpha_bridge import run_backtest, run_jq_backtest, run_ptrade_backtest
 except Exception as _bridge_import_err:
     # rqalpha 是可选依赖（quant/backtest extras）。bridge 导入失败不能在这里中止：
     # 模块加载早于 __main__ 的 try/except，直接抛会让 run 永远卡在 queued。
     # 留 None + 错误，由 main() 检查并抛错，__main__ 兜底把 run 置 failed。
     run_backtest = None
     run_jq_backtest = None
+    run_ptrade_backtest = None
     _BRIDGE_IMPORT_ERROR = _bridge_import_err
 else:
     _BRIDGE_IMPORT_ERROR = None
@@ -60,6 +61,11 @@ def _looks_like_jq(code: str) -> bool:
     return False
 
 
+def _looks_like_ptrade(code: str) -> bool:
+    """PTrade 策略用 .SS/.SZ 代码 + run_daily(context, func, time)，走 ptradecompat 引擎。"""
+    return bool(code) and (".SS" in code or ".SZ" in code)
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: run_quant_backtest.py <run_id>", file=sys.stderr)
@@ -79,13 +85,23 @@ def main():
         code = params.get("strategy_code", "")
     _progress(run_id, "回测子进程已启动，策略代码就绪，正在初始化数据与引擎…")
 
-    if run_backtest is None or run_jq_backtest is None:
+    if run_backtest is None or run_jq_backtest is None or run_ptrade_backtest is None:
         raise RuntimeError(
             "rqalpha bridge 不可用（quant/backtest 可选依赖未安装？）："
             f"{_BRIDGE_IMPORT_ERROR}"
         )
 
-    if _looks_like_jq(code):
+    if _looks_like_ptrade(code):
+        # PTrade 策略（.SS/.SZ + run_daily(context, func, time)）走 ptradecompat 引擎
+        _progress(run_id, "检测到 PTrade 策略，路由到 ptradecompat 引擎（1m 逐 bar）")
+        tmp = os.path.join(CONFIG.runtime_dir, f"ptradestrat_{run_id}.py")
+        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(code)
+        params = dict(params, run_id=run_id, strategy_id=strategy_id or "ptrade",
+                      name=params.get("name", ""), out_dir=os.path.join(CONFIG.runtime_dir, "ptradewufu"))
+        run_ptrade_backtest(tmp, params, db_path=db.routed_db_path(run_id))
+    elif _looks_like_jq(code):
         # 聚宽(jq)策略走 jqcompat 引擎（正确的日志/成交捕获与 ETF 池解析）
         _progress(run_id, "检测到聚宽式策略，路由到 jqcompat 引擎（1m 逐 bar）")
         # run_jq_backtest 需要 strategy 文本；通过临时文件传入（与 scripts/
