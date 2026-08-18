@@ -206,8 +206,63 @@ def sync_etf_minute(day: _date | None = None) -> int:
     return _write_minute_partition(out, ETF_MINUTE_ROOT, day)
 
 
+# mootdx 源错标的 13:00:00 假bar 判定（真实分钟数据下午从 13:01 起，13:00:00 恒为假）
+_PHANTOM_NOON_EXPR = (pl.col("datetime").dt.hour() == 13) & (pl.col("datetime").dt.minute() == 0)
+
+
+def _relabel_phantom_noon_df(df: pl.DataFrame) -> pl.DataFrame:
+    """把分钟分区里 mootdx 错标的 13:00:00 假bar 归位为 11:30:00（任意交易日）。
+
+    通达信分钟源在盘中/盘后拉取时会把某日最后一根上午 bar（11:30）错标成
+    13:00:00 返回（其 OHLCV 即真实 11:30）。同 symbol 已有真实 11:30 时丢弃
+    假bar（unique keep=first + sort 把真实行排前）；11:30 被吞的 symbol 归位
+    即补回。
+    """
+    if not df.filter(_PHANTOM_NOON_EXPR).height:
+        return df
+    relabeled = df.with_columns(
+        _PHANTOM_NOON_EXPR.alias("_is_noon"),
+        pl.when(_PHANTOM_NOON_EXPR)
+          .then(pl.col("datetime") - pl.duration(hours=1, minutes=30))
+          .otherwise(pl.col("datetime")).alias("datetime"))
+    return (relabeled
+            .sort("_is_noon")  # 真实行(False)在前，unique keep=first 保留真实 11:30
+            .unique(subset=["symbol", "datetime"], keep="first")
+            .drop("_is_noon")
+            .sort(["symbol", "datetime"]))
+
+
+def clean_phantom_noon_partitions() -> dict:
+    """清理既有分钟分区中 mootdx 错标的 13:00:00 假bar（归位 11:30:00）。
+
+    通达信源盘中拉取时把某日 11:30 的最后一根 bar 错标 13:00:00 写入分区：
+    ETF 分钟（08-18 案例 1658 只全带）+ 股票分钟（08-05~08-17 十一日，
+    180/180 假bar 与真实 11:30 逐列一致，000838.SZ 的 11:30 被吞需补回）。
+    真实分钟数据下午从 13:01 起，13:00:00 恒为假bar，其值即真实 11:30，
+    归位不丢数据。扫描 ``kline_etf_minute``/``kline_minute`` 全部分区，
+    有假bar 的分区原子重写。返回清理过的分区相对路径列表。
+    """
+    cleaned = []
+    for root in (ETF_MINUTE_ROOT, STOCK_MINUTE_ROOT):
+        for pdir in sorted(root.glob("date=*")):
+            part = pdir / "part.parquet"
+            if not part.exists():
+                continue
+            df = pl.read_parquet(part)
+            if not df.filter(_PHANTOM_NOON_EXPR).height:
+                continue
+            out = _relabel_phantom_noon_df(df)
+            tmp = pdir / "part.tmp"
+            out.write_parquet(tmp)
+            tmp.rename(part)
+            rel = f"{root.name}/{pdir.name}"
+            cleaned.append(rel)
+            logger.info("mootdx_service: %s 清理 13:00:00 假bar（归位 11:30:00）", rel)
+    return {"partitions": cleaned}
+
+
 def _write_minute_partition(df: pl.DataFrame, root: Path, day: _date) -> int:
-    """按 date 分区原子写分钟（读旧→concat→unique→tmp→rename）。返回行数。"""
+    """按 date 分区原子写分钟（读旧→concat→unique→归位假bar→tmp→rename）。返回行数。"""
     pdir = root / f"date={day}"
     pdir.mkdir(parents=True, exist_ok=True)
     part = pdir / "part.parquet"
@@ -216,7 +271,7 @@ def _write_minute_partition(df: pl.DataFrame, root: Path, day: _date) -> int:
         old = pl.read_parquet(part)
         df = pl.concat([old, df]).unique(
             subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
-    df = df.sort(["symbol", "datetime"])
+    df = _relabel_phantom_noon_df(df)
     df.write_parquet(tmp)
     tmp.rename(part)
     logger.info("mootdx_service: 分钟落盘 %d 行 → %s", df.height, part)
@@ -257,6 +312,7 @@ def _flush_stock_minute_chunk(chunk: list[pl.DataFrame]) -> None:
                 subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
         else:
             merged = g
+        merged = _relabel_phantom_noon_df(merged)
         merged.write_parquet(tmp)
         tmp.rename(pfile)
 
@@ -847,9 +903,14 @@ def _missing_minute_days(now: _dt.datetime | None = None) -> list[_date]:
     latest = _date.fromisoformat(existing[-1])
     now = now or _dt.datetime.now()
     today = now.date()
-    if latest >= today and not _market_closed(now):
-        return []
-    return [d for d in _trade_days_up_to(today) if latest < d <= today]
+    days = [d for d in _trade_days_up_to(today) if latest < d <= today]
+    if not _market_closed(now):
+        # 盘中不把"今天"当缺失日：当日分钟尚未走完，回源只拿到半日数据，且
+        # mootdx 会把 11:30 错标 13:00:00，写入即污染分区（08-18 案例：盘中
+        # 重启触发 backfill，latest<today 时旧实现 `latest>=today` 保护失效）。
+        # 无论今日分区是否存在都排除今天；latest 之后的真实历史缺失日仍照常补。
+        return [d for d in days if d < today]
+    return days
 
 
 def _missing_daily_days(root: Path, now: _dt.datetime | None = None) -> list[_date]:
