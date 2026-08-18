@@ -394,14 +394,20 @@ def _get_all_fund_codes():
     except Exception:
         pass
     # 2) 降级：get_market_detail 按 ETF 代码段过滤（沪 51/56/588xxxx、深 159xxx）
+    #    真机回测不支持 get_etf_list，走此路径；只枚举沪深（SS/SZ），按 6 位基码去重
+    #    （真机 get_market_detail 可能跨市场/跨格式重复返回同一产品，3166 多为重复）。
     try:
         ml = get_market_list()
         if ml is None:
             return None
         fund_codes = {}
+        seen_base = set()
         for _, r in ml.iterrows():
             mic = r.get('finance_mic') or r.get('market_code') or r.get('code') or r.get('market')
             if not mic:
+                continue
+            # 只枚举沪深股票市场（SS/SZ）；CSI/XBHS 为指数/板块市场，无场内 ETF
+            if mic not in ('SS', 'SZ', 'XSHG', 'XSHE'):
                 continue
             try:
                 detail = get_market_detail(mic)
@@ -414,29 +420,29 @@ def _get_all_fund_codes():
             pn_col = 'prod_name' if 'prod_name' in cols else ('name' if 'name' in cols else None)
             if not pc_col:
                 continue
+            cnt = 0
             for _, drow in detail.iterrows():
                 try:
                     pc = str(drow[pc_col])
-                    if pc in fund_codes:
-                        continue
                     base = pc.split('.')[0]
                     if not (len(base) == 6 and base.isdigit()):
                         continue
                     # 只保留 ETF 代码段（沪 51/56/588xxxx、深 159xxx），排除 LOF/货币/其他产品
                     if not base.startswith(('51', '56', '588', '159')):
                         continue
+                    if base in seen_base:
+                        continue
+                    seen_base.add(base)
                     if '.' not in pc:
-                        if mic in ('SS', 'XSHG'):
-                            pc = base + '.SS'
-                        elif mic in ('SZ', 'XSHE'):
-                            pc = base + '.SZ'
-                        else:
-                            continue
+                        pc = base + '.SS' if mic in ('SS', 'XSHG') else base + '.SZ'
                     fund_codes[pc] = str(drow[pn_col]) if pn_col else pc
+                    cnt += 1
                 except Exception:
                     continue
+            log.info("【ETF枚举】市场 %s 命中 %d 只" % (mic, cnt))
         if not fund_codes:
             return None
+        log.info("【ETF枚举】合计 %d 只（get_etf_list 真机回测不可用，降级 get_market_detail）" % len(fund_codes))
         return fund_codes
     except Exception as e:
         log.warning('枚举全市场基金失败: %s' % e)
