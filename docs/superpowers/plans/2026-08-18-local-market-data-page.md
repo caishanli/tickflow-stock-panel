@@ -175,7 +175,9 @@ _LOCAL_MARKET_TABLES: dict[str, str] = {
     "index_minute": "kline_index_minute",
 }
 _LOCAL_STATS_TTL = 30.0
-_local_stats_cache: dict[tuple[int, int], tuple[float, dict]] = {}
+# 实现修订（Task 1 评审确认）：键含 str(data_dir)，否则多 data_dir 的测试进程内共享缓存
+# 会交叉污染（test_empty_data_dir 读到 test_counts_per_date 的陈旧结果）；生产单 data_dir 行为不变。
+_local_stats_cache: dict[tuple[str, int, int], tuple[float, dict]] = {}
 _local_stats_lock = threading.Lock()
 ```
 
