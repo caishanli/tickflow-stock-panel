@@ -67,6 +67,10 @@ def test_full_rebuild_overwrites_existing_partitions_without_deleting_base(tmp_p
 
 def test_full_rebuild_rejects_missing_existing_dates_before_writing(tmp_path, monkeypatch):
     _write_daily(tmp_path, "2026-07-15", 15.0)
+    # daily 07-14 分区存在但为空 → 重建结果缺该日期, 属于真实数据丢失(非孤儿)
+    empty = tmp_path / "kline_daily" / "date=2026-07-14" / "part.parquet"
+    empty.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"symbol": [], "date": []}).write_parquet(empty)
     _write_existing(tmp_path, "2026-07-14", 14.0)
     _write_existing(tmp_path, "2026-07-15", 1.0)
     monkeypatch.setattr(pipeline, "compute_enriched", _fake_compute_enriched)
@@ -78,3 +82,19 @@ def test_full_rebuild_rejects_missing_existing_dates_before_writing(tmp_path, mo
         tmp_path / "kline_daily_enriched" / "date=2026-07-15" / "part.parquet"
     )
     assert existing["close"].to_list() == [1.0]
+
+
+def test_full_rebuild_cleans_orphan_dates_not_in_daily(tmp_path, monkeypatch):
+    """重建源(kline_daily)不存在的孤儿 enriched 分区应被清理, 而非阻塞全量重建。"""
+    _write_daily(tmp_path, "2026-07-15", 15.0)
+    _write_existing(tmp_path, "2026-07-14", 14.0)
+    _write_existing(tmp_path, "2026-07-15", 1.0)
+    monkeypatch.setattr(pipeline, "compute_enriched", _fake_compute_enriched)
+
+    written = pipeline.run_pipeline(data_dir=tmp_path)
+
+    assert written == 1
+    assert not (tmp_path / "kline_daily_enriched" / "date=2026-07-14").exists()
+    assert pl.read_parquet(
+        tmp_path / "kline_daily_enriched" / "date=2026-07-15" / "part.parquet"
+    )["close"].to_list() == [15.0]
