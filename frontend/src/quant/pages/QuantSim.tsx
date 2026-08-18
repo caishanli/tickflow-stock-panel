@@ -9,6 +9,8 @@ import * as api from '../api'
 import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
 import { DingtalkConfigDialog } from './DingtalkConfigDialog'
+import { QuantTradeDialog } from '@/components/QuantTradeDialog'
+import type { IntradayMarker } from '@/components/EChartsIntraday'
 
 /** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
 function cssVar(name: string, fallback: string) {
@@ -42,6 +44,20 @@ function fmtPct(v: any) {
 function fmtStopLoss(v: any) {
   if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
   return `${(v * 100).toFixed(2)}%`
+}
+
+/** 从 "YYYY-MM-DD HH:MM:SS"（可省略秒）提取日期 + HH:MM，供分时标记定位 */
+function parseTradeTime(ts: unknown): { date: string; time: string } | null {
+  const s = String(ts ?? '')
+  const m = s.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})/)
+  return m ? { date: m[1], time: m[2] } : null
+}
+
+function toMarkerAction(action: unknown): IntradayMarker['action'] {
+  const a = String(action).toUpperCase()
+  if (a === 'BUY') return 'BUY'
+  if (a === 'STOP_LOSS') return 'STOP_LOSS'
+  return 'SELL'
 }
 
 const RANGES: { label: string; days: number | null }[] = [
@@ -297,6 +313,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
 }) {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'trades' | 'stoploss' | 'logs' | 'alerts'>('trades')
+  const [preview, setPreview] = useState<{ symbol: string; name: string; date?: string; markers: IntradayMarker[] } | null>(null)
   const [showDingtalkCfg, setShowDingtalkCfg] = useState(false)
   const [rangeDays, setRangeDays] = useState<number | null>(null)
   // 止损日志：首拉由 status 的 stop_loss 初始化，盘中新止损由 onTrade(STOP_LOSS) 实时追加
@@ -690,7 +707,18 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                     const pnlAmt = pnlPct != null ? pnlPct * (Number(p.amount) || 0) * (Number(p.avg_cost) || 0) : null
                     return (
-                      <tr key={sym} className="border-t border-border/60">
+                      <tr key={sym}
+                        onClick={() => {
+                          const t = parseTradeTime(p.entry_ts)
+                          setPreview({
+                            symbol: sym,
+                            name: p.name ?? '',
+                            markers: t && Number(p.avg_cost) > 0
+                              ? [{ date: t.date, time: t.time, price: Number(p.avg_cost), action: 'BUY' }]
+                              : [],
+                          })
+                        }}
+                        className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
                         <td className="px-3 py-1.5 text-muted">{p.entry_ts ? String(p.entry_ts).slice(0, 16) : '—'}</td>
                         <td className="px-3 py-1.5">{p.name ?? ''}</td>
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
@@ -750,7 +778,19 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                   {[...sortedTrades].reverse().map((t: any, i: number) => {
                     const h = holdOf(sortedTrades.length - 1 - i)
                     return (
-                    <tr key={i} className="border-t border-border/60 hover:bg-elevated/60 transition-colors">
+                    <tr key={i}
+                      onClick={() => {
+                        const parsed = parseTradeTime(t.ts)
+                        setPreview({
+                          symbol: t.code ?? '',
+                          name: t.name ?? '',
+                          date: String(t.ts ?? '').slice(0, 10),
+                          markers: parsed && typeof t.price === 'number'
+                            ? [{ date: parsed.date, time: parsed.time, price: t.price, action: toMarkerAction(t.action) }]
+                            : [],
+                        })
+                      }}
+                      className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
                       <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
@@ -841,6 +881,16 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           </div>
         )}
       </div>
+      {preview && (
+        <QuantTradeDialog
+          symbol={preview.symbol}
+          name={preview.name}
+          initialView="minute"
+          initialDate={preview.date}
+          intradayMarkers={preview.markers}
+          onClose={() => setPreview(null)}
+        />
+      )}
       {showDingtalkCfg && <DingtalkConfigDialog onClose={() => setShowDingtalkCfg(false)} />}
     </div>
   )

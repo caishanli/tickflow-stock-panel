@@ -17,6 +17,115 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/kline", tags=["kline"])
 
+# ---- 本地 stockdata 服务取数 (仅弹窗 data_source="stockdata" 请求使用) ----
+
+_STOCKDATA_CLIENT = None
+
+
+def _get_stockdata_client():
+    """惰性单例: 主后端 → 本地 stockdata 服务 (TCP)。连接/超时由调用方兜底回退。"""
+    global _STOCKDATA_CLIENT
+    if _STOCKDATA_CLIENT is None:
+        from app.quant.datasource.network_client import StockDataClient
+        _STOCKDATA_CLIENT = StockDataClient()
+    return _STOCKDATA_CLIENT
+
+
+def _to_jq_code(symbol: str) -> str:
+    """000001.SZ → 000001.XSHE; 600000.SH → 600000.XSHG; 未知后缀按深市。"""
+    pure, _, suf = symbol.rpartition(".")
+    if not pure:
+        return symbol
+    return pure + (".XSHG" if suf in ("SH", "XSHG") else ".XSHE")
+
+
+def _to_partition_symbol(symbol: str) -> str:
+    """513360.XSHG → 513360.SH; 000001.XSHE → 000001.SZ; 其余原样 (与 stockdata 服务 _tf_symbol 一致)。"""
+    pure, _, suf = symbol.rpartition(".")
+    if not pure:
+        return symbol
+    return pure + (".SH" if suf in ("XSHG", "SH") else ".SZ")
+
+
+_STOCKDATA_ETF_SET_CACHE: set[str] | None = None
+
+
+def _stockdata_etf_set() -> set[str]:
+    """服务端 ETF 集合 (由 kline_etf_daily 分区推导, .SH 格式)。
+
+    repo.get_etf_symbol_set 依赖 instruments_etf 分区(曾为空导致 ETF 判成股票),
+    弹窗 stockdata 路径以此为准。进程级缓存, 失败重试。
+    """
+    global _STOCKDATA_ETF_SET_CACHE
+    if _STOCKDATA_ETF_SET_CACHE is None:
+        try:
+            df = _get_stockdata_client().get_all_securities(types=["etf"])
+            _STOCKDATA_ETF_SET_CACHE = set(df["symbol"].astype(str)) if df is not None and not df.empty else set()
+        except Exception as e:
+            logger.warning("stockdata 服务 ETF 集合获取失败: %s", e)
+            _STOCKDATA_ETF_SET_CACHE = set()
+    return _STOCKDATA_ETF_SET_CACHE
+
+
+def _stockdata_is_etf(symbol: str) -> bool:
+    return _to_partition_symbol(symbol) in _stockdata_etf_set()
+
+
+def _stockdata_frame(out: dict, jq: str, index_col: str):
+    """StockDataClient 响应 (pandas DatetimeIndex df) → polars, index 还原为 index_col 列。"""
+    import polars as pl
+    pdf = out.get(jq)
+    if pdf is None or pdf.empty:
+        return pl.DataFrame()
+    pdf = pdf.reset_index()
+    pdf = pdf.rename(columns={pdf.columns[0]: index_col})
+    return pl.from_pandas(pdf)
+
+
+def _stockdata_minute(symbol: str, trade_date: date):
+    """本地 stockdata 服务取分钟: 盘中今天走 current_snapshot(按需回源), 历史读分区。失败返回空 df。
+
+    服务分区/内存库 datetime 为北京时 naive, 而前端分时轴契约与 TickFlow 实时路径
+    (_normalize_minute 的 epoch→naive) 均为 UTC naive → 返回前统一 -8h 折算。
+    """
+    import polars as pl
+    try:
+        jq = _to_jq_code(symbol)
+        client = _get_stockdata_client()
+        if trade_date == date.today():
+            out = client.current_snapshot([jq])
+        else:
+            out = client.get_minute_pool([jq], f"{trade_date} 09:30:00", f"{trade_date} 15:00:00")
+        df = _stockdata_frame(out, jq, "datetime")
+        if df.is_empty():
+            return df
+        return df.with_columns(
+            (pl.col("datetime") - pl.duration(hours=8)).alias("datetime"))
+    except Exception as e:
+        logger.warning("stockdata 服务分钟获取失败, 回退后续路径: %s %s: %s", symbol, trade_date, e)
+        return pl.DataFrame()
+
+
+def _stockdata_daily(symbol: str, start: date, end: date, is_stock: bool = True):
+    """本地 stockdata 服务取原始日K (无复权/无指标)。股票 volume 股→手 与 enriched 口径一致。失败返回空 df。"""
+    import polars as pl
+    try:
+        jq = _to_jq_code(symbol)
+        out = _get_stockdata_client().get_price(jq, start_date=start, end_date=end, frequency="daily")
+        df = _stockdata_frame(out, jq, "date")
+        if df.is_empty():
+            return df
+        if "trade_dt" in df.columns:
+            df = df.drop("trade_dt")
+        df = df.with_columns(pl.col("date").cast(pl.Date))
+        df = df.with_columns(pl.lit(symbol).alias("symbol"))
+        if is_stock:
+            df = df.with_columns((pl.col("volume") / 100).alias("volume"))
+        return df
+    except Exception as e:
+        logger.warning("stockdata 服务日K获取失败, 回退后续路径: %s: %s", symbol, e)
+        return pl.DataFrame()
+
 
 def _minute_allowed(capset) -> bool:
     """是否有分钟K权限 (TickFlow Pro+ 或 custom minute 源)。"""
@@ -204,6 +313,7 @@ def get_daily(
     start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD, 优先于 days"),
     end_date: Optional[str] = Query(None, description="截止日期 YYYY-MM-DD, 默认今天"),
     ext_columns: Optional[str] = Query(None, description="逗号分隔的 ext 列: config_id.field_name"),
+    data_source: str = Query("default", description="default=现状; stockdata=弹窗专用, 本地 stockdata 服务优先"),
 ):
     """读取本地 enriched 表中某只股票的日 K。
 
@@ -227,6 +337,34 @@ def get_daily(
 
     # 从 enriched 表读取 (已含前复权 OHLCV + 技术指标 + 信号); ETF/指数走独立存储
     df = repo.get_daily_asset(asset_type, symbol, start, end)
+
+    # 弹窗专用 stockdata 模式: 用服务端 ETF 集合判定 (repo instruments_etf 曾为空,
+    # ETF 会被误判成 stock 走 enriched 周频坏数据)。ETF 直接服务优先; 股票 enriched
+    # 数据正常, 仅空时回退服务。
+    if data_source == "stockdata":
+        sd_is_etf = _stockdata_is_etf(symbol)
+        if sd_is_etf or df.is_empty():
+            raw = _stockdata_daily(symbol, start, end, is_stock=not sd_is_etf)
+            if not raw.is_empty():
+                factors = pl.DataFrame()
+                capset = getattr(request.app.state, "capabilities", None)
+                try:
+                    from app.tickflow.capabilities import Cap
+                    if capset and capset.has(Cap.ADJ_FACTOR):
+                        factors = kline_sync.fetch_adj_factor_single(symbol)
+                except Exception as e:
+                    logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
+                try:
+                    enriched = compute_enriched(raw, factors=factors)
+                except Exception as e:
+                    logger.warning("stockdata 日K enriched 计算失败, 回退后续路径: %s: %s", symbol, e)
+                else:
+                    rows = enriched.tail(days).to_dicts()
+                    rows = _maybe_inject_live_candle(
+                        request, symbol, rows, "etf" if sd_is_etf else asset_type)
+                    resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                            "rows": rows, "source": "stockdata"}
+                    return _attach_ext(resp, repo, symbol, ext_columns)
 
     if df.is_empty():
         try:
@@ -585,6 +723,7 @@ def get_minute(
     request: Request,
     symbol: str = Query(..., description="标的代码"),
     trade_date: date | None = Query(None, alias="date", description="交易日期, 默认最新"),
+    data_source: str = Query("default", description="default=现状; stockdata=弹窗专用, 本地 stockdata 服务优先"),
 ):
     """读取某只股票某天的分钟 K 线。
 
@@ -631,7 +770,6 @@ def get_minute(
     price_limit = _get_price_limit_info(
         repo, symbol, trade_date, asset_type, stock_name,
     )
-    df = repo.get_minute(symbol, trade_date, asset_type=asset_type)
 
     # 完整交易日应有 240 条分钟K；如果是今天(盘中)，期望条数按已交易分钟估算
     expected = 240
@@ -649,6 +787,17 @@ def get_minute(
             expected = 120 + (h - 13) * 60 + m
         else:
             expected = 240
+
+    if data_source == "stockdata":
+        sd_df = _stockdata_minute(symbol, trade_date)
+        # 历史交易日要求 ≥90% 完整度, 不足走本地/TickFlow 补齐; 盘中今天按实际(实时累积)
+        if not sd_df.is_empty() and (trade_date != date.today() or len(sd_df) >= expected * 0.9):
+            return {
+                "symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                "date": str(trade_date), "rows": sd_df.to_dicts(),
+                "source": "stockdata", "price_limit": price_limit,
+            }
+    df = repo.get_minute(symbol, trade_date, asset_type=asset_type)
 
     is_complete = not df.is_empty() and len(df) >= expected * 0.9  # 允许 10% 容差
 

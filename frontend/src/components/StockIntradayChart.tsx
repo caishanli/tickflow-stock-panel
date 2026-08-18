@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { api, type MinuteKlineRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { EChartsIntraday } from '@/components/EChartsIntraday'
+import { EChartsIntraday, type IntradayMarker } from '@/components/EChartsIntraday'
 
 interface Props {
   symbol: string
@@ -14,6 +14,12 @@ interface Props {
   onPriceHover?: (price: number | null) => void
   /** 自动刷新间隔(ms)。undefined/0 = 不轮询(默认)。个股对话框盘中实时刷新时传入。 */
   refetchIntervalMs?: number
+  /** 分时图买卖标记 (date 感知) */
+  markers?: IntradayMarker[]
+  /** 数据源: default=默认 / stockdata=本地 stockdata 服务 */
+  dataSource?: 'default' | 'stockdata'
+  /** 允许「涨跌停」±10% 纵轴模式 (默认 true; 量化弹窗传 false 锁定自适应放大) */
+  allowLimitMode?: boolean
 }
 
 export function StockIntradayChart({
@@ -24,13 +30,16 @@ export function StockIntradayChart({
   className,
   onPriceHover,
   refetchIntervalMs,
+  markers,
+  dataSource,
+  allowLimitMode,
 }: Props) {
   const qc = useQueryClient()
   const [minuteDismissed, setMinuteDismissed] = useState(false)
 
   const minute = useQuery({
-    queryKey: QK.klineMinute(symbol, date ?? ''),
-    queryFn: () => api.klineMinute(symbol, date ?? undefined),
+    queryKey: QK.klineMinute(symbol, date ?? '', dataSource),
+    queryFn: () => api.klineMinute(symbol, date ?? undefined, dataSource),
     enabled: !!symbol && !!date,
     refetchInterval: refetchIntervalMs,
   })
@@ -116,6 +125,8 @@ export function StockIntradayChart({
           date={date}
           priceLimit={minute.data?.price_limit ?? undefined}
           onPriceHover={onPriceHover}
+          markers={markers}
+          allowLimitMode={allowLimitMode}
         />
       )}
     </div>

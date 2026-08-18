@@ -23,10 +23,16 @@ import { WarmupBadge } from '@/components/WarmupBadge'
 import { DatePicker } from '@/components/DatePicker'
 import { StrategyNavChart } from './charts/StrategyNavChart'
 import { ReturnDistributionChart } from './charts/ReturnDistributionChart'
-import { TradeKlineModal } from './components/TradeKlineModal'
+import { QuantTradeDialog } from '@/components/QuantTradeDialog'
+import type { ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
 import { SignalTriggerActions } from '@/components/signals/SignalTriggerActions'
 
 const formatDate = (date: Date) => date.toISOString().slice(0, 10)
+function addDays(date: string, days: number): string {
+  const d = new Date(date)
+  d.setDate(d.getDate() + days)
+  return d.toISOString().slice(0, 10)
+}
 const monthsAgo = (months: number) => {
   const date = new Date()
   date.setMonth(date.getMonth() - months)
@@ -885,6 +891,41 @@ export function StrategyBacktest() {
   const [tradePage, setTradePage] = useState(0)
   const [tradePageSize, setTradePageSize] = useState(10)
   const [selectedTrade, setSelectedTrade] = useState<StrategyBacktestTrade | null>(null)
+
+  const tradeDateRange = useMemo(() => selectedTrade ? {
+    start: addDays(String(selectedTrade.entry_date).slice(0, 10), -45),
+    end: addDays(String(selectedTrade.exit_date).slice(0, 10), 20),
+  } : null, [selectedTrade])
+
+  const tradeRanges = useMemo<ChartRange[]>(() => selectedTrade ? [{
+    start: String(selectedTrade.entry_date).slice(0, 10),
+    end: String(selectedTrade.exit_date).slice(0, 10),
+    label: '持仓区间',
+    color: 'rgba(59,130,246,0.07)',
+  }] : [], [selectedTrade])
+
+  const tradePriceLines = useMemo<ChartPriceLine[]>(() => {
+    if (!selectedTrade) return []
+    const start = String(selectedTrade.entry_date).slice(0, 10)
+    const end = String(selectedTrade.exit_date).slice(0, 10)
+    return [
+      {
+        value: Number(selectedTrade.entry_price),
+        label: `买入价 ${fmtPrice(selectedTrade.entry_price)}`,
+        color: '#C74040',
+        start,
+        end,
+      },
+      {
+        value: Number(selectedTrade.exit_price),
+        label: `卖出价 ${fmtPrice(selectedTrade.exit_price)}`,
+        color: '#2D9B65',
+        start,
+        end,
+      },
+    ]
+  }, [selectedTrade])
+
   const loadedStrategyRef = useRef<string | null>(null)
 
   const strategies = useQuery({
@@ -2590,7 +2631,17 @@ export function StrategyBacktest() {
         </>
       )}
 
-      <TradeKlineModal trade={selectedTrade} onClose={() => setSelectedTrade(null)} />
+      <QuantTradeDialog
+        symbol={selectedTrade?.symbol ?? null}
+        name={selectedTrade?.name}
+        initialView="daily"
+        dateRange={tradeDateRange ?? undefined}
+        ranges={tradeRanges}
+        priceLines={tradePriceLines}
+        showLimitMarkers={false}
+        showMarkerToggle={false}
+        onClose={() => setSelectedTrade(null)}
+      />
     </div>
   )
 }

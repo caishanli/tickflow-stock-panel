@@ -15,6 +15,16 @@ const THEME = {
   volDown: 'rgba(18,183,106,0.6)',
 }
 
+export interface IntradayMarker {
+  /** 标记所属交易日 YYYY-MM-DD，仅在分时显示该日时渲染 */
+  date: string
+  /** 交易时刻 HH:MM（本地时间，直接定位全天 242 点时间轴） */
+  time: string
+  /** 成交价（持仓行用成本价） */
+  price: number
+  action: 'BUY' | 'SELL' | 'STOP_LOSS'
+}
+
 interface Props {
   data: MinuteKlineRow[]
   height?: number
@@ -24,6 +34,9 @@ interface Props {
   onPriceHover?: (price: number | null) => void
   showLimitLines?: boolean
   showAvgLine?: boolean
+  markers?: IntradayMarker[]
+  /** 允许「涨跌停」±10% 纵轴模式 (默认 true; 量化弹窗传 false 锁定自适应放大) */
+  allowLimitMode?: boolean
 }
 
 function fmtTime(dt: string): string {
@@ -50,6 +63,40 @@ function fmtAmt(v: number): string {
   if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(2)}亿`
   if (v >= 10_000) return `${(v / 10_000).toFixed(0)}万`
   return v.toFixed(0)
+}
+
+/** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交 */
+function buildMarkerPoints(
+  markers: IntradayMarker[] | undefined,
+  chartDate: string | undefined,
+  closes: (number | null)[],
+  timeIndexMap: Map<string, number>,
+): any[] {
+  if (!markers || markers.length === 0) return []
+  const out: any[] = []
+  for (const m of markers) {
+    if (m.date !== chartDate) continue
+    const idx = timeIndexMap.get(m.time)
+    if (idx === undefined || !isValidPrice(closes[idx])) continue
+    const stop = m.action === 'STOP_LOSS'
+    const buy = m.action === 'BUY'
+    out.push({
+      coord: [idx, m.price],
+      symbol: stop ? 'circle' : 'triangle',
+      symbolSize: stop ? 17 : 12,
+      symbolRotate: buy ? 0 : 180,
+      itemStyle: { color: stop ? '#F59E0B' : buy ? '#C74040' : '#2D9B65', borderColor: '#FFFFFF', borderWidth: 0.5 },
+      label: {
+        show: true,
+        position: 'inside',
+        color: '#FFFFFF',
+        fontSize: 7,
+        fontWeight: 'bold',
+        formatter: stop ? '止损' : buy ? 'B' : 'S',
+      },
+    })
+  }
+  return out
 }
 
 function isValidPrice(v: number | null | undefined): v is number {
@@ -101,7 +148,7 @@ function getLimitPrices(prevClose: number, priceLimit?: PriceLimitInfo): {
   return { limitUp, limitDown, upPct, downPct }
 }
 
-function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgPrices: number[], lineColor: string, areaColor: string, yMode: YMode, ct: ChartTheme, priceLimit?: PriceLimitInfo, showLimitLines = true, showAvgLine = true): EChartsOption {
+function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgPrices: number[], lineColor: string, areaColor: string, yMode: YMode, ct: ChartTheme, priceLimit?: PriceLimitInfo, showLimitLines = true, showAvgLine = true, chartDate?: string, markers?: IntradayMarker[]): EChartsOption {
   // 将数据映射到全天时间轴上的正确位置
   const timeIndexMap = new Map(FULL_DAY_TIMES.map((t, i) => [t, i]))
   const closes = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
@@ -127,6 +174,8 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
       }
     }
   }
+
+  const markerPoints = buildMarkerPoints(markers, chartDate, closes, timeIndexMap)
 
   const areaStyle: any = {
     color: {
@@ -376,6 +425,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         areaStyle,
         connectNulls: true,
         markLine: markLineData.length > 0 ? { symbol: 'none', data: markLineData, animation: false, silent: true } : undefined,
+        markPoint: markerPoints.length > 0 ? { data: markerPoints, animation: false, silent: true } : undefined,
       },
       ...(showAvgLine ? [{
         name: '均价',
@@ -399,7 +449,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
   }
 }
 
-export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimit, onPriceHover, showLimitLines = true, showAvgLine = true }: Props) {
+export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimit, onPriceHover, showLimitLines = true, showAvgLine = true, markers, allowLimitMode = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<ECharts | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
@@ -413,6 +463,8 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
 
   const [infoIdx, setInfoIdx] = useState(data.length - 1)
   const [yMode, setYMode] = useState<YMode>('adaptive')
+  // allowLimitMode=false (量化弹窗) 时锁定自适应: ±10% 涨跌停模式会压平低波动标的分时线
+  const effectiveYMode: YMode = allowLimitMode ? yMode : 'adaptive'
   const ct = useChartTheme()
   const avgPrices = useMemo(() => computeAvgPrice(data), [data])
 
@@ -488,11 +540,11 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
       }
       fullDayToDataIdx.current = mapping
 
-      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine), true)
+      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), true)
     } else {
       chart.clear()
     }
-  }, [data, prevClose, height, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine])
+  }, [data, prevClose, height, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers])
 
   useEffect(() => {
     return () => {
@@ -516,13 +568,13 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
 
   return (
     <div className="w-full">
-      {/* 按钮行: 切换式按钮组, 居右 */}
-      {showLimitLines && <div className="flex items-center justify-end px-1 pb-0.5">
+      {/* 按钮行: 切换式按钮组, 居右 (量化弹窗 allowLimitMode=false 隐藏涨跌停, 锁定自适应) */}
+      {showLimitLines && allowLimitMode && <div className="flex items-center justify-end px-1 pb-0.5">
         <div className="inline-flex items-center rounded bg-elevated overflow-hidden">
           <button
             onClick={() => setYMode('adaptive')}
             className={`px-2.5 py-0.5 text-[10px] font-mono cursor-pointer transition-colors ${
-              yMode === 'adaptive'
+              effectiveYMode === 'adaptive'
                 ? 'bg-accent/20 text-accent'
                 : 'text-muted hover:text-secondary'
             }`}
@@ -533,7 +585,7 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
           <button
             onClick={() => setYMode('limit')}
             className={`px-2.5 py-0.5 text-[10px] font-mono cursor-pointer transition-colors ${
-              yMode === 'limit'
+              effectiveYMode === 'limit'
                 ? 'bg-accent/20 text-accent'
                 : 'text-muted hover:text-secondary'
             }`}
