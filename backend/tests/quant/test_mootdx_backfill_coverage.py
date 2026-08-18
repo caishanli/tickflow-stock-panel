@@ -1260,3 +1260,100 @@ def test_backfill_to_now_resyncs_sparse_stock_minute(tmp_path, monkeypatch):
 
     assert calls == [[_d(2026, 8, 5)]], f"残缺日应触发 range 重写, 实际 {calls}"
     assert res["missing"]["kline_minute"]["missing"] is True
+
+
+def test_sync_stock_minute_day_with_symbols_subset(tmp_path, monkeypatch):
+    """symbols 参数只拉取给定子集（残片日只补缺失标的）。"""
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [
+        "000001.SZ", "600000.SH", "999999.SZ"])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "000001.SZ": _dt.date(2020, 1, 1),
+        "600000.SH": _dt.date(2020, 1, 1),
+        "999999.SZ": _dt.date(2020, 1, 1),
+    })
+
+    fetched: list[str] = []
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            fetched.append(sym)
+            idx = pd.DatetimeIndex([_dt.datetime(2026, 6, 15, 9, 31)])
+            idx.name = "datetime"
+            return pd.DataFrame({"open": [1.0], "close": [1.0],
+                                 "volume": [100.0], "amount": [100.0]}, index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    n = ms.sync_stock_minute_day(_dt.date(2026, 6, 15),
+                                 symbols=["999999.SZ"])
+
+    assert n == 1
+    assert fetched == ["999999.SZ"], f"只应拉取子集, 实际 {fetched}"
+
+
+def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
+    """中间分区 symbol 数显著低于基线分区(回源中断残片) → 只补缺失标的。"""
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    ms.DATA_ROOT = tmp_path
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    universe = ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]
+    monkeypatch.setattr(ms, "_stock_universe", lambda: list(universe))
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        s: _dt.date(2020, 1, 1) for s in universe})
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_append_failure", lambda s, r: None)
+    # 测试规模小, 阈值降到 2
+    monkeypatch.setattr(ms, "_MINUTE_FRAGMENT_THRESHOLD", 2)
+
+    def _write(day: str, syms: list[str]) -> None:
+        pdir = root / f"date={day}"
+        pdir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({
+            "symbol": syms,
+            "datetime": [_dt.datetime.fromisoformat(f"{day}T09:31:00")] * len(syms),
+            "open": [1.0] * len(syms),
+            "high": [1.0] * len(syms),
+            "low": [1.0] * len(syms),
+            "close": [1.0] * len(syms),
+            "volume": [100.0] * len(syms),
+            "amount": [100.0] * len(syms),
+        }).write_parquet(pdir / "part.parquet")
+
+    # 残片日 08-12 只有 1 只；基线日 08-13 全量（最新日 08-14 只回源了 1 只,
+    # 模拟新交易日回源未完成——基线必须取 08-13 而非最新分区）→ missing = 3 只
+    _write("2026-08-11", ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"])
+    _write("2026-08-12", ["000001.SZ"])
+    _write("2026-08-13", list(universe))
+    _write("2026-08-14", ["000001.SZ"])
+
+    fetched: list[str] = []
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            fetched.append(sym)
+            idx = pd.DatetimeIndex([_dt.datetime(2026, 8, 12, 9, 31)])
+            idx.name = "datetime"
+            return pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0],
+                                 "close": [1.0], "volume": [100.0], "amount": [100.0]},
+                                index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    n = ms.sync_stock_minute()
+
+    # 残片补齐: 只拉 08-12 缺失的 3 只（000002/000003/000004），各 1 根；
+    # resume 再补最新日 08-14 缺失的同 3 只 → 共拉 6 次
+    assert n == 6
+    assert sorted(fetched) == sorted(universe[1:] * 2), \
+        f"残片+resume 应各拉缺失标的, 实际 {sorted(fetched)}"
+    df12 = pl.read_parquet(root / "date=2026-08-12" / "part.parquet")
+    assert sorted(set(df12["symbol"].to_list())) == list(universe)
+    assert df12.height == 4
