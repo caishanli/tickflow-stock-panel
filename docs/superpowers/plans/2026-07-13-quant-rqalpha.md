@@ -1171,7 +1171,7 @@ git commit -m "feat(quant): rqalpha bridge running joinquant-style strategies"
 - Create: `backend/app/quant/strategies/samples/wufu_etf_rotation.py`（迁移自 `/home/ubuntu/quant-daydayup/strategy/wufu_etf_rotation.py`）
 
 **Interfaces:**
-- `list_strategies() -> list[dict]`、`get_strategy(sid) -> dict | None`、`save_strategy(sid, name, code) -> dict`、`delete_strategy(sid) -> None`、`export_strategy(sid) -> str`（返回 .py 文本）、`import_strategy(name, code) -> dict`。`.py` 文件落 `CONFIG.strategies_dir/`；元数据落 `db` 的 `strategies` 表。
+- `list_strategies() -> list[dict]`、`get_strategy(sid) -> dict | None`、`save_strategy(sid, name, code) -> dict`、`delete_strategy(sid) -> None`、`export_strategy(sid) -> str`（返回 .py 文本）、`import_strategy(name, code) -> str`（返回新策略 sid）。`.py` 文件落 `CONFIG.strategies_dir/`；元数据落 `db` 的 `strategies` 表。
 
 **Steps:**
 
