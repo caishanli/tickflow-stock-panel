@@ -1489,6 +1489,8 @@ def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_append_failure", lambda s, r: None)
     # 测试规模小, 阈值降到 2
     monkeypatch.setattr(ms, "_MINUTE_FRAGMENT_THRESHOLD", 2)
+    # 本测试只验证残片+resume，隔离新交易日 range 补全（latest=08-14 vs 真实今天）
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
 
     def _write(day: str, syms: list[str]) -> None:
         pdir = root / f"date={day}"
@@ -1636,3 +1638,88 @@ def test_incomplete_etf_daily_window_250_vs_7(tmp_path, monkeypatch):
     assert ms._incomplete_etf_daily_days(recent=7) == [], "近 7 分区内无残缺"
     left = ms._incomplete_etf_daily_days(recent=250)
     assert len(left) == 1, f"recent=250 应识别 1 个残帧, 实际 {left}"
+
+
+# ---------------------------------------------------------------------------
+# 新交易日股票分钟当日落盘（resume 架空修复）
+# ---------------------------------------------------------------------------
+
+def test_missing_stock_minute_days_intraday_and_after_close(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+    assert ms._missing_stock_minute_days(_dt.datetime(2026, 8, 5, 10, 55)) == [], \
+        "盘中今天不补（防半程数据）"
+    assert ms._missing_stock_minute_days(_dt.datetime(2026, 8, 5, 16, 0)) == [_dt.date(2026, 8, 5)]
+
+
+def test_missing_stock_minute_days_past_gap(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    (root / "date=2026-08-03").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+    days = ms._missing_stock_minute_days(_dt.datetime(2026, 8, 6, 10, 55))
+    assert days == [_dt.date(2026, 8, 4), _dt.date(2026, 8, 5)], "盘中补真实历史缺失日，排除今天"
+
+
+def test_sync_stock_minute_pulls_missing_day_first(monkeypatch, tmp_path):
+    """回归：最新分区=昨天完整、今天无分区、已收盘 → 先 range 补今天再 resume。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(3)])
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": [f"6000{dd:03d}.SH" for dd in range(3)],
+        "datetime": [_dt.datetime(2026, 8, 4, 9, 31)] * 3, "close": [1.0] * 3,
+    }).write_parquet(root / "date=2026-08-04" / "part.parquet")
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    ranges = []
+    monkeypatch.setattr(ms, "sync_stock_minute_range",
+                        lambda days: ranges.append(list(days)) or 10)
+
+    n = ms.sync_stock_minute(limit=None)
+
+    assert ranges == [[_d(2026, 8, 5)]], "应先 range 补今天"
+    assert n == 10, "返回值应包含 range 写入行数"
+
+
+def test_sync_stock_minute_no_range_when_current(monkeypatch, tmp_path):
+    """最新分区=今天 → 不触发 range，正常 resume。"""
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    root = tmp_path / "kline_minute"
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(3)])
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [
+        _dt.date(2026, 8, 5)])
+    (root / "date=2026-08-05").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": [f"6000{dd:03d}.SH" for dd in range(3)],
+        "datetime": [_dt.datetime(2026, 8, 5, 9, 31)] * 3, "close": [1.0] * 3,
+    }).write_parquet(root / "date=2026-08-05" / "part.parquet")
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    ranges = []
+    monkeypatch.setattr(ms, "sync_stock_minute_range",
+                        lambda days: ranges.append(list(days)) or 10)
+
+    n = ms.sync_stock_minute(limit=None)
+
+    assert ranges == [], "最新分区已是今天，不应触发 range"
+    assert n == 0, "resume todo 空 → 0 行"

@@ -455,6 +455,16 @@ def sync_stock_minute(limit: int | None = None) -> int:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
         return 0
     listing = _listing_date_map()
+    # 新交易日整日缺失：resume 只按最新分区判断，最新分区是昨天且完整时会
+    # 误判"已覆盖"而跳过今天（08-18 案例）——先 range 补缺失交易日。盘中
+    # 排除今天，不写半程数据（见 _missing_stock_minute_days）。
+    range_rows = 0
+    missing_days = _missing_stock_minute_days()
+    if missing_days:
+        range_rows = sync_stock_minute_range(missing_days)
+        logger.info("mootdx_service: 股票分钟补齐缺失交易日 %s 共 %d 行",
+                    [d.isoformat() for d in missing_days], range_rows)
+        src = MootdxSource()  # 长批后重建连接
     # 残片自愈: 回源中断会留下中间分区 symbol 数严重不足的残片(如 08-12 凌晨
     # pytdx 崩溃留下 3640/5208), resume 只按最新分区判断会永久跳过这些日子。
     # 先补残片日缺失的 symbol, 再做正常增量回源。
@@ -470,7 +480,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     todo = [s for s in stocks if s not in done_syms]
     if not todo:
         logger.info("mootdx_service: 股票分钟已全部覆盖（%d 只），无需回源", len(done_syms))
-        return fragment_rows
+        return range_rows + fragment_rows
     if limit is not None:
         todo = todo[:limit]
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的 4/1 前
@@ -532,7 +542,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     if chunk:
         _flush_stock_minute_chunk(chunk)
     logger.info("mootdx_service: 股票分钟回源完成, 累计 %d 行", total)
-    return total + fragment_rows
+    return range_rows + total + fragment_rows
 
 
 def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
@@ -986,6 +996,25 @@ def _missing_minute_days(now: _dt.datetime | None = None) -> list[_date]:
         # mootdx 会把 11:30 错标 13:00:00，写入即污染分区（08-18 案例：盘中
         # 重启触发 backfill，latest<today 时旧实现 `latest>=today` 保护失效）。
         # 无论今日分区是否存在都排除今天；latest 之后的真实历史缺失日仍照常补。
+        return [d for d in days if d < today]
+    return days
+
+
+def _missing_stock_minute_days(now: _dt.datetime | None = None) -> list[_date]:
+    """找出股票分钟分区缺失的交易日（latest < d <= today，盘中排除今天）。
+
+    镜像 ``_missing_minute_days``（ETF 分钟），但读 ``STOCK_MINUTE_ROOT``。
+    resume 逻辑只看最新分区，新交易日无分区时会被误判"已覆盖"而跳过——
+    本函数供 ``sync_stock_minute`` 在 resume 之前先 range 补整日缺失。
+    """
+    existing = _partition_dates(STOCK_MINUTE_ROOT)
+    if not existing:
+        return []
+    latest = _dt.date.fromisoformat(existing[-1])
+    now = now or _dt.datetime.now()
+    today = now.date()
+    days = [d for d in _trade_days_up_to(today) if latest < d <= today]
+    if not _market_closed(now):
         return [d for d in days if d < today]
     return days
 
