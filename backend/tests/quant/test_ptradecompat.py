@@ -138,3 +138,33 @@ def test_get_history_single_code_field_column(monkeypatch):
     assert isinstance(df, pd.DataFrame), "单标的必须返回 DataFrame"
     assert "close" in df.columns, "单标的列名必须是行情字段（官方 get_history）"
     assert len(df[df["close"] > 0]) > 0
+
+
+def test_get_price_honors_start_end(monkeypatch):
+    """get_price 把 end_date 透传给 get_history，并按 start_date 过滤行。"""
+    import numpy as np
+    import pandas as pd
+
+    calls = {}
+
+    def _fake_batch(codes, count, freq, fields, end_dt):
+        calls["end_dt"] = end_dt
+        out = {}
+        for c in codes:
+            days = ["20260701093000", "20260702093000", "20260703093000", "20260706093000"]
+            arr = np.zeros(len(days), dtype=np.dtype([("datetime", "S14"), ("close", "f8")]))
+            for i, d in enumerate(days):
+                arr["datetime"][i] = d
+                arr["close"][i] = 1.0 + i
+            out[c] = arr
+        return out
+
+    import app.quant.ptradecompat as pc
+    monkeypatch.setattr(pc, "_history_bars_batch", _fake_batch)
+    df = pc.get_price("510300.SS", start_date="2026-07-02", end_date="2026-07-06",
+                      count=100, frequency="1d", fields=["close"])
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == ["close"]
+    assert calls["end_dt"] is not None, "end_date 必须透传给 get_history"
+    assert (df.index >= pd.Timestamp("2026-07-02")).all()
+    assert (df.index.normalize() <= pd.Timestamp("2026-07-06")).all()
