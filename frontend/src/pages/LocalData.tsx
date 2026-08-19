@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { HardDrive } from 'lucide-react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { HardDrive, Wrench } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
+import { toast } from '@/components/Toast'
 import { api, type LocalMarketStatsRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 
@@ -26,9 +27,30 @@ function fmtCount(n: number): string {
 
 export function LocalData() {
   const [page, setPage] = useState(1)
+  const qc = useQueryClient()
   const { data, isLoading, isError } = useQuery({
     queryKey: QK.localMarketStats(page, PAGE_SIZE),
     queryFn: () => api.localMarketStats(page, PAGE_SIZE),
+  })
+
+  const refreshStats = () => {
+    qc.invalidateQueries({ queryKey: ['local-market-stats'] })
+  }
+
+  const checkDayMut = useMutation({
+    mutationFn: (date: string) => api.checkDay(date),
+    onSuccess: (_data, date) => {
+      toast(`已触发 ${date} 检验补齐`, 'success', 'top')
+      setTimeout(refreshStats, 3000)
+    },
+  })
+
+  const checkFullMut = useMutation({
+    mutationFn: () => api.checkFull(),
+    onSuccess: () => {
+      toast('已触发全量检验补齐', 'success', 'top')
+      setTimeout(refreshStats, 3000)
+    },
   })
 
   const total = data?.total ?? 0
@@ -43,6 +65,18 @@ export function LocalData() {
         subtitle={total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数'}
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
+        {!isLoading && !isError && total > 0 && (
+          <div className="flex items-center justify-end">
+            <button
+              onClick={() => checkFullMut.mutate()}
+              disabled={checkFullMut.isPending}
+              className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+            >
+              <Wrench className="h-3 w-3" />
+              {checkFullMut.isPending ? '校验中...' : '全量检验补齐'}
+            </button>
+          </div>
+        )}
         {isLoading ? (
           <div className="space-y-2">
             {Array.from({ length: 8 }).map((_, i) => (
@@ -67,6 +101,7 @@ export function LocalData() {
                     {COLUMNS.map(c => (
                       <th key={c.key} className="px-3 py-2 font-normal text-right">{c.label}</th>
                     ))}
+                    <th className="px-3 py-2 font-normal text-right">操作</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -78,6 +113,15 @@ export function LocalData() {
                           {fmtCount(row[c.key])}
                         </td>
                       ))}
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          onClick={() => checkDayMut.mutate(row.date)}
+                          disabled={checkDayMut.isPending}
+                          className="px-2 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
+                        >
+                          检验
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

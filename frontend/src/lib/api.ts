@@ -1531,6 +1531,11 @@ export const api = {
   dataStatus: () => request<DataStatus>('/api/data/status'),
   localMarketStats: (page: number, pageSize: number) =>
     request<LocalMarketStats>(`/api/data/local-market-stats?page=${page}&page_size=${pageSize}`),
+  checkDay: (date: string) => request<{ ok: boolean }>('/api/data/check-day', {
+    method: 'POST',
+    body: JSON.stringify({ date }),
+  }),
+  checkFull: () => request<{ ok: boolean }>('/api/data/check-full', { method: 'POST' }),
   dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),
