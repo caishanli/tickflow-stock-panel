@@ -145,7 +145,7 @@ def test_replay_today_after_close_revalues(tmp_quant, monkeypatch):
     monkeypatch.setattr(runner, "is_paused", lambda aid: next(pauses))
     monkeypatch.setattr(runner, "in_trading", lambda now=None: False)
     monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
-    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today: None)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today, conv=None: None)
     monkeypatch.setattr(runner.time, "sleep", lambda s: None)
 
     class _ReplayDM(_StubDM):
@@ -253,7 +253,7 @@ def test_strategy_loop_marks_positions_during_lunch_break(tmp_quant, monkeypatch
     monkeypatch.setattr(runner, "is_paused", lambda aid: next(pauses))
     monkeypatch.setattr(runner, "in_trading", lambda now=None: False)   # 午休非交易
     monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
-    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today: None)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today, conv=None: None)
     monkeypatch.setattr(runner.time, "sleep", lambda s: None)
 
     class _FixedNow(datetime.datetime):
@@ -295,7 +295,7 @@ def test_strategy_loop_live_marks_positions(tmp_quant, monkeypatch):
     monkeypatch.setattr(runner, "is_paused", lambda aid: next(pauses))
     monkeypatch.setattr(runner, "in_trading", lambda now=None: True)
     monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
-    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today: None)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today, conv=None: None)
     sleep_log = []
     monkeypatch.setattr(runner.time, "sleep", lambda s: sleep_log.append(s))
 

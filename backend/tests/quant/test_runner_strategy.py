@@ -93,6 +93,17 @@ def handle_data(context):
     g.count += 1
 '''
 
+STRATEGY_AFTERNOON = '''
+def init(context):
+    context.universe = ["510300.XSHG"]
+    g.afternoon_n = 0
+
+def afternoon(context):
+    g.afternoon_n += 1
+
+run_daily(afternoon, "13:10")
+'''
+
 
 def _today_bar(hour=10, minute=30):
     """今日盘中某时刻的 bar（与测试运行时刻无关，保证 'open'/'HH:MM' 调度确定触发）。"""
@@ -111,7 +122,7 @@ def _patch_one_loop(monkeypatch, ticks=1, pause_checks_before_loop=0):
     monkeypatch.setattr(runner, "is_paused", lambda aid: next(pauses))
     monkeypatch.setattr(runner, "in_trading", lambda now=None: True)
     monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
-    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today: None)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda dm, code, today, conv=None: None)
     monkeypatch.setattr(runner.time, "sleep", lambda s: None)
 
 
@@ -362,8 +373,15 @@ def _replay_dm_cls(days):
 
 
 def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
-    today = datetime.date.today()
-    days = [today - datetime.timedelta(days=n) for n in (4, 3, 2, 1)]
+    class _FixedNow(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 8, 6, 15, 30, 0)
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+    today = datetime.date(2026, 8, 6)
+    days = [datetime.date(2026, 8, 2), datetime.date(2026, 8, 3),
+            datetime.date(2026, 8, 4), datetime.date(2026, 8, 5)]
     save_strategy("s_rp", "s", STRATEGY_BUY)
     aid = service.account_create("acct_rp", 100000.0, 0.03, "s_rp", str(days[0]))
     # 补跑 4 天逐日检查 is_paused，之后实时段只跑 1 个 tick
@@ -382,7 +400,7 @@ def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
     assert trades[1]["ts"].startswith(str(days[1]))
     snaps = db.get_sim_snapshots(aid)
     assert snaps[0]["dt"].startswith(str(days[0]))            # 净值曲线从 start_date 起
-    assert snaps[-1]["dt"].startswith(str(today))             # 末行来自实时 tick
+    assert snaps[-1]["dt"].startswith(str(today))             # 末行来自今日补跑至收盘
     logs = db.get_sim_logs(aid)
     assert any("开始历史补跑" in l["message"] for l in logs)
     assert any("历史补跑完成" in l["message"] for l in logs)
@@ -483,6 +501,37 @@ def test_replays_today_even_if_index_daily_missing(tmp_quant, monkeypatch):
     assert "09:31" in times and "10:30" in times
     logs = db.get_sim_logs(aid)
     assert any("今日" in l["message"] and "回补" in l["message"] for l in logs)
+
+
+def test_replay_partial_day_does_not_refire_daily_pipeline(tmp_quant, monkeypatch):
+    """同日盘中重启补跑不得重触发已执行过的日频流水线。
+
+    回归：d092ad90 08-19 22:49 重启，存档 dt=今日 13:56，_replay_partial_day
+    从 13:57 起重放，13:10 的午盘/卖出/买入流水线在补跑首个 bar 再次到期触发，
+    导致二次卖出买入。
+    """
+    class _FixedNow(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # 存档点在今天 13:56，重启时间为今天 14:00 → 触发同日补跑
+            return datetime.datetime.combine(datetime.date.today(), datetime.time(14, 0))
+
+    monkeypatch.setattr(runner.datetime, "datetime", _FixedNow)
+    today = datetime.date.today()
+    save_strategy("s_af", "s", STRATEGY_AFTERNOON)
+    aid = service.account_create("acct_af", 100000.0, 0.03, "s_af", str(today))
+    protocol.save_state(aid, {
+        "cash": 50000.0, "start_cash": 100000.0, "net_value": 100000.0, "pnl": 0.0,
+        "positions": {"510300.XSHG": {"amount": 5000.0, "avg_cost": 10.0,
+                                      "price": 10.0, "today_amount": 0.0}},
+        "stop_loss_log": [], "dt": f"{today} 13:56:00",
+    })
+    _patch_one_loop(monkeypatch, ticks=1)
+    runner.run_loop(aid, dm=_replay_dm_cls([today])(), feed=_feed_factory(10.0),
+                    matcher=Matcher(0.03))
+    from app.quant.jqengine.engine.jq import api
+    # 13:10 流水线在补跑起点（13:56）前已执行过，重放不得再次触发
+    assert api._state["ctx"].g.afternoon_n == 0
 
 
 STRATEGY_REPLAY_LOG = '''

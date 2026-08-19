@@ -769,6 +769,21 @@ def _flush_replay_batch(account_id: str, aux: dict) -> None:
         _db.batch_insert_logs(logs)
 
 
+def _seed_fired_before(fired: set, bundle, from_ts: datetime.datetime) -> None:
+    """补跑起点前已到点的日频任务预标记为已触发，避免同日补跑重放重复执行。
+
+    盘中重启走 _replay_partial_day：_pre_market 清空 fired 后，从 from_ts 之后
+    的首个 bar 重放。若 13:10 等流水线在补跑起点前已执行过（当日已触发并落库），
+    重放会因 fired 为空再次到期触发 → 重复卖出/买入。此处按调度时刻预填 fired。
+    """
+    for func, t in bundle.daily:
+        ts = str(t)
+        if ts in ("before_open", "after_close", "every_bar"):
+            continue  # 盘前/盘后钩子与每 bar 任务不走 fired 去重
+        if _daily_due(ts, from_ts):
+            fired.add((id(func), ts))
+
+
 def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
                         state: dict, aux: dict, from_ts: datetime.datetime) -> None:
     """补跑同一天内从 from_ts 到当前时间的分钟 bar（盘中重启场景）。"""
@@ -783,6 +798,8 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         _pin_replay_minute_window(dm, ctx, from_ts, today)
         _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
                     datetime.datetime.combine(today, datetime.time(9, 25)), aux)
+        # 预填补跑起点前已到点的日频任务，防重放重复触发当日已执行流水线
+        _seed_fired_before(aux["fired"], bundle, from_ts)
         now = datetime.datetime.now()
         _emit_log(account_id, "info",
                   f"补跑今日 {from_ts.strftime('%H:%M')} ~ {now.strftime('%H:%M')}",
