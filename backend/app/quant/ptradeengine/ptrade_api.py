@@ -381,10 +381,7 @@ def get_trade_days(start_date=None, end_date=None, count=None):
 
 def get_stock_name(stocks):
     """官方 get_stock_name(stocks)：单/多标的，返回 {code: name}。"""
-    if isinstance(stocks, str):
-        codes = [stocks]
-    else:
-        codes = list(stocks)
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
     return {c: _resolve_name(c) for c in codes}
 
 
@@ -536,6 +533,138 @@ log = _LogProxy()
 
 def record(**kw):
     _state["records"].append(kw)
+
+
+def get_price(security, start_date=None, end_date=None, frequency="1d",
+              fields=None, fq="pre", count=None, is_dict=False):
+    """docx 原生 get_price：复用 get_history 口径。返回宽表 DataFrame。"""
+    fields = fields or ["close"]
+    if isinstance(fields, str):
+        fields = [fields]
+    codes = [security] if isinstance(security, str) else list(security)
+    field_out = {}
+    for f in fields:
+        df = get_history(count, frequency, f, security_list=codes, include=False, fq=fq)
+        if df is None or df.empty:
+            continue
+        field_out[f] = df
+    if not field_out:
+        return pd.DataFrame()
+    if len(fields) == 1:
+        df = field_out[fields[0]]
+        if len(codes) == 1 and len(df.columns) == 1:
+            df = df.copy()
+            df.columns = [fields[0]]
+        return df
+    # 多字段：返回 {field: DataFrame} 的 dict（docx py3.5 panel 变体简化）
+    return field_out
+
+
+def check_limit(security, query_date=None):
+    """docx check_limit：{码: int}，-2 触板跌停/-1 跌停/0 平/1 涨停/2 触板涨停。
+    本地引擎用日线 high_limit/low_limit 字段 + 最新价推导。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        out[c] = 0
+        try:
+            df = get_history(1, "1d", ["high_limit", "low_limit", "close"],
+                             security_list=c, include=True)
+            if df is None or df.empty:
+                continue
+            last = float(df["close"].iloc[-1])
+            high = float(df["high_limit"].iloc[-1]) if "high_limit" in df.columns else 0
+            low = float(df["low_limit"].iloc[-1]) if "low_limit" in df.columns else 0
+            if high and last >= high:
+                out[c] = 1
+            elif low and last <= low:
+                out[c] = -1
+        except Exception:
+            continue
+    return out
+
+
+def get_stock_info(stocks, field=None):
+    """docx get_stock_info：{码: {stock_name, listed_date, de_listed_date}}。"""
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
+    fields = ["stock_name", "listed_date", "de_listed_date"] if field is None else (
+        [field] if isinstance(field, str) else list(field))
+    out = {}
+    for c in codes:
+        out[c] = {f: ("" if f != "stock_name" else _resolve_name(c)) for f in fields}
+    return out
+
+
+def get_snapshot(security):
+    """docx get_snapshot：{码: {up_px, down_px, last_px, ...}}。回测回退日线字段。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        snap = {"last_px": 0.0, "up_px": 0.0, "down_px": 0.0,
+                "preclose_px": 0.0, "high_px": 0.0, "low_px": 0.0,
+                "business_balance": 0.0, "volume": 0, "amount": 0}
+        try:
+            df = get_history(1, "1d", ["close", "high_limit", "low_limit", "preclose"],
+                             security_list=c, include=True)
+            if df is not None and not df.empty:
+                snap["last_px"] = float(df["close"].iloc[-1])
+                if "high_limit" in df.columns:
+                    snap["up_px"] = float(df["high_limit"].iloc[-1])
+                if "low_limit" in df.columns:
+                    snap["down_px"] = float(df["low_limit"].iloc[-1])
+                if "preclose" in df.columns:
+                    snap["preclose_px"] = float(df["preclose"].iloc[-1])
+        except Exception:
+            pass
+        out[c] = snap
+    return out
+
+
+def order_target(security, amount, limit_price=None):
+    """docx order_target：调整持仓到目标数量。"""
+    cur = get_position(security).amount
+    diff = int(amount) - int(cur)
+    if diff == 0:
+        return True
+    return order(security, diff) if diff > 0 else order(security, -min(abs(diff), get_position(security).enable_amount))
+
+
+def order_target_value(security, value, limit_price=None):
+    """docx order_target_value：调整持仓到目标市值。本地引擎用 order_value 近似（差异仅整手尾差）。"""
+    price = _live_price(security)
+    if price == 0:
+        return False
+    cur_val = get_position(security).amount * price
+    diff = float(value) - cur_val
+    if abs(diff) < price * 100:
+        return True
+    return order_value(security, diff)
+
+
+def get_all_trades_days(date=None):
+    """docx get_all_trades_days：date 之前的全部交易日（含 date）。"""
+    cal = _get_calendar()
+    if date is not None:
+        cal = cal[cal <= pd.Timestamp(date)]
+    return [d.to_pydatetime().date() for d in cal]
+
+
+def get_trading_day_by_date(query_date, day=0):
+    """docx get_trading_day_by_date：按日期偏移交易日。"""
+    cal = _get_calendar()
+    ts = pd.Timestamp(query_date)
+    idx = int(cal.searchsorted(ts))
+    target = idx + int(day)
+    if target < 0:
+        target = 0
+    if target >= len(cal):
+        target = len(cal) - 1
+    return cal[target].to_pydatetime().date()
+
+
+def get_etf_info(stocks):
+    """docx get_etf_info：{码: 名称}。复用 get_stock_name。"""
+    return get_stock_name(stocks)
 
 
 def build_data_snapshot(ctx):

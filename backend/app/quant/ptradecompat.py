@@ -391,6 +391,147 @@ def get_trade_days(start_date=None, end_date=None, count=None):
     return list(cal)
 
 
+def get_price(security, start_date=None, end_date=None, frequency="1d",
+              fields=None, fq="pre", count=None, is_dict=False):
+    """docx 原生 get_price：复用 get_history 口径（rqalpha 环境）。返回宽表 DataFrame。"""
+    fields = fields or ["close"]
+    if isinstance(fields, str):
+        fields = [fields]
+    codes = [security] if isinstance(security, str) else list(security)
+    field_out = {}
+    for f in fields:
+        df = get_history(count, frequency, f, security_list=codes, include=False, fq=fq)
+        if df is None or df.empty:
+            continue
+        field_out[f] = df
+    if not field_out:
+        return pd.DataFrame()
+    if len(fields) == 1:
+        df = field_out[fields[0]]
+        if len(codes) == 1 and len(df.columns) == 1:
+            df = df.copy()
+            df.columns = [fields[0]]
+        return df
+    return field_out
+
+
+def check_limit(security, query_date=None):
+    """docx check_limit：{码: int}。回测用日线 high_limit/low_limit + 收盘价推导。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        out[c] = 0
+        try:
+            df = get_history(1, "1d", ["high_limit", "low_limit", "close"],
+                             security_list=c, include=True)
+            if df is None or df.empty:
+                continue
+            last = float(df["close"].iloc[-1])
+            high = float(df["high_limit"].iloc[-1]) if "high_limit" in df.columns else 0
+            low = float(df["low_limit"].iloc[-1]) if "low_limit" in df.columns else 0
+            if high and last >= high:
+                out[c] = 1
+            elif low and last <= low:
+                out[c] = -1
+        except Exception:
+            continue
+    return out
+
+
+def get_stock_info(stocks, field=None):
+    """docx get_stock_info：{码: {stock_name, ...}}。名称取 _NAMES。"""
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
+    fields = ["stock_name", "listed_date", "de_listed_date"] if field is None else (
+        [field] if isinstance(field, str) else list(field))
+    out = {}
+    for c in codes:
+        jq = _to_jq(c)
+        out[c] = {f: ("" if f != "stock_name" else _NAMES.get(jq, c)) for f in fields}
+    return out
+
+
+def get_snapshot(security):
+    """docx get_snapshot：{码: {up_px, down_px, last_px, ...}}。回测回退日线字段。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        snap = {"last_px": 0.0, "up_px": 0.0, "down_px": 0.0,
+                "preclose_px": 0.0, "high_px": 0.0, "low_px": 0.0,
+                "business_balance": 0.0, "volume": 0, "amount": 0}
+        try:
+            df = get_history(1, "1d", ["close", "high_limit", "low_limit", "preclose"],
+                             security_list=c, include=True)
+            if df is not None and not df.empty:
+                snap["last_px"] = float(df["close"].iloc[-1])
+                if "high_limit" in df.columns:
+                    snap["up_px"] = float(df["high_limit"].iloc[-1])
+                if "low_limit" in df.columns:
+                    snap["down_px"] = float(df["low_limit"].iloc[-1])
+                if "preclose" in df.columns:
+                    snap["preclose_px"] = float(df["preclose"].iloc[-1])
+        except Exception:
+            pass
+        out[c] = snap
+    return out
+
+
+def order_target(security, amount, limit_price=None):
+    cur = get_position(security).amount
+    diff = int(amount) - int(cur)
+    if diff == 0:
+        return True
+    return order(security, diff) if diff > 0 else order(security, -min(abs(diff), get_position(security).enable_amount))
+
+
+def order_value(security, value):
+    """PTrade order_value（rqalpha 环境）：按市值下单，整手向下取整。"""
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    jq = _to_jq(security)
+    price = float(getattr(env.portfolio, "close_position_prices", {}).get(jq, 0) or 0)
+    if price == 0 or value == 0:
+        return False
+    amount = int(value // price)
+    return order(security, amount)
+
+
+def order_target_value(security, value, limit_price=None):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    jq = _to_jq(security)
+    price = float(getattr(env.portfolio, "close_position_prices", {}).get(jq, 0) or 0)
+    if price == 0:
+        return False
+    cur_val = get_position(security).amount * price
+    diff = float(value) - cur_val
+    if abs(diff) < price * 100:
+        return True
+    return order_value(security, diff)
+
+
+def get_all_trades_days(date=None):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    cal = env.data_proxy.get_trading_calendar()
+    if date is not None:
+        cal = cal[cal <= pd.Timestamp(date)]
+    return [d.to_pydatetime().date() for d in cal]
+
+
+def get_trading_day_by_date(query_date, day=0):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    cal = env.data_proxy.get_trading_calendar()
+    ts = pd.Timestamp(query_date)
+    idx = int(cal.searchsorted(ts))
+    target = min(max(idx + int(day), 0), len(cal) - 1)
+    return cal[target].to_pydatetime().date()
+
+
+def get_etf_info(stocks):
+    return get_stock_name(stocks)
+
+
 def set_universe(codes):
     """PTrade set_universe：只把数据源已知的标的加入 rqalpha universe。
     策略动态池可能含数据源未注册的代码，直接 update_universe 会抛
@@ -430,10 +571,7 @@ def get_stock_status(codes, query_type="HALT", query_date=None):
 def get_stock_name(stocks):
     """官方 get_stock_name(stocks)：单/多标的，返回 {code: name}。
     名称源与 get_market_detail 一致（_NAMES 优先，缺失回退代码，避免池分类漂移）。"""
-    if isinstance(stocks, str):
-        codes = [stocks]
-    else:
-        codes = list(stocks)
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
     out = {}
     for code in codes:
         jq = _to_jq(code)
@@ -532,6 +670,7 @@ def _register_ptrade_apis():
     register_api("get_history", get_history)
     register_api("run_daily", run_daily)
     register_api("order", order)
+    register_api("order_value", order_value)
     register_api("get_position", get_position)
     register_api("get_positions", get_positions)
     register_api("get_trading_day", get_trading_day)
@@ -546,6 +685,15 @@ def _register_ptrade_apis():
     register_api("set_commission", set_commission)
     register_api("set_slippage", set_slippage)
     register_api("log", log)
+    register_api("get_price", get_price)
+    register_api("check_limit", check_limit)
+    register_api("get_stock_info", get_stock_info)
+    register_api("get_snapshot", get_snapshot)
+    register_api("order_target", order_target)
+    register_api("order_target_value", order_target_value)
+    register_api("get_all_trades_days", get_all_trades_days)
+    register_api("get_trading_day_by_date", get_trading_day_by_date)
+    register_api("get_etf_info", get_etf_info)
     register_api("_ptrade_adapt_bar_dict", _ptrade_adapt_bar_dict)
 
 
