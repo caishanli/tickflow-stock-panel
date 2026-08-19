@@ -29,15 +29,16 @@ SAMPLE_CODE = "def init(context):\n    pass\n"
 
 
 def test_import_and_list(env):
-    rec = import_strategy("demo", SAMPLE_CODE)
+    sid = import_strategy("demo", SAMPLE_CODE)
+    assert len(sid) == 8
+    rec = get_strategy(sid)
     assert rec["name"] == "demo" and rec["code"] == SAMPLE_CODE
     names = [s["name"] for s in list_strategies()]
     assert "demo" in names
 
 
 def test_get_and_export(env):
-    rec = import_strategy("demo", SAMPLE_CODE)
-    sid = rec["id"]
+    sid = import_strategy("demo", SAMPLE_CODE)
     got = get_strategy(sid)
     assert got["code"] == SAMPLE_CODE
     assert export_strategy(sid) == SAMPLE_CODE
