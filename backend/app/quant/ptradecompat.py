@@ -52,6 +52,61 @@ def _norm_freq(freq):
 
 
 # ---------------------------------------------------------------------------
+# 涨跌停价推导：真实数据层无 high_limit/low_limit/preclose 列，按昨收+分档幅度计算
+# （镜像 jqcompat._limit_rate/_limit_prices_from_prev_close，适配 PTrade .SS/.SZ）
+# ---------------------------------------------------------------------------
+def _is_st_name(code, name=None):
+    """按名称判定 ST 股票（name 缺省取 _NAMES，PTrade 码先转 JQ 码）。"""
+    if name is None:
+        name = _NAMES.get(_to_jq(code)) or _NAMES.get(code)
+    return bool(name) and "ST" in str(name).upper()
+
+
+def _limit_rate(code, name=None):
+    """按代码分档的涨跌停幅度：沪 68/58 与深 30/159 为 ±20%，ST ±5%，其余 ±10%。"""
+    pure, _, exch = code.partition(".")
+    if exch in ("", "XSHG", "SS") and pure.startswith(("68", "58")):
+        return 0.20
+    if exch in ("", "XSHE", "SZ") and pure.startswith(("30", "159")):
+        return 0.20
+    if _is_st_name(code, name):
+        return 0.05
+    return 0.10
+
+
+def _limit_prices_from_prev_close(close, rate=0.10):
+    """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。"""
+    prev_close = close.shift(1)
+    limit_up = (prev_close * (1 + rate)).round(2)
+    limit_down = (prev_close * (1 - rate)).round(2)
+    return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+
+
+def _close_series(df):
+    """get_history 单标的单字段结果取收盘序列（列名=字段名，兼容代码列名回退）。"""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    if "close" in df.columns:
+        return pd.to_numeric(df["close"], errors="coerce")
+    return pd.to_numeric(df.iloc[:, 0], errors="coerce")
+
+
+def _limit_fields(df, code):
+    """从收盘序列按昨收+分档幅度推导 (last, up_px, down_px, preclose_px)。
+    数据层无 high_limit/low_limit/preclose 列，按交易所口径从昨收计算。"""
+    close = _close_series(df)
+    if close.empty:
+        return 0.0, 0.0, 0.0, 0.0
+    last = float(close.iloc[-1])
+    rate = _limit_rate(code)
+    limit_up, limit_down = _limit_prices_from_prev_close(close, rate)
+    up = float(limit_up[-1]) if len(limit_up) else 0.0
+    down = float(limit_down[-1]) if len(limit_down) else 0.0
+    preclose = float(close.iloc[-2]) if len(close) >= 2 else last
+    return last, up, down, preclose
+
+
+# ---------------------------------------------------------------------------
 # get_history：多标的宽表（index=datetime, columns=PTrade 码）
 # ---------------------------------------------------------------------------
 def _build_history_wide(bars, jq_codes, field):
@@ -433,21 +488,18 @@ def _last_field(df, field):
 
 
 def check_limit(security, query_date=None):
-    """docx check_limit：{码: int}。回测用日线 high_limit/low_limit + 收盘价推导。"""
+    """docx check_limit：{码: int}。真实数据层无 high_limit/low_limit 列：
+    取最近两根日线收盘，按昨收 + 标的分档幅度（_limit_rate）计算涨跌停价并比较。"""
     codes = [security] if isinstance(security, str) else list(security)
     out = {}
     for c in codes:
         out[c] = 0
         try:
-            close = get_history(1, "1d", "close", security_list=c, include=True)
-            high = get_history(1, "1d", "high_limit", security_list=c, include=True)
-            low = get_history(1, "1d", "low_limit", security_list=c, include=True)
-            last = _last_field(close, "close")
-            hp = _last_field(high, "high_limit")
-            lp = _last_field(low, "low_limit")
-            if hp and last >= hp:
+            close = get_history(2, "1d", "close", security_list=c, include=True)
+            last, up, down, _pre = _limit_fields(close, c)
+            if up and last >= up:
                 out[c] = 1
-            elif lp and last <= lp:
+            elif down and last <= down:
                 out[c] = -1
         except Exception:
             continue
@@ -467,7 +519,9 @@ def get_stock_info(stocks, field=None):
 
 
 def get_snapshot(security):
-    """docx get_snapshot：{码: {up_px, down_px, last_px, ...}}。回测回退日线字段。"""
+    """docx get_snapshot：{码: {up_px, down_px, last_px, ...}}。
+    真实数据层无 high_limit/low_limit/preclose 列：由最近两根日线收盘按昨收+
+    分档幅度推导 up_px/down_px/preclose_px。"""
     codes = [security] if isinstance(security, str) else list(security)
     out = {}
     for c in codes:
@@ -475,14 +529,12 @@ def get_snapshot(security):
                 "preclose_px": 0.0, "high_px": 0.0, "low_px": 0.0,
                 "business_balance": 0.0, "volume": 0, "amount": 0}
         try:
-            close = get_history(1, "1d", "close", security_list=c, include=True)
-            high = get_history(1, "1d", "high_limit", security_list=c, include=True)
-            low = get_history(1, "1d", "low_limit", security_list=c, include=True)
-            preclose = get_history(1, "1d", "preclose", security_list=c, include=True)
-            snap["last_px"] = _last_field(close, "close")
-            snap["up_px"] = _last_field(high, "high_limit")
-            snap["down_px"] = _last_field(low, "low_limit")
-            snap["preclose_px"] = _last_field(preclose, "preclose")
+            close = get_history(2, "1d", "close", security_list=c, include=True)
+            last, up, down, preclose = _limit_fields(close, c)
+            snap["last_px"] = last
+            snap["up_px"] = up
+            snap["down_px"] = down
+            snap["preclose_px"] = preclose
         except Exception:
             pass
         out[c] = snap

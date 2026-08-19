@@ -12,28 +12,25 @@ class _FakeMgr:
     def __init__(self):
         self._daily_mem = {}
         self._minute_mem = {}
-        self._last_override = None
+        self._last_close_override = None
 
-    def set_last_day(self, close, high_limit, low_limit, preclose=None):
-        """覆盖最后一个交易日的 close/high_limit/low_limit/preclose（check_limit/get_snapshot 断言用）。"""
-        self._last_override = (close, high_limit, low_limit, preclose)
+    def set_last_close(self, close):
+        """覆盖最后一个交易日 close（check_limit/get_snapshot 断言用）。
+        默认末两日 close 为 [10.0, 10.5]：按昨收 10.0 + 主板 10% 分档，
+        high_limit=round(10×1.1,2)=11.0、low_limit=round(10×0.9,2)=9.0。"""
+        self._last_close_override = close
 
     def fetch(self, name, *a, **kw):
         if name == "get_daily":
             idx = pd.date_range("2026-06-01", "2026-07-09", freq="B")
             close = np.linspace(10, 11, len(idx))
-            high_limit = close + 1
-            low_limit = close - 1
-            preclose = np.concatenate([[close[0]], close[:-1]])
-            if self._last_override is not None:
-                c, h, lo, pc = self._last_override
-                close[-1] = c
-                high_limit[-1] = h
-                low_limit[-1] = lo
-                if pc is not None:
-                    preclose[-1] = pc
-            return pd.DataFrame({"close": close, "high_limit": high_limit,
-                                 "low_limit": low_limit, "preclose": preclose,
+            close[-2] = 10.0
+            close[-1] = 10.5
+            if self._last_close_override is not None:
+                close[-1] = self._last_close_override
+            # 真实数据层无 high_limit/low_limit/preclose 列：check_limit/get_snapshot
+            # 必须按昨收+分档幅度自行推导涨跌停价，不得依赖本帧伪列。
+            return pd.DataFrame({"close": close,
                                  "volume": np.full(len(idx), 1000.0),
                                  "money": np.linspace(1e6, 1.1e6, len(idx))},
                                 index=idx)
@@ -94,34 +91,33 @@ def test_check_limit_returns_dict(pt_ctx):
 
 def test_check_limit_flat_when_close_between_limits(pt_ctx):
     mgr = ptrade_api._state["manager"]
-    mgr.set_last_day(close=10.5, high_limit=11.5, low_limit=9.5)
+    mgr.set_last_close(10.5)
     res = ptrade_api.check_limit("510300.SS")
     assert res["510300.SS"] == 0
 
 
 def test_check_limit_limit_up(pt_ctx):
     mgr = ptrade_api._state["manager"]
-    mgr.set_last_day(close=11.5, high_limit=11.5, low_limit=9.5)
+    mgr.set_last_close(11.0)
     res = ptrade_api.check_limit("510300.SS")
     assert res["510300.SS"] == 1
 
 
 def test_check_limit_limit_down(pt_ctx):
     mgr = ptrade_api._state["manager"]
-    mgr.set_last_day(close=9.5, high_limit=11.5, low_limit=9.5)
+    mgr.set_last_close(9.0)
     res = ptrade_api.check_limit("510300.SS")
     assert res["510300.SS"] == -1
 
 
 def test_get_snapshot_populates_daily_fields(pt_ctx):
     mgr = ptrade_api._state["manager"]
-    mgr.set_last_day(close=10.5, high_limit=11.5, low_limit=9.5, preclose=10.3)
-    snap = ptrade_api.get_snapshot("510300.SS")
-    s = snap["510300.SS"]
-    assert s["last_px"] == pytest.approx(10.5)
-    assert s["up_px"] == pytest.approx(11.5)
-    assert s["down_px"] == pytest.approx(9.5)
-    assert s["preclose_px"] == pytest.approx(10.3)
+    mgr.set_last_close(10.5)
+    snap = ptrade_api.get_snapshot("510300.SS")["510300.SS"]
+    assert snap["last_px"] == pytest.approx(10.5)
+    assert snap["up_px"] == pytest.approx(11.0)
+    assert snap["down_px"] == pytest.approx(9.0)
+    assert snap["preclose_px"] == pytest.approx(10.0)
 
 
 def test_get_price_start_date_end_date_filter_rows(pt_ctx):
@@ -155,3 +151,101 @@ def test_get_etf_info(pt_ctx):
     assert isinstance(info, dict)
     for v in info.values():
         assert isinstance(v, str)
+
+
+# ---------------------------------------------------------------------------
+# rqalpha ptradecompat 引擎：check_limit/get_snapshot 按昨收+分档幅度计算
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def _ptradecompat(monkeypatch):
+    """最小 rqalpha 桩：让 ptradecompat 可导入并运行（复用 test_ptradecompat 手法）。"""
+    import sys
+    import types
+    rq = types.ModuleType("rqalpha")
+    rq.__path__ = []  # namespace package，允许 from rqalpha.xxx import
+    rq.api = types.ModuleType("rqalpha.api")
+    rq.api.register_api = lambda *a, **k: None
+    rq.core = types.ModuleType("rqalpha.core")
+    rq.core.events = types.ModuleType("rqalpha.core.events")
+    rq.core.events.EVENT = types.SimpleNamespace(BAR="bar", BEFORE_TRADING="bt", AFTER_TRADING="at")
+    rq.const = types.ModuleType("rqalpha.const")
+    rq.const.INSTRUMENT_TYPE = rq.const.MARKET = rq.const.TRADING_CALENDAR_TYPE = types.SimpleNamespace()
+    rq.environment = types.ModuleType("rqalpha.environment")
+    rq.environment.Environment = type("Env", (), {"get_instance": staticmethod(lambda: None)})
+    rq.interface = types.ModuleType("rqalpha.interface")
+    rq.interface.AbstractMod = type("AbstractMod", (), {})
+    rq.model = types.ModuleType("rqalpha.model")
+    rq.model.instrument = types.ModuleType("rqalpha.model.instrument")
+    rq.model.instrument.Instrument = object
+    monkeypatch.setitem(sys.modules, "rqalpha", rq)
+    for _name, _mod in (
+            ("rqalpha.api", rq.api), ("rqalpha.core", rq.core),
+            ("rqalpha.core.events", rq.core.events), ("rqalpha.const", rq.const),
+            ("rqalpha.environment", rq.environment), ("rqalpha.interface", rq.interface),
+            ("rqalpha.model", rq.model), ("rqalpha.model.instrument", rq.model.instrument)):
+        monkeypatch.setitem(sys.modules, _name, _mod)
+    import app.quant.ptradecompat as pc
+    return pc
+
+
+def _ptradecompat_bars(closes):
+    """单标的日线 bars：末两日 close 由调用方给定（昨收=closes[-2]，今收=closes[-1]）。"""
+    days = ["20260708093000", "20260709093000"]
+    arr = np.zeros(len(closes), dtype=np.dtype([("datetime", "S14"), ("close", "f8")]))
+    for i, c in enumerate(closes):
+        arr["datetime"][i] = days[i]
+        arr["close"][i] = c
+    return {"510300.XSHG": arr}
+
+
+def test_ptradecompat_check_limit_flat_between_limits(_ptradecompat, monkeypatch):
+    pc = _ptradecompat
+    monkeypatch.setattr(pc, "_history_bars_batch",
+                        lambda *a, **k: _ptradecompat_bars([10.0, 10.5]))
+    res = pc.check_limit("510300.SS")
+    assert res["510300.SS"] == 0
+
+
+def test_ptradecompat_check_limit_limit_up(_ptradecompat, monkeypatch):
+    pc = _ptradecompat
+    monkeypatch.setattr(pc, "_history_bars_batch",
+                        lambda *a, **k: _ptradecompat_bars([10.0, 11.0]))
+    res = pc.check_limit("510300.SS")
+    assert res["510300.SS"] == 1
+
+
+def test_ptradecompat_check_limit_limit_down(_ptradecompat, monkeypatch):
+    pc = _ptradecompat
+    monkeypatch.setattr(pc, "_history_bars_batch",
+                        lambda *a, **k: _ptradecompat_bars([10.0, 9.0]))
+    res = pc.check_limit("510300.SS")
+    assert res["510300.SS"] == -1
+
+
+def test_ptradecompat_get_snapshot_computed(_ptradecompat, monkeypatch):
+    pc = _ptradecompat
+    monkeypatch.setattr(pc, "_history_bars_batch",
+                        lambda *a, **k: _ptradecompat_bars([10.0, 10.5]))
+    snap = pc.get_snapshot("510300.SS")["510300.SS"]
+    assert snap["last_px"] == pytest.approx(10.5)
+    assert snap["up_px"] == pytest.approx(11.0)
+    assert snap["down_px"] == pytest.approx(9.0)
+    assert snap["preclose_px"] == pytest.approx(10.0)
+
+
+def test_ptradecompat_get_price_start_end_filter(_ptradecompat, monkeypatch):
+    """get_price 透传 end_date 并按 start_date 过滤（真实-ish recarray 形状）。"""
+    pc = _ptradecompat
+    bars = {
+        "510300.XSHG": np.array(
+            [(20260701093000, 1.0), (20260702093000, 1.1),
+             (20260703093000, 1.2), (20260706093000, 1.3)],
+            dtype=[("datetime", "int64"), ("close", "f8")]),
+    }
+    monkeypatch.setattr(pc, "_history_bars_batch", lambda *a, **k: bars)
+    df = pc.get_price("510300.SS", start_date="2026-07-02", end_date="2026-07-06",
+                      count=100, frequency="1d", fields=["close"])
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == ["close"]
+    assert (df.index >= pd.Timestamp("2026-07-02")).all()
+    assert (df.index.normalize() <= pd.Timestamp("2026-07-06")).all()
