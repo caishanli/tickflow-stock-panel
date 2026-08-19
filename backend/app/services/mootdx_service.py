@@ -792,6 +792,15 @@ def check_and_repair_day(day: _date) -> dict:
                                           "coverage": float|None, "symbols": int}}}。
     单类失败不阻断其它类。
     """
+    today = _date.today()
+    if day == today and not _market_closed():
+        # 盘中当日半程数据不可作基线（08-18 11:30 误标 13:00 同类污染），
+        # 单日补齐同样跳过当日，防把半程残帧写成"完整"分区。
+        return {"day": day.isoformat(), "results": {
+            key: {"status": "skip", "coverage": None, "symbols": 0}
+            for key in ["stock_daily", "etf_daily", "index_daily",
+                        "etf_minute", "stock_minute"]}}
+
     results: dict[str, dict] = {}
     try:
         stocks = _stock_universe()

@@ -1906,6 +1906,37 @@ def test_check_and_repair_day_noop_when_complete(tmp_path, monkeypatch):
     assert all(v["status"] == "ok" for v in res["results"].values())
 
 
+def test_check_and_repair_day_skips_today_intraday(tmp_path, monkeypatch):
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [f"6000{dd:02d}.SH" for dd in range(3)])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(3)])
+    monkeypatch.setattr(ms, "_index_universe", lambda: ["000001.SH", "000300.SH", "399006.SZ"])
+    # 今日盘中即使残缺也不应重写（防 08-18 半程污染写入）
+    for sub in ["kline_daily", "kline_etf_daily", "kline_index_daily",
+                "kline_etf_minute", "kline_minute"]:
+        pdir = tmp_path / sub / "date=2026-08-05"
+        pdir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"symbol": ["000300.SH"], "close": [1.0]}).write_parquet(
+            pdir / "part.parquet")
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda: False)  # 盘中
+    calls = {"n": 0}
+    for fn in ["sync_daily", "sync_index_daily", "sync_etf_minute", "sync_stock_minute_day"]:
+        monkeypatch.setattr(ms, fn, lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+
+    res = ms.check_and_repair_day(_d(2026, 8, 5))
+
+    assert calls["n"] == 0, "盘中当日不应触发任何重写"
+    assert all(v["status"] == "skip" for v in res["results"].values())
+
+
 def test_check_and_repair_full_uses_250_window(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
     seen = {}
