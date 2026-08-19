@@ -371,7 +371,7 @@ def test_incomplete_etf_daily_detects_sparse_partitions(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
         lambda: _d(2026, 8, 5))})())
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_d(2026, 8, 3), _d(2026, 8, 4), _d(2026, 8, 5)])
-    monkeypatch.setattr(ms, "_market_closed", lambda now: True)
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
 
     leftovers = ms._incomplete_etf_daily_days()
     assert _d(2026, 8, 4) in leftovers, "1只残缺日应被识别"
@@ -1533,3 +1533,106 @@ def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
     df12 = pl.read_parquet(root / "date=2026-08-12" / "part.parquet")
     assert sorted(set(df12["symbol"].to_list())) == list(universe)
     assert df12.height == 4
+
+
+# ---------------------------------------------------------------------------
+# 近一年内容校验：5 类统一（07-31 指数日线残帧回归）
+# ---------------------------------------------------------------------------
+
+def test_incomplete_index_daily_flags_fallback_fragment(tmp_path, monkeypatch):
+    """07-31 回归：指数日线用兜底 4 只写入的残帧应被判残缺、完整日不误报。"""
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "_index_universe",
+                        lambda: [f"000{i:03d}.SH" for i in range(1, 61)] + ["399006.SZ"])
+    root = tmp_path / "kline_index_daily"
+    (root / "date=2026-07-31").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["000300.SH", "000510.SH", "399006.SZ", "399101.SZ"],
+        "open": [1.0] * 4, "close": [1.0] * 4,
+    }).write_parquet(root / "date=2026-07-31" / "part.parquet")
+    (root / "date=2026-08-03").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": [f"000{i:03d}.SH" for i in range(1, 61)] + ["399006.SZ"],
+        "open": [1.0] * 61, "close": [1.0] * 61,
+    }).write_parquet(root / "date=2026-08-03" / "part.parquet")
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+
+    leftovers = ms._incomplete_index_daily_days()
+    assert _d(2026, 7, 31) in leftovers, "4/61 残帧应被判残缺"
+    assert _d(2026, 8, 3) not in leftovers, "完整日不应误报"
+
+
+def test_incomplete_stock_daily_detects_sparse(tmp_path, monkeypatch):
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: [f"6000{dd:03d}.SH" for dd in range(90)])
+    root = tmp_path / "kline_daily"
+    for d in ["2026-08-03", "2026-08-04"]:
+        (root / f"date={d}").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": [f"6000{dd:03d}.SH" for dd in range(90)],
+        "open": [1.0] * 90, "close": [1.0] * 90,
+    }).write_parquet(root / "date=2026-08-03" / "part.parquet")
+    pl.DataFrame({"symbol": ["600000.SH"], "open": [1.0], "close": [1.0]}).write_parquet(
+        root / "date=2026-08-04" / "part.parquet")
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+
+    leftovers = ms._incomplete_stock_daily_days()
+    assert _d(2026, 8, 4) in leftovers
+    assert _d(2026, 8, 3) not in leftovers
+
+
+def test_incomplete_etf_minute_detects_sparse(tmp_path, monkeypatch):
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "_etf_universe",
+                        lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
+    root = tmp_path / "kline_etf_minute"
+    (root / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["159900.SZ"],
+        "datetime": [_dt.datetime(2026, 8, 4, 9, 31)],
+        "close": [1.0],
+    }).write_parquet(root / "date=2026-08-04" / "part.parquet")
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+
+    assert _d(2026, 8, 4) in ms._incomplete_etf_minute_days()
+
+
+def test_incomplete_etf_daily_window_250_vs_7(tmp_path, monkeypatch):
+    """残缺分区位于第 31~250 位之间：recent=250 识别、recent=7 不识别。"""
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "_etf_universe",
+                        lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 1))})())
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    root = tmp_path / "kline_etf_daily"
+    for i in range(60):
+        ds = (_d(2026, 8, 1) - _dt.timedelta(days=i)).isoformat()
+        (root / f"date={ds}").mkdir(parents=True, exist_ok=True)
+        if i == 40:  # 第 41 新的分区为残帧（1 只）
+            df = pl.DataFrame({"symbol": ["159900.SZ"], "open": [1.0], "close": [1.0]})
+        else:
+            df = pl.DataFrame({
+                "symbol": [f"1599{dd:02d}.SZ" for dd in range(90)],
+                "open": [1.0] * 90, "close": [1.0] * 90,
+            })
+        df.write_parquet(root / f"date={ds}" / "part.parquet")
+
+    assert ms._incomplete_etf_daily_days(recent=7) == [], "近 7 分区内无残缺"
+    left = ms._incomplete_etf_daily_days(recent=250)
+    assert len(left) == 1, f"recent=250 应识别 1 个残帧, 实际 {left}"

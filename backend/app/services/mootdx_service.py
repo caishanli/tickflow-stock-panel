@@ -44,17 +44,15 @@ FAILURE_LOG_PATH = DATA_ROOT / "mootdx_sync_failures.csv"
 # 只处理 2020 年以来的除权事件（回测窗口有限，太早的因子无意义）
 _SINCE_YEAR = 2020
 
-# ETF 日线内容完整性校验阈值：分区 symbol 覆盖率低于该值即判残缺重写。
-# 宇宙缺陷/真实退市不会把覆盖率打到 0.5 以下（全市场 1658 只正常全落盘）。
-_ETF_DAILY_MIN_COVERAGE = 0.5
-# 内容校验只看最近 N 个分区（早年分区无必要逐日读文件，性能考虑）。
-_ETF_DAILY_RECENT_LIMIT = 30
-# 股票分钟内容完整性校验阈值：分区 symbol 覆盖率低于该值即判残缺重写；
-# 可由环境变量覆盖（STOCK_MINUTE_MIN_COVERAGE=0.3），默认 0.5。
+# 内容完整性校验（symbol 覆盖率 vs 基准宇宙）：
+# 覆盖率低于阈值即判残缺重写，防止"目录存在但只剩几只"的残帧永久污染。
+# 全量手动校验回看近一年（默认 250 个交易分区）；每日自动只查近 1 周。
+_CONTENT_CHECK_RECENT_DAYS = int(os.getenv("CONTENT_CHECK_RECENT_DAYS", "250"))
+_DAILY_CHECK_RECENT_PARTITIONS = int(os.getenv("DAILY_CHECK_RECENT_PARTITIONS", "7"))
+_CONTENT_CHECK_MIN_COVERAGE = float(os.getenv("CONTENT_CHECK_MIN_COVERAGE", "0.5"))
+# 股票分钟 legacy 覆盖（env 可调；默认与共享常量一致）。
 _STOCK_MINUTE_MIN_COVERAGE = float(os.getenv("STOCK_MINUTE_MIN_COVERAGE", "0.5"))
-# 股票分钟内容校验看最近 N 个分区（全市场 ~5200 只，逐日读 symbol 列成本更高，
-# 只看近窗口）。可由 STOCK_MINUTE_RECENT_LIMIT 覆盖。
-_STOCK_MINUTE_RECENT_LIMIT = int(os.getenv("STOCK_MINUTE_RECENT_LIMIT", "30"))
+_STOCK_MINUTE_RECENT_LIMIT = int(os.getenv("STOCK_MINUTE_RECENT_LIMIT", "250"))
 # 权威 ETF 代码段（对齐聚宽 get_all_securities(['etf']) 名单段分布）。
 # 深市 159/161/169/180/181；沪市 501/506/510~518/520/526/530/551/560~563/588/589。
 # 每个段在完整名单中至少出现 1 只；宇宙缺失整个段 = 快照/回源异常（如 501018
@@ -1064,92 +1062,25 @@ def _safe_universe_segment_missing() -> list[str]:
     return _etf_universe_segment_missing(codes)
 
 
-def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
-    """返回 ETF 日线中**内容残缺**的分区日期（符号数 << ETF 宇宙）。
+def _incomplete_partition_days(root: Path, target: set[str], recent: int,
+                               min_coverage: float,
+                               skip_today_intraday: bool = True) -> list[_date]:
+    """最近 recent 个分区 symbol 覆盖率 < min_coverage 即判残缺（目录存在≠完整）。
 
-    背景：宽缺口判定（``_missing_daily_days``/``_partition_dates``）只检查
-    分区目录是否存在，一个**只有 1 只 ETF **的分区与 1600 只的完整分区
-    被视为等价——一旦某天曾以残缺状态落盘（回源中断、宇宙快照零星等），
-    增量追溯永不重写，残帧永久污染净值曲线。
-
-    这里做内容级校验：对最近 ``recent``（默认 30）个分区，读 symbol 列与
-    ETF 宇宙比对，覆盖率 < ``_ETF_DAILY_MIN_COVERAGE``（默认 0.5）即判残缺。
-    宇宙为空时跳过（无基线可比）；覆盖率 >= 阈值的正常分区不误报。
+    root: 分区根目录；target: 已归一化的基准宇宙 symbol 集合。
+    分区根 / 宇宙为空 → []（无基线可比）。盘中跳过当日分区（防半程误伤）。
     """
-    existing = _partition_dates(ETF_DAILY_ROOT)
-    if not existing:
+    existing = _partition_dates(root)
+    if not existing or not target:
         return []
-    try:
-        codes = _etf_universe()
-    except Exception:
-        logger.warning("mootdx_service: ETF 宇宙读取失败，跳过内容校验", exc_info=True)
-        return []
-    if not codes:
-        return []
-
-    recent = _ETF_DAILY_RECENT_LIMIT if recent is None else recent
-    target = set(_to_tf_symbol(c) for c in codes)
-    out: list[_date] = []
-    for ds in existing[-recent:]:
-        pdir = ETF_DAILY_ROOT / f"date={ds}"
-        parts = sorted(pdir.glob("*.parquet"))
-        if not parts:
-            continue
-        syms: set[str] = set()
-        for p in parts:
-            try:
-                df = pl.read_parquet(p, columns=None)  # ETF 分区无 date 列，读全列取 symbol
-                syms |= set(df["symbol"].to_list())
-            except Exception:
-                continue
-        coverage = len(syms & target) / len(target)
-        if coverage < _ETF_DAILY_MIN_COVERAGE:
-            out.append(_dt.date.fromisoformat(ds))
-    logger.info("mootdx_service: ETF 日线内容校验 %d/%d 分区, 残缺 %d: %s",
-                len(existing[-recent:]), len(existing), len(out),
-                [d.isoformat() for d in out])
-    return out
-
-
-def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
-    """返回股票分钟 ``kline_minute`` 中**内容残缺**的分区日期（symbol 覆盖率 << 宇宙）。
-
-    背景：宽缺口判定（``_missing_days_in``/``_partition_dates``）只检查分区
-    目录是否存在，一个只有 1 只股票的分区与完整分区被视为等价——一旦某天曾
-    以残缺状态落盘（回源中断、全市场失败如 pytdx 缺失事故 5226 只全失败），
-    增量追溯永不重写，最新交易日分钟数据永久缺失。
-
-    这里做内容级校验：对最近 ``recent``（默认由 ``_STOCK_MINUTE_RECENT_LIMIT``
-    控制）个分区，读 symbol 列与股票宇宙（``_stock_universe``，.SH/.SZ）比对，
-    覆盖率 < ``_STOCK_MINUTE_MIN_COVERAGE``（默认 0.5）即判残缺。宇宙为空时
-    跳过（无基线可比）；覆盖率 >= 阈值的正常分区不误报。
-
-    盘中（<15:00）跳过当日分区：当日分钟本就走了一半（未收盘），覆盖率天然
-    偏低，误判会触发 ``sync_stock_minute_range`` 全市场重拉（~2h 浪费），
-    且写回的是半程数据。收盘后才把当日纳入残缺校验（对齐 ``_missing_minute_days``
-    口径）。
-    """
-    existing = _partition_dates(STOCK_MINUTE_ROOT)
-    if not existing:
-        return []
-    try:
-        codes = _stock_universe()
-    except Exception:  # noqa: BLE001
-        logger.warning("mootdx_service: 股票宇宙读取失败，跳过分钟内容校验", exc_info=True)
-        return []
-    if not codes:
-        return []
-
     today = _date.today()
-    recent = _STOCK_MINUTE_RECENT_LIMIT if recent is None else recent
-    target = set(codes)
     out: list[_date] = []
     for ds in existing[-recent:]:
         d = _dt.date.fromisoformat(ds)
-        if d == today and not _market_closed():
-            logger.info("mootdx_service: 当日 %s 盘中未收盘，跳过残缺校验", ds)
+        if skip_today_intraday and d == today and not _market_closed():
+            logger.info("mootdx_service: 当日 %s 盘中未收盘，跳过内容校验", ds)
             continue
-        pdir = STOCK_MINUTE_ROOT / f"date={ds}"
+        pdir = root / f"date={ds}"
         parts = sorted(pdir.glob("*.parquet"))
         if not parts:
             continue
@@ -1161,12 +1092,92 @@ def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
             except Exception:  # noqa: BLE001
                 continue
         coverage = len(syms & target) / len(target)
-        if coverage < _STOCK_MINUTE_MIN_COVERAGE:
-            out.append(_dt.date.fromisoformat(ds))
-    logger.info("mootdx_service: 股票分钟内容校验 %d/%d 分区, 残缺 %d: %s",
-                len(existing[-recent:]), len(existing), len(out),
+        if coverage < min_coverage:
+            out.append(d)
+    logger.info("mootdx_service: 内容校验 %s 最近 %d 分区, 残缺 %d: %s",
+                root.name, len(existing[-recent:]), len(out),
                 [d.isoformat() for d in out])
     return out
+
+
+def _incomplete_stock_daily_days(recent: int | None = None) -> list[_date]:
+    """股票日线内容残缺分区（symbol 覆盖率 << 股票宇宙）。"""
+    try:
+        codes = _stock_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: 股票宇宙读取失败，跳过股票日线内容校验",
+                       exc_info=True)
+        return []
+    return _incomplete_partition_days(
+        STOCK_DAILY_ROOT, set(codes),
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+
+
+def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
+    """ETF 日线内容残缺分区（symbol 覆盖率 << ETF 宇宙）。"""
+    try:
+        codes = _etf_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: ETF 宇宙读取失败，跳过 ETF 日线内容校验",
+                       exc_info=True)
+        return []
+    if not codes:
+        return []
+    target = set(_to_tf_symbol(c) for c in codes)
+    return _incomplete_partition_days(
+        ETF_DAILY_ROOT, target,
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+
+
+def _incomplete_index_daily_days(recent: int | None = None) -> list[_date]:
+    """指数日线内容残缺分区（symbol 覆盖率 << 指数宇宙）。
+
+    07-31 案例：instruments_index 缺失时曾用兜底 4 只指数写入，4/600 残帧
+    目录存在 → 分区级扫描永不重写；此处内容校验兜住。
+    """
+    try:
+        codes = _index_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: 指数宇宙读取失败，跳过指数日线内容校验",
+                       exc_info=True)
+        return []
+    if not codes:
+        return []
+    return _incomplete_partition_days(
+        INDEX_DAILY_ROOT, set(codes),
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+
+
+def _incomplete_etf_minute_days(recent: int | None = None) -> list[_date]:
+    """ETF 分钟内容残缺分区（symbol 覆盖率 << ETF 宇宙）。"""
+    try:
+        codes = _etf_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: ETF 宇宙读取失败，跳过 ETF 分钟内容校验",
+                       exc_info=True)
+        return []
+    if not codes:
+        return []
+    target = set(_to_tf_symbol(c) for c in codes)
+    return _incomplete_partition_days(
+        ETF_MINUTE_ROOT, target,
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+
+
+def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
+    """股票分钟内容残缺分区（symbol 覆盖率 << 股票宇宙）。"""
+    try:
+        codes = _stock_universe()
+    except Exception:  # noqa: BLE001
+        logger.warning("mootdx_service: 股票宇宙读取失败，跳过分钟内容校验",
+                       exc_info=True)
+        return []
+    if not codes:
+        return []
+    recent = _STOCK_MINUTE_RECENT_LIMIT if recent is None else recent
+    return _incomplete_partition_days(
+        STOCK_MINUTE_ROOT, set(codes),
+        recent, _STOCK_MINUTE_MIN_COVERAGE)
 
 
 def _stock_universe() -> list[str]:
