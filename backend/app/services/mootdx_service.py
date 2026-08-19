@@ -753,6 +753,7 @@ def scan_and_backfill_full(content_recent: int | None = None) -> dict:
     msg = "mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s"
     args = (total, {k: len(v) for k, v in backfilled.items()},
             len(backfilled["errors"]))
+    # 补全后有残留错误 → WARNING（供钉钉通知等消费）
     if backfilled["errors"]:
         logger.warning(msg, *args)
     else:
@@ -937,9 +938,9 @@ def scan_missing_partitions(start: _date | None = None,
     检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
     仅分区级（分区存在即视为该日已覆盖），不逐 symbol 校验。
 
-    对 ETF 日线额外做内容级校验：``_incomplete_etf_daily_days()`` 能把
-    "目录存在但内容残缺"（如只剩 1 只）的日子也归为缺失，触发重写，防
-    残帧永久污染（见该函数 docstring）。
+    内容级校验与分区缺口并集：5 类数据（ETF日线/股票日线/指数日线/ETF分钟/
+    股票分钟）统一跑 ``_incomplete_*_days()``，把"目录存在但内容残缺"（如只剩
+    1 只）的日子也归为缺失，触发重写，防残帧永久污染（见各函数 docstring）。
 
     额外返回 ``etf_universe_segments``（list[str]）：ETF 宇宙快照缺失的
     权威代码段（如 501/161）。分区覆盖率 vs 残缺宇宙永远测不出"快照缺段"，
