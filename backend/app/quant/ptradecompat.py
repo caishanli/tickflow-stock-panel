@@ -481,15 +481,6 @@ def get_price(security, start_date=None, end_date=None, frequency="1d",
     return field_out
 
 
-def _last_field(df, field):
-    """get_history 单标的单字段结果取最新值（列名=字段名，兼容代码列名回退）。"""
-    if df is None or df.empty:
-        return 0.0
-    if field in df.columns:
-        return float(df[field].iloc[-1])
-    return float(df.iloc[-1, 0])
-
-
 def check_limit(security, query_date=None):
     """docx check_limit：{码: int}。真实数据层无 high_limit/low_limit 列：
     取最近两根日线收盘，按昨收 + 标的分档幅度（_limit_rate）计算涨跌停价并比较。"""
