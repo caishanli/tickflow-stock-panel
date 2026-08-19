@@ -741,16 +741,19 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
     return result
 
 
-def scan_and_backfill_full() -> dict:
-    """00:00 全量巡检 + 补全入口：扫描缺失 → 逐日补全 → 汇总。"""
-    missing = scan_missing_partitions()
+def scan_and_backfill_full(content_recent: int | None = None) -> dict:
+    """00:00 全量巡检 + 补全入口：扫描缺失 → 逐日补全 → 汇总。
+
+    ``content_recent``：内容校验窗口，默认近 1 周（``_DAILY_CHECK_RECENT_PARTITIONS``）；
+    手动全量检验传 250（``_CONTENT_CHECK_RECENT_DAYS``）。
+    """
+    missing = scan_missing_partitions(content_recent=content_recent)
     backfilled = backfill_missing_partitions(missing)
     total = sum(len(v) for v in missing.values())
     msg = "mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s"
     args = (total, {k: len(v) for k, v in backfilled.items()},
             len(backfilled["errors"]))
     if backfilled["errors"]:
-        # 补全后有残留错误 → WARNING（供钉钉通知等消费）
         logger.warning(msg, *args)
     else:
         logger.info(msg, *args)
@@ -927,7 +930,8 @@ def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
     return [d for d in calendar if d.isoformat() not in existing]
 
 
-def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]]:
+def scan_missing_partitions(start: _date | None = None,
+                            content_recent: int | None = None) -> dict[str, list[_date]]:
     """分区级缺失扫描：4/1（或 start）至今，6 类数据按交易日历逐日比对。
 
     检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
@@ -940,19 +944,29 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
     额外返回 ``etf_universe_segments``（list[str]）：ETF 宇宙快照缺失的
     权威代码段（如 501/161）。分区覆盖率 vs 残缺宇宙永远测不出"快照缺段"，
     必须用权威段结构做基线（见 ``_etf_universe_segment_missing``）。
+
+    ``content_recent`` 默认 ``_DAILY_CHECK_RECENT_PARTITIONS``（近 1 周），
+    全量手动传 250。
     """
     today = _date.today()
     calendar = _trade_days_in_range(start or STOCK_MINUTE_START, today)
     from app.services.etf_nav_service import _missing_etf_nav_days as _missing_nav
+    content = (_DAILY_CHECK_RECENT_PARTITIONS
+               if content_recent is None else content_recent)
     missing_etf_daily = set(_missing_days_in(calendar, ETF_DAILY_ROOT))
-    missing_etf_daily |= set(_incomplete_etf_daily_days())
+    missing_etf_daily |= set(_incomplete_etf_daily_days(recent=content))
     # 盘中半程快照自愈（08-11 案例）：昨日/历史日分区 mtime 早于自身日期
     # 15:00 即判残缺重写。00:00 巡检跨天也能识别（旧实现只查今天）。
     missing_etf_daily |= set(_stale_daily_days(ETF_DAILY_ROOT))
     missing_stock_daily = set(_missing_days_in(calendar, STOCK_DAILY_ROOT))
     missing_stock_daily |= set(_stale_daily_days(STOCK_DAILY_ROOT))
+    missing_stock_daily |= set(_incomplete_stock_daily_days(recent=content))
+    missing_index_daily = set(_missing_days_in(calendar, INDEX_DAILY_ROOT))
+    missing_index_daily |= set(_incomplete_index_daily_days(recent=content))
+    missing_etf_minute = set(_missing_days_in(calendar, ETF_MINUTE_ROOT))
+    missing_etf_minute |= set(_incomplete_etf_minute_days(recent=content))
     missing_stock_minute = set(_missing_days_in(calendar, STOCK_MINUTE_ROOT))
-    missing_stock_minute |= set(_incomplete_stock_minute_days())
+    missing_stock_minute |= set(_incomplete_stock_minute_days(recent=content))
     seg_missing = _safe_universe_segment_missing()
     if seg_missing:
         logger.warning("mootdx_service: ETF 宇宙快照缺代码段 %s，"
@@ -961,8 +975,8 @@ def scan_missing_partitions(start: _date | None = None) -> dict[str, list[_date]
     return {
         "kline_daily":       sorted(missing_stock_daily),
         "kline_etf_daily":   sorted(missing_etf_daily),
-        "kline_index_daily": _missing_days_in(calendar, INDEX_DAILY_ROOT),
-        "kline_etf_minute":  _missing_days_in(calendar, ETF_MINUTE_ROOT),
+        "kline_index_daily": sorted(missing_index_daily),
+        "kline_etf_minute":  sorted(missing_etf_minute),
         "kline_minute":      sorted(missing_stock_minute),
         "etf_nav":           _missing_nav(),
         "etf_universe_segments": sorted(seg_missing),
@@ -1606,9 +1620,18 @@ def backfill_to_now() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
 
+    content = _DAILY_CHECK_RECENT_PARTITIONS
+    incomplete_etf_minute = set(_incomplete_etf_minute_days(recent=content))
+    incomplete_stock_daily = set(_incomplete_stock_daily_days(recent=content))
+    incomplete_etf_daily = set(_incomplete_etf_daily_days(recent=content))
+    incomplete_index_daily = set(_incomplete_index_daily_days(recent=content))
+    incomplete_stock_minute = set(_incomplete_stock_minute_days(recent=content))
+    missing_stock_minute_days = set(_missing_stock_minute_days())
+
     result["missing"] = {
         "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
-                               "empty": not etf_minute_days, "missing": bool(_missing_minute_days())},
+                               "empty": not etf_minute_days,
+                               "missing": bool(_missing_minute_days() or incomplete_etf_minute)},
         "kline_daily":        {"latest": stocks_daily[-1] if stocks_daily else None,
                                "empty": not stocks_daily, "missing": bool(_missing_daily_days(STOCK_DAILY_ROOT))},
         "kline_etf_daily":    {"latest": etf_daily_days[-1] if etf_daily_days else None,
@@ -1617,9 +1640,11 @@ def backfill_to_now() -> dict[str, Any]:
                                                or _incomplete_etf_daily_days()),
                                "segment_missing": _safe_universe_segment_missing()},
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
-                               "empty": not index_daily_days, "missing": bool(_missing_index_daily_days())},
+                               "empty": not index_daily_days,
+                               "missing": bool(_missing_index_daily_days() or incomplete_index_daily)},
         "kline_minute":       {"latest": stock_minute_days[-1] if stock_minute_days else None,
-                               "empty": not stock_minute_days, "missing": bool(_incomplete_stock_minute_days())},
+                               "empty": not stock_minute_days,
+                               "missing": bool(missing_stock_minute_days or incomplete_stock_minute)},
         "adj_factor_etf":     {"latest": adj_factor_latest, "empty": not ADJ_FACTOR_PATH.exists(),
                                "missing": _adj_factor_stale()},
         "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
@@ -1627,7 +1652,7 @@ def backfill_to_now() -> dict[str, Any]:
     }
 
     # 1. ETF 分钟
-    for day in _missing_minute_days():
+    for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute):
         try:
             n = sync_etf_minute(day)
             result["minute_days"].append(str(day))
@@ -1640,12 +1665,15 @@ def backfill_to_now() -> dict[str, Any]:
     today = _date.today()
     daily_days = sorted(set(_missing_daily_days(STOCK_DAILY_ROOT))
                         | set(_missing_daily_days(ETF_DAILY_ROOT))
-                        | set(_incomplete_etf_daily_days()))
+                        | set(_incomplete_etf_daily_days())
+                        | set(incomplete_stock_daily)
+                        | set(incomplete_etf_daily))
     # 股票日线根为空时的兜底种子窗口；残缺 ETF 日（内容校验）必须保留，
     # 否则会被空窗分支整体覆盖而漏补。
     if _missing_daily_days(STOCK_DAILY_ROOT) == [] and not stocks_daily:
         seed = set(_trade_days_up_to(today)) - set(_partition_dates(STOCK_DAILY_ROOT))
-        daily_days = sorted(seed | set(_incomplete_etf_daily_days()))
+        daily_days = sorted(seed | set(_incomplete_etf_daily_days())
+                            | set(incomplete_stock_daily) | set(incomplete_etf_daily))
     for day in daily_days:
         try:
             w = sync_daily(day)
@@ -1657,9 +1685,10 @@ def backfill_to_now() -> dict[str, Any]:
             result["errors"].append(f"daily {day}: {e}")
 
     # 2b. 指数日线（新增）——空时补最近窗口
-    idx_days = sorted(_missing_index_daily_days())
+    idx_days = sorted(set(_missing_index_daily_days()) | set(incomplete_index_daily))
     if not idx_days and not index_daily_days:
-        idx_days = sorted(set(_trade_days_up_to(today)) - set(_partition_dates(INDEX_DAILY_ROOT)))
+        idx_days = sorted(set(_trade_days_up_to(today))
+                          - set(_partition_dates(INDEX_DAILY_ROOT)))
     for day in idx_days:
         try:
             w = sync_index_daily(day)
@@ -1680,16 +1709,17 @@ def backfill_to_now() -> dict[str, Any]:
 
     # 3. 股票分钟：先修复内容残缺分区（range 全量，走所有缺失日前的分支），
     #    再跑增量慢跑（每次一批，resume 跳过已覆盖，多轮自动补齐）
-    incomplete_minute = _incomplete_stock_minute_days()
+    incomplete_minute = incomplete_stock_minute | missing_stock_minute_days
     if incomplete_minute:
         try:
-            n = sync_stock_minute_range(incomplete_minute)
+            min_days = sorted(incomplete_minute)
+            n = sync_stock_minute_range(min_days)
             result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
-            result["stock_minute_days"] = [d.isoformat() for d in incomplete_minute]
+            result["stock_minute_days"] = [d.isoformat() for d in min_days]
         except Exception as e:  # noqa: BLE001
-            logger.warning("mootdx_service: 股票分钟残缺分区重写失败 %s: %s",
-                           incomplete_minute, e)
-            result["errors"].append(f"stock_minute_range {incomplete_minute}: {e}")
+            logger.warning("mootdx_service: 股票分钟残缺/缺失分区重写失败 %s: %s",
+                           sorted(incomplete_minute), e)
+            result["errors"].append(f"stock_minute_range {sorted(incomplete_minute)}: {e}")
     try:
         n = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
         result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n

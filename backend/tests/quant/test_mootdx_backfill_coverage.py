@@ -207,6 +207,7 @@ def test_backfill_noop_when_all_current(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     calls = {"n": 0}
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("n", calls["n"] + 1))
@@ -440,7 +441,8 @@ def test_scan_missing_partitions_flags_sparse_etf_daily(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
         _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)])
     monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
-    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [_dt.date(2026, 8, 4)])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days",
+                        lambda recent=None: [_dt.date(2026, 8, 4)])
 
     # ETF 分区 8/4 已存在（但残缺，被内容校验兜住）
     root = tmp_path / "kline_etf_daily"
@@ -465,7 +467,8 @@ def test_backfill_to_now_resyncs_sparse_etf_daily(tmp_path, monkeypatch):
     _stub_etf_nav(monkeypatch)
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
     # 残缺日 = 8/5；其余判定给空，保证只有残缺触发 sync_daily
-    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [_d(2026, 8, 5)])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days",
+                        lambda recent=None: [_d(2026, 8, 5)])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
     monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
@@ -678,7 +681,7 @@ def test_scan_missing_partitions_flags_stale_yesterday_etf_daily(tmp_path, monke
     monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [
         _dt.date(2026, 8, 10), _dt.date(2026, 8, 11)])
     monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(90)])
-    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda recent=None: [])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
 
     # 昨天 08-11 12:50 盘中写入的 ETF 日线分区（半程快照，symbol 全覆盖）
@@ -901,7 +904,7 @@ def test_scan_missing_partitions_reports_universe_segments(tmp_path, monkeypatch
     # 宇宙缺 501/161 段（服务器快照实际形态）
     monkeypatch.setattr(ms, "_etf_universe", lambda: [
         "159985.XSHE", "510300.XSHG", "506000.XSHG", "169101.XSHE"])
-    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda recent=None: [])
 
     missing = ms.scan_missing_partitions()
     assert "501" in missing["etf_universe_segments"]
@@ -923,7 +926,7 @@ def test_backfill_to_now_flags_missing_universe_segments(tmp_path, monkeypatch):
     _stub_etf_nav(monkeypatch)
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 5))})())
     monkeypatch.setattr(ms, "_etf_universe", lambda: ["159985.XSHE", "510300.XSHG"])
-    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda recent=None: [])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
     monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
@@ -1723,3 +1726,89 @@ def test_sync_stock_minute_no_range_when_current(monkeypatch, tmp_path):
 
     assert ranges == [], "最新分区已是今天，不应触发 range"
     assert n == 0, "resume todo 空 → 0 行"
+
+
+# ---------------------------------------------------------------------------
+# 内容校验接入巡检/启动回源
+# ---------------------------------------------------------------------------
+
+def test_scan_missing_partitions_content_recent_default(tmp_path, monkeypatch):
+    """content_recent 默认近 1 周（7），显式传 250 时透传给全部 _incomplete_*。"""
+    import datetime as _dt
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    for key in ["STOCK_DAILY_ROOT", "ETF_DAILY_ROOT", "INDEX_DAILY_ROOT",
+                "ETF_MINUTE_ROOT", "STOCK_MINUTE_ROOT"]:
+        monkeypatch.setattr(ms, key, tmp_path / key.lower())
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [_dt.date(2026, 8, 4)])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159900.XSHE"])
+    monkeypatch.setattr(ms, "_stale_daily_days", lambda root, now=None: [])
+    seen: dict[str, int | None] = {}
+
+    def _mk(name):
+        def f(recent=None):
+            seen[name] = recent
+            return []
+        return f
+
+    monkeypatch.setattr(ms, "_incomplete_stock_daily_days", _mk("stock_daily"))
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", _mk("etf_daily"))
+    monkeypatch.setattr(ms, "_incomplete_index_daily_days", _mk("index_daily"))
+    monkeypatch.setattr(ms, "_incomplete_etf_minute_days", _mk("etf_minute"))
+    monkeypatch.setattr(ms, "_incomplete_stock_minute_days", _mk("stock_minute"))
+
+    ms.scan_missing_partitions()
+    assert set(seen.values()) == {ms._DAILY_CHECK_RECENT_PARTITIONS}, \
+        f"默认应传近 1 周窗口, 实际 {seen}"
+
+    seen.clear()
+    ms.scan_missing_partitions(content_recent=250)
+    assert set(seen.values()) == {250}, f"显式 250 应透传, 实际 {seen}"
+
+
+def test_backfill_to_now_resyncs_content_flagged_index(monkeypatch, tmp_path):
+    """启动回源用近 1 周窗口：内容残缺的指数日线触发 sync_index_daily 重写。"""
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch)
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
+        lambda: _d(2026, 8, 5))})())
+    for name in ["kline_etf_minute", "kline_etf_daily", "kline_index_daily", "kline_daily"]:
+        (tmp_path / name / "date=2026-08-04").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"], "trade_date": [_d(2026, 8, 4)], "ex_factor": [1.0],
+    }).write_parquet(tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_incomplete_etf_minute_days", lambda recent=None: [])
+    monkeypatch.setattr(ms, "_incomplete_stock_daily_days", lambda recent=None: [])
+    monkeypatch.setattr(ms, "_incomplete_etf_daily_days", lambda recent=None: [])
+    monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
+
+    def _flagged_index(recent=None):
+        w = recent or ms._CONTENT_CHECK_RECENT_DAYS
+        return [_d(2026, 7, 31)] if w <= ms._DAILY_CHECK_RECENT_PARTITIONS else []
+
+    monkeypatch.setattr(ms, "_incomplete_index_daily_days", _flagged_index)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+    days = []
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: days.append(d) or {"written": 1})
+
+    res = ms.backfill_to_now()
+
+    assert days == [_d(2026, 7, 31)], f"启动回源应重写内容残缺指数日线, 实际 {days}"
+    assert res["missing"]["kline_index_daily"]["missing"] is True
