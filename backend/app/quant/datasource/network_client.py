@@ -195,8 +195,8 @@ class StockDataClient:
     def status(self) -> dict:
         return self._request("status", {})["d"]
 
-    def trigger_sync(self, kind: str) -> dict:
-        return self._request("trigger_sync", {"kind": kind})["d"]
+    def trigger_sync(self, kind: str, **params) -> dict:
+        return self._request("trigger_sync", {"kind": kind, **params})["d"]
 
     def close(self) -> None:
         with self._sock_lock:

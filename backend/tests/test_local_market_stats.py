@@ -97,3 +97,59 @@ def test_empty_data_dir(tmp_path: Path) -> None:
     client = TestClient(_make_app(repo))
     body = client.get("/api/data/local-market-stats").json()
     assert body == {"total": 0, "page": 1, "page_size": 15, "rows": []}
+
+
+def test_check_day_endpoint_triggers(monkeypatch) -> None:
+    from app.quant.datasource import network_client as nc
+    calls: list[tuple] = []
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            pass
+
+        def trigger_sync(self, kind: str, **params):
+            calls.append((kind, params))
+
+    monkeypatch.setattr(nc, "StockDataClient", _FakeClient)
+    client = TestClient(_make_app(repo))
+    r = client.post("/api/data/check-day", json={"date": "2026-08-05"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert calls == [("check_day", {"day": "2026-08-05"})]
+    bad = client.post("/api/data/check-day", json={"date": "not-a-date"})
+    assert bad.status_code == 400
+
+
+def test_check_full_endpoint_triggers(monkeypatch) -> None:
+    from app.quant.datasource import network_client as nc
+    calls: list[tuple] = []
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            pass
+
+        def trigger_sync(self, kind: str, **params):
+            calls.append((kind, params))
+
+    monkeypatch.setattr(nc, "StockDataClient", _FakeClient)
+    client = TestClient(_make_app(repo))
+    r = client.post("/api/data/check-full")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert calls == [("check_full", {})]
+
+
+def test_check_day_endpoint_503_when_service_down(monkeypatch) -> None:
+    from app.quant.datasource import network_client as nc
+
+    class _BrokenClient:
+        def __init__(self) -> None:
+            pass
+
+        def trigger_sync(self, kind: str, **params):
+            raise ConnectionError("stockdata down")
+
+    monkeypatch.setattr(nc, "StockDataClient", _BrokenClient)
+    client = TestClient(_make_app(repo))
+    r = client.post("/api/data/check-day", json={"date": "2026-08-05"})
+    assert r.status_code == 503

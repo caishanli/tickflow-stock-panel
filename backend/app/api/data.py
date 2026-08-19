@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.indicators.pipeline import ENRICHED_COLUMNS
 
@@ -694,6 +694,35 @@ def local_market_stats(
     with _local_stats_lock:
         _local_stats_cache[key] = (now, result)
     return result
+
+
+@router.post("/check-day")
+def data_check_day(payload: dict, request: Request):
+    """触发单日检验补齐（stockdata 服务后台执行，异步）。"""
+    day = payload.get("date")
+    try:
+        datetime.fromisoformat(day or "")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="date 需为 YYYY-MM-DD")
+    try:
+        from app.quant.datasource.network_client import StockDataClient
+        StockDataClient().trigger_sync("check_day", day=day)
+    except Exception as e:
+        logger.warning("check-day 触发失败: %s", e)
+        raise HTTPException(status_code=503, detail="stockdata 服务不可达")
+    return {"ok": True}
+
+
+@router.post("/check-full")
+def data_check_full(request: Request):
+    """触发全量检验补齐（stockdata 服务后台执行，异步）。"""
+    try:
+        from app.quant.datasource.network_client import StockDataClient
+        StockDataClient().trigger_sync("check_full")
+    except Exception as e:
+        logger.warning("check-full 触发失败: %s", e)
+        raise HTTPException(status_code=503, detail="stockdata 服务不可达")
+    return {"ok": True}
 
 
 @router.post("/clear")
