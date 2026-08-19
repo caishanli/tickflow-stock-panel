@@ -210,10 +210,11 @@ def set_universe(codes):
     _state["ctx"].universe = list(codes)  # PTrade 域（runner feed 前转引擎码）
 
 
-def get_history(count, frequency, field, security_list=None, include=True, fq="pre"):
+def get_history(count, frequency, field, security_list=None, include=True, fq="pre", end_dt=None):
     """PTrade get_history：多标的宽表（index=datetime, columns=PTrade 码）。
 
-    数据走 DataManager（JQ 码），fq='pre' 与 jq get_price 同口径。"""
+    数据走 DataManager（JQ 码），fq='pre' 与 jq get_price 同口径。end_dt 覆盖
+    当前上下文时间（get_price 的 end_date 透传）。"""
     mgr = _state.get("manager")
     ctx = _state.get("ctx")
     if mgr is None:
@@ -231,7 +232,8 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
     # 本地 DataManager 日线列为 money（原始成交额，与 jq get_price 口径一致），
     # 非 rqalpha recarray 的 total_turnover。
     col = "money" if field == "money" else field
-    now = pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None
+    now = pd.Timestamp(end_dt) if end_dt is not None else (
+        pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None)
     # money_corrected：修正后的元成交额（对齐聚宽 get_daily_money_cached 口径，
     # 本地日线 money 列单位经 _ensure_money_yuan 修正，history_bars 的
     # total_turnover=close×volume 在部分 ETF 上被放大）
@@ -544,9 +546,12 @@ def get_price(security, start_date=None, end_date=None, frequency="1d",
     codes = [security] if isinstance(security, str) else list(security)
     field_out = {}
     for f in fields:
-        df = get_history(count, frequency, f, security_list=codes, include=False, fq=fq)
+        df = get_history(count, frequency, f, security_list=codes, include=False, fq=fq,
+                         end_dt=end_date if end_date is not None else None)
         if df is None or df.empty:
             continue
+        if start_date is not None:
+            df = df[df.index >= pd.Timestamp(start_date)]
         field_out[f] = df
     if not field_out:
         return pd.DataFrame()
@@ -560,6 +565,15 @@ def get_price(security, start_date=None, end_date=None, frequency="1d",
     return field_out
 
 
+def _last_field(df, field):
+    """get_history 单标的单字段结果取最新值（列名=字段名，兼容代码列名回退）。"""
+    if df is None or df.empty:
+        return 0.0
+    if field in df.columns:
+        return float(df[field].iloc[-1])
+    return float(df.iloc[-1, 0])
+
+
 def check_limit(security, query_date=None):
     """docx check_limit：{码: int}，-2 触板跌停/-1 跌停/0 平/1 涨停/2 触板涨停。
     本地引擎用日线 high_limit/low_limit 字段 + 最新价推导。"""
@@ -568,16 +582,15 @@ def check_limit(security, query_date=None):
     for c in codes:
         out[c] = 0
         try:
-            df = get_history(1, "1d", ["high_limit", "low_limit", "close"],
-                             security_list=c, include=True)
-            if df is None or df.empty:
-                continue
-            last = float(df["close"].iloc[-1])
-            high = float(df["high_limit"].iloc[-1]) if "high_limit" in df.columns else 0
-            low = float(df["low_limit"].iloc[-1]) if "low_limit" in df.columns else 0
-            if high and last >= high:
+            close = get_history(1, "1d", "close", security_list=c, include=True)
+            high = get_history(1, "1d", "high_limit", security_list=c, include=True)
+            low = get_history(1, "1d", "low_limit", security_list=c, include=True)
+            last = _last_field(close, "close")
+            hp = _last_field(high, "high_limit")
+            lp = _last_field(low, "low_limit")
+            if hp and last >= hp:
                 out[c] = 1
-            elif low and last <= low:
+            elif lp and last <= lp:
                 out[c] = -1
         except Exception:
             continue
@@ -604,16 +617,14 @@ def get_snapshot(security):
                 "preclose_px": 0.0, "high_px": 0.0, "low_px": 0.0,
                 "business_balance": 0.0, "volume": 0, "amount": 0}
         try:
-            df = get_history(1, "1d", ["close", "high_limit", "low_limit", "preclose"],
-                             security_list=c, include=True)
-            if df is not None and not df.empty:
-                snap["last_px"] = float(df["close"].iloc[-1])
-                if "high_limit" in df.columns:
-                    snap["up_px"] = float(df["high_limit"].iloc[-1])
-                if "low_limit" in df.columns:
-                    snap["down_px"] = float(df["low_limit"].iloc[-1])
-                if "preclose" in df.columns:
-                    snap["preclose_px"] = float(df["preclose"].iloc[-1])
+            close = get_history(1, "1d", "close", security_list=c, include=True)
+            high = get_history(1, "1d", "high_limit", security_list=c, include=True)
+            low = get_history(1, "1d", "low_limit", security_list=c, include=True)
+            preclose = get_history(1, "1d", "preclose", security_list=c, include=True)
+            snap["last_px"] = _last_field(close, "close")
+            snap["up_px"] = _last_field(high, "high_limit")
+            snap["down_px"] = _last_field(low, "low_limit")
+            snap["preclose_px"] = _last_field(preclose, "preclose")
         except Exception:
             pass
         out[c] = snap
