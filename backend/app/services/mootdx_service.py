@@ -762,6 +762,102 @@ def scan_and_backfill_full(content_recent: int | None = None) -> dict:
             "errors": backfilled["errors"]}
 
 
+def _partition_symbols(root: Path, day: _date) -> set[str]:
+    """读某日分区所有 parquet 的 symbol 集合（异常/缺失 → 空集）。"""
+    pdir = root / f"date={day.isoformat()}"
+    syms: set[str] = set()
+    for p in sorted(pdir.glob("*.parquet")):
+        try:
+            syms |= set(pl.read_parquet(p, columns=["symbol"])["symbol"].to_list())
+        except Exception:  # noqa: BLE001
+            continue
+    return syms
+
+
+def _coverage(root: Path, day: _date, target: set[str]) -> tuple[float, set[str]]:
+    """返回 (覆盖率, 缺失 symbol)。分区不存在/宇宙空 → (0.0, target)。"""
+    if not target:
+        return 0.0, set()
+    have = _partition_symbols(root, day)
+    if not have:
+        return 0.0, target
+    inter = have & target
+    return len(inter) / len(target), target - have
+
+
+def check_and_repair_day(day: _date) -> dict:
+    """单日检验补齐：对该日 5 类逐类查内容，残缺/缺失则重写。
+
+    返回 {"day": str, "results": {type: {"status": "ok"|"repaired"|"skip"|"failed",
+                                          "coverage": float|None, "symbols": int}}}。
+    单类失败不阻断其它类。
+    """
+    results: dict[str, dict] = {}
+    try:
+        stocks = _stock_universe()
+    except Exception:  # noqa: BLE001
+        stocks = []
+    try:
+        etf_tf = set(_to_tf_symbol(c) for c in _etf_universe())
+    except Exception:  # noqa: BLE001
+        etf_tf = set()
+    try:
+        idx = _index_universe()
+    except Exception:  # noqa: BLE001
+        idx = []
+
+    for key, root, target, repair in [
+        ("stock_daily", STOCK_DAILY_ROOT, set(stocks), lambda: sync_daily(day)),
+        ("etf_daily", ETF_DAILY_ROOT, etf_tf, lambda: sync_daily(day)),
+        ("index_daily", INDEX_DAILY_ROOT, set(idx), lambda: sync_index_daily(day)),
+        ("etf_minute", ETF_MINUTE_ROOT, etf_tf, lambda: sync_etf_minute(day)),
+    ]:
+        if not target:
+            results[key] = {"status": "skip", "coverage": None, "symbols": 0}
+            continue
+        cov, _missing = _coverage(root, day, target)
+        have = len(_partition_symbols(root, day))
+        if cov >= _CONTENT_CHECK_MIN_COVERAGE:
+            results[key] = {"status": "ok", "coverage": round(cov, 4), "symbols": have}
+            continue
+        try:
+            repair()
+            results[key] = {"status": "repaired", "coverage": round(cov, 4), "symbols": have}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 单日补齐 %s %s 失败: %s", key, day, e)
+            results[key] = {"status": "failed", "coverage": round(cov, 4), "symbols": have}
+
+    # 股票分钟：只补缺失 symbol（残缺少时快；停牌标的该日无 bar 由 sync 内部跳过）
+    stock_target = set(stocks)
+    cov, missing = _coverage(STOCK_MINUTE_ROOT, day, stock_target)
+    have = len(_partition_symbols(STOCK_MINUTE_ROOT, day))
+    if not stock_target:
+        results["stock_minute"] = {"status": "skip", "coverage": None, "symbols": 0}
+    elif cov >= _CONTENT_CHECK_MIN_COVERAGE:
+        results["stock_minute"] = {"status": "ok", "coverage": round(cov, 4), "symbols": have}
+    else:
+        try:
+            sync_stock_minute_day(day, symbols=sorted(missing))
+            results["stock_minute"] = {"status": "repaired", "coverage": round(cov, 4),
+                                       "symbols": have}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 单日补齐 stock_minute %s 失败: %s", day, e)
+            results["stock_minute"] = {"status": "failed", "coverage": round(cov, 4),
+                                       "symbols": have}
+
+    return {"day": day.isoformat(), "results": results}
+
+
+def check_and_repair_full(content_recent: int | None = None) -> dict:
+    """全量检验补齐：全窗口内容校验 + 全量分区缺失补全。
+
+    content_recent 默认 ``_CONTENT_CHECK_RECENT_DAYS``（250，≈1 年交易日）。
+    """
+    if content_recent is None:
+        content_recent = _CONTENT_CHECK_RECENT_DAYS
+    return scan_and_backfill_full(content_recent=content_recent)
+
+
 def sync_adj_factor() -> dict:
     """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建）。
 

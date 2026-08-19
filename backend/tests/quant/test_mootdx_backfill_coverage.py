@@ -1835,3 +1835,86 @@ def test_backfill_to_now_resyncs_content_flagged_index(monkeypatch, tmp_path):
 
     assert days == [_d(2026, 7, 31)], f"启动回源应重写内容残缺指数日线, 实际 {days}"
     assert res["missing"]["kline_index_daily"]["missing"] is True
+
+
+# ---------------------------------------------------------------------------
+# 单日 / 全量检验补齐
+# ---------------------------------------------------------------------------
+
+def test_check_and_repair_day_repairs_sparse_index(tmp_path, monkeypatch):
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [f"6000{dd:02d}.SH" for dd in range(3)])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(3)])
+    monkeypatch.setattr(ms, "_index_universe", lambda: ["000001.SH", "000300.SH", "399006.SZ"])
+    root = tmp_path / "kline_index_daily"
+    (root / "date=2026-07-31").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"symbol": ["000300.SH"], "open": [1.0], "close": [1.0]}).write_parquet(
+        root / "date=2026-07-31" / "part.parquet")
+    calls = {"daily": 0, "index": [], "etf_minute": 0, "stock_minute": []}
+    monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("daily", calls["daily"] + 1))
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls["index"].append(d) or {"written": 3})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("etf_minute", calls["etf_minute"] + 1))
+    monkeypatch.setattr(ms, "sync_stock_minute_day",
+                        lambda day, symbols=None: calls["stock_minute"].append(sorted(symbols or [])) or 0)
+
+    res = ms.check_and_repair_day(_d(2026, 7, 31))
+
+    assert calls["index"] == [_d(2026, 7, 31)], "指数日线残缺应重写"
+    assert res["results"]["index_daily"]["status"] == "repaired"
+    # 其它类型该日无分区 → 覆盖率为 0 → 也重写（股票分钟只补缺失 symbol）
+    assert calls["daily"] >= 1
+    assert calls["etf_minute"] >= 1
+    assert calls["stock_minute"] == [[
+        "600000.SH", "600001.SH", "600002.SH"]], "股票分钟应只补缺失 symbol"
+
+
+def test_check_and_repair_day_noop_when_complete(tmp_path, monkeypatch):
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [f"6000{dd:02d}.SH" for dd in range(3)])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [f"1599{dd:02d}.XSHE" for dd in range(3)])
+    monkeypatch.setattr(ms, "_index_universe", lambda: ["000001.SH", "000300.SH", "399006.SZ"])
+    for sub, syms in [
+        ("kline_daily", ["600000.SH", "600001.SH", "600002.SH"]),
+        ("kline_etf_daily", ["159900.SZ", "159901.SZ", "159902.SZ"]),
+        ("kline_index_daily", ["000001.SH", "000300.SH", "399006.SZ"]),
+        ("kline_etf_minute", ["159900.SZ", "159901.SZ", "159902.SZ"]),
+        ("kline_minute", ["600000.SH", "600001.SH", "600002.SH"]),
+    ]:
+        pdir = tmp_path / sub / "date=2026-08-04"
+        pdir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"symbol": syms, "close": [1.0] * len(syms)}).write_parquet(
+            pdir / "part.parquet")
+    calls = {"n": 0}
+    for fn in ["sync_daily", "sync_index_daily", "sync_etf_minute", "sync_stock_minute_day"]:
+        monkeypatch.setattr(ms, fn, lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+
+    res = ms.check_and_repair_day(_d(2026, 8, 4))
+
+    assert calls["n"] == 0, "全部完整时不应触发任何重写"
+    assert all(v["status"] == "ok" for v in res["results"].values())
+
+
+def test_check_and_repair_full_uses_250_window(monkeypatch, tmp_path):
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    seen = {}
+    monkeypatch.setattr(ms, "scan_and_backfill_full",
+                        lambda content_recent=None: seen.setdefault(
+                            "recent", content_recent)
+                        and {"missing": {}, "backfilled": {}, "errors": []})
+
+    res = ms.check_and_repair_full()
+
+    assert seen["recent"] == ms._CONTENT_CHECK_RECENT_DAYS, "全量默认用近一年窗口"
+    assert res["errors"] == []
