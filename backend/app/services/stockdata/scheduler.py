@@ -69,6 +69,38 @@ def _run_sync(full_stock_minute: bool = False):
             logger.exception("scheduled mootdx sync failed")
 
 
+def _run_check_day(day: str) -> None:
+    """单日检验补齐（后台线程）：解析日期并执行。"""
+    with _sync_lock:
+        try:
+            from app.services import mootdx_service
+            d = _dt.date.fromisoformat(day)
+            res = mootdx_service.check_and_repair_day(d)
+            with _lock:
+                _scheduler_state["last_check_day"] = day
+                _scheduler_state["check_day_result"] = res
+            logger.info("stockdata check_day %s done: %s", day,
+                        {k: v["status"] for k, v in res["results"].items()})
+        except Exception:  # noqa: BLE001
+            logger.exception("stockdata check_day %s failed", day)
+
+
+def _run_check_full() -> None:
+    """全量检验补齐（后台线程）：执行并记录汇总。"""
+    with _sync_lock:
+        try:
+            from app.services import mootdx_service
+            res = mootdx_service.check_and_repair_full()
+            with _lock:
+                _scheduler_state["last_check_full"] = str(_dt.datetime.now())
+                _scheduler_state["check_full_result"] = res
+            logger.info("stockdata check_full done: %s",
+                        {k: len(v) for k, v in (res.get("missing") or {}).items()}
+                        if isinstance(res.get("missing"), dict) else res)
+        except Exception:  # noqa: BLE001
+            logger.exception("stockdata check_full failed")
+
+
 def _sync_cron_loop():
     """15:35（工作日）触发 _run_sync；非交易日不触发。"""
     while not _stop.is_set():
@@ -171,10 +203,19 @@ def _midnight_clear_loop(data_sources) -> None:
             last_date = today
 
 
-def trigger_sync(kind: str) -> dict:
-    """手动触发同步（供 handler 调用）。kind: backfill|daily|etf_minute|stock_minute|adj_factor"""
+def trigger_sync(kind: str, **params) -> dict:
+    """手动触发同步（供 handler 调用）。
+
+    kind: backfill|daily|etf_minute|stock_minute|adj_factor|check_day|check_full
+    check_day 需传 ``day``（YYYY-MM-DD）。
+    """
     if kind == "backfill":
         threading.Thread(target=_backfill_loop, daemon=True).start()
+    elif kind == "check_day":
+        threading.Thread(target=_run_check_day, args=(params["day"],),
+                         daemon=True).start()
+    elif kind == "check_full":
+        threading.Thread(target=_run_check_full, daemon=True).start()
     else:
         threading.Thread(target=_run_sync, daemon=True).start()
     return {"ok": True}

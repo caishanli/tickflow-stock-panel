@@ -81,3 +81,49 @@ def test_run_sync_incremental_keeps_limit(monkeypatch):
     sch._run_sync(full_stock_minute=False)
 
     assert calls["stock_limit"] == mootdx_service.STOCK_MINUTE_BATCH_LIMIT
+
+
+def test_run_check_day_runs_repair(monkeypatch):
+    """check_day 后台执行体：解析日期并调 mootdx_service.check_and_repair_day。"""
+    from datetime import date as _d
+    from app.services import mootdx_service
+    calls = []
+    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_lock", threading.Lock())
+    monkeypatch.setattr(mootdx_service, "check_and_repair_day",
+                        lambda day: calls.append(day) or {"day": str(day), "results": {}})
+    sch._run_check_day("2026-08-05")
+    assert calls == [_d(2026, 8, 5)]
+    assert sch._scheduler_state["check_day_result"]["day"] == "2026-08-05"
+
+
+def test_run_check_full_runs_repair(monkeypatch):
+    """check_full 后台执行体：调 check_and_repair_full 并记录汇总。"""
+    from app.services import mootdx_service
+    calls = []
+    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_lock", threading.Lock())
+    monkeypatch.setattr(mootdx_service, "check_and_repair_full",
+                        lambda content_recent=None: calls.append(content_recent)
+                        or {"missing": {}, "backfilled": {}, "errors": []})
+    sch._run_check_full()
+    assert calls == [None]
+    assert sch._scheduler_state["check_full_result"]["errors"] == []
+
+
+def test_trigger_sync_check_kinds_spawn_thread(monkeypatch):
+    """trigger_sync 的 check_day/check_full 走后台线程（start 不阻塞）。"""
+    spawned = []
+
+    class _T(threading.Thread):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            spawned.append(k.get("args", ()))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(threading, "Thread", _T)
+    assert sch.trigger_sync("check_day", day="2026-08-05") == {"ok": True}
+    assert sch.trigger_sync("check_full") == {"ok": True}
+    assert len(spawned) == 2

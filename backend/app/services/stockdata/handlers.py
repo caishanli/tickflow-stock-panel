@@ -105,7 +105,8 @@ def h_get_etf_nav(p, s: DataSources):
 def h_trigger_sync(p, s: DataSources):
     from .scheduler import trigger_sync
     kind = p.get("kind", "backfill")
-    trigger_sync(kind)
+    params = {k: v for k, v in p.items() if k != "kind"}
+    trigger_sync(kind, **params)
     return "json", {"ok": True, "kind": kind}
 
 

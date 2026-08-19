@@ -52,3 +52,18 @@ def test_norm_code_with_suffix():
     assert _norm_code("512670.SH") == "512670.XSHG"
     assert _norm_code("000300.XSHG") == "000300.XSHG"
     assert _norm_code("000001.SZ") == "000001.XSHE"
+
+
+def test_h_trigger_sync_passes_params(monkeypatch):
+    """trigger_sync handler 应透传 kind 之外的参数（如 day）。"""
+    from app.services.stockdata import handlers
+    got = {}
+
+    def fake_trigger(kind, **params):
+        got["kind"] = kind
+        got["params"] = params
+
+    monkeypatch.setattr("app.services.stockdata.scheduler.trigger_sync", fake_trigger)
+    out = handlers.h_trigger_sync({"kind": "check_day", "day": "2026-08-05"}, None)
+    assert got == {"kind": "check_day", "params": {"day": "2026-08-05"}}
+    assert out == ("json", {"ok": True, "kind": "check_day"})
