@@ -72,7 +72,7 @@ def test_thirteen_ten_tasks_same_time():
     assert src.count("time='13:10'") == 3, "13:10 同点任务应为 3 个"
     assert src.count("time='09:40'") == 1
     for fn in ["afternoon_routine", "sell_routine", "buy_routine"]:
-        assert ("run_daily(context, %s, time='13:10')" % fn) in src, fn
+        assert f"run_daily(context, {fn}, time='13:10')" in src, fn
 
 def test_no_fstring_log():
     import re
