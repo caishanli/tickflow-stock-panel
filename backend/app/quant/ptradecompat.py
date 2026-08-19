@@ -182,14 +182,17 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
         # 回退：按普通 'money' 处理（真 PTrade 无 money_corrected 字段）
         field = "money"
         actual_field = "total_turnover"
+    # count=None（get_price start_date+end_date 无 count 场景）：取大固定窗口，
+    # 由 get_price 的 start_date 过滤与 include 的 end_dt 切片收口到区间。
+    _hist_count = int(count) if count is not None else 5000
     try:
-        bars = _history_bars_batch(jq_codes, int(count), freq, [actual_field], end_dt)
+        bars = _history_bars_batch(jq_codes, _hist_count, freq, [actual_field], end_dt)
     except Exception as e:  # noqa: BLE001
         logger.debug("get_history 批量失败，回退逐只: %s", e)
         bars = {}
         for jc in jq_codes:
             try:
-                arr = env.data_source.history_bars(jc, int(count), freq, [actual_field])
+                arr = env.data_source.history_bars(jc, _hist_count, freq, [actual_field])
                 if arr is not None and len(arr):
                     bars[jc] = arr
             except Exception:  # noqa: BLE001

@@ -168,3 +168,40 @@ def test_get_price_honors_start_end(monkeypatch):
     assert calls["end_dt"] is not None, "end_date 必须透传给 get_history"
     assert (df.index >= pd.Timestamp("2026-07-02")).all()
     assert (df.index.normalize() <= pd.Timestamp("2026-07-06")).all()
+
+
+def test_get_price_no_count_returns_full_range(monkeypatch):
+    """get_price start_date+end_date 无 count：取大固定窗口，返回区间内全部行。"""
+    import numpy as np
+    import pandas as pd
+
+    calls = {}
+
+    def _fake_batch(codes, count, freq, fields, end_dt):
+        calls["count"] = count
+        calls["end_dt"] = end_dt
+        days = ["20260701093000", "20260702093000", "20260703093000",
+                "20260706093000", "20260707093000"]
+        rows = [(d, 1000.0 + i) for i, d in enumerate(days)
+                if pd.Timestamp(d).normalize() <= pd.Timestamp(end_dt).normalize()]
+        out = {}
+        for c in codes:
+            arr = np.zeros(len(rows), dtype=np.dtype([("datetime", "S14"),
+                                                      ("volume", "f8")]))
+            for i, (d, v) in enumerate(rows):
+                arr["datetime"][i] = d
+                arr["volume"][i] = v
+            out[c] = arr
+        return out
+
+    import app.quant.ptradecompat as pc
+    monkeypatch.setattr(pc, "_history_bars_batch", _fake_batch)
+    df = pc.get_price("510300.SS", start_date="2026-07-02", end_date="2026-07-06",
+                      frequency="1m", fields=["volume"])
+    assert isinstance(df, pd.DataFrame)
+    assert not df.empty, "count=None 时 get_price 必须返回非空 DataFrame"
+    assert list(df.columns) == ["volume"]
+    assert calls["count"] == 5000, "count=None 应解析为大固定窗口"
+    assert (df.index >= pd.Timestamp("2026-07-02")).all()
+    assert (df.index.normalize() <= pd.Timestamp("2026-07-06")).all()
+    assert len(df.index) == 3  # 07-02/07-03/07-06（07-07 超出 end_date 被切掉）
