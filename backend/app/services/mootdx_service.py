@@ -524,6 +524,12 @@ def sync_stock_minute(limit: int | None = None) -> int:
                 df[c] = None
         df = df[keep]
         df = df[pd.to_datetime(df["datetime"]).dt.date >= sym_start]
+        # 盘中排除今天的半程 bar：get_minute 全量历史含今天盘中数据，写入
+        # date=today 分区即污染（且会让 resume 误判"最新分区已覆盖"而跳过
+        # 今天完整回源）。与 _missing_stock_minute_days 的盘中约定一致；
+        # 收盘后今天整日数据可正常落盘。
+        if not _market_closed():
+            df = df[pd.to_datetime(df["datetime"]).dt.date < _date.today()]
         if df.empty:
             _append_failure(sym, f"no_data_since_{sym_start}")
             continue

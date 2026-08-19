@@ -27,6 +27,22 @@ def _patch_index_universe(monkeypatch, syms):
     monkeypatch.setattr(ms, "_index_universe", lambda: syms)
 
 
+class _D:
+    """可调用的假 date 类：today() 固定返回固定日期，实例化仍返回真 date。
+
+    mootdx_service 里 ``_date`` 既被 ``_date.today()`` 调用、又被当构造器
+    ``_date(y,m,d)`` 使用（如 1970 占位判断），故测试假体须同时支持两者。
+    """
+    def __init__(self, y, m, d):
+        self._today = _dt.date(y, m, d)
+
+    def today(self):
+        return self._today
+
+    def __call__(self, y, m, d):
+        return _dt.date(y, m, d)
+
+
 def test_trade_days_in_range(monkeypatch):
     class _FakeSrc:
         def get_daily(self, code, start, end):
@@ -1462,6 +1478,93 @@ def test_backfill_to_now_resyncs_sparse_stock_minute(tmp_path, monkeypatch):
 
     assert calls == [[_d(2026, 8, 5)]], f"残缺日应触发 range 重写, 实际 {calls}"
     assert res["missing"]["kline_minute"]["missing"] is True
+
+
+def test_sync_stock_minute_skips_today_intraday_bars(tmp_path, monkeypatch):
+    """sync_stock_minute 主循环盘中（<15:00）不得把今天的半程分钟 bar 落盘。
+
+    回归：启动回源（backfill_to_now → sync_stock_minute(limit=20)）盘中拉
+    get_minute 全量历史时把今天的半程数据写进 date=today 分区（08-19 案例：
+    08-19 盘中落盘 181 只到 13:46），违反「当日盘中分钟线不落盘」；且该脏分区
+    会让后续 resume 误判"最新分区已覆盖"而永久跳过今天的完整回源。
+    """
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ", "600000.SH"])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "000001.SZ": _dt.date(2020, 1, 1),
+        "600000.SH": _dt.date(2020, 1, 1),
+    })
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
+    monkeypatch.setattr(ms, "_date", _D(2026, 8, 5))
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: False)  # 盘中
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            idx = pd.DatetimeIndex([
+                _dt.datetime(2026, 8, 4, 9, 31),   # 昨日（完整）
+                _dt.datetime(2026, 8, 5, 9, 31),   # 今天（盘中半程）
+                _dt.datetime(2026, 8, 5, 13, 46)])
+            idx.name = "datetime"
+            return pd.DataFrame({"open": [1.0] * len(idx), "close": [1.0] * len(idx),
+                                 "volume": [100.0] * len(idx), "amount": [100.0] * len(idx)},
+                                index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_START", _dt.date(2026, 4, 1))
+    monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
+
+    n = ms.sync_stock_minute(limit=None)
+    # 昨日 2 只 × 1 根 = 2；今天盘中 2 只 × 2 根被排除
+    assert n == 2
+    yesterday = tmp_path / "kline_minute" / "date=2026-08-04" / "part.parquet"
+    assert yesterday.exists(), "昨日完整分钟应落盘"
+    today = tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet"
+    assert not today.exists(), "盘中今天的半程分钟不应落盘"
+
+
+def test_sync_stock_minute_writes_today_after_close(tmp_path, monkeypatch):
+    """收盘后 sync_stock_minute 才允许把今天整日分钟落盘。"""
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ"])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "000001.SZ": _dt.date(2020, 1, 1)})
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
+    monkeypatch.setattr(ms, "_date", _D(2026, 8, 5))
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)  # 已收盘
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            idx = pd.DatetimeIndex([
+                _dt.datetime(2026, 8, 4, 9, 31),
+                _dt.datetime(2026, 8, 5, 15, 0)])
+            idx.name = "datetime"
+            return pd.DataFrame({"open": [1.0] * len(idx), "close": [1.0] * len(idx),
+                                 "volume": [100.0] * len(idx), "amount": [100.0] * len(idx)},
+                                index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_START", _dt.date(2026, 4, 1))
+    monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
+
+    n = ms.sync_stock_minute(limit=None)
+    assert n == 2, "收盘后今日整日分钟应落盘"
+    assert (tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet").exists()
 
 
 def test_sync_stock_minute_day_with_symbols_subset(tmp_path, monkeypatch):

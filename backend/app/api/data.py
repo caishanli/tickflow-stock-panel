@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -701,7 +701,7 @@ def data_check_day(payload: dict, request: Request):
     """触发单日检验补齐（stockdata 服务后台执行，异步）。"""
     day = payload.get("date")
     try:
-        datetime.fromisoformat(day or "")
+        d = datetime.fromisoformat(day or "")
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="date 需为 YYYY-MM-DD")
     try:
@@ -710,6 +710,8 @@ def data_check_day(payload: dict, request: Request):
     except Exception as e:
         logger.warning("check-day 触发失败: %s", e)
         raise HTTPException(status_code=503, detail="stockdata 服务不可达")
+    # mootdx 无北交所源 — 叠加 TickFlow 全宇宙日K把 BJ 并进同一天分区
+    _spawn_bj_complement(request, start_date=d, end_date=d + timedelta(days=1))
     return {"ok": True}
 
 
@@ -722,7 +724,38 @@ def data_check_full(request: Request):
     except Exception as e:
         logger.warning("check-full 触发失败: %s", e)
         raise HTTPException(status_code=503, detail="stockdata 服务不可达")
+    # mootdx 无北交所源 — 叠加 TickFlow 全宇宙日K补最近窗口的 BJ
+    repo = request.app.state.repo
+    dates = _local_market_dates(repo.store.data_dir)
+    if dates:
+        start = datetime.combine(dates[-1], datetime.min.time())
+        end = datetime.combine(dates[0] + timedelta(days=1), datetime.min.time())
+        _spawn_bj_complement(request, start_date=start, end_date=end)
     return {"ok": True}
+
+
+def _spawn_bj_complement(
+    request: Request,
+    start_date: datetime,
+    end_date: datetime,
+) -> None:
+    """后台线程补 BJ 日K：用 TickFlow 全宇宙日K merge-upsert 进 kline_daily。
+
+    与 stockdata 的 mootdx 补齐取并集（mootdx 无北交所源，BJ 只有 TickFlow 有）。
+    """
+    repo = request.app.state.repo
+
+    def _run() -> None:
+        try:
+            capset = getattr(request.app.state, "capabilities", None)
+            if capset is None:
+                return
+            from app.services.kline_sync import complement_daily_bj
+            complement_daily_bj(repo, capset, start_date=start_date, end_date=end_date)
+        except Exception as e:
+            logger.warning("check BJ 补齐失败: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @router.post("/clear")

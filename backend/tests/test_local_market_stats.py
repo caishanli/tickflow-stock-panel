@@ -40,6 +40,7 @@ def _make_app(repo: _FakeRepo) -> FastAPI:
     app = FastAPI()
     app.include_router(api.router)
     app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
     return app
 
 
@@ -99,7 +100,7 @@ def test_empty_data_dir(tmp_path: Path) -> None:
     assert body == {"total": 0, "page": 1, "page_size": 15, "rows": []}
 
 
-def test_check_day_endpoint_triggers(monkeypatch) -> None:
+def test_check_day_endpoint_triggers(monkeypatch, repo: _FakeRepo) -> None:
     from app.quant.datasource import network_client as nc
     calls: list[tuple] = []
 
@@ -120,7 +121,7 @@ def test_check_day_endpoint_triggers(monkeypatch) -> None:
     assert bad.status_code == 400
 
 
-def test_check_full_endpoint_triggers(monkeypatch) -> None:
+def test_check_full_endpoint_triggers(monkeypatch, repo: _FakeRepo) -> None:
     from app.quant.datasource import network_client as nc
     calls: list[tuple] = []
 
@@ -153,3 +154,139 @@ def test_check_day_endpoint_503_when_service_down(monkeypatch) -> None:
     client = TestClient(_make_app(repo))
     r = client.post("/api/data/check-day", json={"date": "2026-08-05"})
     assert r.status_code == 503
+
+
+def test_complement_daily_bj_filters_bj_symbols(monkeypatch, tmp_path: Path) -> None:
+    """补 BJ 只拉 920xxx.BJ 标的, 透传日期区间给批量同步。"""
+    from datetime import datetime as _dt
+
+    from app.jobs import daily_pipeline
+    from app.services import kline_sync
+
+    called: dict = {}
+
+    def fake_universe(capset) -> list[str]:
+        return ["000001.SZ", "920425.BJ", "600000.SH", "920035.BJ", "000002.SZ"]
+
+    def fake_sync(symbols, repo, capset, **kw):
+        called["symbols"] = list(symbols)
+        called.update(kw)
+        return 7
+
+    monkeypatch.setattr(daily_pipeline, "_resolve_universe", fake_universe)
+    monkeypatch.setattr(kline_sync, "sync_and_persist_daily_batch", fake_sync)
+    repo = _FakeRepo(tmp_path / "data")
+    n = kline_sync.complement_daily_bj(
+        repo, None,
+        start_date=_dt(2026, 8, 7), end_date=_dt(2026, 8, 8),
+    )
+    assert n == 7
+    assert called["symbols"] == ["920035.BJ", "920425.BJ"]
+    assert called["start_date"] == _dt(2026, 8, 7)
+    assert called["end_date"] == _dt(2026, 8, 8)
+
+
+def test_complement_daily_bj_empty_universe(monkeypatch, tmp_path: Path) -> None:
+    """宇宙无 BJ 标的 → 跳过, 不触发批量同步。"""
+    from app.jobs import daily_pipeline
+    from app.services import kline_sync
+
+    monkeypatch.setattr(daily_pipeline, "_resolve_universe", lambda capset: ["000001.SZ"])
+    called = []
+
+    def fake_sync(symbols, repo, capset, **kw):
+        called.append(symbols)
+        return 0
+
+    monkeypatch.setattr(kline_sync, "sync_and_persist_daily_batch", fake_sync)
+    repo = _FakeRepo(tmp_path / "data")
+    assert kline_sync.complement_daily_bj(repo, None) == 0
+    assert called == []
+
+
+def test_check_day_endpoint_spawns_bj_complement(monkeypatch, repo: _FakeRepo) -> None:
+    """check-day 触发 stockdata 后, 叠加后台补 BJ 线程(Thread.start 同步执行 target)。"""
+    from datetime import datetime as _dt
+
+    from app.quant.datasource import network_client as nc
+    from app.services import kline_sync
+
+    trigger_calls: list[tuple] = []
+    bj_calls: list[tuple] = []
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            pass
+
+        def trigger_sync(self, kind: str, **params):
+            trigger_calls.append((kind, params))
+
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs or {}
+
+        def start(self) -> None:
+            self.target(*self.args, **self.kwargs)
+
+    monkeypatch.setattr(nc, "StockDataClient", _FakeClient)
+    monkeypatch.setattr(api.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        kline_sync, "complement_daily_bj",
+        lambda *a, **k: bj_calls.append((a, k)) or 0,
+    )
+
+    app = _make_app(repo)
+    client = TestClient(app)
+    r = client.post("/api/data/check-day", json={"date": "2026-08-07"})
+    assert r.status_code == 200
+    assert trigger_calls == [("check_day", {"day": "2026-08-07"})]
+    assert bj_calls, "check-day 应叠加补 BJ 线程"
+    _, kwargs = bj_calls[0]
+    assert kwargs["start_date"] == _dt(2026, 8, 7)
+    assert kwargs["end_date"] == _dt(2026, 8, 8)
+
+
+def test_check_full_endpoint_spawns_bj_complement(monkeypatch, repo: _FakeRepo) -> None:
+    """check-full 触发 stockdata 后, 叠加覆盖本地全部日K日期的后台补 BJ 线程。"""
+    from datetime import datetime as _dt
+
+    from app.quant.datasource import network_client as nc
+    from app.services import kline_sync
+
+    trigger_calls: list[tuple] = []
+    bj_calls: list[tuple] = []
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            pass
+
+        def trigger_sync(self, kind: str, **params):
+            trigger_calls.append((kind, params))
+
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs or {}
+
+        def start(self) -> None:
+            self.target(*self.args, **self.kwargs)
+
+    monkeypatch.setattr(nc, "StockDataClient", _FakeClient)
+    monkeypatch.setattr(api.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        kline_sync, "complement_daily_bj",
+        lambda *a, **k: bj_calls.append((a, k)) or 0,
+    )
+
+    client = TestClient(_make_app(repo))
+    r = client.post("/api/data/check-full")
+    assert r.status_code == 200
+    assert trigger_calls == [("check_full", {})]
+    assert bj_calls, "check-full 应叠加补 BJ 线程"
+    _, kwargs = bj_calls[0]
+    # 本地 kline_daily 日期为 2026-08-14 / 2026-08-17, start=最早(08-14) end=今天之后
+    assert kwargs["start_date"] == _dt(2026, 8, 14)
+    assert kwargs["end_date"] > _dt(2026, 8, 17)

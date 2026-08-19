@@ -228,6 +228,36 @@ def sync_and_persist_daily_batch(
     return df.height
 
 
+def complement_daily_bj(
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+) -> int:
+    """用 TickFlow 全宇宙日K补北交所(BJ)标的 — mootdx 无 BJ 源。
+
+    stockdata 内容校验/补齐只回源 mootdx(不含 920xxx.BJ), 而 BJ 日线唯一来源是
+    主后端 TickFlow。check-day/check-full 触发 stockdata 补齐后叠加调用本函数,
+    拉全宇宙里 .BJ 标的的日K, merge-upsert 进 kline_daily 与 mootdx 数据取并集。
+
+    返回写入行数。
+    """
+    from app.jobs.daily_pipeline import _resolve_universe
+
+    universe = _resolve_universe(capset)
+    bj_symbols = sorted(s for s in universe if s.endswith(".BJ"))
+    if not bj_symbols:
+        logger.info("complement_daily_bj: 宇宙无 BJ 标的, 跳过")
+        return 0
+    n = sync_and_persist_daily_batch(
+        bj_symbols, repo, capset,
+        start_date=start_date, end_date=end_date,
+    )
+    logger.info("complement_daily_bj: 补齐 %d 只 BJ 日K %s~%s 写入 %d 行",
+                len(bj_symbols), start_date, end_date, n)
+    return n
+
+
 def sync_daily_by_quotes(repo: KlineRepository) -> int:
     """用实时行情接口拉全市场当日数据,覆写 kline_daily 今天分区。
 
