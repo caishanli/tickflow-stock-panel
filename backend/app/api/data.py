@@ -715,6 +715,32 @@ def local_market_stats(
     return result
 
 
+@router.get("/stockdata-log")
+def stockdata_log(
+    request: Request,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    """stockdata 服务日志, 按行号倒序分页返回(offset=0 最新)。"""
+    log_path = request.app.state.repo.store.data_dir / "stockdata.log"
+    if not log_path.is_file():
+        return {"total": 0, "offset": offset, "limit": limit, "rows": []}
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        logger.warning("stockdata-log read failed: %s", e)
+        raise HTTPException(status_code=500, detail="读取日志失败")
+    lines = text.splitlines()
+    total = len(lines)
+    # 倒序切片: offset 从最新行往回
+    start = max(0, total - offset - limit)
+    end = max(0, total - offset)
+    selected = lines[start:end]  # 文件顺序正序切片
+    selected.reverse()  # 倒序返回
+    rows = [{"line": total - offset - i, "text": ln} for i, ln in enumerate(selected)]
+    return {"total": total, "offset": offset, "limit": limit, "rows": rows}
+
+
 @router.post("/check-day")
 def data_check_day(payload: dict, request: Request):
     """触发单日检验补齐（stockdata 服务后台执行，异步）。"""

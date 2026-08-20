@@ -25,6 +25,11 @@ def _write_partition(root: Path, sub: str, d: str, symbols: list[str]) -> None:
     df.write_parquet(part / "part.parquet")
 
 
+def _write_log(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 class _FakeRepo:
     """最小 repo: data_dir + 真实 duckdb 执行 SQL (SQL 内 read_parquet 读真实文件)。"""
 
@@ -350,3 +355,48 @@ def test_local_market_stats_refresh_bypasses_cache(repo: _FakeRepo, tmp_path: Pa
     # refresh=1 绕过缓存 → 新值 (3)
     refreshed = client.get("/api/data/local-market-stats?page=1&page_size=15&refresh=1").json()
     assert refreshed["rows"][0]["stock_daily"] == 3
+
+
+def test_stockdata_log_reverse_pagination(monkeypatch, repo: _FakeRepo, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    log_path = tmp_path / "data" / "stockdata.log"
+    _write_log(log_path, [f"line-{i}" for i in range(1, 11)])  # 10 行
+    # repo 的 data_dir 指向临时数据目录
+    repo.store = SimpleNamespace(data_dir=tmp_path / "data")
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
+    client = TestClient(app)
+
+    first = client.get("/api/data/stockdata-log?offset=0&limit=5").json()
+    assert first["total"] == 10
+    assert [r["text"] for r in first["rows"]] == ["line-10", "line-9", "line-8", "line-7", "line-6"]
+    assert [r["line"] for r in first["rows"]] == [10, 9, 8, 7, 6]
+
+    second = client.get("/api/data/stockdata-log?offset=5&limit=5").json()
+    assert [r["text"] for r in second["rows"]] == ["line-5", "line-4", "line-3", "line-2", "line-1"]
+
+
+def test_stockdata_log_missing_file(repo: _FakeRepo, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    repo.store = SimpleNamespace(data_dir=tmp_path / "data" / "none")
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
+    client = TestClient(app)
+    body = client.get("/api/data/stockdata-log").json()
+    assert body == {"total": 0, "offset": 0, "limit": 100, "rows": []}
+
+
+def test_stockdata_log_limit_validation(repo: _FakeRepo, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    repo.store = SimpleNamespace(data_dir=tmp_path / "data")
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
+    client = TestClient(app)
+    assert client.get("/api/data/stockdata-log?limit=0").status_code == 422
+    assert client.get("/api/data/stockdata-log?limit=501").status_code == 422
