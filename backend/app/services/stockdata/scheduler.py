@@ -203,6 +203,22 @@ def _midnight_clear_loop(data_sources) -> None:
             last_date = today
 
 
+def _dayfile_sweep_loop(data_sources, interval: float = 10.0) -> None:
+    """每 10s 清扫日线日期文件缓存：先踢超 60s 未访问，再按最后访问踢旧至 ≤60。
+
+    纯后台清扫、访问时不清理（spec 2026-08-21-stockdata-daily-dayfile-lru-design
+    第 1 节卸载规则）；异常只记日志不退出，下次循环继续。
+    """
+    while not _stop.is_set():
+        time.sleep(interval)
+        try:
+            evicted = data_sources.dayfile_cache.sweep()
+            if evicted:
+                logger.debug("stockdata dayfile cache sweep evicted %d files", evicted)
+        except Exception:  # noqa: BLE001
+            logger.warning("stockdata dayfile cache sweep failed", exc_info=True)
+
+
 def trigger_sync(kind: str, **params) -> dict:
     """手动触发同步（供 handler 调用）。
 
@@ -229,6 +245,7 @@ def start_scheduler(data_sources=None) -> None:
                _full_scan_watchdog_loop]
     if data_sources is not None:
         targets.append(lambda: _midnight_clear_loop(data_sources))
+        targets.append(lambda: _dayfile_sweep_loop(data_sources))
     for target in targets:
         t = threading.Thread(target=target, name=f"stockdata-{target.__name__}", daemon=True)
         t.start()
