@@ -9,11 +9,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 
-from .. import db
+from .. import db, service
 from ..config import CONFIG
-from .. import service
 
 logger = logging.getLogger("app.quant.simulate.daemon")
 
@@ -55,9 +53,7 @@ class SimDaemon:
             return False
         if _alive(aid, acct.get("pid")):
             return False
-        if os.path.exists(os.path.join(CONFIG.runtime_dir, f"{aid}.pause")):
-            return False
-        return True
+        return not os.path.exists(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"))
 
     def _sweep(self) -> None:
         try:
@@ -65,7 +61,7 @@ class SimDaemon:
                 if self._should_restart(acct):
                     logger.warning("sim account %s dead, auto restarting", acct["id"][:8])
                     service.account_ensure_running(acct["id"])
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("[sim-daemon] sweep 异常，下轮重试")
 
     def _watch(self) -> None:
