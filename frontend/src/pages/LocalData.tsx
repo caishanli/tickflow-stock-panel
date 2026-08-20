@@ -91,11 +91,9 @@ export function LocalData() {
       const res = await api.stockdataLog(offset, LOG_LIMIT)
       setLogLines(prev => {
         const seen = new Set(prev.map(r => r.line))
-        const merged = [...prev]
-        for (const r of res.rows) {
-          if (!seen.has(r.line)) merged.push(r)
-        }
-        return merged
+        const fresh = res.rows.filter(r => !seen.has(r.line))
+        if (fresh.length === 0) return prev
+        return offset === 0 ? [...fresh, ...prev] : [...prev, ...fresh]
       })
       return res
     } catch {
