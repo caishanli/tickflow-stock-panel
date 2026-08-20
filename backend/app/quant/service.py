@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -25,6 +26,11 @@ def _script(name: str) -> str:
 
 _SIM_CHILD_TABLES = ("sim_state", "sim_equity_snapshots", "sim_trades", "sim_stop_loss",
                      "sim_logs")
+
+# 串行化 account_start / account_ensure_running 的 spawn 决策，堵并发双 spawn。
+# account_start 先置 running 后写 pid，窗口内 daemon sweep 会误判死 pid 而重复拉起；
+# 用同一把锁 + pid 存活复核双保险（见 account_ensure_running 内注释）。
+_spawn_lock = threading.Lock()
 
 
 def kill_process_group(pid) -> bool:
@@ -115,58 +121,67 @@ def account_create(name: str, capital: float, stop_loss: float, strategy_id: str
 
 
 def account_start(aid: str) -> None:
-    acct = db.get_sim_account(aid)
-    if not acct:
-        raise ValueError(f"account not found: {aid}")
-    if acct.get("status") == "running":
-        return  # M4：幂等，运行中重复 start 不再拉起第二个进程
-    pause = os.path.join(CONFIG.runtime_dir, f"{aid}.pause")
-    if os.path.exists(pause):
-        os.remove(pause)
-    db.update_sim_account(
-        aid, status="running", started_at=datetime.datetime.now().isoformat()
-    )
-    os.makedirs(CONFIG.runtime_dir, exist_ok=True)
-    proc = subprocess.Popen(
-        [sys.executable, _script("run_quant_sim.py"), aid],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    # M5：pid 落库，reset/终止时按 pid 杀进程组
-    pid = getattr(proc, "pid", None)
-    if pid:
-        db.update_sim_account(aid, pid=pid)
-
-
-def account_ensure_running(aid: str) -> None:
-    """守护自动拉起：仅当账户 status=running 且无 pause 文件时 spawn 子进程。
-
-    与 account_start 不同——account_start 遇 running 幂等直接返回，无法重拉
-    崩溃的账户。守护用此入口独立重拉：清 pause、置 running、pid 落库、留日志。
-    """
-    acct = db.get_sim_account(aid)
-    if not acct or acct.get("status") != "running":
-        return
-    pause = os.path.join(CONFIG.runtime_dir, f"{aid}.pause")
-    if os.path.exists(pause):
-        return
-    os.makedirs(CONFIG.runtime_dir, exist_ok=True)
-    db.update_sim_account(aid, started_at=datetime.datetime.now().isoformat())
-    try:
+    with _spawn_lock:
+        acct = db.get_sim_account(aid)
+        if not acct:
+            raise ValueError(f"account not found: {aid}")
+        if acct.get("status") == "running":
+            return  # M4：幂等，运行中重复 start 不再拉起第二个进程
+        pause = os.path.join(CONFIG.runtime_dir, f"{aid}.pause")
+        if os.path.exists(pause):
+            os.remove(pause)
+        db.update_sim_account(
+            aid, status="running", started_at=datetime.datetime.now().isoformat()
+        )
+        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
         proc = subprocess.Popen(
             [sys.executable, _script("run_quant_sim.py"), aid],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-    except Exception as e:  # noqa: BLE001
-        db.insert_sim_log(aid, str(datetime.datetime.now()), "error",
-                          f"守护自动重启失败: {e}")
-        return
-    db.update_sim_account(aid, pid=getattr(proc, "pid", None))
-    db.insert_sim_log(aid, str(datetime.datetime.now()), "warn",
-                      "检测到进程退出，自动重启")
+        # M5：pid 落库，reset/终止时按 pid 杀进程组
+        pid = getattr(proc, "pid", None)
+        if pid:
+            db.update_sim_account(aid, pid=pid)
+
+
+def account_ensure_running(aid: str) -> None:
+    """守护自动拉起：仅当账户 status=running 且无 pause 文件时 spawn 子进程。
+
+    与 account_start 不同——account_start 遇 running 幂等直接返回，无法重拉
+    崩溃的账户。守护用此入口独立重拉：置 running、pid 落库、留日志；
+    pause 文件存在（有意停止）时跳过，不清除。
+    """
+    with _spawn_lock:
+        acct = db.get_sim_account(aid)
+        if not acct or acct.get("status") != "running":
+            return
+        pause = os.path.join(CONFIG.runtime_dir, f"{aid}.pause")
+        if os.path.exists(pause):
+            return
+        # 锁内复核 pid 存活：account_start 可能刚在同锁下拉起（running+新 pid），
+        # 此时 pid 已落库且存活，直接放弃，避免与 account_start 双 spawn 竞态。
+        from .simulate.daemon import _alive  # 延迟导入避免 daemon↔service 循环依赖
+
+        if _alive(aid, acct.get("pid")):
+            return
+        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+        db.update_sim_account(aid, started_at=datetime.datetime.now().isoformat())
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, _script("run_quant_sim.py"), aid],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            db.insert_sim_log(aid, str(datetime.datetime.now()), "error",
+                              f"守护自动重启失败: {e}")
+            return
+        db.update_sim_account(aid, pid=getattr(proc, "pid", None))
+        db.insert_sim_log(aid, str(datetime.datetime.now()), "warn",
+                          "检测到进程退出，自动重启")
 
 
 def account_pause(aid: str) -> None:

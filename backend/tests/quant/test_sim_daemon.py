@@ -65,6 +65,20 @@ def test_account_ensure_running_skips_when_pause_file(tmp_quant, monkeypatch):
     assert calls == []
 
 
+def test_account_ensure_running_skips_when_pid_alive(tmp_quant, monkeypatch):
+    # 竞态回归：account_start 已拉起（pid 存活）时，守护不得重复 spawn。
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=4242)
+    calls = []
+    monkeypatch.setattr(service.subprocess, "Popen",
+                        lambda *a, **k: calls.append((a, k)) or _FakePopen(*a, **k))
+    from app.quant.simulate import daemon
+
+    monkeypatch.setattr(daemon, "_alive", lambda aid, pid: True)
+    service.account_ensure_running("a1")
+    assert calls == []
+
+
 def test_account_ensure_running_logs_error_on_popen_failure(tmp_quant, monkeypatch):
     db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
     monkeypatch.setattr(service.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
