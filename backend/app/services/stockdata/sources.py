@@ -339,6 +339,7 @@ class DataSources:
                 fetch_workers = 16
         self.dedup = DedupCache()
         self.minute_store = MinuteMemoryStore()
+        self.dayfile_cache = DayFileCache()
         self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
         self._names_map: dict[str, str] | None = None
         self._names_cache_file = os.path.join(self.data_root, ".stock_names_cache.json")
@@ -377,61 +378,87 @@ class DataSources:
         lo = end - _dt.timedelta(days=lookback_days * 2)  # 余量覆盖非交易日
         return lo.isoformat(), end.isoformat()
 
-    def _load_daily(self, lookback_days: int, asof: _dt.date | None) -> pl.DataFrame:
-        lo, hi = self._daily_days(lookback_days, asof)
+    def _read_day_file(self, subdir: str, date: str) -> pl.DataFrame | None:
+        """读单个日期分区（含全市场标的）→ 8 列原始帧；分区不存在返回 None。"""
+        root = os.path.join(self.data_root, subdir, f"date={date}")
+        if not os.path.isdir(root):
+            return None
+        import glob as _glob
+        paths = _glob.glob(os.path.join(root, "*.parquet"))
+        if not paths:
+            return None
         cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-        parts = []
-        # 批量预载只含股票+ETF：指数（kline_index_daily）会污染下游 ETF 宇宙
-        # （_is_jq_etf_code 放行 932xxx 等指数代码，如 932000.XSHG）。指数日线
-        # 仍走 get_daily 按需服务（策略 get_price 指数等），不入预载。
-        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
-            df = self._scan_partitions(subdir, lo, hi, None, cols)
-            if df.is_empty():
+        lf = pl.scan_parquet(paths, hive_partitioning=True)
+        return _as_datetime(lf.select(cols).collect())
+
+    def _existing_day_files(self, subdir: str, lo: str | None,
+                            hi: str | None) -> list[str]:
+        """区间内已存在的日期分区名（升序，ISO 字符串）。"""
+        root = os.path.join(self.data_root, subdir)
+        if not os.path.isdir(root):
+            return []
+        out = []
+        for name in sorted(os.listdir(root)):
+            if not name.startswith("date="):
                 continue
-            if is_stock:
-                df = df.with_columns((pl.col("volume") * 100).alias("volume"))
-            parts.append(df)
+            ds = name[len("date="):]
+            if lo and ds < lo:
+                continue
+            if hi and ds > hi:
+                continue
+            out.append(ds)
+        return out
+
+    def preload_daily(self, lookback_days: int = 400, asof: _dt.date | None = None) -> pl.DataFrame:
+        """预载全市场日线（只含股票+ETF，不含指数）：逐日文件经 LRU 拼帧返回。
+
+        帧不驻留（LRU 按 60s/60 文件自然淘汰）——spec
+        2026-08-21-stockdata-daily-dayfile-lru-design 第 3 节。
+        """
+        lo, hi = self._daily_days(lookback_days, asof)
+        parts = []
+        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
+            for day in self._existing_day_files(subdir, lo, hi):
+                frame = self.dayfile_cache.get_or_load(
+                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                if frame is None or frame.is_empty():
+                    continue
+                if is_stock:
+                    frame = frame.with_columns((pl.col("volume") * 100).alias("volume"))
+                parts.append(frame)
         if not parts:
             return pl.DataFrame()
-        out = pl.concat(parts)
-        out = _normalize_etf_volume_unit(out)
+        out = _normalize_etf_volume_unit(pl.concat(parts))
         if asof is not None:
             out = out.filter(pl.col("date") <= asof)
         return out
 
-    def preload_daily(self, lookback_days: int = 400, asof: _dt.date | None = None) -> pl.DataFrame:
-        key = f"preload_daily:{lookback_days}:{asof or ''}"
-        return self.get_or_fetch(key, _HIST_TTL,
-                                 lambda: self._load_daily(lookback_days, asof))
-
     def get_daily(self, codes: list[str], start_date: str, end_date: str) -> pl.DataFrame:
         # 日期规范化：兼容 %Y%m%d（模拟盘 jqcompat _DayBarStore 传入）与 ISO
         # （rqalpha_bridge 传入）两种格式。分区名恒为 ISO（date=YYYY-MM-DD），
-        # _scan_partitions 用字符串比较；'20260601' 与 '2026-06-01' 比较恒 False
-        # 会把全部分区跳过 → 指数走弱期判断「数据不足」/全球池成交额过滤静默失效。
+        # 字符串比较；'20260601' 与 '2026-06-01' 比较恒 False 会把全部分区跳过。
         # 统一转 ISO 再比较。
         start_date = str(pd_to_date(start_date)) if start_date else None
         end_date = str(pd_to_date(end_date)) if end_date else None
 
-        def _load():
-            syms = {_tf_symbol(c) for c in codes}
-            cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-            parts = []
-            for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
-                                     ("kline_index_daily", False)):
-                df = self._scan_partitions(subdir, start_date, end_date, syms, cols)
-                if df.is_empty():
+        syms = {_tf_symbol(c) for c in codes}
+        parts = []
+        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
+                                 ("kline_index_daily", False)):
+            for day in self._existing_day_files(subdir, start_date, end_date):
+                frame = self.dayfile_cache.get_or_load(
+                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                if frame is None or frame.is_empty():
+                    continue
+                sub = frame.filter(pl.col("symbol").is_in(syms))
+                if sub.is_empty():
                     continue
                 if is_stock:
-                    df = df.with_columns((pl.col("volume") * 100).alias("volume"))
-                parts.append(df)
-            if not parts:
-                return pl.DataFrame()
-            return _normalize_etf_volume_unit(pl.concat(parts))
-
-        # 短 TTL 仅突发去重，不驻留内存（历史数据每轮仍按需读盘）
-        key = f"daily:{','.join(sorted(codes))}:{start_date}:{end_date}"
-        return self.get_or_fetch(key, _HIST_TTL, _load)
+                    sub = sub.with_columns((pl.col("volume") * 100).alias("volume"))
+                parts.append(sub)
+        if not parts:
+            return pl.DataFrame()
+        return _normalize_etf_volume_unit(pl.concat(parts))
 
     def get_etf_nav(self, codes: list[str], date: str | None = None) -> pl.DataFrame:
         """读 etf_nav 分区（date 给定用该日，None 用最新分区）。"""

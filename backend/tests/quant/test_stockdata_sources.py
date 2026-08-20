@@ -370,6 +370,24 @@ def test_get_stock_names_etf_from_local_parquet(tmp_path, monkeypatch):
         os.environ.pop("PARTITION_DATA_ROOT", None)
 
 
+def test_get_daily_serves_via_dayfile_cache(src):
+    """get_daily 走日线日期文件 LRU：结果与直读分区一致，且日期文件入缓存。"""
+    day = _dt.date.today().isoformat()
+    df = src.get_daily(["600000.XSHG"], day, day)
+    assert df["symbol"].to_list() == ["600000.SH"]
+    assert df["volume"].to_list() == [100000]  # 股票手→股 ×100
+    assert len(src.dayfile_cache) >= 1
+    assert src.dayfile_cache.get("kline_daily", day) is not None
+
+
+def test_preload_daily_uses_dayfile_cache(src):
+    df = src.preload_daily(lookback_days=400)
+    assert not df.is_empty()
+    assert df["symbol"].to_list() == ["600000.SH"]
+    assert df["volume"].to_list() == [100000]
+    assert len(src.dayfile_cache) >= 1
+
+
 def test_get_stock_names_writes_cache_when_etf_ok(tmp_path, monkeypatch):
     """ETF 段成功（含 517xxx 等非前缀列表内代码）时缓存应落盘。"""
     import json
