@@ -71,3 +71,13 @@ def test_account_ensure_running_logs_error_on_popen_failure(tmp_quant, monkeypat
     service.account_ensure_running("a1")  # 不应 raise
     logs = db.get_sim_logs("a1")
     assert any(m["level"] == "error" for m in logs)
+
+
+def test_account_reset_writes_pause_even_when_kill_succeeds(tmp_quant, monkeypatch):
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=9999)
+    monkeypatch.setattr(service, "kill_process_group", lambda pid: True)
+    monkeypatch.setattr(service, "_SIM_CHILD_TABLES", ())
+    service.account_reset("a1")
+    import os as _os
+    assert _os.path.exists(tmp_quant / "quant_sim" / "a1.pause")

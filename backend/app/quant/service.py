@@ -178,12 +178,13 @@ def account_pause(aid: str) -> None:
 
 def account_reset(aid: str) -> None:
     acct = db.get_sim_account(aid) or {}
-    # M4：先停活进程再清库，否则旧进程继续循环会把已删状态"复活"
-    if not kill_process_group(acct.get("pid")) and acct.get("status") == "running":
-        # 无 pid 的旧进程：落 pause 文件让它下一轮自行退出（account_start 会清掉该文件）
-        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
-        with open(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"), "w"):
-            pass
+    # M4：先停活进程再清库，否则旧进程继续循环会把已删状态"复活"。
+    # 先写 pause 再 kill：堵住 kill 后 DB 更新前 daemon 误拉起的窗口
+    # （daemon 见 pause 文件会跳过）。pause 由下次 account_start 清除。
+    os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+    with open(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"), "w"):
+        pass
+    kill_process_group(acct.get("pid"))
     db.update_sim_account(aid, status="created", pid=None)
     with db.get_conn() as c:
         for t in _SIM_CHILD_TABLES:
@@ -192,10 +193,10 @@ def account_reset(aid: str) -> None:
 
 def account_delete(aid: str) -> None:
     acct = db.get_sim_account(aid) or {}
-    if not kill_process_group(acct.get("pid")) and acct.get("status") == "running":
-        os.makedirs(CONFIG.runtime_dir, exist_ok=True)
-        with open(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"), "w"):
-            pass
+    os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+    with open(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"), "w"):
+        pass
+    kill_process_group(acct.get("pid"))
     db.delete_sim_account(aid)
 
 
