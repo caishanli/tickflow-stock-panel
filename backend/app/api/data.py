@@ -62,7 +62,7 @@ _LOCAL_MARKET_TABLES: dict[str, str] = {
     "index_minute": "kline_index_minute",
 }
 _LOCAL_STATS_TTL = 30.0
-_local_stats_cache: dict[tuple[str, int, int], tuple[float, dict]] = {}
+_local_stats_cache: dict[tuple, tuple[float, dict]] = {}
 _local_stats_lock = threading.Lock()
 
 
@@ -668,18 +668,37 @@ def local_market_stats(
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(15, ge=1, le=100),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    refresh: bool = Query(False),
 ) -> dict:
-    """按日期分区统计本地各表去重标的数(服务端分页, 30s TTL)。"""
+    """按日期分区统计本地各表去重标的数(服务端分页, 30s TTL, 可筛选日期范围/强制刷新)。"""
+    def _parse(d: str | None) -> date | None:
+        if not d:
+            return None
+        try:
+            return datetime.fromisoformat(d).date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期需为 YYYY-MM-DD") from None
+
+    start = _parse(start_date)
+    end = _parse(end_date)
+
     repo = request.app.state.repo
     data_dir = repo.store.data_dir
-    key = (str(data_dir), page, page_size)
+    key = (str(data_dir), page, page_size, start_date, end_date)
     now = time.time()
-    with _local_stats_lock:
-        cached = _local_stats_cache.get(key)
-        if cached is not None and (now - cached[0]) < _LOCAL_STATS_TTL:
-            return cached[1]
+    if not refresh:
+        with _local_stats_lock:
+            cached = _local_stats_cache.get(key)
+            if cached is not None and (now - cached[0]) < _LOCAL_STATS_TTL:
+                return cached[1]
 
     dates = _local_market_dates(data_dir)
+    if start:
+        dates = [d for d in dates if d >= start]
+    if end:
+        dates = [d for d in dates if d <= end]
     total = len(dates)
     page_dates = dates[(page - 1) * page_size : page * page_size]
 

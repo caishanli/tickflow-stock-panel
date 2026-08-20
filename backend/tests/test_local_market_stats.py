@@ -290,3 +290,63 @@ def test_check_full_endpoint_spawns_bj_complement(monkeypatch, repo: _FakeRepo) 
     # 本地 kline_daily 日期为 2026-08-14 / 2026-08-17, start=最早(08-14) end=今天之后
     assert kwargs["start_date"] == _dt(2026, 8, 14)
     assert kwargs["end_date"] > _dt(2026, 8, 17)
+
+
+def test_date_range_filter_start(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get("/api/data/local-market-stats?start_date=2026-08-16").json()
+    assert [r["date"] for r in body["rows"]] == ["2026-08-17"]
+    assert body["total"] == 1
+
+
+def test_date_range_filter_end(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get("/api/data/local-market-stats?end_date=2026-08-15").json()
+    assert [r["date"] for r in body["rows"]] == ["2026-08-14"]
+    assert body["total"] == 1
+
+
+def test_date_range_filter_both_inclusive(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get(
+        "/api/data/local-market-stats?start_date=2026-08-14&end_date=2026-08-17"
+    ).json()
+    assert [r["date"] for r in body["rows"]] == ["2026-08-17", "2026-08-14"]
+    assert body["total"] == 2
+
+
+def test_date_range_filter_no_match(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get(
+        "/api/data/local-market-stats?start_date=2026-09-01&end_date=2026-09-30"
+    ).json()
+    assert body["total"] == 0
+    assert body["rows"] == []
+
+
+def test_date_range_filter_invalid_date(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    assert client.get("/api/data/local-market-stats?start_date=not-a-date").status_code == 400
+
+
+def test_local_market_stats_refresh_bypasses_cache(repo: _FakeRepo, tmp_path: Path) -> None:
+    # 复用默认 repo 首次请求 → 命中缓存
+    client = TestClient(_make_app(repo))
+    first = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert first["rows"][0]["stock_daily"] == 2
+
+    # 磁盘改动: 往 2026-08-17 分区加一个新 symbol
+    part = repo.store.data_dir / "kline_daily" / "date=2026-08-17"
+    df = pl.DataFrame({
+        "symbol": ["000001.SZ", "600000.SH", "000002.SZ"],
+        "date": [date(2026, 8, 17)] * 3,
+    })
+    df.write_parquet(part / "part.parquet")
+
+    # 普通请求仍返回旧缓存 (2)
+    cached = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert cached["rows"][0]["stock_daily"] == 2
+
+    # refresh=1 绕过缓存 → 新值 (3)
+    refreshed = client.get("/api/data/local-market-stats?page=1&page_size=15&refresh=1").json()
+    assert refreshed["rows"][0]["stock_daily"] == 3
