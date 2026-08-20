@@ -1529,8 +1529,15 @@ export const api = {
     ),
 
   dataStatus: () => request<DataStatus>('/api/data/status'),
-  localMarketStats: (page: number, pageSize: number) =>
-    request<LocalMarketStats>(`/api/data/local-market-stats?page=${page}&page_size=${pageSize}`),
+  localMarketStats: (page: number, pageSize: number, start?: string, end?: string, refresh?: boolean) => {
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+    if (start) params.set('start_date', start)
+    if (end) params.set('end_date', end)
+    if (refresh) params.set('refresh', '1')
+    return request<LocalMarketStats>(`/api/data/local-market-stats?${params.toString()}`)
+  },
+  stockdataLog: (offset: number, limit: number) =>
+    request<StockdataLog>(`/api/data/stockdata-log?offset=${offset}&limit=${limit}`),
   checkDay: (date: string) => request<{ ok: boolean }>('/api/data/check-day', {
     method: 'POST',
     body: JSON.stringify({ date }),
@@ -2293,6 +2300,18 @@ export interface LocalMarketStats {
   page: number
   page_size: number
   rows: LocalMarketStatsRow[]
+}
+
+export interface StockdataLogRow {
+  line: number
+  text: string
+}
+
+export interface StockdataLog {
+  total: number
+  offset: number
+  limit: number
+  rows: StockdataLogRow[]
 }
 
 export interface EnrichedField {
