@@ -81,3 +81,73 @@ def test_account_reset_writes_pause_even_when_kill_succeeds(tmp_quant, monkeypat
     service.account_reset("a1")
     import os as _os
     assert _os.path.exists(tmp_quant / "quant_sim" / "a1.pause")
+
+
+import os as _os
+
+from app.quant.simulate import daemon
+
+
+def test_alive_true_when_proc_and_cmdline_match(tmp_quant, monkeypatch):
+    pid = _os.getpid()  # 当前进程存在，但 cmdline 不含 run_quant_sim
+    assert daemon._alive("a1", pid) is False
+
+
+def test_alive_false_when_pid_missing(tmp_quant, monkeypatch):
+    assert daemon._alive("a1", 999999) is False
+
+
+def test_alive_false_when_cmdline_mismatch(tmp_quant, monkeypatch):
+    # 模拟 pid 被复用为其它进程：cmdline 不匹配 run_quant_sim.py {aid}
+    pid = _os.getpid()
+    monkeypatch.setattr(daemon, "_read_cmdline", lambda p: "python\x00other.py")
+    assert daemon._alive("a1", pid) is False
+
+
+def test_alive_true_when_cmdline_matches(tmp_quant, monkeypatch):
+    pid = _os.getpid()
+    monkeypatch.setattr(daemon, "_read_cmdline",
+                        lambda p: "/usr/bin/python\x00/path/run_quant_sim.py\x00a1")
+    monkeypatch.setattr(daemon.os.path, "exists", lambda p: True)
+    assert daemon._alive("a1", pid) is True
+
+
+def test_sweep_restarts_dead_running_no_pause(tmp_quant, monkeypatch):
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=12345)
+    db.insert_sim_account("a2", "acc2", 100000.0, 0.03, "paused")
+    db.insert_sim_account("a3", "acc3", 100000.0, 0.03, "failed")
+    calls = []
+    monkeypatch.setattr(daemon, "_alive", lambda aid, pid: False)  # 全部判死
+    monkeypatch.setattr(daemon.service, "account_ensure_running",
+                        lambda aid: calls.append(aid))
+    d = daemon.SimDaemon()
+    d._sweep()
+    assert calls == ["a1"]  # 仅 running 账户被拉起
+
+
+def test_sweep_skips_when_pause_file(tmp_quant, monkeypatch):
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=12345)
+    pause = tmp_quant / "quant_sim" / "a1.pause"
+    pause.parent.mkdir(parents=True, exist_ok=True)
+    pause.write_text("")
+    calls = []
+    monkeypatch.setattr(daemon, "_alive", lambda aid, pid: False)
+    monkeypatch.setattr(daemon.service, "account_ensure_running",
+                        lambda aid: calls.append(aid))
+    d = daemon.SimDaemon()
+    d._sweep()
+    assert calls == []
+
+
+def test_sweep_skips_alive_process(tmp_quant, monkeypatch):
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=12345)
+    calls = []
+    monkeypatch.setattr(daemon, "_alive", lambda aid, pid: True)
+    monkeypatch.setattr(daemon.service, "account_ensure_running",
+                        lambda aid: calls.append(aid))
+    d = daemon.SimDaemon()
+    d._sweep()
+    assert calls == []
