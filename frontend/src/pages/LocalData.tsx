@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { HardDrive, RefreshCw, Wrench, ChevronDown } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
 import { DatePicker } from '@/components/DatePicker'
 import { toast } from '@/components/Toast'
-import { api, type LocalMarketStatsRow } from '@/lib/api'
+import { api, type LocalMarketStatsRow, type StockdataLogRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
@@ -41,7 +41,13 @@ export function LocalData() {
   const { data, isLoading, isFetching, isError } = useQuery({
     queryKey: QK.localMarketStats(page, pageSize, start, end, refreshNonce),
     queryFn: () => api.localMarketStats(page, pageSize, start, end, refreshNonce > 0),
+    placeholderData: keepPreviousData,
   })
+
+  // 刷新请求完成后复位 refreshNonce: 后续 refetch(窗口聚焦/invalidate/重挂载)不再带 refresh=true
+  useEffect(() => {
+    if (refreshNonce > 0 && !isFetching) setRefreshNonce(0)
+  }, [refreshNonce, isFetching])
 
   const refreshStats = () => {
     qc.invalidateQueries({ queryKey: ['local-market-stats'] })
@@ -80,7 +86,7 @@ export function LocalData() {
   })
 
   const [logOpen, setLogOpen] = useState(false)
-  const [logLines, setLogLines] = useState<import('@/lib/api').StockdataLogRow[]>([])
+  const [logLines, setLogLines] = useState<StockdataLogRow[]>([])
   const [logOffset, setLogOffset] = useState(0)
   const [logLoadingMore, setLogLoadingMore] = useState(false)
   const logScrollRef = useRef<HTMLDivElement>(null)
@@ -130,6 +136,11 @@ export function LocalData() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const safePage = Math.min(page, totalPages)
   const rows = data?.rows ?? []
+
+  // 数据变少导致当前页越界时回落，避免卡在空页
+  useEffect(() => {
+    if (safePage < page) setPage(safePage)
+  }, [safePage, page])
 
   const onFilterChange = () => {
     setPage(1)

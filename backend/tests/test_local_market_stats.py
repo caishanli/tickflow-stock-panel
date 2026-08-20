@@ -357,6 +357,33 @@ def test_local_market_stats_refresh_bypasses_cache(repo: _FakeRepo, tmp_path: Pa
     assert refreshed["rows"][0]["stock_daily"] == 3
 
 
+def test_date_range_cache_key_isolation(repo: _FakeRepo) -> None:
+    """不同日期参数使用独立 TTL 缓存 key（改日期后不返回旧缓存结果）。"""
+    from datetime import date
+    import polars as pl
+
+    client = TestClient(_make_app(repo))
+    base = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert base["total"] == 2
+
+    # 变更磁盘数据: 往 2026-08-14 分区追加一个 symbol
+    part = repo.store.data_dir / "kline_daily" / "date=2026-08-14"
+    df = pl.DataFrame({
+        "symbol": ["000001.SZ", "600000.SH", "000002.SZ", "600519.SH"],
+        "date": [date(2026, 8, 14)] * 4,
+    })
+    df.write_parquet(part / "part2.parquet")
+
+    # 无过滤请求命中旧缓存 → total 仍 2
+    cached = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert cached["total"] == 2
+
+    # 但带 start_date 的请求 key 不同 → 重新计算 → total 2 且该日 stock_daily 4
+    filtered = client.get("/api/data/local-market-stats?page=1&page_size=15&start_date=2026-08-14").json()
+    assert filtered["total"] == 2
+    assert filtered["rows"][1]["stock_daily"] == 4
+
+
 def test_stockdata_log_reverse_pagination(monkeypatch, repo: _FakeRepo, tmp_path: Path) -> None:
     from fastapi import FastAPI
     log_path = tmp_path / "data" / "stockdata.log"

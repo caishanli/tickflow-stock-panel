@@ -62,7 +62,7 @@ _LOCAL_MARKET_TABLES: dict[str, str] = {
     "index_minute": "kline_index_minute",
 }
 _LOCAL_STATS_TTL = 30.0
-_local_stats_cache: dict[tuple, tuple[float, dict]] = {}
+_local_stats_cache: dict[tuple[str, int, int, str | None, str | None], tuple[float, dict]] = {}
 _local_stats_lock = threading.Lock()
 
 
