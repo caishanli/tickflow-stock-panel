@@ -13,6 +13,7 @@ import json as _json
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypeVar
@@ -161,6 +162,72 @@ class MinuteMemoryStore:
             df = pl.concat(parts).filter(
                 (pl.col("datetime") >= pd_to_ts(lo_ts)) & (pl.col("datetime") <= pd_to_ts(hi_ts)))
             return df
+
+
+class DayFileCache:
+    """日线日期文件缓存：键=(subdir, date) → 该日全市场整帧（原始单位）。
+
+    日线分区按日存储、每日期文件含全市场标的：读取时整文件载入内存，同文件
+    其他标的的后续请求直接命中。后台清扫线程每 10s 卸载超时（默认 60s）未
+    访问的文件，并执行容量上限（默认 60 文件）淘汰。不预载、不驻留 400 天
+    全市场整帧（spec 2026-08-21-stockdata-daily-dayfile-lru-design）。
+    """
+
+    def __init__(self, ttl: float = 60.0, cap: int = 60) -> None:
+        self._ttl = ttl
+        self._cap = cap
+        self._items: dict[tuple[str, str], tuple[float, pl.DataFrame]] = {}
+        self._lock = threading.Lock()
+        self._single = SingleFlight()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def get(self, subdir: str, date: str) -> pl.DataFrame | None:
+        """命中返回帧并刷新该文件最后访问时间；未命中返回 None（不加载）。"""
+        with self._lock:
+            item = self._items.get((subdir, date))
+            if item is None:
+                return None
+            _ts, frame = item
+            self._items[(subdir, date)] = (time.monotonic(), frame)
+            return frame
+
+    def get_or_load(self, subdir: str, date: str,
+                    loader: Callable[[], pl.DataFrame | None]) -> pl.DataFrame | None:
+        """缓存命中直接返回；未命中日期文件级 single-flight 读盘（同键并发只读一次）。"""
+        hit = self.get(subdir, date)
+        if hit is not None:
+            return hit
+        return self._single.run(
+            f"{subdir}:{date}",
+            lambda: self._insert(subdir, date, loader()))
+
+    def _insert(self, subdir: str, date: str,
+                frame: pl.DataFrame | None) -> pl.DataFrame | None:
+        if frame is None or frame.is_empty():
+            return None
+        with self._lock:
+            # double-check：single-flight 期间可能已有其他线程载入
+            if (subdir, date) not in self._items:
+                self._items[(subdir, date)] = (time.monotonic(), frame)
+        return frame
+
+    def sweep(self) -> int:
+        """卸载超时未访问文件；仍超容量上限时按最后访问时间从旧到新踢。返回卸载数。"""
+        now = time.monotonic()
+        evicted = 0
+        with self._lock:
+            for k in [k for k, (ts, _f) in self._items.items() if now - ts > self._ttl]:
+                del self._items[k]
+                evicted += 1
+            if len(self._items) > self._cap:
+                oldest = sorted(self._items.items(), key=lambda kv: kv[1][0])
+                for k, _v in oldest[: len(self._items) - self._cap]:
+                    del self._items[k]
+                    evicted += 1
+        return evicted
 
 
 class NetworkPuller:
