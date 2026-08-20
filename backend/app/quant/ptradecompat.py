@@ -52,6 +52,61 @@ def _norm_freq(freq):
 
 
 # ---------------------------------------------------------------------------
+# 涨跌停价推导：真实数据层无 high_limit/low_limit/preclose 列，按昨收+分档幅度计算
+# （镜像 jqcompat._limit_rate/_limit_prices_from_prev_close，适配 PTrade .SS/.SZ）
+# ---------------------------------------------------------------------------
+def _is_st_name(code, name=None):
+    """按名称判定 ST 股票（name 缺省取 _NAMES，PTrade 码先转 JQ 码）。"""
+    if name is None:
+        name = _NAMES.get(_to_jq(code)) or _NAMES.get(code)
+    return bool(name) and "ST" in str(name).upper()
+
+
+def _limit_rate(code, name=None):
+    """按代码分档的涨跌停幅度：沪 68/58 与深 30/159 为 ±20%，ST ±5%，其余 ±10%。"""
+    pure, _, exch = code.partition(".")
+    if exch in ("", "XSHG", "SS") and pure.startswith(("68", "58")):
+        return 0.20
+    if exch in ("", "XSHE", "SZ") and pure.startswith(("30", "159")):
+        return 0.20
+    if _is_st_name(code, name):
+        return 0.05
+    return 0.10
+
+
+def _limit_prices_from_prev_close(close, rate=0.10):
+    """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。"""
+    prev_close = close.shift(1)
+    limit_up = (prev_close * (1 + rate)).round(2)
+    limit_down = (prev_close * (1 - rate)).round(2)
+    return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+
+
+def _close_series(df):
+    """get_history 单标的单字段结果取收盘序列（列名=字段名，兼容代码列名回退）。"""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    if "close" in df.columns:
+        return pd.to_numeric(df["close"], errors="coerce")
+    return pd.to_numeric(df.iloc[:, 0], errors="coerce")
+
+
+def _limit_fields(df, code):
+    """从收盘序列按昨收+分档幅度推导 (last, up_px, down_px, preclose_px)。
+    数据层无 high_limit/low_limit/preclose 列，按交易所口径从昨收计算。"""
+    close = _close_series(df)
+    if close.empty:
+        return 0.0, 0.0, 0.0, 0.0
+    last = float(close.iloc[-1])
+    rate = _limit_rate(code)
+    limit_up, limit_down = _limit_prices_from_prev_close(close, rate)
+    up = float(limit_up[-1]) if len(limit_up) else 0.0
+    down = float(limit_down[-1]) if len(limit_down) else 0.0
+    preclose = float(close.iloc[-2]) if len(close) >= 2 else last
+    return last, up, down, preclose
+
+
+# ---------------------------------------------------------------------------
 # get_history：多标的宽表（index=datetime, columns=PTrade 码）
 # ---------------------------------------------------------------------------
 def _build_history_wide(bars, jq_codes, field):
@@ -80,8 +135,11 @@ def _history_bars_batch(codes, count, freq, fields, end_dt):
     return env.data_source.history_bars_batch(codes, count, freq, fields, end_dt)
 
 
-def get_history(count, frequency, field, security_list=None, include=True, fq="pre"):
-    """PTrade get_history：单/多标的宽表。security_list 缺省用 _UNIVERSE。"""
+def get_history(count, frequency, field, security_list=None, include=True, fq="pre", end_dt=None):
+    """PTrade get_history：单/多标的宽表。security_list 缺省用 _UNIVERSE。
+
+    end_dt 覆盖 env.trading_dt（get_price 的 end_date 透传），日线 <15:00 的
+    回退逻辑仍作用于有效结束日。"""
     from rqalpha.environment import Environment
     env = Environment.get_instance()
     if security_list is None:
@@ -92,17 +150,19 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
         codes = list(security_list)
     jq_codes = [_to_jq(c) for c in codes]
     freq = _norm_freq(frequency)
-    end_dt = getattr(env, "trading_dt", None) or pd.Timestamp.now()
+    now = pd.Timestamp(end_dt) if end_dt is not None else (
+        getattr(env, "trading_dt", None) or pd.Timestamp.now())
     # 日线盘中（<15:00）回退到前一交易日：聚宽/PTrade 日线历史不含"未完成的当日"，
     # 且 qfq 前复权因子按该日锚定（含当日会取到次日分拆/分红因子，历史价错位）。
     if freq == "1d":
-        _now = pd.Timestamp(getattr(env, "trading_dt", end_dt))
-        if pd.Timestamp(end_dt) >= _now.normalize() \
+        _now = pd.Timestamp(getattr(env, "trading_dt", None) or pd.Timestamp.now())
+        if now >= _now.normalize() \
                 and (_now.hour, _now.minute, _now.second) < (15, 0, 0):
             try:
-                end_dt = pd.Timestamp(env.data_proxy.get_previous_trading_date(_now.date()))
+                now = pd.Timestamp(env.data_proxy.get_previous_trading_date(_now.date()))
             except Exception:  # noqa: BLE001
-                end_dt = _now.normalize() - pd.Timedelta(days=1)
+                now = _now.normalize() - pd.Timedelta(days=1)
+    end_dt = now
     actual_field = "total_turnover" if field == "money" else field
     # 修正后的元成交额（引擎专用字段）：对齐聚宽 get_daily_money_cached 口径
     # （本地日线 money 列单位需经 _ensure_money_yuan 修正，history_bars 的
@@ -122,14 +182,17 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
         # 回退：按普通 'money' 处理（真 PTrade 无 money_corrected 字段）
         field = "money"
         actual_field = "total_turnover"
+    # count=None（get_price start_date+end_date 无 count 场景）：取大固定窗口，
+    # 由 get_price 的 start_date 过滤与 include 的 end_dt 切片收口到区间。
+    _hist_count = int(count) if count is not None else 5000
     try:
-        bars = _history_bars_batch(jq_codes, int(count), freq, [actual_field], end_dt)
+        bars = _history_bars_batch(jq_codes, _hist_count, freq, [actual_field], end_dt)
     except Exception as e:  # noqa: BLE001
         logger.debug("get_history 批量失败，回退逐只: %s", e)
         bars = {}
         for jc in jq_codes:
             try:
-                arr = env.data_source.history_bars(jc, int(count), freq, [actual_field])
+                arr = env.data_source.history_bars(jc, _hist_count, freq, [actual_field])
                 if arr is not None and len(arr):
                     bars[jc] = arr
             except Exception:  # noqa: BLE001
@@ -391,6 +454,144 @@ def get_trade_days(start_date=None, end_date=None, count=None):
     return list(cal)
 
 
+def get_price(security, start_date=None, end_date=None, frequency="1d",
+              fields=None, fq="pre", count=None, is_dict=False):
+    """docx 原生 get_price：复用 get_history 口径（rqalpha 环境）。返回宽表 DataFrame。"""
+    fields = fields or ["close"]
+    if isinstance(fields, str):
+        fields = [fields]
+    codes = [security] if isinstance(security, str) else list(security)
+    field_out = {}
+    for f in fields:
+        df = get_history(count, frequency, f, security_list=codes, include=False, fq=fq,
+                         end_dt=end_date if end_date is not None else None)
+        if df is None or df.empty:
+            continue
+        if start_date is not None:
+            df = df[df.index >= pd.Timestamp(start_date)]
+        field_out[f] = df
+    if not field_out:
+        return pd.DataFrame()
+    if len(fields) == 1:
+        df = field_out[fields[0]]
+        if len(codes) == 1 and len(df.columns) == 1:
+            df = df.copy()
+            df.columns = [fields[0]]
+        return df
+    return field_out
+
+
+def check_limit(security, query_date=None):
+    """docx check_limit：{码: int}。真实数据层无 high_limit/low_limit 列：
+    取最近两根日线收盘，按昨收 + 标的分档幅度（_limit_rate）计算涨跌停价并比较。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        out[c] = 0
+        try:
+            close = get_history(2, "1d", "close", security_list=c, include=True)
+            last, up, down, _pre = _limit_fields(close, c)
+            if up and last >= up:
+                out[c] = 1
+            elif down and last <= down:
+                out[c] = -1
+        except Exception:
+            continue
+    return out
+
+
+def get_stock_info(stocks, field=None):
+    """docx get_stock_info：{码: {stock_name, ...}}。名称取 _NAMES。"""
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
+    fields = ["stock_name", "listed_date", "de_listed_date"] if field is None else (
+        [field] if isinstance(field, str) else list(field))
+    out = {}
+    for c in codes:
+        jq = _to_jq(c)
+        out[c] = {f: ("" if f != "stock_name" else _NAMES.get(jq, c)) for f in fields}
+    return out
+
+
+def get_snapshot(security):
+    """docx get_snapshot：{码: {up_px, down_px, last_px, ...}}。
+    真实数据层无 high_limit/low_limit/preclose 列：由最近两根日线收盘按昨收+
+    分档幅度推导 up_px/down_px/preclose_px。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        snap = {"last_px": 0.0, "up_px": 0.0, "down_px": 0.0,
+                "preclose_px": 0.0, "high_px": 0.0, "low_px": 0.0,
+                "business_balance": 0.0, "volume": 0, "amount": 0}
+        try:
+            close = get_history(2, "1d", "close", security_list=c, include=True)
+            last, up, down, preclose = _limit_fields(close, c)
+            snap["last_px"] = last
+            snap["up_px"] = up
+            snap["down_px"] = down
+            snap["preclose_px"] = preclose
+        except Exception:
+            pass
+        out[c] = snap
+    return out
+
+
+def order_target(security, amount, limit_price=None):
+    cur = get_position(security).amount
+    diff = int(amount) - int(cur)
+    if diff == 0:
+        return True
+    return order(security, diff) if diff > 0 else order(security, -min(abs(diff), get_position(security).enable_amount))
+
+
+def order_value(security, value):
+    """PTrade order_value（rqalpha 环境）：按市值下单，整手向下取整。"""
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    jq = _to_jq(security)
+    price = float(getattr(env.portfolio, "close_position_prices", {}).get(jq, 0) or 0)
+    if price == 0 or value == 0:
+        return False
+    amount = int(value // price)
+    return order(security, amount)
+
+
+def order_target_value(security, value, limit_price=None):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    jq = _to_jq(security)
+    price = float(getattr(env.portfolio, "close_position_prices", {}).get(jq, 0) or 0)
+    if price == 0:
+        return False
+    cur_val = get_position(security).amount * price
+    diff = float(value) - cur_val
+    if abs(diff) < price * 100:
+        return True
+    return order_value(security, diff)
+
+
+def get_all_trades_days(date=None):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    cal = env.data_proxy.get_trading_calendar()
+    if date is not None:
+        cal = cal[cal <= pd.Timestamp(date)]
+    return [d.to_pydatetime().date() for d in cal]
+
+
+def get_trading_day_by_date(query_date, day=0):
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    cal = env.data_proxy.get_trading_calendar()
+    ts = pd.Timestamp(query_date)
+    idx = int(cal.searchsorted(ts))
+    target = min(max(idx + int(day), 0), len(cal) - 1)
+    return cal[target].to_pydatetime().date()
+
+
+def get_etf_info(stocks):
+    return get_stock_name(stocks)
+
+
 def set_universe(codes):
     """PTrade set_universe：只把数据源已知的标的加入 rqalpha universe。
     策略动态池可能含数据源未注册的代码，直接 update_universe 会抛
@@ -430,10 +631,7 @@ def get_stock_status(codes, query_type="HALT", query_date=None):
 def get_stock_name(stocks):
     """官方 get_stock_name(stocks)：单/多标的，返回 {code: name}。
     名称源与 get_market_detail 一致（_NAMES 优先，缺失回退代码，避免池分类漂移）。"""
-    if isinstance(stocks, str):
-        codes = [stocks]
-    else:
-        codes = list(stocks)
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
     out = {}
     for code in codes:
         jq = _to_jq(code)
@@ -532,6 +730,7 @@ def _register_ptrade_apis():
     register_api("get_history", get_history)
     register_api("run_daily", run_daily)
     register_api("order", order)
+    register_api("order_value", order_value)
     register_api("get_position", get_position)
     register_api("get_positions", get_positions)
     register_api("get_trading_day", get_trading_day)
@@ -546,6 +745,15 @@ def _register_ptrade_apis():
     register_api("set_commission", set_commission)
     register_api("set_slippage", set_slippage)
     register_api("log", log)
+    register_api("get_price", get_price)
+    register_api("check_limit", check_limit)
+    register_api("get_stock_info", get_stock_info)
+    register_api("get_snapshot", get_snapshot)
+    register_api("order_target", order_target)
+    register_api("order_target_value", order_target_value)
+    register_api("get_all_trades_days", get_all_trades_days)
+    register_api("get_trading_day_by_date", get_trading_day_by_date)
+    register_api("get_etf_info", get_etf_info)
     register_api("_ptrade_adapt_bar_dict", _ptrade_adapt_bar_dict)
 
 

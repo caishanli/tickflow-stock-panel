@@ -99,6 +99,15 @@ def load_strategy(code, manager, fee, slippage, cash):
         "set_slippage": ptrade_api.set_slippage,
         "log": ptrade_api.log,
         "record": ptrade_api.record,
+        "get_price": ptrade_api.get_price,
+        "check_limit": ptrade_api.check_limit,
+        "get_stock_info": ptrade_api.get_stock_info,
+        "get_snapshot": ptrade_api.get_snapshot,
+        "order_target": ptrade_api.order_target,
+        "order_target_value": ptrade_api.order_target_value,
+        "get_all_trades_days": ptrade_api.get_all_trades_days,
+        "get_trading_day_by_date": ptrade_api.get_trading_day_by_date,
+        "get_etf_info": ptrade_api.get_etf_info,
     }
     ns["json"] = json
     import math
