@@ -79,6 +79,20 @@ def test_account_ensure_running_skips_when_pid_alive(tmp_quant, monkeypatch):
     assert calls == []
 
 
+def test_account_ensure_running_spawns_when_pid_dead(tmp_quant, monkeypatch):
+    # 反面分支：pid 已落库但进程死掉（_alive False）→ 仍应拉起。
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=4242)
+    calls = []
+    monkeypatch.setattr(service.subprocess, "Popen",
+                        lambda *a, **k: calls.append((a, k)) or _FakePopen(*a, **k))
+    from app.quant.simulate import daemon
+
+    monkeypatch.setattr(daemon, "_alive", lambda aid, pid: False)
+    service.account_ensure_running("a1")
+    assert len(calls) == 1
+
+
 def test_account_ensure_running_logs_error_on_popen_failure(tmp_quant, monkeypatch):
     db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
     monkeypatch.setattr(service.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
