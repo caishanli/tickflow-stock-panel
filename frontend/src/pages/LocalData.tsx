@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, RefreshCw, Wrench } from 'lucide-react'
+import { HardDrive, RefreshCw, Wrench, ChevronDown } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
@@ -78,6 +78,55 @@ export function LocalData() {
     },
     onSettled: () => setRefreshingRow(null),
   })
+
+  const [logOpen, setLogOpen] = useState(false)
+  const [logLines, setLogLines] = useState<import('@/lib/api').StockdataLogRow[]>([])
+  const [logOffset, setLogOffset] = useState(0)
+  const [logLoadingMore, setLogLoadingMore] = useState(false)
+  const logScrollRef = useRef<HTMLDivElement>(null)
+  const LOG_LIMIT = 100
+
+  const loadLogPage = useCallback(async (offset: number) => {
+    try {
+      const res = await api.stockdataLog(offset, LOG_LIMIT)
+      setLogLines(prev => {
+        const seen = new Set(prev.map(r => r.line))
+        const merged = [...prev]
+        for (const r of res.rows) {
+          if (!seen.has(r.line)) merged.push(r)
+        }
+        return merged
+      })
+      return res
+    } catch {
+      toast('加载日志失败', 'error')
+      return null
+    }
+  }, [])
+
+  // 打开时首次加载 + 每 5s 轮询最新一屏
+  useEffect(() => {
+    if (!logOpen) return
+    setLogLines([])
+    setLogOffset(0)
+    loadLogPage(0)
+    const t = setInterval(() => loadLogPage(0), 5000)
+    return () => clearInterval(t)
+  }, [logOpen, loadLogPage])
+
+  // 滚动到底加载更早日志
+  const onLogScroll = useCallback(() => {
+    const el = logScrollRef.current
+    if (!el || logLoadingMore) return
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+      setLogLoadingMore(true)
+      const nextOffset = logOffset + LOG_LIMIT
+      loadLogPage(nextOffset).then(res => {
+        if (res && res.rows.length > 0) setLogOffset(nextOffset)
+        setLogLoadingMore(false)
+      })
+    }
+  }, [logLoadingMore, logOffset, loadLogPage])
 
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
@@ -220,6 +269,34 @@ export function LocalData() {
                   下一页
                 </button>
               </div>
+            </div>
+
+            <div className="rounded-card border border-border bg-surface overflow-hidden mt-3">
+              <button
+                onClick={() => setLogOpen(v => !v)}
+                className="w-full flex items-center justify-between px-3 py-2 text-xs text-foreground hover:bg-elevated/40 transition-colors"
+              >
+                <span className="font-medium">stockdata 日志</span>
+                <ChevronDown className={`h-3.5 w-3.5 text-muted transition-transform ${logOpen ? 'rotate-180' : ''}`} />
+              </button>
+              {logOpen && (
+                <div
+                  ref={logScrollRef}
+                  onScroll={onLogScroll}
+                  className="h-[30vh] overflow-y-auto border-t border-border/60 p-2 font-mono text-[11px] leading-relaxed text-muted"
+                >
+                  {logLines.length === 0 ? (
+                    <div className="text-center py-6 text-muted/60">暂无日志</div>
+                  ) : (
+                    logLines.map(r => (
+                      <div key={r.line} className="whitespace-pre-wrap break-all">
+                        {r.text}
+                      </div>
+                    ))
+                  )}
+                  {logLoadingMore && <div className="text-center py-2 text-muted/50">加载更早日志...</div>}
+                </div>
+              )}
             </div>
           </>
         )}
