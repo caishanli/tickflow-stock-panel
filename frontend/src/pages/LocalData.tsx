@@ -63,14 +63,6 @@ export function LocalData() {
     },
   })
 
-  const refreshPageMut = useMutation({
-    mutationFn: () => api.localMarketStats(page, pageSize, start, end, true),
-    onSuccess: () => {
-      setRefreshNonce(0)
-      refreshStats()
-    },
-  })
-
   const refreshRowMut = useMutation({
     mutationFn: (_date: string) => api.localMarketStats(page, pageSize, start, end, true),
     onSuccess: (data, date) => {
@@ -122,13 +114,13 @@ export function LocalData() {
             </div>
             <div className="flex items-center gap-1.5">
               <button
-                onClick={() => refreshPageMut.mutate()}
-                disabled={refreshPageMut.isPending}
+                onClick={() => setRefreshNonce(n => n + 1)}
+                disabled={isFetching}
                 className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
                 title="刷新当前页统计"
               >
-                <RefreshCw className={`h-3 w-3 ${refreshPageMut.isPending ? 'animate-spin' : ''}`} />
-                {refreshPageMut.isPending ? '刷新中...' : '刷新'}
+                <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
+                {isFetching ? '刷新中...' : '刷新'}
               </button>
               <button
                 onClick={() => checkFullMut.mutate()}
