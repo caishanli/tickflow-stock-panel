@@ -428,8 +428,9 @@ class DataManager:
                 if df is not None and not df.empty:
                     self._minute_mem[code] = df
                     if win:
-                        # 记录实际覆盖区间（上界归一到当日 15:00），供命中校验
-                        self._minute_cov[code] = (win[0], self._hi_eff(win[1]))
+                        # 下界记请求窗口起点，上界记帧真实末 bar（避免把未落盘的
+                        # 当日算进覆盖 → 补跑取到昨日价；回归 513030）
+                        self._minute_cov[code] = (win[0], df.index.max())
                     count += 1
             except Exception:
                 continue
@@ -745,7 +746,8 @@ class DataManager:
             df = self._load_minute_merged(code, lo_hi=(lo_ts, hi_ts))
             if df is not None and not df.empty:
                 self._minute_mem[code] = df
-                self._minute_cov[code] = (lo_ts, hi_eff)
+                # 上界记帧真实末 bar：hit 校验用帧实际覆盖，而非请求区间上界
+                self._minute_cov[code] = (lo_ts, df.index.max())
         if df is None or (hasattr(df, "empty") and df.empty):
             # feed 缺失标的返回空 DataFrame，rqalpha 跳过该标的而非中止回测。
             return pd.DataFrame()
@@ -828,7 +830,9 @@ class DataManager:
         is_today = as_of_ts.normalize().date() == pd.Timestamp.today().date()
         if df is not None and not df.empty:
             self._minute_mem[code] = df
-            self._minute_cov[code] = (lo_ts, hi_eff)
+            # 上界记帧真实末 bar：覆盖校验按实际数据（非请求 hi_eff）判定命中，
+            # 补跑/盘中当日分区未落盘时不会把当日算进覆盖区间（回归 513030）
+            self._minute_cov[code] = (lo_ts, df.index.max())
             if is_today and getattr(self, "_diag_minute", False):
                 logger.info("[minute-diag] %s 盘中加载成功 bars=%d 末bar=%s as_of=%s",
                             code, len(df), df.index.max(), as_of_ts)
@@ -935,7 +939,7 @@ class DataManager:
                     df = df.loc[(df.index >= lo_ts) & (df.index <= hi_eff)]
                     if not df.empty:
                         self._minute_mem[code] = df
-                        self._minute_cov[code] = (lo_ts, hi_eff)
+                        self._minute_cov[code] = (lo_ts, df.index.max())
                         loaded += 1
                         continue
                 # 批量缺失 → 优先用批量实时回源结果，其次回退单标的路径
@@ -944,7 +948,7 @@ class DataManager:
                     rdf = rdf.loc[(rdf.index >= lo_ts) & (rdf.index <= hi_eff)]
                     if not rdf.empty:
                         self._minute_mem[code] = rdf
-                        self._minute_cov[code] = (lo_ts, hi_eff)
+                        self._minute_cov[code] = (lo_ts, rdf.index.max())
                         loaded += 1
                         continue
                 df = self._ensure_minute_windowed(code, as_of_ts)
@@ -970,6 +974,11 @@ class DataManager:
                 or dt_ts > cov[1] or dt_ts < cov[0]):
             df = self._ensure_minute_windowed(code, dt_ts)
         if df is None or (hasattr(df, "empty") and df.empty):
+            return None
+        # 数据缺口：帧内最晚 bar 早于 dt 所在交易日（目标日分区未落盘 / 停牌）→
+        # 返回 None，绝不把前一交易日收盘价当成当日价（补跑撞上当日分区未落盘
+        # 时 513030 以 08-14 收盘 1.940 买入，真实 08-17 13:10 为 1.985 的回归）。
+        if pd.Timestamp(df.index.max()).normalize() < dt_ts.normalize():
             return None
         try:
             pos = df.index.searchsorted(dt_ts, side="right") - 1
