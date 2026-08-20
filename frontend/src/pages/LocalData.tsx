@@ -1,14 +1,15 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, Wrench } from 'lucide-react'
+import { HardDrive, RefreshCw, Wrench } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
+import { DatePicker } from '@/components/DatePicker'
 import { toast } from '@/components/Toast'
 import { api, type LocalMarketStatsRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 
-const PAGE_SIZE = 15
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 
 type CountKey = Exclude<keyof LocalMarketStatsRow, 'date'>
 
@@ -27,10 +28,19 @@ function fmtCount(n: number): string {
 
 export function LocalData() {
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(10)
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const [refreshNonce, setRefreshNonce] = useState(0)
+  const [refreshingRow, setRefreshingRow] = useState<string | null>(null)
   const qc = useQueryClient()
-  const { data, isLoading, isError } = useQuery({
-    queryKey: QK.localMarketStats(page, PAGE_SIZE),
-    queryFn: () => api.localMarketStats(page, PAGE_SIZE),
+
+  const start = startDate || undefined
+  const end = endDate || undefined
+
+  const { data, isLoading, isFetching, isError } = useQuery({
+    queryKey: QK.localMarketStats(page, pageSize, start, end, refreshNonce),
+    queryFn: () => api.localMarketStats(page, pageSize, start, end, refreshNonce > 0),
   })
 
   const refreshStats = () => {
@@ -53,10 +63,39 @@ export function LocalData() {
     },
   })
 
+  const refreshPageMut = useMutation({
+    mutationFn: () => api.localMarketStats(page, pageSize, start, end, true),
+    onSuccess: () => {
+      setRefreshNonce(0)
+      refreshStats()
+    },
+  })
+
+  const refreshRowMut = useMutation({
+    mutationFn: (_date: string) => api.localMarketStats(page, pageSize, start, end, true),
+    onSuccess: (data, date) => {
+      qc.setQueryData(
+        QK.localMarketStats(page, pageSize, start, end, refreshNonce),
+        (old: typeof data | undefined) => {
+          if (!old) return old
+          const newRow = data.rows.find(r => r.date === date)
+          if (!newRow) return old
+          return { ...old, rows: old.rows.map(r => (r.date === date ? newRow : r)) }
+        },
+      )
+    },
+    onSettled: () => setRefreshingRow(null),
+  })
+
   const total = data?.total ?? 0
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const safePage = Math.min(page, totalPages)
   const rows = data?.rows ?? []
+
+  const onFilterChange = () => {
+    setPage(1)
+    setRefreshNonce(0)
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -66,15 +105,40 @@ export function LocalData() {
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
         {!isLoading && !isError && total > 0 && (
-          <div className="flex items-center justify-end">
-            <button
-              onClick={() => checkFullMut.mutate()}
-              disabled={checkFullMut.isPending}
-              className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
-            >
-              <Wrench className="h-3 w-3" />
-              {checkFullMut.isPending ? '校验中...' : '全量检验补齐'}
-            </button>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <DatePicker value={startDate} onChange={v => { setStartDate(v); onFilterChange() }} placeholder="起始日期" />
+              <span className="text-muted text-xs">~</span>
+              <DatePicker value={endDate} onChange={v => { setEndDate(v); onFilterChange() }} placeholder="结束日期" />
+              <select
+                value={pageSize}
+                onChange={e => { setPageSize(Number(e.target.value)); onFilterChange() }}
+                className="h-7 rounded-btn border border-border bg-elevated px-2 text-xs text-foreground"
+              >
+                {PAGE_SIZE_OPTIONS.map(n => (
+                  <option key={n} value={n}>{n} 条/页</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => refreshPageMut.mutate()}
+                disabled={refreshPageMut.isPending}
+                className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+                title="刷新当前页统计"
+              >
+                <RefreshCw className={`h-3 w-3 ${refreshPageMut.isPending ? 'animate-spin' : ''}`} />
+                {refreshPageMut.isPending ? '刷新中...' : '刷新'}
+              </button>
+              <button
+                onClick={() => checkFullMut.mutate()}
+                disabled={checkFullMut.isPending}
+                className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+              >
+                <Wrench className="h-3 w-3" />
+                {checkFullMut.isPending ? '校验中...' : '全量检验补齐'}
+              </button>
+            </div>
           </div>
         )}
         {isLoading ? (
@@ -89,11 +153,19 @@ export function LocalData() {
           <EmptyState
             icon={HardDrive}
             title="暂无本地数据"
-            hint="本地尚无任何行情数据，数据同步完成后会在此展示各日期的标的覆盖情况。"
+            hint={startDate || endDate ? '当前日期范围内无数据。' : '本地尚无任何行情数据，数据同步完成后会在此展示各日期的标的覆盖情况。'}
           />
         ) : (
           <>
-            <div className="rounded-card border border-border bg-surface overflow-hidden">
+            <div className="rounded-card border border-border bg-surface overflow-hidden relative">
+              {isFetching && !isLoading && (
+                <div className="absolute inset-0 bg-elevated/30 flex items-center justify-center z-10">
+                  <div className="text-xs text-muted flex items-center gap-2">
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    刷新中...
+                  </div>
+                </div>
+              )}
               <table className="w-full text-xs">
                 <thead className="text-muted bg-elevated/40">
                   <tr className="text-left">
@@ -113,11 +185,21 @@ export function LocalData() {
                           {fmtCount(row[c.key])}
                         </td>
                       ))}
-                      <td className="px-3 py-2 text-right">
+                      <td className="px-3 py-2 text-right whitespace-nowrap">
+                        <button
+                          onClick={() => { setRefreshingRow(row.date); refreshRowMut.mutate(row.date) }}
+                          disabled={refreshRowMut.isPending}
+                          className="px-2 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors inline-flex items-center gap-1"
+                        >
+                          {refreshingRow === row.date
+                            ? <RefreshCw className="h-3 w-3 animate-spin" />
+                            : <RefreshCw className="h-3 w-3" />}
+                          刷新
+                        </button>
                         <button
                           onClick={() => checkDayMut.mutate(row.date)}
                           disabled={checkDayMut.isPending}
-                          className="px-2 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
+                          className="px-2 py-1 ml-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
                         >
                           检验
                         </button>
@@ -132,14 +214,14 @@ export function LocalData() {
               <span>共 {total} 天 · 第 {safePage}/{totalPages} 页</span>
               <div className="flex items-center gap-1">
                 <button
-                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                  onClick={() => { setPage(p => Math.max(1, p - 1)); setRefreshNonce(0) }}
                   disabled={safePage <= 1}
                   className="px-2.5 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
                 >
                   上一页
                 </button>
                 <button
-                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                  onClick={() => { setPage(p => Math.min(totalPages, p + 1)); setRefreshNonce(0) }}
                   disabled={safePage >= totalPages}
                   className="px-2.5 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
                 >
