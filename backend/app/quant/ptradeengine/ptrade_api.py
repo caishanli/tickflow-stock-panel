@@ -17,6 +17,7 @@ from __future__ import annotations
 import types
 from typing import ClassVar
 
+import numpy as np
 import pandas as pd
 
 from .context import PtradeContext, PtradePortfolio, PtradePosition, ptrade_code_conv
@@ -61,6 +62,61 @@ def _norm_freq(freq):
     if freq in ("min", "minute", "1m"):
         return "1m"
     return freq
+
+
+# ---------------------------------------------------------------------------
+# 涨跌停价推导：真实数据层无 high_limit/low_limit/preclose 列，按昨收+分档幅度计算
+# （镜像 jqcompat._limit_rate/_limit_prices_from_prev_close，适配 PTrade .SS/.SZ）
+# ---------------------------------------------------------------------------
+def _is_st_name(code, name=None):
+    """按名称判定 ST 股票（name 缺省取名称映射，取不到按非 ST 处理）。"""
+    if name is None:
+        name = _resolve_name(code)
+    return bool(name) and "ST" in str(name).upper()
+
+
+def _limit_rate(code, name=None):
+    """按代码分档的涨跌停幅度：沪 68/58 与深 30/159 为 ±20%，ST ±5%，其余 ±10%。"""
+    pure, _, exch = code.partition(".")
+    if exch in ("", "XSHG", "SS") and pure.startswith(("68", "58")):
+        return 0.20
+    if exch in ("", "XSHE", "SZ") and pure.startswith(("30", "159")):
+        return 0.20
+    if _is_st_name(code, name):
+        return 0.05
+    return 0.10
+
+
+def _limit_prices_from_prev_close(close, rate=0.10):
+    """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。"""
+    prev_close = close.shift(1)
+    limit_up = (prev_close * (1 + rate)).round(2)
+    limit_down = (prev_close * (1 - rate)).round(2)
+    return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+
+
+def _close_series(df):
+    """get_history 单标的单字段结果取收盘序列（列名=字段名，兼容代码列名回退）。"""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    if "close" in df.columns:
+        return pd.to_numeric(df["close"], errors="coerce")
+    return pd.to_numeric(df.iloc[:, 0], errors="coerce")
+
+
+def _limit_fields(df, code):
+    """从收盘序列按昨收+分档幅度推导 (last, up_px, down_px, preclose_px)。
+    数据层无 high_limit/low_limit/preclose 列，按交易所口径从昨收计算。"""
+    close = _close_series(df)
+    if close.empty:
+        return 0.0, 0.0, 0.0, 0.0
+    last = float(close.iloc[-1])
+    rate = _limit_rate(code)
+    limit_up, limit_down = _limit_prices_from_prev_close(close, rate)
+    up = float(limit_up[-1]) if len(limit_up) else 0.0
+    down = float(limit_down[-1]) if len(limit_down) else 0.0
+    preclose = float(close.iloc[-2]) if len(close) >= 2 else last
+    return last, up, down, preclose
 
 
 def _reset(manager, fee, slippage, cash):
@@ -210,10 +266,11 @@ def set_universe(codes):
     _state["ctx"].universe = list(codes)  # PTrade 域（runner feed 前转引擎码）
 
 
-def get_history(count, frequency, field, security_list=None, include=True, fq="pre"):
+def get_history(count, frequency, field, security_list=None, include=True, fq="pre", end_dt=None):
     """PTrade get_history：多标的宽表（index=datetime, columns=PTrade 码）。
 
-    数据走 DataManager（JQ 码），fq='pre' 与 jq get_price 同口径。"""
+    数据走 DataManager（JQ 码），fq='pre' 与 jq get_price 同口径。end_dt 覆盖
+    当前上下文时间（get_price 的 end_date 透传）。"""
     mgr = _state.get("manager")
     ctx = _state.get("ctx")
     if mgr is None:
@@ -231,7 +288,8 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
     # 本地 DataManager 日线列为 money（原始成交额，与 jq get_price 口径一致），
     # 非 rqalpha recarray 的 total_turnover。
     col = "money" if field == "money" else field
-    now = pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None
+    now = pd.Timestamp(end_dt) if end_dt is not None else (
+        pd.Timestamp(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None)
     # money_corrected：修正后的元成交额（对齐聚宽 get_daily_money_cached 口径，
     # 本地日线 money 列单位经 _ensure_money_yuan 修正，history_bars 的
     # total_turnover=close×volume 在部分 ETF 上被放大）
@@ -381,10 +439,7 @@ def get_trade_days(start_date=None, end_date=None, count=None):
 
 def get_stock_name(stocks):
     """官方 get_stock_name(stocks)：单/多标的，返回 {code: name}。"""
-    if isinstance(stocks, str):
-        codes = [stocks]
-    else:
-        codes = list(stocks)
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
     return {c: _resolve_name(c) for c in codes}
 
 
@@ -536,6 +591,135 @@ log = _LogProxy()
 
 def record(**kw):
     _state["records"].append(kw)
+
+
+def get_price(security, start_date=None, end_date=None, frequency="1d",
+              fields=None, fq="pre", count=None, is_dict=False):
+    """docx 原生 get_price：复用 get_history 口径。返回宽表 DataFrame。"""
+    fields = fields or ["close"]
+    if isinstance(fields, str):
+        fields = [fields]
+    codes = [security] if isinstance(security, str) else list(security)
+    field_out = {}
+    for f in fields:
+        df = get_history(count, frequency, f, security_list=codes, include=False, fq=fq,
+                         end_dt=end_date if end_date is not None else None)
+        if df is None or df.empty:
+            continue
+        if start_date is not None:
+            df = df[df.index >= pd.Timestamp(start_date)]
+        field_out[f] = df
+    if not field_out:
+        return pd.DataFrame()
+    if len(fields) == 1:
+        df = field_out[fields[0]]
+        if len(codes) == 1 and len(df.columns) == 1:
+            df = df.copy()
+            df.columns = [fields[0]]
+        return df
+    # 多字段：返回 {field: DataFrame} 的 dict（docx py3.5 panel 变体简化）
+    return field_out
+
+
+def check_limit(security, query_date=None):
+    """docx check_limit：{码: int}，-2 触板跌停/-1 跌停/0 平/1 涨停/2 触板涨停。
+    真实数据层无 high_limit/low_limit 列：取最近两根日线收盘，按昨收 + 标的
+    分档幅度（_limit_rate）计算涨跌停价并与最新收盘比较。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        out[c] = 0
+        try:
+            close = get_history(2, "1d", "close", security_list=c, include=True)
+            last, up, down, _pre = _limit_fields(close, c)
+            if up and last >= up:
+                out[c] = 1
+            elif down and last <= down:
+                out[c] = -1
+        except Exception:
+            continue
+    return out
+
+
+def get_stock_info(stocks, field=None):
+    """docx get_stock_info：{码: {stock_name, listed_date, de_listed_date}}。"""
+    codes = [stocks] if isinstance(stocks, str) else list(stocks)
+    fields = ["stock_name", "listed_date", "de_listed_date"] if field is None else (
+        [field] if isinstance(field, str) else list(field))
+    out = {}
+    for c in codes:
+        out[c] = {f: ("" if f != "stock_name" else _resolve_name(c)) for f in fields}
+    return out
+
+
+def get_snapshot(security):
+    """docx get_snapshot：{码: {up_px, down_px, last_px, ...}}。
+    真实数据层无 high_limit/low_limit/preclose 列：由最近两根日线收盘按昨收+
+    分档幅度推导 up_px/down_px/preclose_px。"""
+    codes = [security] if isinstance(security, str) else list(security)
+    out = {}
+    for c in codes:
+        snap = {"last_px": 0.0, "up_px": 0.0, "down_px": 0.0,
+                "preclose_px": 0.0, "high_px": 0.0, "low_px": 0.0,
+                "business_balance": 0.0, "volume": 0, "amount": 0}
+        try:
+            close = get_history(2, "1d", "close", security_list=c, include=True)
+            last, up, down, preclose = _limit_fields(close, c)
+            snap["last_px"] = last
+            snap["up_px"] = up
+            snap["down_px"] = down
+            snap["preclose_px"] = preclose
+        except Exception:
+            pass
+        out[c] = snap
+    return out
+
+
+def order_target(security, amount, limit_price=None):
+    """docx order_target：调整持仓到目标数量。"""
+    cur = get_position(security).amount
+    diff = int(amount) - int(cur)
+    if diff == 0:
+        return True
+    return order(security, diff) if diff > 0 else order(security, -min(abs(diff), get_position(security).enable_amount))
+
+
+def order_target_value(security, value, limit_price=None):
+    """docx order_target_value：调整持仓到目标市值。本地引擎用 order_value 近似（差异仅整手尾差）。"""
+    price = _live_price(security)
+    if price == 0:
+        return False
+    cur_val = get_position(security).amount * price
+    diff = float(value) - cur_val
+    if abs(diff) < price * 100:
+        return True
+    return order_value(security, diff)
+
+
+def get_all_trades_days(date=None):
+    """docx get_all_trades_days：date 之前的全部交易日（含 date）。"""
+    cal = _get_calendar()
+    if date is not None:
+        cal = cal[cal <= pd.Timestamp(date)]
+    return [d.to_pydatetime().date() for d in cal]
+
+
+def get_trading_day_by_date(query_date, day=0):
+    """docx get_trading_day_by_date：按日期偏移交易日。"""
+    cal = _get_calendar()
+    ts = pd.Timestamp(query_date)
+    idx = int(cal.searchsorted(ts))
+    target = idx + int(day)
+    if target < 0:
+        target = 0
+    if target >= len(cal):
+        target = len(cal) - 1
+    return cal[target].to_pydatetime().date()
+
+
+def get_etf_info(stocks):
+    """docx get_etf_info：{码: 名称}。复用 get_stock_name。"""
+    return get_stock_name(stocks)
 
 
 def build_data_snapshot(ctx):

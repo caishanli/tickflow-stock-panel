@@ -73,6 +73,29 @@ def test_strategies_list_and_create(client):
     assert r.json()["data"]["code"] == "print(1)"
 
 
+def test_strategies_import_returns_sid(client):
+    # ptrade 风格代码 (含 .SS 后缀), import 落盘并返回 8 位 sid
+    code = (
+        "def initialize(context):\n"
+        "    context.security = '600000.SS'\n"
+        "def handle_data(context, data):\n"
+        "    order('600000.SS', 100)\n"
+    )
+    r = client.post("/api/quant/strategies/import",
+                    json={"name": "ptrade-import", "code": code})
+    assert r.status_code == 200
+    sid = r.json()["data"]
+    assert isinstance(sid, str)
+    assert len(sid) == 8
+
+    # 导入的 sid 即策略 id, 可经单策略接口取回
+    r = client.get(f"/api/quant/strategies/{sid}")
+    assert r.status_code == 200
+    assert r.json()["data"]["id"] == sid
+    assert r.json()["data"]["name"] == "ptrade-import"
+    assert ".SS" in r.json()["data"]["code"]
+
+
 def test_datasource_priority(client):
     r = client.get("/api/quant/datasource")
     assert r.status_code == 200

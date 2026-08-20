@@ -65,4 +65,5 @@ def export_strategy(sid):
 
 def import_strategy(name, code):
     sid = uuid.uuid4().hex[:8]
-    return save_strategy(sid, name, code)
+    save_strategy(sid, name, code)
+    return sid
