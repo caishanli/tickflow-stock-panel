@@ -140,6 +140,28 @@ def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
     assert df["close"].to_list() == [1.0]
 
 
+def test_realtime_snapshot_uses_dayfile_cache(src, monkeypatch):
+    """当日分钟分区经 DayFileCache：二次调用不再读盘（删源文件仍命中）。"""
+    import os
+    import shutil
+
+    day = _dt.date.today().isoformat()
+    _write_minute(str(src.data_root), "kline_etf_minute", day, [
+        {"symbol": "512670.SH", "datetime": f"{day} 00:00:01", "open": 1.0,
+         "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1000, "amount": 1000.0},
+    ])
+    # 非交易时段门控：不触网，只验读路径
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
+    got1 = src.get_realtime_snapshot(["512670.XSHG"])
+    assert not got1.is_empty()
+    assert src.dayfile_cache.get("kline_etf_minute", day) is not None
+    # 删掉底层分区文件后二次调用仍命中缓存（证明未重扫）
+    shutil.rmtree(os.path.join(str(src.data_root), "kline_etf_minute", f"date={day}"))
+    got2 = src.get_realtime_snapshot(["512670.XSHG"])
+    assert not got2.is_empty()
+    assert got2["close"].to_list() == got1["close"].to_list()
+
+
 def test_realtime_snapshot_mixed_ns_us_datetime(src, monkeypatch):
     """回归：分区帧 datetime 为 Datetime('us')（parquet 落盘口径），实时回源
     pl.from_pandas 为 Datetime('ns')；两者经 _as_datetime 应统一单位，pl.concat

@@ -378,8 +378,12 @@ class DataSources:
         lo = end - _dt.timedelta(days=lookback_days * 2)  # 余量覆盖非交易日
         return lo.isoformat(), end.isoformat()
 
-    def _read_day_file(self, subdir: str, date: str) -> pl.DataFrame | None:
-        """读单个日期分区（含全市场标的）→ 8 列原始帧；分区不存在返回 None。"""
+    def _read_day_file(self, subdir: str, date: str,
+                       cols: list[str] | None = None) -> pl.DataFrame | None:
+        """读单个日期分区（含全市场标的）→ 原始帧；分区不存在返回 None。
+
+        cols 缺省为日线 8 列；分钟分区传 _MINUTE_COLS。
+        """
         root = os.path.join(self.data_root, subdir, f"date={date}")
         if not os.path.isdir(root):
             return None
@@ -387,7 +391,8 @@ class DataSources:
         paths = _glob.glob(os.path.join(root, "*.parquet"))
         if not paths:
             return None
-        cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+        if cols is None:
+            cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
         lf = pl.scan_parquet(paths, hive_partitioning=True)
         return _as_datetime(lf.select(cols).collect())
 
@@ -518,12 +523,14 @@ class DataSources:
         tf_syms = {_tf_symbol(c) for c in codes}
         self.minute_store.ensure_day(today)
 
-        # 基础帧：当日分区（收盘同步/重启场景）+ 内存库（网络实时）
+        # 基础帧：当日分区（收盘同步/重启场景，经日期文件 LRU 缓存避免逐请求重扫）
+        # + 内存库（网络实时）。spec 2026-08-21-stockdata-realtime-cache-design。
         base_parts = []
-        part = self._scan_partitions("kline_etf_minute", today.isoformat(),
-                                     today.isoformat(), tf_syms, _MINUTE_COLS)
-        if not part.is_empty():
-            base_parts.append(part)
+        part = self.dayfile_cache.get_or_load(
+            "kline_etf_minute", today.isoformat(),
+            lambda: self._read_day_file("kline_etf_minute", today.isoformat(), _MINUTE_COLS))
+        if part is not None and not part.is_empty():
+            base_parts.append(part.filter(pl.col("symbol").is_in(tf_syms)))
         mem = self.minute_store.get_slice(tf_syms, f"{today} 00:00:00", str(asof_ts))
         if not mem.is_empty():
             base_parts.append(mem)
