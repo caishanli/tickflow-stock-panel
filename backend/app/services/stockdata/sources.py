@@ -689,6 +689,11 @@ class DataSources:
         return {c: n for c, n in self._names_map.items() if c in set(codes)}
 
     def get_adj_factors(self) -> pl.DataFrame:
+        # 因子表仅除权事件/15:35 同步后变化：TTL 300s 去重即可，
+        # 避免每次调用 recursive glob + 全量 scan_parquet（含 lf.columns schema 解析）。
+        return self.get_or_fetch("adj_factors", 300.0, self._load_adj_factors)
+
+    def _load_adj_factors(self) -> pl.DataFrame:
         root = os.path.join(self.data_root, "adj_factor_etf")
         if not os.path.isdir(root):
             return pl.DataFrame()

@@ -434,3 +434,26 @@ def test_get_stock_names_writes_cache_when_etf_ok(tmp_path, monkeypatch):
     finally:
         s.puller.shutdown()
         os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_get_adj_factors_cached(tmp_path):
+    """adj_factors 走 DedupCache：TTL 内二次调用不重扫（删源文件仍返回）。"""
+    import os
+    import shutil
+
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    d = os.path.join(str(tmp_path), "adj_factor_etf")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame({"symbol": ["512670.SH"], "trade_date": ["2026-08-20"],
+                  "ex_factor": [1.05]}).write_parquet(os.path.join(d, "all.parquet"))
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
+    try:
+        got1 = s.get_adj_factors()
+        assert got1["symbol"].to_list() == ["512670.SH"]
+        assert got1["ex_factor"].to_list() == [1.05]
+        # 删源文件后 TTL 内二次调用仍命中缓存
+        shutil.rmtree(d)
+        got2 = s.get_adj_factors()
+        assert got2["symbol"].to_list() == ["512670.SH"]
+    finally:
+        os.environ.pop("PARTITION_DATA_ROOT", None)
