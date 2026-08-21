@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, RefreshCw, Wrench, ChevronDown, Server, Activity, Inbox, Clock, CheckCircle2, Loader2 } from 'lucide-react'
+import { HardDrive, RefreshCw, Wrench, Server, Activity, Inbox, Clock, CheckCircle2, Loader2 } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
@@ -10,8 +10,6 @@ import { api, type LocalMarketStatsRow, type StockdataLogRow, type StockdataStat
 import { QK } from '@/lib/queryKeys'
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
-
-type TabKey = 'stats' | 'status'
 
 const TASK_LABELS: Record<string, string> = {
   backfill: '启动回源 backfill',
@@ -214,7 +212,6 @@ export function LocalData() {
   const [endDate, setEndDate] = useState('')
   const [refreshNonce, setRefreshNonce] = useState(0)
   const [refreshingRow, setRefreshingRow] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<TabKey>('stats')
   const qc = useQueryClient()
 
   const start = startDate || undefined
@@ -267,7 +264,7 @@ export function LocalData() {
     onSettled: () => setRefreshingRow(null),
   })
 
-  const [logOpen, setLogOpen] = useState(false)
+  const [bottomTab, setBottomTab] = useState<'log' | 'status'>('log')
   const [logLines, setLogLines] = useState<StockdataLogRow[]>([])
   const [logOffset, setLogOffset] = useState(0)
   const [logLoadingMore, setLogLoadingMore] = useState(false)
@@ -290,15 +287,15 @@ export function LocalData() {
     }
   }, [])
 
-  // 打开时首次加载 + 每 5s 轮询最新一屏
+  const logVisible = bottomTab === 'log'
   useEffect(() => {
-    if (!logOpen) return
+    if (!logVisible) return
     setLogLines([])
     setLogOffset(0)
     loadLogPage(0)
     const t = setInterval(() => loadLogPage(0), 5000)
     return () => clearInterval(t)
-  }, [logOpen, loadLogPage])
+  }, [logVisible, loadLogPage])
 
   // 滚动到底加载更早日志
   const onLogScroll = useCallback(() => {
@@ -333,32 +330,9 @@ export function LocalData() {
     <div className="flex flex-col h-full">
       <PageHeader
         title="本地股市数据"
-        subtitle={activeTab === 'stats' ? (total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数') : 'stockdata 服务运行状态 · 每 5 秒自动刷新'}
-        right={
-          <div className="inline-flex rounded-btn border border-border bg-surface/80 p-0.5 shadow-sm">
-            {(['stats', 'status'] as const).map(tab => {
-              const active = activeTab === tab
-              return (
-                <button
-                  key={tab}
-                  onClick={() => setActiveTab(tab)}
-                  className={`inline-flex items-center gap-1.5 rounded-[5px] px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
-                    active ? 'bg-accent text-white shadow-sm' : 'text-secondary hover:bg-elevated hover:text-foreground'
-                  }`}
-                >
-                  {tab === 'stats' ? <HardDrive className="h-3.5 w-3.5" /> : <Server className="h-3.5 w-3.5" />}
-                  {tab === 'stats' ? '数据统计' : '服务状态'}
-                </button>
-              )
-            })}
-          </div>
-        }
+        subtitle={total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数'}
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
-        {activeTab === 'status' ? (
-          <StockdataStatusPanel />
-        ) : (
-        <>
         {!isLoading && !isError && total > 0 && (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -486,18 +460,28 @@ export function LocalData() {
             </div>
 
             <div className="rounded-card border border-border bg-surface overflow-hidden mt-3">
-              <button
-                onClick={() => setLogOpen(v => !v)}
-                className="w-full flex items-center justify-between px-3 py-2 text-xs text-foreground hover:bg-elevated/40 transition-colors"
-              >
-                <span className="font-medium">stockdata 日志</span>
-                <ChevronDown className={`h-3.5 w-3.5 text-muted transition-transform ${logOpen ? 'rotate-180' : ''}`} />
-              </button>
-              {logOpen && (
+              <div className="flex items-center border-b border-border/60">
+                {(['log', 'status'] as const).map(tab => {
+                  const active = bottomTab === tab
+                  return (
+                    <button
+                      key={tab}
+                      onClick={() => setBottomTab(tab)}
+                      className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors border-b-2 ${
+                        active ? 'text-accent border-accent' : 'text-secondary border-transparent hover:text-foreground'
+                      }`}
+                    >
+                      {tab === 'log' ? <Activity className="h-3.5 w-3.5" /> : <Server className="h-3.5 w-3.5" />}
+                      {tab === 'log' ? '日志' : '服务状态'}
+                    </button>
+                  )
+                })}
+              </div>
+              {bottomTab === 'log' ? (
                 <div
                   ref={logScrollRef}
                   onScroll={onLogScroll}
-                  className="h-[30vh] overflow-y-auto border-t border-border/60 p-2 font-mono text-[11px] leading-relaxed text-muted"
+                  className="h-[30vh] overflow-y-auto p-2 font-mono text-[11px] leading-relaxed text-muted"
                 >
                   {logLines.length === 0 ? (
                     <div className="text-center py-6 text-muted/60">暂无日志</div>
@@ -510,11 +494,13 @@ export function LocalData() {
                   )}
                   {logLoadingMore && <div className="text-center py-2 text-muted/50">加载更早日志...</div>}
                 </div>
+              ) : (
+                <div className="h-[30vh] overflow-y-auto p-3">
+                  <StockdataStatusPanel />
+                </div>
               )}
             </div>
           </>
-        )}
-        </>
         )}
       </div>
     </div>
