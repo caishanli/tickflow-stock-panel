@@ -252,15 +252,23 @@ class MootdxSource(DataSource):
         返回全部历史除权行（category==1 为除权除息：fenhong=每10股红利(元)、
         songzhuangu=每10股送转、peigu=每10股配股、peigujia=配股价）。
         无记录返回 []、失败返回 None，调用方据此保持 raw 口径。
+
+        失败（整轮服务器轮换耗尽）返回 None 且**不缓存**——下次调用重试；
+        只有成功结果（[] 或事件列表）才进缓存。否则一次 socket 抖动会把
+        None 钉进缓存，该标的当轮被静默跳过且进程内再无自愈机会
+        （159667 拆分事件漏采数周的根因）。
         """
         if sym in self._xdxr_cache:
             return self._xdxr_cache[sym]
-        try:
-            market = int(get_stock_market(sym))
-            rows, _ = self._with_server_retry(
-                lambda c: c.client.get_xdxr_info(market, sym), empty_ok=True)
-        except Exception:
-            rows = None
+        rows = None
+        for _ in range(2):  # 整轮轮换失败后再补一轮；仍失败才算真失败
+            rows, _err = self._with_server_retry(
+                lambda c: c.client.get_xdxr_info(int(get_stock_market(sym)), sym),
+                empty_ok=True)
+            if rows is not None:
+                break
+        if rows is None:
+            return None  # 不缓存失败
         self._xdxr_cache[sym] = rows
         return rows
 
