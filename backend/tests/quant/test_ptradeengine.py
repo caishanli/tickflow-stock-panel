@@ -122,6 +122,42 @@ def test_loader_bundle_hooks_and_conv():
     assert len(b.daily) == 1 and b.daily[0][1] == "13:10"
 
 
+def test_loader_hook_signature_adaptive():
+    """after_trading_end(context) 1 参不被注入 data；handle_data 2 参正常注入。
+
+    回归：wufu-v5.4.ptrade.py 用官方 1 参签名，引擎按签名自适应，不得抛
+    TypeError: after_trading_end() takes 1 positional argument but 2 were given。
+    """
+    from app.quant.ptradeengine import ptrade_loader
+
+    calls = {"ate": None, "hd": None}
+
+    def _ate(context):
+        calls["ate"] = context
+
+    def _hd(context, data):
+        calls["hd"] = (context, data)
+
+    ns = {
+        "initialize": lambda context: None,
+        "handle_data": _hd,
+        "before_trading_start": lambda context, data: None,
+        "after_trading_end": _ate,
+    }
+
+    class _Ctx:
+        universe = []
+        portfolio = type("P", (), {"positions": {}})()
+
+    b = ptrade_loader.StrategyBundle(ns["initialize"], _Ctx(), ns)
+    ctx = _Ctx()
+    b.after_trading_end(ctx)   # 1 参 → 只传 context
+    b.handle_data(ctx)         # 2 参 → 注入快照
+    assert calls["ate"] is ctx
+    assert calls["hd"][0] is ctx
+    assert calls["hd"][1] is not None
+
+
 def test_get_history_single_code_field_column_local():
     """官方格式：本地引擎 ptrade_api.get_history 单标的列=行情字段（df['close']）。"""
     from datetime import datetime
