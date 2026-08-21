@@ -46,16 +46,28 @@ function fmtStopLoss(v: any) {
   return `${(v * 100).toFixed(2)}%`
 }
 
-function fmtPriceTs(ts: unknown): string | null {
+const localDay = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+function fmtPriceTs(ts: unknown, today?: string): string | null {
   if (!ts) return null
   const m = String(ts).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/)
   if (!m) return null
-  const now = new Date()
-  const isToday =
-    Number(m[1]) === now.getFullYear() &&
-    Number(m[2]) === now.getMonth() + 1 &&
-    Number(m[3]) === now.getDate()
+  const isToday = `${m[1]}-${m[2]}-${m[3]}` === (today ?? localDay())
   return isToday ? `${m[4]}:${m[5]}` : `${m[2]}-${m[3]} ${m[4]}:${m[5]}`
+}
+
+/** 当天日期（本地时区 YYYY-MM-DD）；跨天自动更新，驱动现价时间 HH:MM / MM-DD HH:MM 格式翻转 */
+function useToday(): string {
+  const [today, setToday] = useState(() => localDay())
+  useEffect(() => {
+    const id = setInterval(() => {
+      const d = localDay()
+      setToday(prev => (prev === d ? prev : d))
+    }, 30_000)
+    return () => clearInterval(id)
+  }, [])
+  return today
 }
 
 /** 从 "YYYY-MM-DD HH:MM:SS"（可省略秒）提取日期 + HH:MM，供分时标记定位 */
@@ -330,6 +342,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const [rangeDays, setRangeDays] = useState<number | null>(null)
   // 止损日志：首拉由 status 的 stop_loss 初始化，盘中新止损由 onTrade(STOP_LOSS) 实时追加
   const [stoplossRows, setStoplossRows] = useState<any[]>([])
+  const today = useToday()
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
   // 兜底：SSE 断线/后台标签页挂起后数据可能长期缺失，10s 定时重取 + 窗口聚焦重取自愈
   const { data: st } = useQuery({
@@ -718,6 +731,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
                     const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                     const pnlAmt = pnlPct != null ? pnlPct * (Number(p.amount) || 0) * (Number(p.avg_cost) || 0) : null
+                    const tsLabel = fmtPriceTs(p.price_ts, today)
                     return (
                       <tr key={sym}
                         onClick={() => {
@@ -738,9 +752,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         <td className="px-3 py-1.5 num">{fmtNum(p.avg_cost, 3)}</td>
                         <td className="px-3 py-1.5 num">
                           {fmtNum(p.price, 3)}
-                          {fmtPriceTs(p.price_ts) && (
+                          {tsLabel && (
                             <span className="ml-1 text-[10px] text-muted font-normal">
-                              ({fmtPriceTs(p.price_ts)})
+                              ({tsLabel})
                             </span>
                           )}
                         </td>
