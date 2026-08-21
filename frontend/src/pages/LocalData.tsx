@@ -329,7 +329,7 @@ export function LocalData() {
   return (
     <div className="flex flex-col h-full">
       <PageHeader
-        title="本地股市数据"
+        title="本地数据"
         subtitle={total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数'}
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
