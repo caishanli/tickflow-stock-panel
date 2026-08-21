@@ -133,7 +133,7 @@ function StockdataStatusPanel() {
                   {mx.data?.servers.map(s => (
                     <li key={s.ip} className="flex items-center gap-2 text-xs">
                       <span className={`inline-block h-2 w-2 rounded-full ${s.ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
-                      <span className="font-mono text-foreground">{s.ip}:{s.port}</span>
+                      <span className="w-36 shrink-0 font-mono text-foreground">{s.ip}:{s.port}</span>
                       <span className={`${s.ok ? 'text-secondary' : 'text-red-500'}`}>
                         {s.ok ? `${s.latency_ms}ms` : '—'}
                       </span>
