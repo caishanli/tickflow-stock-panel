@@ -1,10 +1,11 @@
 """mootdx (通达信) 数据源实现。"""
 
 import socket
-import pandas as pd
 
+import pandas as pd
 from mootdx.quotes import Quotes
 from mootdx.utils import get_stock_market
+
 from .base import DataSource, DataSourceError
 
 
@@ -47,6 +48,16 @@ _TDX_SERVERS = [
     ('123.60.70.228', 7709), ('124.71.9.153', 7709), ('110.41.147.114', 7709),
     ('124.71.187.122', 7709),
 ]
+
+# pytdx 连接后 socket 读超时（秒）：只设了 connect time_out=10 的话，服务器
+# 静默断开会话时 c.bars() 会在 recv 上永久阻塞 → _with_server_retry 的 10s
+# join 只能弃线程，外层 _guarded_get_minute 30s 再把它掐掉、遗弃内层线程继续
+# 后台轮换，长跑回源里线程/socket 堆积形成死亡螺旋。设读超时后 recv 会按时
+# 抛 socket.timeout，轮换能跑完并命中可用服务器。
+_TDX_SOCKET_READ_TIMEOUT = 10.0
+# 外层守护超时需覆盖内层整轮服务器轮换的最坏耗时（_TDX_SERVERS 各一次 + 兜底），
+# 否则会在轮换中途被掐断、永远到不了可用服务器（08-19 长跑回源每只 30s 超时根因）。
+_TDX_FETCH_GUARD_TIMEOUT = len(_TDX_SERVERS) * _TDX_SOCKET_READ_TIMEOUT + 30.0
 
 
 def _probe(ip, port, timeout=2.0):
@@ -109,14 +120,17 @@ class MootdxSource(DataSource):
         顺序：1) 显式 _TDX_SERVERS 探测 → 2) 裸 factory 兜底。
         返回 StdQuotes 实例（client.client 已替换为 pytdx.TdxHq_API）。
         """
-        from mootdx.quotes import Quotes
         import pytdx.hq as _pytdx_hq
+        from mootdx.quotes import Quotes
 
         def _patch(quotes_client, ip, port):
             """用 pytdx 替换 mootdx 内部的 tdxpy client，修复 bars/quotes 返回空。"""
             try:
                 px = _pytdx_hq.TdxHq_API()
                 px.connect(ip, int(port), time_out=10)
+                # 读超时：服务器静默断开会话时 recv 不再永久阻塞，而是按时抛
+                # socket.timeout，让 _with_server_retry 的轮换能继续换服务器。
+                px.client.settimeout(_TDX_SOCKET_READ_TIMEOUT)
                 quotes_client.client = px
             except Exception:
                 pass
@@ -440,7 +454,7 @@ class MootdxSource(DataSource):
             "data", ".stock_names_cache.json")
         if os.path.exists(cache_file):
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
+                with open(cache_file, encoding="utf-8") as f:
                     _STOCK_NAMES_CACHE = json.load(f)
                 return _STOCK_NAMES_CACHE
             except Exception:
@@ -479,3 +493,27 @@ class MootdxSource(DataSource):
             return True, "mootdx 连接正常"
         except Exception as e:
             return False, str(e)
+
+
+def probe_servers(timeout: float = 1.5) -> list[dict]:
+    """并发探测全部显式 mootdx 服务器 TCP 连通与延迟。
+
+    返回按 _TDX_SERVERS 顺序的列表，每项 {ip, port, ok, latency_ms}；
+    latency_ms 为连接建立耗时（毫秒，整数），不可达为 None。
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(item):
+        ip, port = item
+        t0 = time.perf_counter()
+        ok = False
+        try:
+            ok = _probe(ip, port, timeout)
+        except Exception:
+            ok = False
+        return {"ip": ip, "port": port, "ok": ok,
+                "latency_ms": round((time.perf_counter() - t0) * 1000) if ok else None}
+
+    with ThreadPoolExecutor(max_workers=len(_TDX_SERVERS)) as ex:
+        return list(ex.map(_one, _TDX_SERVERS))

@@ -1529,13 +1529,22 @@ export const api = {
     ),
 
   dataStatus: () => request<DataStatus>('/api/data/status'),
-  localMarketStats: (page: number, pageSize: number) =>
-    request<LocalMarketStats>(`/api/data/local-market-stats?page=${page}&page_size=${pageSize}`),
+  localMarketStats: (page: number, pageSize: number, start?: string, end?: string, refresh?: boolean) => {
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+    if (start) params.set('start_date', start)
+    if (end) params.set('end_date', end)
+    if (refresh) params.set('refresh', '1')
+    return request<LocalMarketStats>(`/api/data/local-market-stats?${params.toString()}`)
+  },
+  stockdataLog: (offset: number, limit: number) =>
+    request<StockdataLog>(`/api/data/stockdata-log?offset=${offset}&limit=${limit}`),
   checkDay: (date: string) => request<{ ok: boolean }>('/api/data/check-day', {
     method: 'POST',
     body: JSON.stringify({ date }),
   }),
   checkFull: () => request<{ ok: boolean }>('/api/data/check-full', { method: 'POST' }),
+  stockdataStatus: () => request<StockdataStatus>('/api/data/stockdata-status'),
+  mootdxServers: () => request<{ servers: MootdxServerRow[]; ts: string }>('/api/data/mootdx-servers'),
   dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),
@@ -2293,6 +2302,44 @@ export interface LocalMarketStats {
   page: number
   page_size: number
   rows: LocalMarketStatsRow[]
+}
+
+export interface StockdataLogRow {
+  line: number
+  text: string
+}
+
+export interface StockdataLog {
+  total: number
+  offset: number
+  limit: number
+  rows: StockdataLogRow[]
+}
+
+export interface StockdataStatus {
+  ts: string
+  process_started: string
+  active_tasks: string[]
+  last_backfill: string | null
+  backfill_result?: Record<string, unknown> | null
+  last_sync: string | null
+  sync_result?: Record<string, unknown> | null
+  sync_job?: string | null
+  last_check_day?: string | null
+  check_day_result?: Record<string, unknown> | null
+  last_check_full?: string | null
+  check_full_result?: Record<string, unknown> | null
+  full_scan_started?: string | null
+  last_full_scan?: string | null
+  full_scan_result?: Record<string, unknown> | null
+  full_scan_date?: string | null
+}
+
+export interface MootdxServerRow {
+  ip: string
+  port: number
+  ok: boolean
+  latency_ms: number | null
 }
 
 export interface EnrichedField {

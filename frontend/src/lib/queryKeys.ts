@@ -47,7 +47,8 @@ export const QK = {
 
   // Data / Pipeline
   dataStatus:           ['data-status'] as const,
-  localMarketStats:     (page: number, pageSize: number) => ['local-market-stats', page, pageSize] as const,
+  localMarketStats:     (page: number, pageSize: number, start?: string, end?: string, refreshNonce?: number) =>
+                          ['local-market-stats', page, pageSize, start ?? null, end ?? null, refreshNonce ?? 0] as const,
   pipelineJobs:         ['pipeline-jobs'] as const,
   pipelineJob:          (id: string) => ['pipeline-job', id] as const,
   extData:              ['ext-data'] as const,

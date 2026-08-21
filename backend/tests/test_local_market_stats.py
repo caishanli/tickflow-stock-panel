@@ -25,6 +25,11 @@ def _write_partition(root: Path, sub: str, d: str, symbols: list[str]) -> None:
     df.write_parquet(part / "part.parquet")
 
 
+def _write_log(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 class _FakeRepo:
     """最小 repo: data_dir + 真实 duckdb 执行 SQL (SQL 内 read_parquet 读真实文件)。"""
 
@@ -290,3 +295,135 @@ def test_check_full_endpoint_spawns_bj_complement(monkeypatch, repo: _FakeRepo) 
     # 本地 kline_daily 日期为 2026-08-14 / 2026-08-17, start=最早(08-14) end=今天之后
     assert kwargs["start_date"] == _dt(2026, 8, 14)
     assert kwargs["end_date"] > _dt(2026, 8, 17)
+
+
+def test_date_range_filter_start(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get("/api/data/local-market-stats?start_date=2026-08-16").json()
+    assert [r["date"] for r in body["rows"]] == ["2026-08-17"]
+    assert body["total"] == 1
+
+
+def test_date_range_filter_end(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get("/api/data/local-market-stats?end_date=2026-08-15").json()
+    assert [r["date"] for r in body["rows"]] == ["2026-08-14"]
+    assert body["total"] == 1
+
+
+def test_date_range_filter_both_inclusive(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get(
+        "/api/data/local-market-stats?start_date=2026-08-14&end_date=2026-08-17"
+    ).json()
+    assert [r["date"] for r in body["rows"]] == ["2026-08-17", "2026-08-14"]
+    assert body["total"] == 2
+
+
+def test_date_range_filter_no_match(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    body = client.get(
+        "/api/data/local-market-stats?start_date=2026-09-01&end_date=2026-09-30"
+    ).json()
+    assert body["total"] == 0
+    assert body["rows"] == []
+
+
+def test_date_range_filter_invalid_date(repo: _FakeRepo) -> None:
+    client = TestClient(_make_app(repo))
+    assert client.get("/api/data/local-market-stats?start_date=not-a-date").status_code == 400
+
+
+def test_local_market_stats_refresh_bypasses_cache(repo: _FakeRepo, tmp_path: Path) -> None:
+    # 复用默认 repo 首次请求 → 命中缓存
+    client = TestClient(_make_app(repo))
+    first = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert first["rows"][0]["stock_daily"] == 2
+
+    # 磁盘改动: 往 2026-08-17 分区加一个新 symbol
+    part = repo.store.data_dir / "kline_daily" / "date=2026-08-17"
+    df = pl.DataFrame({
+        "symbol": ["000001.SZ", "600000.SH", "000002.SZ"],
+        "date": [date(2026, 8, 17)] * 3,
+    })
+    df.write_parquet(part / "part.parquet")
+
+    # 普通请求仍返回旧缓存 (2)
+    cached = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert cached["rows"][0]["stock_daily"] == 2
+
+    # refresh=1 绕过缓存 → 新值 (3)
+    refreshed = client.get("/api/data/local-market-stats?page=1&page_size=15&refresh=1").json()
+    assert refreshed["rows"][0]["stock_daily"] == 3
+
+
+def test_date_range_cache_key_isolation(repo: _FakeRepo) -> None:
+    """不同日期参数使用独立 TTL 缓存 key（改日期后不返回旧缓存结果）。"""
+    from datetime import date
+    import polars as pl
+
+    client = TestClient(_make_app(repo))
+    base = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert base["total"] == 2
+
+    # 变更磁盘数据: 往 2026-08-14 分区追加一个 symbol
+    part = repo.store.data_dir / "kline_daily" / "date=2026-08-14"
+    df = pl.DataFrame({
+        "symbol": ["000001.SZ", "600000.SH", "000002.SZ", "600519.SH"],
+        "date": [date(2026, 8, 14)] * 4,
+    })
+    df.write_parquet(part / "part2.parquet")
+
+    # 无过滤请求命中旧缓存 → total 仍 2
+    cached = client.get("/api/data/local-market-stats?page=1&page_size=15").json()
+    assert cached["total"] == 2
+
+    # 但带 start_date 的请求 key 不同 → 重新计算 → total 2 且该日 stock_daily 4
+    filtered = client.get("/api/data/local-market-stats?page=1&page_size=15&start_date=2026-08-14").json()
+    assert filtered["total"] == 2
+    assert filtered["rows"][1]["stock_daily"] == 4
+
+
+def test_stockdata_log_reverse_pagination(monkeypatch, repo: _FakeRepo, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    log_path = tmp_path / "data" / "stockdata.log"
+    _write_log(log_path, [f"line-{i}" for i in range(1, 11)])  # 10 行
+    # repo 的 data_dir 指向临时数据目录
+    repo.store = SimpleNamespace(data_dir=tmp_path / "data")
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
+    client = TestClient(app)
+
+    first = client.get("/api/data/stockdata-log?offset=0&limit=5").json()
+    assert first["total"] == 10
+    assert [r["text"] for r in first["rows"]] == ["line-10", "line-9", "line-8", "line-7", "line-6"]
+    assert [r["line"] for r in first["rows"]] == [10, 9, 8, 7, 6]
+
+    second = client.get("/api/data/stockdata-log?offset=5&limit=5").json()
+    assert [r["text"] for r in second["rows"]] == ["line-5", "line-4", "line-3", "line-2", "line-1"]
+
+
+def test_stockdata_log_missing_file(repo: _FakeRepo, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    repo.store = SimpleNamespace(data_dir=tmp_path / "data" / "none")
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
+    client = TestClient(app)
+    body = client.get("/api/data/stockdata-log").json()
+    assert body == {"total": 0, "offset": 0, "limit": 100, "rows": []}
+
+
+def test_stockdata_log_limit_validation(repo: _FakeRepo, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    repo.store = SimpleNamespace(data_dir=tmp_path / "data")
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.repo = repo
+    app.state.capabilities = SimpleNamespace(has=lambda *_: True)
+    client = TestClient(app)
+    assert client.get("/api/data/stockdata-log?limit=0").status_code == 422
+    assert client.get("/api/data/stockdata-log?limit=501").status_code == 422

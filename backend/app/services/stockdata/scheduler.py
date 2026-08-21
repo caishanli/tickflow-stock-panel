@@ -17,8 +17,48 @@ _stop = threading.Event()
 _threads: list[threading.Thread] = []
 _sync_lock = threading.Lock()  # 15:35 cron 与手动 trigger 串行
 
+# 当前正在执行的后台任务集合（供 get_status 查询"正在干什么"）
+_active_tasks: set[str] = set()
+_PROCESS_STARTED = _dt.datetime.now().isoformat()
+
+
+def _mark_active(name: str) -> None:
+    with _lock:
+        _active_tasks.add(name)
+
+
+def _mark_idle(name: str) -> None:
+    with _lock:
+        _active_tasks.discard(name)
+
+
+def _json_safe(value):
+    """递归把 date/datetime 转字符串，其余保持（供 msgpack/json 序列化）。"""
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def get_status() -> dict:
+    """返回 scheduler 状态快照（最近任务结果 + 当前正在执行的任务），JSON 安全。
+
+    供 status handler 经 TCP 回传主后端，前端用于展示"服务在干什么 / 有哪些待办"。
+    """
+    with _lock:
+        state = dict(_scheduler_state)
+        active = sorted(_active_tasks)
+    state["active_tasks"] = active
+    state["ts"] = _dt.datetime.now().isoformat()
+    state["process_started"] = _PROCESS_STARTED
+    return _json_safe(state)
+
 
 def _backfill_loop():
+    _mark_active("backfill")
     try:
         from app.services import mootdx_service
         res = mootdx_service.backfill_to_now()
@@ -28,6 +68,8 @@ def _backfill_loop():
         logger.info("stockdata startup backfill done: %s", res)
     except Exception:  # noqa: BLE001
         logger.exception("stockdata startup backfill failed")
+    finally:
+        _mark_idle("backfill")
 
 
 def _run_sync(full_stock_minute: bool = False):
@@ -38,6 +80,7 @@ def _run_sync(full_stock_minute: bool = False):
     （盘中触发写半程日线会污染分区）。
     """
     with _sync_lock:
+        _mark_active("sync")
         try:
             from app.services import mootdx_service
             minutes = mootdx_service.sync_etf_minute()
@@ -67,11 +110,14 @@ def _run_sync(full_stock_minute: bool = False):
                         minutes, adj, stock, nav, daily, index_daily)
         except Exception:  # noqa: BLE001
             logger.exception("scheduled mootdx sync failed")
+        finally:
+            _mark_idle("sync")
 
 
 def _run_check_day(day: str) -> None:
     """单日检验补齐（后台线程）：解析日期并执行。"""
     with _sync_lock:
+        _mark_active("check_day")
         try:
             from app.services import mootdx_service
             d = _dt.date.fromisoformat(day)
@@ -83,11 +129,14 @@ def _run_check_day(day: str) -> None:
                         {k: v["status"] for k, v in res["results"].items()})
         except Exception:  # noqa: BLE001
             logger.exception("stockdata check_day %s failed", day)
+        finally:
+            _mark_idle("check_day")
 
 
 def _run_check_full() -> None:
     """全量检验补齐（后台线程）：执行并记录汇总。"""
     with _sync_lock:
+        _mark_active("check_full")
         try:
             from app.services import mootdx_service
             res = mootdx_service.check_and_repair_full()
@@ -99,6 +148,8 @@ def _run_check_full() -> None:
                         if isinstance(res.get("missing"), dict) else res)
         except Exception:  # noqa: BLE001
             logger.exception("stockdata check_full failed")
+        finally:
+            _mark_idle("check_full")
 
 
 def _sync_cron_loop():
@@ -126,6 +177,7 @@ def _run_full_scan_once() -> None:
     with _lock:
         _scheduler_state["full_scan_started"] = _dt.date.today().isoformat()
     with _sync_lock:
+        _mark_active("full_scan")
         try:
             from app.services import mootdx_service
             res = mootdx_service.scan_and_backfill_full()
@@ -138,6 +190,8 @@ def _run_full_scan_once() -> None:
                         if isinstance(res.get("missing"), dict) else res)
         except Exception:  # noqa: BLE001
             logger.exception("stockdata midnight full scan failed")
+        finally:
+            _mark_idle("full_scan")
 
 
 def _midnight_scan_loop():

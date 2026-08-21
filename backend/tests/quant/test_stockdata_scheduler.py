@@ -5,6 +5,48 @@ import threading
 from app.services.stockdata import scheduler as sch
 
 
+def test_get_status_returns_json_safe_snapshot(monkeypatch):
+    """get_status 返回 scheduler 状态快照，date 等非 JSON 类型需转字符串。"""
+    monkeypatch.setattr(sch, "_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_active_tasks", {"backfill"})
+    monkeypatch.setattr(sch, "_scheduler_state", {
+        "last_backfill": "2026-08-20 10:00:00",
+        "backfill_result": {"missing": {"kline_minute": True},
+                            "daily_days": [_dt.date(2026, 8, 19)]},
+        "last_sync": None,
+    })
+    st = sch.get_status()
+    # 非 JSON 类型已转字符串
+    assert st["backfill_result"]["daily_days"] == ["2026-08-19"]
+    assert st["active_tasks"] == ["backfill"]
+    assert "ts" in st
+    # 全部值可被 json 序列化
+    import json
+    json.dumps(st)
+
+
+def test_run_sync_tracks_active_task(monkeypatch):
+    """_run_sync 执行期间 active_tasks 含 'sync'，结束后移除。"""
+    from app.services import mootdx_service
+
+    monkeypatch.setattr(sch, "_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_scheduler_state", {})
+    observed = []
+
+    def fake_stock_minute(limit=None):
+        observed.append(sch.get_status()["active_tasks"])
+        return 0
+
+    monkeypatch.setattr(mootdx_service, "sync_etf_minute", lambda: 0)
+    monkeypatch.setattr(mootdx_service, "sync_adj_factor", lambda: {})
+    monkeypatch.setattr(mootdx_service, "sync_stock_minute", fake_stock_minute)
+
+    sch._run_sync()
+    assert observed == [["sync"]]
+    assert "sync" not in sch.get_status()["active_tasks"]
+
+
 def test_run_sync_full_stock_minute_syncs_daily_and_index_daily(monkeypatch):
     """15:35 收盘路径(full_stock_minute=True)应同步当天日线 + 指数日线 +
     全量股票分钟(limit=None),而非增量慢跑。
