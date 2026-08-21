@@ -78,6 +78,46 @@ def _append_failure(sym: str, reason: str) -> None:
         logger.warning("mootdx_service: 失败记录写入失败: %s", sym)
 
 
+# 回源断点续传 manifest：任务启动写 targets，每批 flush 后追加 done。
+# 重启后 todo = targets − done − 最新分区已有 → 精确续跑。
+MANIFEST_PATH = DATA_ROOT / "backfill_state.json"
+
+
+def _manifest_load() -> dict:
+    import json
+    try:
+        return json.loads(MANIFEST_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _manifest_save(data: dict) -> None:
+    import json
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    tmp.rename(MANIFEST_PATH)
+
+
+def _manifest_reset(dataset: str, targets: list[str], mode: str) -> None:
+    data = _manifest_load()
+    data[dataset] = {"targets": list(targets), "done": [], "mode": mode,
+                     "updated_at": _dt.datetime.now().isoformat()}
+    _manifest_save(data)
+
+
+def _manifest_mark_done(dataset: str, symbols: list[str]) -> None:
+    data = _manifest_load()
+    entry = data.setdefault(dataset, {"targets": [], "done": [], "mode": ""})
+    entry["done"] = sorted(set(entry.get("done") or []) | set(symbols))
+    entry["updated_at"] = _dt.datetime.now().isoformat()
+    _manifest_save(data)
+
+
+def _manifest_done(dataset: str) -> set[str]:
+    return set(_manifest_load().get(dataset, {}).get("done") or [])
+
+
 # 后台回源节流：客户端请求优先占用 mootdx socket/CPU，backfill 每取 N 个 symbol
 # 主动 sleep 一小段让出资源。默认开启（每 5 个 symbol 睡 0.2s），环境变量可调。
 _BACKFILL_THROTTLE_EVERY = int(os.getenv("BACKFILL_THROTTLE_EVERY", "5"))
