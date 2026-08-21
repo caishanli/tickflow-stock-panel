@@ -337,7 +337,7 @@ git commit -m "feat: 本地数据页/菜单改名为「本地数据」"
 - Modify: `backend/app/quant/jqengine/datasource/mootdx_src.py`
 - Modify: `backend/app/api/data.py`
 - Test: `backend/tests/quant/test_mootdx_server_probe.py`（新建）
-- Test: `backend/tests/api/test_data_mootdx_servers.py`（新建）
+- Test: `backend/tests/test_mootdx_servers.py`（新建，沿用仓库扁平测试目录约定）
 
 **Interfaces:**
 - Consumes: `_TDX_SERVERS`（已有列表）、`_probe(ip, port, timeout)`（已有函数）
@@ -415,15 +415,19 @@ Expected: PASS（1 passed）
 
 - [ ] **Step 5: 写 failing 测试（端点到响应形态 + TTL）**
 
-新建 `backend/tests/api/test_data_mootdx_servers.py`:
+新建 `backend/tests/test_mootdx_servers.py`（沿用仓库既有约定：扁平目录 + 新鲜 FastAPI app + `include_router(api.router)`，见 `test_local_market_stats.py`）:
 ```python
 """GET /api/data/mootdx-servers 端点。"""
-import importlib
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.api import data as api
 
-client = TestClient(app)
+
+def _make_app():
+    app = FastAPI()
+    app.include_router(api.router)
+    return TestClient(app)
 
 
 def _probe_stub():
@@ -432,18 +436,44 @@ def _probe_stub():
 
 
 def test_mootdx_servers_endpoint(monkeypatch):
-    import app.api.data as data_mod
-    monkeypatch.setattr(data_mod, "_mootdx_probe", lambda: _probe_stub())
-    r = client.get("/api/data/mootdx-servers")
+    monkeypatch.setattr(api, "_mootdx_probe", lambda: _probe_stub())
+    r = _make_app().get("/api/data/mootdx-servers")
     assert r.status_code == 200
     body = r.json()
     assert body["servers"] == _probe_stub()
     assert "ts" in body
+
+
+def test_mootdx_probe_cache(monkeypatch):
+    """真实 _mootdx_probe 的 TTL 缓存逻辑: 新鲜命中, 过期重新探测。"""
+    from app.quant.jqengine.datasource import mootdx_src as msrc
+    calls = {"n": 0}
+
+    def counting():
+        calls["n"] += 1
+        return [{"ip": "1.1.1.1", "port": 7709, "ok": True, "latency_ms": 12}]
+
+    monkeypatch.setattr(msrc, "probe_servers", counting)
+    monkeypatch.setattr(api, "_mootdx_probe_cache", {"ts": 0.0, "data": None})
+    now = [100.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: now[0])
+
+    # 缓存空 → 首次探测, 写缓存 (ts=100)
+    assert api._mootdx_probe() == [{"ip": "1.1.1.1", "port": 7709, "ok": True, "latency_ms": 12}]
+    assert calls["n"] == 1
+    # 5s 后仍新鲜 (<10s) → 命中缓存, 不重新探测
+    now[0] = 105.0
+    assert api._mootdx_probe() == [{"ip": "1.1.1.1", "port": 7709, "ok": True, "latency_ms": 12}]
+    assert calls["n"] == 1
+    # 15s 后过期 (>10s) → 重新探测
+    now[0] = 115.0
+    assert api._mootdx_probe() == [{"ip": "1.1.1.1", "port": 7709, "ok": True, "latency_ms": 12}]
+    assert calls["n"] == 2
 ```
 
 - [ ] **Step 6: 运行测试验证失败**
 
-Run: `cd backend && uv run --extra dev pytest tests/api/test_data_mootdx_servers.py -v`
+Run: `cd backend && uv run --extra dev pytest tests/test_mootdx_servers.py -v`
 Expected: FAIL（端点 404/字段不存在）
 
 - [ ] **Step 7: 实现端点 + TTL 缓存**
@@ -478,7 +508,7 @@ def data_mootdx_servers():
 
 - [ ] **Step 8: 运行测试验证通过**
 
-Run: `cd backend && uv run --extra dev pytest tests/api/test_data_mootdx_servers.py tests/quant/test_mootdx_server_probe.py -v`
+Run: `cd backend && uv run --extra dev pytest tests/test_mootdx_servers.py tests/quant/test_mootdx_server_probe.py -v`
 Expected: PASS（2 passed）
 
 - [ ] **Step 9: ruff + mypy 检查**
@@ -489,7 +519,7 @@ Expected: 无新增错误（若有既有全文件问题请记录，不强行修�
 - [ ] **Step 10: 提交**
 
 ```bash
-git add backend/app/quant/jqengine/datasource/mootdx_src.py backend/app/api/data.py backend/tests/quant/test_mootdx_server_probe.py backend/tests/api/test_data_mootdx_servers.py
+git add backend/app/quant/jqengine/datasource/mootdx_src.py backend/app/api/data.py backend/tests/quant/test_mootdx_server_probe.py backend/tests/test_mootdx_servers.py
 git commit -m "feat: mootdx 服务器连通状态探测 + /api/data/mootdx-servers 端点"
 ```
 
