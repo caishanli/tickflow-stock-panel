@@ -553,7 +553,6 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
         pass
     # 盘前日线新鲜度由按需取数保证（get_price/get_history 走网络批量读最新分区，
     # 服务端 LRU 命中），不再整体预载全市场日线（见 _make_dm 注释）。
-    dm = aux.get("dm") if aux is not None else None
     for func, t in bundle.daily:
         if str(t) == "before_open":
             fired.add((id(func), "before_open"))
