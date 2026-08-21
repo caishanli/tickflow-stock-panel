@@ -320,3 +320,24 @@ def test_strategy_loop_live_marks_positions(tmp_quant, monkeypatch):
     assert st["net_value"] == pytest.approx(5000 * 12.0)
     snaps = db.get_sim_snapshots(aid)
     assert snaps and snaps[-1]["positions_value"] == pytest.approx(5000 * 12.0)
+
+
+def test_state_roundtrip_preserves_price_ts(tmp_quant):
+    """positions_json 序列化/恢复保留逐股行情时间 price_ts。"""
+    from app.quant.jqengine.engine.jq.context import Position
+
+    aid = _revalue_at_close_setup(tmp_quant)
+    st = protocol.read_state(aid)
+    ctx = type("Ctx", (), {"portfolio": type("Pf", (), {
+        "positions": {"510300.XSHG": Position(amount=5000.0, avg_cost=10.0,
+                                              price=12.0,
+                                              price_ts="2026-07-17 10:31")},
+        "cash": 0.0})()})()
+
+    runner._state_from_portfolio(ctx, st)
+    assert st["positions"]["510300.XSHG"]["price_ts"] == "2026-07-17 10:31"
+
+    ctx2 = type("Ctx", (), {"portfolio": type("Pf", (), {
+        "positions": {}, "cash": 0.0})()})()
+    runner._restore_portfolio(ctx2, st)
+    assert ctx2.portfolio.positions["510300.XSHG"].price_ts == "2026-07-17 10:31"

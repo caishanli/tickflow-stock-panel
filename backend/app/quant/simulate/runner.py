@@ -422,6 +422,7 @@ def _restore_portfolio(ctx, st: dict) -> None:
             price=float(sp.get("price", 0.0) or 0.0),
             today_amount=float(sp.get("today_amount", 0.0) or 0.0),
             entry_ts=sp.get("entry_ts"),
+            price_ts=sp.get("price_ts"),
         )
     pf.cash = float(st.get("cash", pf.cash) or 0.0)
 
@@ -444,6 +445,7 @@ def _state_from_portfolio(ctx, state: dict) -> dict:
             "price": float(p.price),
             "today_amount": float(getattr(p, "today_amount", 0.0) or 0.0),
             "entry_ts": _entry_ts_str(getattr(p, "entry_ts", None)),
+            "price_ts": getattr(p, "price_ts", None),
             "name": names.resolve_name(code),
         }
         for code, p in ctx.portfolio.positions.items()
@@ -467,6 +469,7 @@ def _apply_matcher_result(ctx, state: dict) -> None:
         pos.avg_cost = sp.get("avg_cost", pos.avg_cost)
         pos.price = sp.get("price", pos.price)
         pos.today_amount = sp.get("today_amount", 0.0)
+        pos.price_ts = sp.get("price_ts", getattr(pos, "price_ts", None))
     pf.cash = float(state["cash"])
 
 
