@@ -48,6 +48,16 @@ _TDX_SERVERS = [
     ('124.71.187.122', 7709),
 ]
 
+# pytdx 连接后 socket 读超时（秒）：只设了 connect time_out=10 的话，服务器
+# 静默断开会话时 c.bars() 会在 recv 上永久阻塞 → _with_server_retry 的 10s
+# join 只能弃线程，外层 _guarded_get_minute 30s 再把它掐掉、遗弃内层线程继续
+# 后台轮换，长跑回源里线程/socket 堆积形成死亡螺旋。设读超时后 recv 会按时
+# 抛 socket.timeout，轮换能跑完并命中可用服务器。
+_TDX_SOCKET_READ_TIMEOUT = 10.0
+# 外层守护超时需覆盖内层整轮服务器轮换的最坏耗时（_TDX_SERVERS 各一次 + 兜底），
+# 否则会在轮换中途被掐断、永远到不了可用服务器（08-19 长跑回源每只 30s 超时根因）。
+_TDX_FETCH_GUARD_TIMEOUT = len(_TDX_SERVERS) * _TDX_SOCKET_READ_TIMEOUT + 30.0
+
 
 def _probe(ip, port, timeout=2.0):
     """TCP 握手探测，判断服务器是否可达。"""
@@ -117,6 +127,9 @@ class MootdxSource(DataSource):
             try:
                 px = _pytdx_hq.TdxHq_API()
                 px.connect(ip, int(port), time_out=10)
+                # 读超时：服务器静默断开会话时 recv 不再永久阻塞，而是按时抛
+                # socket.timeout，让 _with_server_retry 的轮换能继续换服务器。
+                px.client.settimeout(_TDX_SOCKET_READ_TIMEOUT)
                 quotes_client.client = px
             except Exception:
                 pass

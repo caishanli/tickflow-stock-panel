@@ -30,8 +30,9 @@ def h_ping(p, s: DataSources):
 
 
 def h_status(p, s: DataSources):
-    # 注：DataSources 不再维护 fail_counts（Task4 review 已移除），状态仅回显基础信息
-    return "json", {"ok": True, "ts": _dt.datetime.now().isoformat()}
+    # 返回 scheduler 状态（最近任务结果 + 当前正在执行的任务），供前端展示
+    from .scheduler import get_status
+    return "json", get_status()
 
 
 def h_get_price(p, s: DataSources):

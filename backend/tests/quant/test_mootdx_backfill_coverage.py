@@ -1567,6 +1567,66 @@ def test_sync_stock_minute_writes_today_after_close(tmp_path, monkeypatch):
     assert (tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet").exists()
 
 
+def test_sync_stock_minute_ignores_limit_when_latest_partial_after_close(tmp_path, monkeypatch):
+    """收盘后最新分区残缺（覆盖率不足）时，limit 应被忽略全量补齐。
+
+    回归：15:35 全量回源被重启打断会留下残缺的最新分区（08-19 案例：
+    只写了 3600/5209）。resume 只按最新分区判断"已覆盖"，后续每次启动
+    只补 limit=20 只（需 ~70 轮才追上），当天分钟线永久缺失——所有自愈
+    机制（残片检测跳过最新分区、内容校验 50% 阈值、00:00 巡检）都看不见
+    它。收盘后最新分区覆盖率显著不足时应直接全量补齐缺失标的。
+    """
+    import datetime as _dt
+    import pandas as pd
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe", lambda: [
+        "000001.SZ", "600000.SH", "601398.SH"])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "000001.SZ": _dt.date(2020, 1, 1),
+        "600000.SH": _dt.date(2020, 1, 1),
+        "601398.SH": _dt.date(2020, 1, 1),
+    })
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_date", _D(2026, 8, 19))
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)  # 已收盘
+
+    # 最新分区 date=2026-08-19 只写了 1/3 只（残缺）：000001.SZ 已覆盖
+    part = tmp_path / "kline_minute" / "date=2026-08-19" / "part.parquet"
+    part.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["000001.SZ"],
+        "datetime": [_dt.datetime(2026, 8, 19, 15, 0)],
+        "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+        "volume": [1.0], "amount": [1.0],
+    }).write_parquet(part)
+
+    fetched: list[str] = []
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            fetched.append(sym)
+            idx = pd.DatetimeIndex([_dt.datetime(2026, 8, 19, 15, 0)])
+            idx.name = "datetime"
+            return pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0],
+                                 "close": [1.0], "volume": [100.0],
+                                 "amount": [100.0]}, index=idx)
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_START", _dt.date(2026, 4, 1))
+    monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_BATCH_LIMIT", 1)
+
+    n = ms.sync_stock_minute(limit=1)
+    # 残缺分区覆盖率 1/3 < 阈值：应忽略 limit 全量补齐缺失的 2 只
+    assert set(fetched) == {"600000.SH", "601398.SH"}, f"应全量补齐, 实际 {fetched}"
+    assert n == 2
+
+
 def test_sync_stock_minute_day_with_symbols_subset(tmp_path, monkeypatch):
     """symbols 参数只拉取给定子集（残片日只补缺失标的）。"""
     import datetime as _dt

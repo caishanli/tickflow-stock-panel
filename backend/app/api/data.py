@@ -741,6 +741,21 @@ def stockdata_log(
     return {"total": total, "offset": offset, "limit": limit, "rows": rows}
 
 
+@router.get("/stockdata-status")
+def data_stockdata_status():
+    """stockdata 服务运行状态：最近任务结果 + 当前正在执行的任务 + 待办缺口。
+
+    经 TCP 向 stockdata 子进程查询 scheduler 状态（scheduler.get_status）。
+    """
+    from app.quant.datasource.network_client import StockDataClient
+    try:
+        st = StockDataClient().status()
+    except Exception as e:
+        logger.warning("stockdata-status 查询失败: %s", e)
+        raise HTTPException(status_code=503, detail="stockdata 服务不可达")
+    return st
+
+
 @router.post("/check-day")
 def data_check_day(payload: dict, request: Request):
     """触发单日检验补齐（stockdata 服务后台执行，异步）。"""

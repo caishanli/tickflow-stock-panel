@@ -1,15 +1,35 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, RefreshCw, Wrench, ChevronDown } from 'lucide-react'
+import { HardDrive, RefreshCw, Wrench, ChevronDown, Server, Activity, Inbox, Clock, CheckCircle2, Loader2 } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
 import { DatePicker } from '@/components/DatePicker'
 import { toast } from '@/components/Toast'
-import { api, type LocalMarketStatsRow, type StockdataLogRow } from '@/lib/api'
+import { api, type LocalMarketStatsRow, type StockdataLogRow, type StockdataStatus } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
+
+type TabKey = 'stats' | 'status'
+
+const TASK_LABELS: Record<string, string> = {
+  backfill: '启动回源 backfill',
+  sync: '收盘/手动同步 sync',
+  check_day: '单日检验 check_day',
+  check_full: '全量检验 check_full',
+  full_scan: '00:00 全量巡检',
+}
+
+const DATASET_LABELS: Record<string, string> = {
+  kline_etf_minute: 'ETF分钟线',
+  kline_daily: '股市日线',
+  kline_etf_daily: 'ETF日线',
+  kline_index_daily: '指数日线',
+  kline_minute: '股市分钟线',
+  adj_factor_etf: 'ETF前复权因子',
+  etf_nav: 'ETF单位净值',
+}
 
 type CountKey = Exclude<keyof LocalMarketStatsRow, 'date'>
 
@@ -26,6 +46,167 @@ function fmtCount(n: number): string {
   return n.toLocaleString('zh-CN')
 }
 
+function fmtTime(t?: string | null): string {
+  if (!t) return '—'
+  return t.replace('T', ' ').slice(0, 19)
+}
+
+function extractMissing(st: StockdataStatus): { label: string; note: string }[] {
+  const out: { label: string; note: string }[] = []
+  const sources = [
+    st.backfill_result,
+    st.check_full_result,
+    st.full_scan_result,
+  ]
+  for (const src of sources) {
+    const missing = src?.missing
+    if (missing && typeof missing === 'object') {
+      for (const [key, val] of Object.entries(missing as Record<string, unknown>)) {
+        if (typeof val !== 'object' || val === null) continue
+        const v = val as Record<string, unknown>
+        const isMissing = Boolean(v.missing) || Boolean(v.empty)
+        if (isMissing) {
+          out.push({ label: DATASET_LABELS[key] ?? key, note: v.empty ? '空分区' : '有缺失/缺口' })
+        }
+      }
+    }
+  }
+  return out
+}
+
+function StockdataStatusPanel() {
+  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+    queryKey: ['stockdata-status'],
+    queryFn: () => api.stockdataStatus(),
+    refetchInterval: 5000,
+  })
+
+  const active = data?.active_tasks ?? []
+  const missing = data ? extractMissing(data) : []
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs text-muted">
+          <Server className="h-3.5 w-3.5" />
+          <span>服务时间 {fmtTime(data?.ts)}</span>
+          <span>·</span>
+          <span>启动于 {fmtTime(data?.process_started)}</span>
+        </div>
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className="px-2.5 py-1 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors inline-flex items-center gap-1.5 text-xs"
+        >
+          <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
+          刷新
+        </button>
+      </div>
+
+      {isLoading ? (
+        <div className="space-y-2">
+          {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-10 w-full" />)}
+        </div>
+      ) : isError ? (
+        <EmptyState icon={Server} title="服务不可达" hint="无法获取 stockdata 服务状态，请检查服务是否存活。" />
+      ) : (
+        <>
+          <div className="rounded-card border border-border bg-surface overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
+              <Activity className="h-3.5 w-3.5 text-accent" />
+              当前正在执行
+            </div>
+            <div className="p-3">
+              {active.length === 0 ? (
+                <div className="flex items-center gap-2 text-xs text-muted">
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                  空闲，无后台任务
+                </div>
+              ) : (
+                <div className="flex flex-wrap gap-2">
+                  {active.map(t => (
+                    <span key={t} className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs text-accent">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      {TASK_LABELS[t] ?? t}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-card border border-border bg-surface overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
+              <Inbox className="h-3.5 w-3.5 text-amber-500" />
+              待办 / 数据缺口
+            </div>
+            <div className="p-3">
+              {missing.length === 0 ? (
+                <div className="flex items-center gap-2 text-xs text-muted">
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                  最近巡检未报告缺口
+                </div>
+              ) : (
+                <ul className="space-y-1.5">
+                  {missing.map((m, i) => (
+                    <li key={i} className="flex items-center justify-between text-xs">
+                      <span className="text-foreground">{m.label}</span>
+                      <span className="text-amber-500">{m.note}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-card border border-border bg-surface overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
+              <Clock className="h-3.5 w-3.5 text-muted" />
+              最近任务记录
+            </div>
+            <div className="divide-y divide-border/60">
+              <TaskRow label="启动回源 backfill" time={data?.last_backfill} note={statusNote(data, 'backfill_result')} />
+              <TaskRow label="收盘/手动同步 sync" time={data?.last_sync} note={statusNote(data, 'sync_result')} />
+              <TaskRow label="单日检验 check_day" time={data?.last_check_day} note={statusNote(data, 'check_day_result')} />
+              <TaskRow label="全量检验 check_full" time={data?.last_check_full} />
+              <TaskRow label="00:00 全量巡检" time={data?.last_full_scan} note={data?.full_scan_date} />
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function TaskRow({ label, time, note }: { label: string; time?: string | null; note?: unknown }) {
+  const noteStr = typeof note === 'string' ? note : note === undefined || note === null ? undefined : String(note)
+  return (
+    <div className="flex items-center justify-between px-3 py-2 text-xs">
+      <span className="text-secondary">{label}</span>
+      <span className="text-muted">{fmtTime(time)}{noteStr ? ` · ${noteStr}` : ''}</span>
+    </div>
+  )
+}
+
+function statusNote(st: StockdataStatus | undefined, field: string): string | undefined {
+  if (!st) return undefined
+  const src = st[field as keyof StockdataStatus]
+  if (!src || typeof src !== 'object') return undefined
+  const rec = src as Record<string, unknown>
+  if (field === 'backfill_result') {
+    const errs = rec.errors
+    return Array.isArray(errs) && errs.length ? `errors=${errs.length}` : undefined
+  }
+  if (field === 'sync_result') {
+    const rows = rec.stock_minute_rows
+    return rows === undefined ? undefined : `stock_minute_rows=${rows}`
+  }
+  if (field === 'check_day_result') {
+    return rec.day ? String(rec.day) : undefined
+  }
+  return undefined
+}
+
 export function LocalData() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
@@ -33,6 +214,7 @@ export function LocalData() {
   const [endDate, setEndDate] = useState('')
   const [refreshNonce, setRefreshNonce] = useState(0)
   const [refreshingRow, setRefreshingRow] = useState<string | null>(null)
+  const [activeTab, setActiveTab] = useState<TabKey>('stats')
   const qc = useQueryClient()
 
   const start = startDate || undefined
@@ -151,9 +333,32 @@ export function LocalData() {
     <div className="flex flex-col h-full">
       <PageHeader
         title="本地股市数据"
-        subtitle={total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数'}
+        subtitle={activeTab === 'stats' ? (total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数') : 'stockdata 服务运行状态 · 每 5 秒自动刷新'}
+        right={
+          <div className="inline-flex rounded-btn border border-border bg-surface/80 p-0.5 shadow-sm">
+            {(['stats', 'status'] as const).map(tab => {
+              const active = activeTab === tab
+              return (
+                <button
+                  key={tab}
+                  onClick={() => setActiveTab(tab)}
+                  className={`inline-flex items-center gap-1.5 rounded-[5px] px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                    active ? 'bg-accent text-white shadow-sm' : 'text-secondary hover:bg-elevated hover:text-foreground'
+                  }`}
+                >
+                  {tab === 'stats' ? <HardDrive className="h-3.5 w-3.5" /> : <Server className="h-3.5 w-3.5" />}
+                  {tab === 'stats' ? '数据统计' : '服务状态'}
+                </button>
+              )
+            })}
+          </div>
+        }
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
+        {activeTab === 'status' ? (
+          <StockdataStatusPanel />
+        ) : (
+        <>
         {!isLoading && !isError && total > 0 && (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -308,6 +513,8 @@ export function LocalData() {
               )}
             </div>
           </>
+        )}
+        </>
         )}
       </div>
     </div>

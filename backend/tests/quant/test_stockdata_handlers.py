@@ -41,6 +41,22 @@ def test_ping(src):
     assert t == "json" and data["pong"] is True
 
 
+def test_h_status_includes_scheduler_state(monkeypatch):
+    """status handler 应返回 scheduler 状态（含待办/最近任务），而非仅基础信息。"""
+    from app.services.stockdata import handlers
+    fake = {
+        "last_backfill": "2026-08-20 10:00:00",
+        "backfill_result": {"missing": {"kline_minute": True}},
+        "active_tasks": ["backfill"],
+        "ts": "2026-08-20 10:05:00",
+    }
+    monkeypatch.setattr("app.services.stockdata.scheduler.get_status", lambda: fake)
+    t, data = handlers.h_status({}, None)
+    assert t == "json"
+    assert data["last_backfill"] == "2026-08-20 10:00:00"
+    assert data["active_tasks"] == ["backfill"]
+
+
 def test_norm_code_bare_6_digit():
     assert _norm_code("512670") == "512670.XSHG"   # 6 开头 → 沪市
     assert _norm_code("600000") == "600000.XSHG"   # 6 开头 → 沪市

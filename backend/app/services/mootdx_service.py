@@ -281,9 +281,18 @@ STOCK_MINUTE_ROOT = DATA_ROOT / "kline_minute"
 STOCK_MINUTE_START = _date(2026, 4, 1)
 # 每攒满多少只股票一次性批量写分区（写盘 IO 与内存的折中）
 _STOCK_MINUTE_BATCH = 100
+# 回源进度日志间隔（只数）：100 只才 flush 一次（约 10 分钟），期间无任何输出，
+# 无法区分"卡死"与"正常积累"。每间隔这么多只打一条进度日志（已处理/总数 +
+# 当前标的 + 耗时），保证长回源全程可见。
+_STOCK_MINUTE_PROGRESS_STEP = 25
 # 调度任务单次回源的股票分钟只数上限（增量慢跑：启动线程与盘后 cron 各跑
 # 一批，resume 跳过已覆盖，多轮后自动补齐全部缺口；None = 一次拉全量）
 STOCK_MINUTE_BATCH_LIMIT = 20
+# 收盘后最新分钟分区覆盖率的"完整"阈值：低于它视为回源中断残留的残缺日
+# （如 08-19 只写了 3600/5209），此时忽略 limit 直接全量补齐。正常完整日
+# 覆盖率 >99%，阈值取 0.95 与增量慢跑/内容校验（0.5）的语义区分开。
+_STOCK_MINUTE_RESUME_COVERAGE = float(
+    os.getenv("STOCK_MINUTE_RESUME_COVERAGE", "0.95"))
 
 
 def _flush_stock_minute_chunk(chunk: list[pl.DataFrame]) -> None:
@@ -334,6 +343,24 @@ def _existing_minute_symbols() -> set[str]:
         return set(df["symbol"].to_list())
     except Exception:  # noqa: BLE001
         return set()
+
+
+def _stock_minute_latest_partial(done_syms: set[str], stocks: list[str]) -> bool:
+    """收盘后最新分钟分区覆盖率显著不足时返回 True（触发全量补齐而非增量慢跑）。
+
+    15:35 全量回源（limit=None）被重启打断会留下残缺的最新分区（08-19 案例：
+    只写了 3600/5209）。resume 只按最新分区判断"已覆盖"，后续每次启动只补
+    limit=20 只（需 ~70 轮才追上），残片检测又跳过最新分区 —— 当天分钟线
+    永久缺失。此处以完整日覆盖率（正常 >99%）为基线，最新分区覆盖率低于
+    ``_STOCK_MINUTE_RESUME_COVERAGE`` 即视为中断残留，应一次全量补齐缺失
+    标的，而不是受 limit 限制慢慢爬。
+    """
+    if not _market_closed():
+        return False
+    if not done_syms or not stocks:
+        return False
+    coverage = len(done_syms & set(stocks)) / len(stocks)
+    return coverage < _STOCK_MINUTE_RESUME_COVERAGE
 
 
 # 分区 symbol 数低于基线该数量以上视为残片（回源中断产物）。
@@ -482,7 +509,13 @@ def sync_stock_minute(limit: int | None = None) -> int:
         logger.info("mootdx_service: 股票分钟已全部覆盖（%d 只），无需回源", len(done_syms))
         return range_rows + fragment_rows
     if limit is not None:
-        todo = todo[:limit]
+        if _stock_minute_latest_partial(done_syms, stocks):
+            logger.info("mootdx_service: 最新分钟分区残缺（覆盖率 %.1f%%），"
+                        "忽略 limit=%d 全量补齐 %d 只",
+                        len(done_syms & set(stocks)) / len(stocks) * 100,
+                        limit, len(todo))
+        else:
+            todo = todo[:limit]
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的 4/1 前
     # 已无交易，回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过。
     pre_delisted = [s for s in todo if listing.get(s) == _date(1970, 1, 1)]
@@ -495,8 +528,13 @@ def sync_stock_minute(limit: int | None = None) -> int:
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     total = 0
     chunk: list[pl.DataFrame] = []
+    _t0 = time.time()
     for i, sym in enumerate(todo):
         _throttle_backfill(i)
+        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
+            logger.info("mootdx_service: 股票分钟回源进度 %d/%d 只"
+                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        i + 1, len(todo), sym, total, time.time() - _t0)
         # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
         sym_start = STOCK_MINUTE_START
         ld = listing.get(sym)
@@ -582,8 +620,13 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     total = 0
     chunk: list[pl.DataFrame] = []
+    _t0 = time.time()
     for i, sym in enumerate(stocks):
         _throttle_backfill(i)
+        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
+            logger.info("mootdx_service: 股票分钟按日回源 %s 进度 %d/%d 只"
+                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        day, i + 1, len(stocks), sym, total, time.time() - _t0)
         ld = listing.get(sym)
         if ld is not None and ld > day:
             continue  # 上市晚于目标日，该日无数据
@@ -653,8 +696,13 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     total = 0
     chunk: list[pl.DataFrame] = []
+    _t0 = time.time()
     for i, sym in enumerate(stocks):
         _throttle_backfill(i)
+        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
+            logger.info("mootdx_service: 股票分钟批量回源进度 %d/%d 只"
+                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        i + 1, len(stocks), sym, total, time.time() - _t0)
         ld = listing.get(sym)
         if ld is not None and ld > window_end:
             continue  # 上市晚于整个缺失窗口，窗口内无数据
@@ -1392,12 +1440,17 @@ def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
 
 
 def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
-                        timeout: float = 30.0) -> pd.DataFrame | None:
+                        timeout: float | None = None) -> pd.DataFrame | None:
     """带墙钟超时的 mootdx 分钟取数，防长批回源时单只卡死整批。
 
     ``get_minute`` 分页拉取（单只最多 50 页），正常 ~2s、慢标的 ~15s；服务器
     劣化时底层 socket 可能永久挂起。这里外包线程守护，超时**抛异常**让调用方
     重建 MootdxSource（彻底刷新连接状态，避免坏 socket/坏 server 索引残留）。
+
+    默认超时须覆盖内层 ``_with_server_retry`` 整轮服务器轮换的最坏耗时
+    （``_TDX_FETCH_GUARD_TIMEOUT``）：否则会在轮换中途被掐断、遗弃内层线程
+    （线程继续后台换服务器、堆积 socket），长跑回源形成死亡螺旋（08-19 案例）。
+    因 socket 已设读超时（见 mootdx_src._patch），单次轮换是有界的，不会无限挂。
     """
     import threading as _th
     box: dict = {}
@@ -1408,6 +1461,9 @@ def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
         except Exception as e:  # noqa: BLE001
             box["err"] = e
 
+    if timeout is None:
+        from app.quant.jqengine.datasource import mootdx_src as _msrc
+        timeout = _msrc._TDX_FETCH_GUARD_TIMEOUT
     t = _th.Thread(target=_run, daemon=True)
     t.start()
     t.join(timeout)

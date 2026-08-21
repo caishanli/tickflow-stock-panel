@@ -1543,6 +1543,7 @@ export const api = {
     body: JSON.stringify({ date }),
   }),
   checkFull: () => request<{ ok: boolean }>('/api/data/check-full', { method: 'POST' }),
+  stockdataStatus: () => request<StockdataStatus>('/api/data/stockdata-status'),
   dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),
@@ -2312,6 +2313,25 @@ export interface StockdataLog {
   offset: number
   limit: number
   rows: StockdataLogRow[]
+}
+
+export interface StockdataStatus {
+  ts: string
+  process_started: string
+  active_tasks: string[]
+  last_backfill: string | null
+  backfill_result?: Record<string, unknown> | null
+  last_sync: string | null
+  sync_result?: Record<string, unknown> | null
+  sync_job?: string | null
+  last_check_day?: string | null
+  check_day_result?: Record<string, unknown> | null
+  last_check_full?: string | null
+  check_full_result?: Record<string, unknown> | null
+  full_scan_started?: string | null
+  last_full_scan?: string | null
+  full_scan_result?: Record<string, unknown> | null
+  full_scan_date?: string | null
 }
 
 export interface EnrichedField {
