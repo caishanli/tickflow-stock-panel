@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, Suspense } from 'react'
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { useQuoteStream, useQuoteStreamStatus } from '@/lib/useQuoteStream'
@@ -30,6 +30,7 @@ import {
   Key,
   Database,
   Loader2,
+  Menu,
   LayoutDashboard,
   Tags,
   TrendingUp,
@@ -328,6 +329,24 @@ export function Layout() {
   const realtimeEnabled = prefs?.realtime_quotes_enabled ?? false
   // Free 档监控限制提示: 可手动关闭, 不持久化 (刷新后恢复显示)
   const [dismissFreeHint, setDismissFreeHint] = useState(false)
+  // 移动端 (<768px) 抽屉式侧栏开关; 桌面端侧栏常驻, 此状态无效
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const { pathname } = useLocation()
+
+  // 路由变化自动收起抽屉 (点菜单项导航后)
+  useEffect(() => {
+    setMobileNavOpen(false)
+  }, [pathname])
+
+  // Esc 关闭抽屉
+  useEffect(() => {
+    if (!mobileNavOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMobileNavOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [mobileNavOpen])
   const indicesPinned = prefs?.indices_nav_pinned ?? true
   const sidebarIndexSymbols = prefs?.sidebar_index_symbols ?? CORE_INDEXES.map(p => p.symbol)
   const sidebarIndexes = CORE_INDEXES.filter(item => sidebarIndexSymbols.includes(item.symbol))
@@ -428,8 +447,18 @@ export function Layout() {
   }
 
   return (
-    <div className="h-screen grid grid-cols-[14rem_1fr] bg-base text-foreground overflow-hidden">
-      <aside className="border-r border-border bg-surface flex flex-col h-full min-h-0 overflow-hidden">
+    <div className="h-screen supports-[height:100dvh]:h-dvh grid grid-cols-1 md:grid-cols-[14rem_1fr] bg-base text-foreground overflow-hidden">
+      <aside
+        className={cn(
+          // 移动端: fixed 抽屉, 默认藏于屏外, 打开滑入
+          'fixed inset-y-0 left-0 z-50 w-64 max-w-[80vw] border-r border-border bg-surface',
+          'flex flex-col h-full min-h-0 overflow-hidden',
+          'transition-transform duration-200 ease-smooth',
+          mobileNavOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full',
+          // 桌面端: 回到网格列常驻
+          'md:static md:w-auto md:translate-x-0 md:shadow-none',
+        )}
+      >
         <div className="px-5 py-5 border-b border-border shrink-0">
           {/* Brand block — 原创 logo + 等宽 wordmark */}
           <div className="flex items-center gap-2.5">
@@ -466,7 +495,7 @@ export function Layout() {
           />
         </div>
 
-        <nav className="flex-1 min-h-0 overflow-y-auto px-2 py-3 space-y-0.5">
+        <nav className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-2 py-3 space-y-0.5">
           {visibleNavItems.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
@@ -659,12 +688,37 @@ export function Layout() {
         </div>
       </aside>
 
+      {/* 移动端抽屉遮罩 */}
+      {mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/50 md:hidden"
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
       <motion.main
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
         className="h-full overflow-auto scrollbar-gutter-stable"
       >
+        {/* 移动端顶栏: hamburger 唤起抽屉侧栏 (桌面端隐藏) */}
+        <header className="sticky top-0 z-30 flex h-12 shrink-0 items-center gap-2 border-b border-border bg-surface/95 px-3 backdrop-blur md:hidden">
+          <button
+            onClick={() => setMobileNavOpen(true)}
+            className="-ml-1 flex items-center justify-center rounded-btn p-2 text-foreground/80 transition-colors hover:bg-elevated hover:text-foreground"
+            aria-label="打开菜单"
+          >
+            <Menu className="h-5 w-5" />
+          </button>
+          <div className="flex items-center gap-1.5">
+            <Logo size={20} className="shrink-0" style={{ color: BRAND }} />
+            <span className="font-mono text-xs font-bold tracking-[0.06em] text-foreground">
+              TickFlow
+            </span>
+          </div>
+        </header>
         {streamStatus === 'reconnecting' && (
           <div
             role="status"

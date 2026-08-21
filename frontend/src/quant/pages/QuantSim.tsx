@@ -63,6 +63,16 @@ function fmtPriceTs(ts: unknown, today?: string): string | null {
   return isToday ? `${m[4]}:${m[5]}` : `${m[2]}-${m[3]} ${m[4]}:${m[5]}`
 }
 
+/** 紧凑两行时间（表格固定列用）: 首行日期、次行时分；跨年首行补两位年份，title 留完整时间 */
+function splitTs(v: unknown): { d: string; t: string; full: string } {
+  const full = String(v ?? '')
+  const m = full.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/)
+  if (!m) return { d: full.slice(0, 10), t: '', full }
+  const [, y, mo, da, hh, mm] = m
+  const d = y === String(new Date().getFullYear()) ? `${mo}-${da}` : `${y.slice(2)}-${mo}-${da}`
+  return { d, t: `${hh}:${mm}`, full }
+}
+
 /** 当天日期（本地时区 YYYY-MM-DD）；跨天自动更新，驱动现价时间 HH:MM / MM-DD HH:MM 格式翻转 */
 function useToday(): string {
   const [today, setToday] = useState(() => localDay())
@@ -258,8 +268,9 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
       {accounts.length === 0 ? (
         <EmptyState title="暂无模拟账户" hint="点击左上角「新建模拟」创建一个" />
       ) : (
-        <div className="rounded-card border border-border bg-surface overflow-hidden">
-          <table className="w-full text-xs">
+        <>
+        <div className="hidden md:block rounded-card border border-border bg-surface overflow-hidden">
+            <table className="w-full text-xs">
             <thead className="text-muted border-b border-border">
               <tr className="text-left">
                 <th className="px-3 py-2.5 font-normal w-10">#</th>
@@ -325,8 +336,63 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
                 )
               })}
             </tbody>
-          </table>
+            </table>
         </div>
+
+        {/* 移动端卡片布局：名称在上，其余信息纵向排列 */}
+        <div className="md:hidden space-y-2">
+          {accounts.map((a: any) => {
+            const ret = typeof a.net_value === 'number' && a.capital
+              ? a.net_value / a.capital - 1 : null
+            return (
+              <div key={a.id} onClick={() => onOpen(a.id)}
+                className="rounded-card border border-border bg-surface p-3 cursor-pointer transition-colors hover:bg-elevated/60">
+                <div className="flex items-center gap-2">
+                  <span className="flex-1 min-w-0 truncate text-sm font-medium text-foreground">{a.name}</span>
+                  <button onClick={(e) => { e.stopPropagation(); if (window.confirm(`确定删除「${a.name}」？`)) onDelete(a.id) }}
+                    className="p-1 rounded hover:bg-bear/10 text-muted hover:text-bear transition-colors shrink-0"
+                    title="删除">
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+                <div className="mt-1.5 font-mono text-[11px] text-muted">
+                  <span className="copy-id inline-flex items-center gap-1 cursor-pointer hover:text-accent transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      const ta = document.createElement('textarea')
+                      ta.value = a.id
+                      ta.style.position = 'fixed'
+                      ta.style.left = '-9999px'
+                      document.body.appendChild(ta)
+                      ta.select()
+                      try { document.execCommand('copy'); toast('已复制', 'success', 'top') }
+                      catch { toast('复制失败', 'error') }
+                      document.body.removeChild(ta)
+                    }}>
+                    {a.id}
+                  </span>
+                </div>
+                <div className="mt-1 text-[11px] text-muted flex flex-wrap gap-x-2 gap-y-0.5">
+                  <span>{strategyName(a.strategy_id)}</span>
+                  <span>{FREQ_LABEL[a.frequency] ?? a.frequency ?? '分钟级'}</span>
+                  <span className={statusTone(a.status)}>{STATUS_LABEL[a.status] ?? a.status}</span>
+                  {a.start_date && <span>{a.start_date}</span>}
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div>
+                    <div className="text-[10px] text-muted">净值</div>
+                    <div className="text-xs num font-medium">{fmtNum(a.net_value)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted">收益率</div>
+                    <div className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</div>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        </>
       )}
     </div>
   )
@@ -725,8 +791,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             <table className="w-full text-xs">
                 <thead className="text-muted sticky top-0 bg-surface">
                   <tr className="text-left">
-                    <th className="px-3 py-1.5 font-normal">买入时间</th>
-                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-3 py-1.5 font-normal">买入时间</th>
+                    <th className="sticky left-20 z-10 bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
                     <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">数量</th>
                     <th className="px-3 py-1.5 font-normal">成本</th>
@@ -742,6 +808,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                     const pnlAmt = pnlPct != null ? pnlPct * (Number(p.amount) || 0) * (Number(p.avg_cost) || 0) : null
                     const tsLabel = fmtPriceTs(p.price_ts, today)
+                    const entryTs = splitTs(p.entry_ts)
                     return (
                       <tr key={sym}
                         onClick={() => {
@@ -754,9 +821,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                               : [],
                           })
                         }}
-                        className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                        <td className="px-3 py-1.5 text-muted">{p.entry_ts ? String(p.entry_ts).slice(0, 16) : '—'}</td>
-                        <td className="px-3 py-1.5">{p.name ?? ''}</td>
+                        className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
+                        <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
+                          <div className="num">{p.entry_ts ? entryTs.d : '—'}</div>
+                          {p.entry_ts && entryTs.t && <div className="num">{entryTs.t}</div>}
+                        </td>
+                        <td className="sticky left-20 z-10 bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
                         <td className="px-3 py-1.5 num">{p.amount}</td>
                         <td className="px-3 py-1.5 num">{fmtNum(p.avg_cost, 3)}</td>
@@ -805,8 +875,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
               <table className="w-full text-xs">
                 <thead className="text-muted sticky top-0 bg-surface">
                   <tr className="text-left">
-                    <th className="px-3 py-1.5 font-normal">时间</th>
-                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky left-20 z-10 bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
                     <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">持仓时长</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
@@ -833,9 +903,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                             : [],
                         })
                       }}
-                      className="border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                      <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
-                      <td className="px-3 py-1.5">{t.name ?? ''}</td>
+                      className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
+                      <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                        <div className="num">{splitTs(t.ts).d}</div>
+                        {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
+                      </td>
+                      <td className="sticky left-20 z-10 bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       {(() => {
                         const holdDays = t.action === 'BUY'
@@ -882,8 +955,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
               <table className="w-full text-xs">
                 <thead className="text-muted sticky top-0 bg-surface">
                   <tr className="text-left">
-                    <th className="px-3 py-1.5 font-normal">时间</th>
-                    <th className="px-3 py-1.5 font-normal">名称</th>
+                    <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky left-20 z-10 bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
                     <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
                     <th className="px-3 py-1.5 font-normal">价格</th>
@@ -895,9 +968,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </thead>
                 <tbody className="text-foreground">
                   {[...stoplossRows].reverse().map((t: any, i: number) => (
-                    <tr key={i} className="border-t border-border/60 hover:bg-elevated/60 transition-colors">
-                      <td className="px-3 py-1.5 text-muted">{String(t.ts ?? '')}</td>
-                      <td className="px-3 py-1.5">{t.name ?? ''}</td>
+                    <tr key={i} className="group border-t border-border/60 hover:bg-elevated/60 transition-colors">
+                      <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                        <div className="num">{splitTs(t.ts).d}</div>
+                        {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
+                      </td>
+                      <td className="sticky left-20 z-10 bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className="px-3 py-1.5 text-bear">止损</td>
                       <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>
