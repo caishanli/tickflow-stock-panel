@@ -639,6 +639,7 @@ def _revalue_at_close(dm, ctx, state: dict, bar_dt) -> None:
             log.warning("[runner] %s 收盘重估无价，保留现价 %.4f", code, pos.price)
             continue
         pos.price = float(price)
+        pos.price_ts = str(close_ts)
         changed = True
     if changed:
         _state_from_portfolio(ctx, state)
@@ -722,7 +723,8 @@ def _hist_feed(dm, codes, now, _acc):
 
     走 ``dm.get_minute_price_at`` 滑窗加载（C1 近 3 月真实 1m / 更早 baostock 5m
     插值，均在内存，不落盘）；无数据标的缺席，全部无数据则 bar_dt=None（该 bar
-    跳过，如停牌/数据空洞）。
+    跳过，如停牌/数据空洞）。返回 ``(prices, bar_dt, price_ts)``，price_ts 为
+    ``{code: 该 code 现价 bar 时刻字符串}``。
 
     当日（now 与真实今天同一天）全部取不到价时回退 ``current_snapshot`` 实时
     兜底：stock data 服务刚重启/当日分区尚未落盘的竞态下，get_minute 分区取数
@@ -730,24 +732,25 @@ def _hist_feed(dm, codes, now, _acc):
     后 11:51 补跑 ETF 分钟分区 11:51:51 才落盘，全部 bar 被跳过、持仓价停旧值）。
     历史日分区应已存在，缺失即真实缺失（停牌），不做兜底，避免错配今日价。
     """
-    prices = {}
+    prices, price_ts = {}, {}
     for code in dict.fromkeys(codes):
         p = dm.get_minute_price_at(code, now)
         if p is not None:
             prices[code] = float(p)
+            price_ts[code] = str(pd.Timestamp(now))
     if prices:
-        return prices, (now if prices else None)
+        return prices, now, price_ts
     now_ts = pd.Timestamp(now)
     if now_ts.date() != pd.Timestamp(datetime.datetime.now()).date():
-        return prices, None
+        return prices, None, price_ts
     client = getattr(dm, "client", None)
     if client is None:
-        return prices, None
+        return prices, None, price_ts
     try:
         snap = client.current_snapshot(list(dict.fromkeys(codes)), as_of=now_ts)
     except Exception as e:  # noqa: BLE001
         log.warning("[hist_feed] 当日实时兜底取数失败: %s", e)
-        return prices, None
+        return prices, None, price_ts
     for code, df in (snap or {}).items():
         if df is None or (hasattr(df, "empty") and df.empty):
             continue
@@ -755,7 +758,8 @@ def _hist_feed(dm, codes, now, _acc):
         if sub.empty:
             continue
         prices[code] = float(sub["close"].iloc[-1])
-    return prices, (now_ts if prices else None)
+        price_ts[code] = str(sub.index[-1])
+    return prices, (now_ts if prices else None), price_ts
 
 
 def _flush_replay_batch(account_id: str, aux: dict) -> None:
@@ -965,9 +969,10 @@ def _mark_to_market(feed, dm, ctx, state: dict, last_mark: dict, now) -> bool:
     conv = getattr(ctx, "_code_conv", None)
     codes = list(pf.positions.keys())
     engine_codes = [conv[0](c) for c in codes] if conv else codes
-    prices, _bar = feed(dm, engine_codes, now, None)
+    prices, _bar, bar_ts_map = feed(dm, engine_codes, now, None)
     if prices and conv is not None:
         prices = {conv[1](c): v for c, v in prices.items()}
+        bar_ts_map = {conv[1](c): v for c, v in (bar_ts_map or {}).items()}
     if not prices:
         return False
     dirty = False
@@ -983,6 +988,9 @@ def _mark_to_market(feed, dm, ctx, state: dict, last_mark: dict, now) -> bool:
         elif abs(px / prev - 1) >= MARK_SNAPSHOT_TICK:
             dirty = True
         pos.price = float(px)
+        ts = bar_ts_map.get(code)
+        if ts:
+            pos.price_ts = str(ts)
         last_mark[code] = float(px)
     if dirty:
         _state_from_portfolio(ctx, state)
@@ -1008,9 +1016,10 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         list(getattr(ctx, "universe", None) or [])
         + list(ctx.portfolio.positions.keys())))
     # 数据层用引擎码（JQ），feed 前转换；ptrade 策略域为 .SS/.SZ
-    prices, bar_dt = feed(dm, [_to_engine(c) for c in watch], now, aux["fresh_frames"])
+    prices, bar_dt, price_ts = feed(dm, [_to_engine(c) for c in watch], now, aux["fresh_frames"])
     if prices:
         prices = {_to_pt(c): v for c, v in prices.items()}
+        price_ts = {_to_pt(c): v for c, v in (price_ts or {}).items()}
     if bar_dt is None:
         # 收盘宽限期内无实时数据属正常，不报警
         t = pd.Timestamp(now).time()
@@ -1064,6 +1073,9 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     for code, pos in ctx.portfolio.positions.items():
         if code in prices:
             pos.price = prices[code]
+            ts = price_ts.get(code)
+            if ts:
+                pos.price_ts = str(ts)
     _persist(account_id, ctx, state, bar_ts, jq_api, aux)
     return bar_ts
 

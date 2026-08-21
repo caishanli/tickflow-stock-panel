@@ -112,7 +112,7 @@ def _today_bar(hour=10, minute=30):
 
 def _feed_factory(price=10.0, bar=None):
     def _feed(dm, codes, now, acc):
-        return {c: price for c in codes}, (bar or _today_bar())
+        return {c: price for c in codes}, (bar or _today_bar()), {}
     return _feed
 
 
@@ -169,7 +169,7 @@ def test_strategy_loop_new_bar_refires(tmp_quant, monkeypatch):
     bars = iter([_today_bar(), _today_bar(minute=31)])
 
     def _feed(dm, codes, now, acc):
-        return {c: 10.0 for c in codes}, next(bars)
+        return {c: 10.0 for c in codes}, next(bars), {}
 
     runner.run_loop(aid, dm=_StubDM(), feed=_feed, matcher=Matcher(0.03))
     from app.quant.jqengine.engine.jq import api
@@ -265,7 +265,7 @@ def test_run_daily_fires_once_per_day(tmp_quant, monkeypatch):
     def _feed(dm, codes, now, acc):
         p = next(bars, None)
         # 主循环盘中 mark 子循环会基于持仓反复取价，越界后钳制在最后一根 bar
-        return {c: 10.0 for c in codes}, (p or _today_bar(minute=31))
+        return {c: 10.0 for c in codes}, (p or _today_bar(minute=31)), {}
 
     runner.run_loop(aid, dm=_StubDM(), feed=_feed, matcher=Matcher(0.03))
     # 'open' 任务每日只触发一次：两个 bar 也只有一笔买入（第二根 bar 现金已不足再触发目标仓位）
@@ -630,7 +630,7 @@ def test_daily_frequency_one_tick_all_tasks(tmp_quant, monkeypatch):
     bars = iter([_today_bar(minute=31), _today_bar(minute=32), _today_bar(minute=33)])
 
     def _feed(dm, codes, now, acc):
-        return {c: 10.0 for c in codes}, next(bars)
+        return {c: 10.0 for c in codes}, next(bars), {}
 
     runner.run_loop(aid, dm=_StubDM(), feed=_feed, matcher=Matcher(0.03))
     from app.quant.jqengine.engine.jq import api
