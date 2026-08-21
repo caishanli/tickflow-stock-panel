@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { PageHeader } from '@/components/PageHeader'
 import { Modal } from '@/components/Modal'
 import { toast } from '@/components/Toast'
 import { DatePicker } from '@/components/DatePicker'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History, Save,
+  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History, Save, ChevronDown,
 } from 'lucide-react'
 import * as api from '../api'
 import { openBacktestStream } from '../stream'
@@ -21,10 +21,20 @@ const INPUT_CLS =
 const SECTION_TITLE = 'text-[11px] font-medium uppercase tracking-wide text-muted flex items-center gap-1.5'
 
 function statusTone(s: string | undefined) {
-  if (s === 'done') return 'text-bull'
-  if (s === 'failed') return 'text-bear'
-  if (s === 'running' || s === 'queued') return 'text-accent'
+  if (s === 'completed' || s === 'success' || s === 'done') return 'text-bull'
+  if (s === 'failed' || s === 'error') return 'text-bear'
+  if (s === 'running' || s === 'pending') return 'text-accent'
   return 'text-muted'
+}
+
+/** 紧凑两行时间（表格固定列用）: 首行日期、次行时分；跨年首行补两位年份，title 留完整时间 */
+function splitTs(v: unknown): { d: string; t: string; full: string } {
+  const full = String(v ?? '')
+  const m = full.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/)
+  if (!m) return { d: full.slice(0, 10), t: '', full }
+  const [, y, mo, da, hh, mm] = m
+  const d = y === String(new Date().getFullYear()) ? `${mo}-${da}` : `${y.slice(2)}-${mo}-${da}`
+  return { d, t: `${hh}:${mm}`, full }
 }
 
 // 回测运行时间（created_at）格式化为 MM-DD HH:mm
@@ -138,8 +148,8 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             <Plus size={14} />新建
           </button>
         </div>
-        <div className="rounded-card border border-border bg-surface overflow-hidden">
-          <table className="w-full text-xs">
+        <div className="hidden md:block rounded-card border border-border bg-surface overflow-hidden">
+            <table className="w-full text-xs">
             <thead className="text-muted bg-elevated/40">
               <tr className="text-left">
                 <th className="px-3 py-2 font-normal w-10 text-center">#</th>
@@ -211,7 +221,56 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                 )
               })}
             </tbody>
-          </table>
+            </table>
+        </div>
+
+        {/* 移动端卡片布局：策略名称在上，其余信息纵向排列 */}
+        <div className="md:hidden space-y-2">
+          {pageItems.length === 0 && (
+            <div className="rounded-card border border-border bg-surface px-3 py-10 text-center text-muted text-xs">
+              暂无策略，点击左上角新建
+            </div>
+          )}
+          {pageItems.map((s) => {
+            const m = pickMetrics(s.latest?.metrics_json)
+            const period = s.latest ? `${s.latest.start ?? ''} ~ ${s.latest.end ?? ''}` : '—'
+            const checked = selected.has(s.id)
+            return (
+              <div key={s.id} onClick={() => onOpen(s.id)}
+                className={`rounded-card border border-border bg-surface p-3 cursor-pointer transition-colors hover:bg-elevated/60 ${checked ? 'bg-accent/5' : ''}`}>
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
+                    onClick={e => e.stopPropagation()}
+                    className="accent-accent cursor-pointer align-middle shrink-0" />
+                  <span className="flex-1 min-w-0 truncate text-sm font-medium text-foreground">{s.name}</span>
+                  <button onClick={(e) => { e.stopPropagation(); setDelIds([s.id]) }}
+                    className="inline-flex items-center gap-1 text-bear hover:underline text-xs shrink-0">
+                    <Trash2 className="h-3.5 w-3.5" />删除
+                  </button>
+                </div>
+                <div className="mt-1.5 pl-6 font-mono text-[11px] text-muted truncate">{s.id}</div>
+                <div className="mt-1 pl-6 text-[11px] text-muted num truncate">{period}</div>
+                <div className="mt-2 pl-6 grid grid-cols-4 gap-2">
+                  <div>
+                    <div className="text-[10px] text-muted">收益率</div>
+                    <div className={`text-xs num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted">最大回撤</div>
+                    <div className={`text-xs num ${tone(m.max_drawdown ? -m.max_drawdown : null)}`}>{m.max_drawdown == null ? '—' : fmtPct(-m.max_drawdown)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted">夏普</div>
+                    <div className={`text-xs num ${tone(m.sharpe)}`}>{fmtNum(m.sharpe)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted">回测次数</div>
+                    <div className="text-xs num">{s.run_count}</div>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
         </div>
 
         {totalPages > 1 && (
@@ -262,6 +321,8 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
   const [confirmBatchDel, setConfirmBatchDel] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
   const [leftPct, setLeftPct] = useState(50)
+  // 策略代码折叠状态: 手机端默认收起(先看结果), 桌面端默认展开; 点击标题切换
+  const [codeOpen, setCodeOpen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 768)
   const bodyRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
 
@@ -446,70 +507,79 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
 
   return (
     <div className="flex flex-col h-full">
-      <header className="px-4 py-3 border-b border-border flex items-center gap-2 flex-wrap">
-        <button onClick={onBack} className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg bg-elevated text-foreground text-xs">
-          <ArrowLeft size={14} />返回列表
-        </button>
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="策略名称"
-          className="h-9 w-44 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
-        <span className="text-xs text-muted font-mono cursor-pointer hover:text-accent transition-colors"
-          title="点击复制策略ID"
-          onClick={() => {
-            const ta = document.createElement('textarea')
-            ta.value = strategyId
-            ta.style.position = 'fixed'
-            ta.style.left = '-9999px'
-            document.body.appendChild(ta)
-            ta.select()
-            try { document.execCommand('copy'); toast('策略ID已复制', 'success', 'top') }
-            catch { toast('复制失败', 'error') }
-            document.body.removeChild(ta)
-          }}>{strategyId}</span>
-        <button onClick={saveStrategy} disabled={!name.trim()}
-          className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
-          <Save className="h-3.5 w-3.5" />保存策略
-        </button>
-        <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} label="开始" placeholder="选择日期" buttonClassName="h-9 justify-between w-44" />
-        <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} label="结束" placeholder="选择日期" buttonClassName="h-9 justify-between w-44" />
-        <input type="number" value={form.capital} onChange={e => setForm({ ...form, capital: +e.target.value })} placeholder="初始金额"
-          className="h-9 w-28 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
-        <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}
-          className="h-9 w-24 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50">
-          <option value="daily">daily</option>
-          <option value="1m">1m</option>
-        </select>
-        <div className="relative">
-          <button onClick={() => { setAdvOpen(o => !o); setHistOpen(false) }} title="高级参数"
-            className={`inline-flex items-center gap-1 h-9 px-2.5 rounded-btn border border-border text-xs ${advOpen ? 'text-accent' : 'text-secondary hover:text-foreground'} transition-colors`}>
-            <Settings2 className="h-3.5 w-3.5" />高级
+      <header className="px-3 md:px-4 py-2 md:py-3 border-b border-border flex items-center gap-1.5 md:gap-2 flex-wrap">
+        {/* 移动端按组换行压缩高度; 桌面端 md:contents 还原为平铺一行 */}
+        <div className="flex items-center gap-1.5 md:gap-2 flex-wrap w-full md:w-auto md:contents">
+          <button onClick={onBack} className="inline-flex items-center gap-1 px-2.5 h-8 md:h-9 rounded-lg bg-elevated text-foreground text-xs">
+            <ArrowLeft size={14} />返回列表
           </button>
-          {advOpen && (
-            <div className="absolute z-20 right-0 top-11 w-64 rounded-card border border-border bg-surface p-3 space-y-2 shadow-xl">
-              <div className="text-[10px] uppercase tracking-wide text-muted">手续费</div>
-              <input type="number" step="0.0001" value={form.fee} onChange={e => setForm({ ...form, fee: +e.target.value })} className={INPUT_CLS} />
-              <div className="text-[10px] uppercase tracking-wide text-muted">滑点</div>
-              <input type="number" step="0.0001" value={form.slippage} onChange={e => setForm({ ...form, slippage: +e.target.value })} className={INPUT_CLS} />
-              <button onClick={() => { saveStrategy(); setAdvOpen(false) }} className="w-full h-9 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">保存策略</button>
-            </div>
+          <input value={name} onChange={e => setName(e.target.value)} placeholder="策略名称"
+            className="h-8 md:h-9 min-w-0 flex-1 md:flex-none md:w-44 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+          <span className="text-xs text-muted font-mono cursor-pointer hover:text-accent transition-colors truncate min-w-0 max-w-[12rem] md:max-w-none"
+            title="点击复制策略ID"
+            onClick={() => {
+              const ta = document.createElement('textarea')
+              ta.value = strategyId
+              ta.style.position = 'fixed'
+              ta.style.left = '-9999px'
+              document.body.appendChild(ta)
+              ta.select()
+              try { document.execCommand('copy'); toast('策略ID已复制', 'success', 'top') }
+              catch { toast('复制失败', 'error') }
+              document.body.removeChild(ta)
+            }}>{strategyId}</span>
+          <button onClick={saveStrategy} disabled={!name.trim()}
+            className="inline-flex items-center gap-1.5 h-8 md:h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
+            <Save className="h-3.5 w-3.5" />保存策略
+          </button>
+        </div>
+        <div className="flex items-center gap-1.5 md:gap-2 w-full md:w-auto md:contents">
+          <DatePicker value={form.start} onChange={d => setForm({ ...form, start: d })} label="开始" placeholder="选择日期" buttonClassName="h-8 md:h-9 justify-between flex-1 md:flex-none md:w-44" />
+          <DatePicker value={form.end} onChange={d => setForm({ ...form, end: d })} label="结束" placeholder="选择日期" buttonClassName="h-8 md:h-9 justify-between flex-1 md:flex-none md:w-44" />
+        </div>
+        <div className="flex items-center gap-1.5 md:gap-2 w-full md:w-auto md:contents">
+          <input type="number" value={form.capital} onChange={e => setForm({ ...form, capital: +e.target.value })} placeholder="初始金额"
+            className="h-8 md:h-9 min-w-0 flex-1 md:flex-none md:w-28 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50" />
+          <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}
+            className="h-8 md:h-9 min-w-0 flex-1 md:flex-none md:w-24 rounded-btn bg-base border border-border px-2.5 text-xs text-foreground focus:outline-none focus:border-accent/50">
+            <option value="daily">daily</option>
+            <option value="1m">1m</option>
+          </select>
+          <div className="relative">
+            <button onClick={() => { setAdvOpen(o => !o); setHistOpen(false) }} title="高级参数"
+              className={`inline-flex items-center gap-1 h-8 md:h-9 px-2.5 rounded-btn border border-border text-xs ${advOpen ? 'text-accent' : 'text-secondary hover:text-foreground'} transition-colors`}>
+              <Settings2 className="h-3.5 w-3.5" />高级
+            </button>
+            {advOpen && (
+              <div className="absolute z-20 right-0 top-11 w-64 rounded-card border border-border bg-surface p-3 space-y-2 shadow-xl">
+                <div className="text-[10px] uppercase tracking-wide text-muted">手续费</div>
+                <input type="number" step="0.0001" value={form.fee} onChange={e => setForm({ ...form, fee: +e.target.value })} className={INPUT_CLS} />
+                <div className="text-[10px] uppercase tracking-wide text-muted">滑点</div>
+                <input type="number" step="0.0001" value={form.slippage} onChange={e => setForm({ ...form, slippage: +e.target.value })} className={INPUT_CLS} />
+                <button onClick={() => { saveStrategy(); setAdvOpen(false) }} className="w-full h-9 rounded-btn bg-elevated text-secondary text-xs hover:text-foreground transition-colors">保存策略</button>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 md:gap-2 w-full md:w-auto md:contents">
+          <button onClick={() => runMut.mutate(true)} disabled={!code || runMut.isPending || isRunning}
+            className="inline-flex items-center gap-1.5 h-8 md:h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
+            <Play className="h-3.5 w-3.5" />编译运行
+          </button>
+          <button onClick={() => runMut.mutate(false)} disabled={!code || !form.start || !form.end || runMut.isPending || isRunning}
+            className="inline-flex items-center justify-center gap-1.5 h-8 md:h-9 px-4 flex-1 md:flex-none rounded-btn bg-accent text-base text-xs font-medium disabled:opacity-50 hover:bg-accent/90 transition-colors">
+            <Play className="h-4 w-4" />{runMut.isPending ? '提交中…' : isRunning ? '运行中…' : '开始回测'}
+          </button>
+          {lastStatus && (
+            <span className={`text-xs font-medium px-2 py-0.5 rounded-btn bg-base border border-border ${statusTone(lastStatus)}`}>{lastStatus}</span>
+          )}
+          {liveRunId && (
+            <button onClick={() => setLiveOn(!liveOn)} title="实时刷新开关"
+              className={`inline-flex items-center gap-1.5 h-8 md:h-9 px-2.5 rounded-btn border border-border text-xs transition-colors ${liveOn ? 'text-accent' : 'text-muted hover:text-foreground'}`}>
+              <Activity className="h-3.5 w-3.5" />{liveOn ? '实时' : '暂停'}
+            </button>
           )}
         </div>
-        <button onClick={() => runMut.mutate(true)} disabled={!code || runMut.isPending || isRunning}
-          className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors disabled:opacity-50">
-          <Play className="h-3.5 w-3.5" />编译运行
-        </button>
-        <button onClick={() => runMut.mutate(false)} disabled={!code || !form.start || !form.end || runMut.isPending || isRunning}
-          className="inline-flex items-center gap-1.5 h-9 px-4 rounded-btn bg-accent text-base text-xs font-medium disabled:opacity-50 hover:bg-accent/90 transition-colors">
-          <Play className="h-4 w-4" />{runMut.isPending ? '提交中…' : isRunning ? '运行中…' : '开始回测'}
-        </button>
-        {lastStatus && (
-          <span className={`text-xs font-medium px-2 py-0.5 rounded-btn bg-base border border-border ${statusTone(lastStatus)}`}>{lastStatus}</span>
-        )}
-        {liveRunId && (
-          <button onClick={() => setLiveOn(!liveOn)} title="实时刷新开关"
-            className={`inline-flex items-center gap-1.5 h-9 px-2.5 rounded-btn border border-border text-xs transition-colors ${liveOn ? 'text-accent' : 'text-muted hover:text-foreground'}`}>
-            <Activity className="h-3.5 w-3.5" />{liveOn ? '实时' : '暂停'}
-          </button>
-        )}
         <div className="relative ml-auto">
           <button onClick={() => { setHistOpen(o => !o); setAdvOpen(false) }} className="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-btn border border-border text-xs text-secondary hover:text-foreground transition-colors">
             <History className="h-3.5 w-3.5" />历史{runList.length > 0 ? `(${runList.length})` : ''}
@@ -587,22 +657,34 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
         </div>
       </header>
 
-      <div ref={bodyRef} className="flex-1 min-h-0 flex overflow-hidden">
-        <div className="p-3 flex flex-col overflow-hidden" style={{ width: `${leftPct}%` }}>
-          <div className={`${SECTION_TITLE} mb-2`}><FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)</div>
-          <div ref={editorBoxRef} className="relative flex-1 min-h-0 rounded-card border border-border overflow-hidden">
-            <CodeEditor value={code} onChange={setCode} height={`${editorH}px`} />
-          </div>
+      {/* 移动端上下堆叠（代码在上、结果在下），桌面端左右分栏 */}
+      <div ref={bodyRef} className="flex-1 min-h-0 flex flex-col overflow-auto md:flex-row md:overflow-hidden">
+        <div
+          className="p-3 w-full md:w-[var(--left-pct)] shrink-0 md:shrink md:flex-col flex flex-col md:overflow-hidden"
+          style={{ '--left-pct': `${leftPct}%` } as CSSProperties}
+        >
+          <button
+            onClick={() => setCodeOpen(o => !o)}
+            className={`${SECTION_TITLE} mb-2 w-full text-left cursor-pointer hover:text-foreground transition-colors md:cursor-default md:pointer-events-none`}
+          >
+            <FileCode2 className="h-3.5 w-3.5" />策略代码 (Python)
+            <ChevronDown className={`ml-auto h-3.5 w-3.5 transition-transform duration-200 md:hidden ${codeOpen ? '' : '-rotate-90'}`} />
+          </button>
+          {codeOpen && (
+            <div ref={editorBoxRef} className="relative h-[320px] md:h-auto md:flex-1 min-h-0 rounded-card border border-border overflow-hidden">
+              <CodeEditor value={code} onChange={setCode} height={`${editorH}px`} />
+            </div>
+          )}
         </div>
 
         <div
           onMouseDown={startDrag}
-          className="w-1 shrink-0 cursor-col-resize bg-border hover:bg-accent/60 transition-colors"
+          className="hidden md:block w-1 shrink-0 cursor-col-resize bg-border hover:bg-accent/60 transition-colors"
           title="拖动调整宽度"
         />
 
-        <div className="flex-1 min-w-0 border-l border-border flex flex-col overflow-hidden">
-          <div className="p-3 grid grid-cols-4 gap-2 shrink-0">
+        <div className="flex-1 min-w-0 border-t md:border-t-0 md:border-l border-border flex flex-col md:overflow-hidden">
+          <div className="p-3 grid grid-cols-2 md:grid-cols-4 gap-2 shrink-0">
             <MetricCard label="收益率" value={fmtPct(shownReturn)} tone={tone(shownReturn)} />
             <MetricCard label="年化" value={fmtPct(metrics.annualized)} tone={tone(metrics.annualized)} />
             <MetricCard label="夏普" value={fmtNum(metrics.sharpe)} tone={tone(metrics.sharpe)} />
@@ -871,8 +953,8 @@ function TradeTable({ trades }: { trades: any[] }) {
       <table className="w-full text-xs">
         <thead className="text-muted sticky top-0 bg-surface">
           <tr className="text-left">
-            <th className="px-2 py-1.5 font-normal">时间</th>
-            <th className="px-2 py-1.5 font-normal">名称</th>
+            <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-2 py-1.5 font-normal">时间</th>
+            <th className="sticky left-20 z-10 bg-surface px-2 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
             <th className="px-2 py-1.5 font-normal">代码</th>
             <th className="px-2 py-1.5 font-normal">持仓时长</th>
             <th className="px-2 py-1.5 font-normal">方向</th>
@@ -895,8 +977,11 @@ function TradeTable({ trades }: { trades: any[] }) {
               : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`
             return (
               <tr key={origIdx} className="border-t border-border/60">
-                <td className="px-2 py-1.5 text-muted">{String(t.ts ?? t.datetime ?? '')}</td>
-                <td className="px-2 py-1.5">{t.name ?? ''}</td>
+                <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-2 py-1.5" title={splitTs(t.ts ?? t.datetime).full}>
+                  <div className="num">{splitTs(t.ts ?? t.datetime).d}</div>
+                  {splitTs(t.ts ?? t.datetime).t && <div className="num">{splitTs(t.ts ?? t.datetime).t}</div>}
+                </td>
+                <td className="sticky left-20 z-10 bg-surface px-2 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                 <td className="px-2 py-1.5 text-muted">{t.code ?? t.symbol ?? ''}</td>
                 <td className={`px-2 py-1.5 num ${holdText === '—' ? 'text-muted' : ''}`}>{holdText}</td>
                 <td className={`px-2 py-1.5 ${buy ? 'text-bull' : 'text-bear'}`}>{buy ? '买入' : '卖出'}</td>
