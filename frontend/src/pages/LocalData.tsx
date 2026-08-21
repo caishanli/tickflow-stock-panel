@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, RefreshCw, Wrench, Server, Activity, Inbox, Clock, CheckCircle2, Loader2 } from 'lucide-react'
+import { HardDrive, RefreshCw, Wrench, Server, Activity, Inbox, Clock, CheckCircle2, Loader2, Wifi } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
@@ -79,6 +79,12 @@ function StockdataStatusPanel() {
     refetchInterval: 5000,
   })
 
+  const mx = useQuery({
+    queryKey: ['mootdx-servers'],
+    queryFn: () => api.mootdxServers(),
+    refetchInterval: 10000,
+  })
+
   const active = data?.active_tasks ?? []
   const missing = data ? extractMissing(data) : []
 
@@ -109,6 +115,35 @@ function StockdataStatusPanel() {
         <EmptyState icon={Server} title="服务不可达" hint="无法获取 stockdata 服务状态，请检查服务是否存活。" />
       ) : (
         <>
+          <div className="rounded-card border border-border bg-surface overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
+              <div className="flex items-center gap-2">
+                <Wifi className="h-3.5 w-3.5 text-sky-500" />
+                mootdx 服务器
+              </div>
+              <span className="text-muted font-normal">每 10 秒刷新</span>
+            </div>
+            <div className="p-3">
+              {mx.isLoading ? (
+                <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-6 w-full" />)}</div>
+              ) : mx.isError ? (
+                <div className="text-xs text-muted">无法获取 mootdx 服务器状态</div>
+              ) : (
+                <ul className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                  {mx.data?.servers.map(s => (
+                    <li key={s.ip} className="flex items-center gap-2 text-xs">
+                      <span className={`inline-block h-2 w-2 rounded-full ${s.ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                      <span className="font-mono text-foreground">{s.ip}:{s.port}</span>
+                      <span className={`ml-auto ${s.ok ? 'text-secondary' : 'text-red-500'}`}>
+                        {s.ok ? `${s.latency_ms}ms` : '—'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
           <div className="rounded-card border border-border bg-surface overflow-hidden">
             <div className="flex items-center gap-2 px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
               <Activity className="h-3.5 w-3.5 text-accent" />
