@@ -46,6 +46,30 @@ function fmtStopLoss(v: any) {
   return `${(v * 100).toFixed(2)}%`
 }
 
+const localDay = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+function fmtPriceTs(ts: unknown, today?: string): string | null {
+  if (!ts) return null
+  const m = String(ts).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/)
+  if (!m) return null
+  const isToday = `${m[1]}-${m[2]}-${m[3]}` === (today ?? localDay())
+  return isToday ? `${m[4]}:${m[5]}` : `${m[2]}-${m[3]} ${m[4]}:${m[5]}`
+}
+
+/** 当天日期（本地时区 YYYY-MM-DD）；跨天自动更新，驱动现价时间 HH:MM / MM-DD HH:MM 格式翻转 */
+function useToday(): string {
+  const [today, setToday] = useState(() => localDay())
+  useEffect(() => {
+    const id = setInterval(() => {
+      const d = localDay()
+      setToday(prev => (prev === d ? prev : d))
+    }, 30_000)
+    return () => clearInterval(id)
+  }, [])
+  return today
+}
+
 /** 从 "YYYY-MM-DD HH:MM:SS"（可省略秒）提取日期 + HH:MM，供分时标记定位 */
 function parseTradeTime(ts: unknown): { date: string; time: string } | null {
   const s = String(ts ?? '')
@@ -318,6 +342,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const [rangeDays, setRangeDays] = useState<number | null>(null)
   // 止损日志：首拉由 status 的 stop_loss 初始化，盘中新止损由 onTrade(STOP_LOSS) 实时追加
   const [stoplossRows, setStoplossRows] = useState<any[]>([])
+  const today = useToday()
   // 首拉全量历史；运行期增量由 SSE 推送（见下方 openSimStream），不再定时轮询。
   // 兜底：SSE 断线/后台标签页挂起后数据可能长期缺失，10s 定时重取 + 窗口聚焦重取自愈
   const { data: st } = useQuery({
@@ -693,12 +718,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal">买入时间</th>
                     <th className="px-3 py-1.5 font-normal">名称</th>
                     <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                    <th className="px-3 py-1.5 font-normal text-right">成本</th>
-                    <th className="px-3 py-1.5 font-normal text-right">现价</th>
-                    <th className="px-3 py-1.5 font-normal text-right">市值</th>
-                    <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal text-right">收益率</th>
+                    <th className="px-3 py-1.5 font-normal">数量</th>
+                    <th className="px-3 py-1.5 font-normal">成本</th>
+                    <th className="px-3 py-1.5 font-normal">现价</th>
+                    <th className="px-3 py-1.5 font-normal">市值</th>
+                    <th className="px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -706,6 +731,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
                     const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
                     const pnlAmt = pnlPct != null ? pnlPct * (Number(p.amount) || 0) * (Number(p.avg_cost) || 0) : null
+                    const tsLabel = fmtPriceTs(p.price_ts, today)
                     return (
                       <tr key={sym}
                         onClick={() => {
@@ -722,14 +748,21 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         <td className="px-3 py-1.5 text-muted">{p.entry_ts ? String(p.entry_ts).slice(0, 16) : '—'}</td>
                         <td className="px-3 py-1.5">{p.name ?? ''}</td>
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
-                        <td className="px-3 py-1.5 text-right num">{p.amount}</td>
-                        <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
-                        <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
-                        <td className="px-3 py-1.5 text-right num">{fmtNum(value)}</td>
-                        <td className={`px-3 py-1.5 text-right num ${pnlAmt == null ? '' : pnlAmt >= 0 ? 'text-bull' : 'text-bear'}`}>
+                        <td className="px-3 py-1.5 num">{p.amount}</td>
+                        <td className="px-3 py-1.5 num">{fmtNum(p.avg_cost, 3)}</td>
+                        <td className="px-3 py-1.5 num">
+                          {fmtNum(p.price, 3)}
+                          {tsLabel && (
+                            <span className="ml-1 text-[10px] text-muted font-normal">
+                              ({tsLabel})
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 num">{fmtNum(value)}</td>
+                        <td className={`px-3 py-1.5 num ${pnlAmt == null ? '' : pnlAmt >= 0 ? 'text-bull' : 'text-bear'}`}>
                           {pnlAmt == null ? '—' : fmtNum(pnlAmt)}
                         </td>
-                        <td className={`px-3 py-1.5 text-right num ${pnlPct == null ? '' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
+                        <td className={`px-3 py-1.5 num ${pnlPct == null ? '' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
                           {fmtPct(pnlPct)}
                         </td>
                       </tr>
@@ -767,11 +800,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">持仓时长</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
-                    <th className="px-3 py-1.5 font-normal text-right">价格</th>
-                    <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                    <th className="px-3 py-1.5 font-normal text-right">手续费</th>
-                    <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal text-right">收益率</th>
+                    <th className="px-3 py-1.5 font-normal">价格</th>
+                    <th className="px-3 py-1.5 font-normal">数量</th>
+                    <th className="px-3 py-1.5 font-normal">手续费</th>
+                    <th className="px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -795,23 +828,34 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       {(() => {
-                        const holdText = t.action === 'BUY'
+                        const holdDays = t.action === 'BUY'
                           ? (h?.open
-                              ? (h?.hold == null ? '持仓中' : h.hold === 0 ? '<1天（持仓中）' : `${h.hold}个交易日（持仓中）`)
-                              : '—')
-                          : h?.hold == null ? '—' : h.hold === 0 ? '<1天' : `${h.hold}个交易日`
-                        return <td className={`px-3 py-1.5 num ${holdText === '—' ? 'text-muted' : ''}`}>{holdText}</td>
+                              ? (h?.hold == null ? null : h.hold === 0 ? '<1天' : `${h.hold}个交易日`)
+                              : null)
+                          : h?.hold == null ? null : h.hold === 0 ? '<1天' : `${h.hold}个交易日`
+                        const holding = t.action === 'BUY' && !!h?.open
+                        if (holdDays == null && !holding) {
+                          return <td className="px-3 py-1.5"><span className="text-muted">—</span></td>
+                        }
+                        return (
+                          <td className="px-3 py-1.5">
+                            {holdDays}
+                            {holding && (
+                              <span className="text-muted">{holdDays ? '（持仓中）' : '持仓中'}</span>
+                            )}
+                          </td>
+                        )
                       })()}
                       <td className={`px-3 py-1.5 ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>
                         {t.action === 'BUY' ? '买入' : t.action === 'STOP_LOSS' ? '止损' : '卖出'}
                       </td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
-                      <td className="px-3 py-1.5 text-right num">{t.amount}</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
-                      <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                      <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>
+                      <td className="px-3 py-1.5 num">{t.amount}</td>
+                      <td className="px-3 py-1.5 num">{fmtNum(t.commission, 2)}</td>
+                      <td className={`px-3 py-1.5 num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
                       </td>
-                      <td className={`px-3 py-1.5 text-right num ${t.action !== 'BUY' && typeof t.pnl_pct === 'number' ? (t.pnl_pct >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                      <td className={`px-3 py-1.5 num ${t.action !== 'BUY' && typeof t.pnl_pct === 'number' ? (t.pnl_pct >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {t.action === 'BUY' ? '—' : fmtPct(t.pnl_pct)}
                       </td>
                     </tr>
@@ -832,11 +876,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="px-3 py-1.5 font-normal">名称</th>
                     <th className="px-3 py-1.5 font-normal">代码</th>
                     <th className="px-3 py-1.5 font-normal">方向</th>
-                    <th className="px-3 py-1.5 font-normal text-right">价格</th>
-                    <th className="px-3 py-1.5 font-normal text-right">数量</th>
-                    <th className="px-3 py-1.5 font-normal text-right">手续费</th>
-                    <th className="px-3 py-1.5 font-normal text-right">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal text-right">收益率</th>
+                    <th className="px-3 py-1.5 font-normal">价格</th>
+                    <th className="px-3 py-1.5 font-normal">数量</th>
+                    <th className="px-3 py-1.5 font-normal">手续费</th>
+                    <th className="px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -846,13 +890,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       <td className="px-3 py-1.5">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className="px-3 py-1.5 text-bear">止损</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
-                      <td className="px-3 py-1.5 text-right num">{t.amount}</td>
-                      <td className="px-3 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
-                      <td className={`px-3 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? 'text-bear' : 'text-muted'}`}>
+                      <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>
+                      <td className="px-3 py-1.5 num">{t.amount}</td>
+                      <td className="px-3 py-1.5 num">{fmtNum(t.commission, 2)}</td>
+                      <td className={`px-3 py-1.5 num ${typeof t.pnl === 'number' && t.pnl !== 0 ? 'text-bear' : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
                       </td>
-                      <td className={`px-3 py-1.5 text-right num ${typeof t.pnl_pct === 'number' ? 'text-bear' : 'text-muted'}`}>
+                      <td className={`px-3 py-1.5 num ${typeof t.pnl_pct === 'number' ? 'text-bear' : 'text-muted'}`}>
                         {fmtPct(t.pnl_pct)}
                       </td>
                     </tr>

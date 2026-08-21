@@ -168,7 +168,8 @@ def test_replay_today_after_close_revalues(tmp_quant, monkeypatch):
 
 def _feed(price):
     def _fe(dm, codes, now, acc):
-        return {c: price for c in codes}, pd.Timestamp(now)
+        ts = str(pd.Timestamp(now))
+        return {c: price for c in codes}, pd.Timestamp(now), {c: ts for c in codes}
     return _fe
 
 
@@ -222,10 +223,11 @@ def test_hist_feed_falls_back_to_current_snapshot_when_minute_empty(tmp_quant):
     dm.client = _FakeClient(price=12.0)     # current_snapshot 兜底源
     now = pd.Timestamp(datetime.datetime.now().date()).replace(hour=10, minute=49)
 
-    prices, bar_dt = runner._hist_feed(dm, ["510300.XSHG"], now, {})
+    prices, bar_dt, price_ts = runner._hist_feed(dm, ["510300.XSHG"], now, {})
 
     assert prices["510300.XSHG"] == 12.0
     assert bar_dt is not None
+    assert price_ts["510300.XSHG"] == str(now)   # 兜底快照 bar = as_of
 
 
 def test_hist_feed_skips_fallback_for_historical_day(tmp_quant):
@@ -235,10 +237,11 @@ def test_hist_feed_skips_fallback_for_historical_day(tmp_quant):
     dm.client = _FakeClient(price=12.0)
     now = pd.Timestamp("2026-07-16 10:49:00")   # 非今日
 
-    prices, bar_dt = runner._hist_feed(dm, ["510300.XSHG"], now, {})
+    prices, bar_dt, price_ts = runner._hist_feed(dm, ["510300.XSHG"], now, {})
 
     assert prices == {}
     assert bar_dt is None
+    assert price_ts == {}
 
 
 def test_strategy_loop_marks_positions_during_lunch_break(tmp_quant, monkeypatch):
@@ -320,3 +323,24 @@ def test_strategy_loop_live_marks_positions(tmp_quant, monkeypatch):
     assert st["net_value"] == pytest.approx(5000 * 12.0)
     snaps = db.get_sim_snapshots(aid)
     assert snaps and snaps[-1]["positions_value"] == pytest.approx(5000 * 12.0)
+
+
+def test_state_roundtrip_preserves_price_ts(tmp_quant):
+    """positions_json 序列化/恢复保留逐股行情时间 price_ts。"""
+    from app.quant.jqengine.engine.jq.context import Position
+
+    aid = _revalue_at_close_setup(tmp_quant)
+    st = protocol.read_state(aid)
+    ctx = type("Ctx", (), {"portfolio": type("Pf", (), {
+        "positions": {"510300.XSHG": Position(amount=5000.0, avg_cost=10.0,
+                                              price=12.0,
+                                              price_ts="2026-07-17 10:31")},
+        "cash": 0.0})()})()
+
+    runner._state_from_portfolio(ctx, st)
+    assert st["positions"]["510300.XSHG"]["price_ts"] == "2026-07-17 10:31"
+
+    ctx2 = type("Ctx", (), {"portfolio": type("Pf", (), {
+        "positions": {}, "cash": 0.0})()})()
+    runner._restore_portfolio(ctx2, st)
+    assert ctx2.portfolio.positions["510300.XSHG"].price_ts == "2026-07-17 10:31"

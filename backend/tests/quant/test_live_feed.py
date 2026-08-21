@@ -67,9 +67,10 @@ def test_refresh_default_loader_uses_client_snapshot():
     """默认 loader 走网络客户端 current_snapshot（不再有 mootdx/分区直读路径）。"""
     dm = _DM(_FakeClient())
     now = pd.Timestamp("2026-07-17 09:31:30")
-    prices, bar_dt = live_feed.refresh(dm, ["510300.XSHG"], now)
+    prices, bar_dt, price_ts = live_feed.refresh(dm, ["510300.XSHG"], now)
     assert prices == {"510300.XSHG": 1.0}
     assert bar_dt == now
+    assert price_ts == {"510300.XSHG": "2026-07-17 09:31:30"}
     assert dm._minute_mem["510300.XSHG"]["close"].iloc[-1] == 1.0
 
 
@@ -87,8 +88,8 @@ def test_refresh_custom_loader_overrides_default():
 
     dm = _DM(_FakeClient())
     now = pd.Timestamp("2026-07-17 10:00")
-    prices, bar_dt = live_feed.refresh(dm, ["510300.XSHG"], now, loader=_loader)
-    assert prices == {} and bar_dt is None
+    prices, bar_dt, price_ts = live_feed.refresh(dm, ["510300.XSHG"], now, loader=_loader)
+    assert prices == {} and bar_dt is None and price_ts == {}
     assert called == [(["510300.XSHG"], now)]
 
 
@@ -100,9 +101,10 @@ def test_refresh_merges_into_minute_mem_and_snapshots():
     dm._minute_cov["510300.XSHG"] = (old.index.min(), old.index.max())
     acc = {}
     now = pd.Timestamp("2026-07-17 09:31:30")
-    prices, bar_dt = live_feed.refresh(dm, ["510300.XSHG"], now, acc)
+    prices, bar_dt, price_ts = live_feed.refresh(dm, ["510300.XSHG"], now, acc)
     assert prices == {"510300.XSHG": 10.2}
     assert bar_dt == pd.Timestamp("2026-07-17 09:31")
+    assert price_ts == {"510300.XSHG": "2026-07-17 09:31"}
     merged = dm._minute_mem["510300.XSHG"]
     assert len(merged) == 4                     # 历史段与当日段合并
     assert dm._minute_cov["510300.XSHG"] == (merged.index.min(), merged.index.max())
@@ -115,7 +117,7 @@ def test_refresh_dedupes_overlapping_bars_keep_last():
     dm = _DM(_FakeClient({"510300.XSHG": fresh}))
     dm._minute_mem["510300.XSHG"] = old
     now = pd.Timestamp("2026-07-17 09:32:10")
-    prices, _ = live_feed.refresh(dm, ["510300.XSHG"], now)
+    prices, _, _ = live_feed.refresh(dm, ["510300.XSHG"], now)
     merged = dm._minute_mem["510300.XSHG"]
     assert len(merged) == 3
     # 重复 bar 以最新一帧为准
@@ -128,15 +130,17 @@ def test_refresh_failure_falls_back_to_old_frame():
     dm = _DM(_FakeClient({"510300.XSHG": RuntimeError("网络抖动")}))
     dm._minute_mem["510300.XSHG"] = old
     now = pd.Timestamp("2026-07-17 09:31:10")
-    prices, bar_dt = live_feed.refresh(dm, ["510300.XSHG"], now)
+    prices, bar_dt, price_ts = live_feed.refresh(dm, ["510300.XSHG"], now)
     assert prices == {"510300.XSHG": 10.0}      # 失败沿用旧帧最后价
     assert bar_dt == pd.Timestamp("2026-07-17 09:30")
+    assert price_ts == {"510300.XSHG": "2026-07-17 09:30"}   # 旧帧的 bar 时间
 
 
 def test_refresh_no_data_returns_none_bar_dt():
     dm = _DM(_FakeClient({"510300.XSHG": None}))
-    prices, bar_dt = live_feed.refresh(dm, ["510300.XSHG"], pd.Timestamp("2026-07-17 10:00"))
-    assert prices == {} and bar_dt is None
+    prices, bar_dt, price_ts = live_feed.refresh(
+        dm, ["510300.XSHG"], pd.Timestamp("2026-07-17 10:00"))
+    assert prices == {} and bar_dt is None and price_ts == {}
 
 
 def test_persist_real_is_noop():

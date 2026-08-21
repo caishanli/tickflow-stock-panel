@@ -11,12 +11,13 @@ class Position:
     """持仓：数量 / 成本 / 现价。``today_amount`` 为当日买入量（T+1 当日不可卖）。"""
 
     def __init__(self, amount=0, avg_cost=0.0, price=0.0, today_amount=0.0,
-                 entry_ts=None):
+                 entry_ts=None, price_ts=None):
         self.amount = amount
         self.avg_cost = avg_cost
         self.price = price
         self.today_amount = today_amount
         self.entry_ts = entry_ts  # 首次建仓时间（模拟盘展示用）
+        self.price_ts = price_ts  # 现价对应行情 bar 时间（模拟盘展示用）
 
     @property
     def total_amount(self):

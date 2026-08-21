@@ -21,10 +21,12 @@ def _load_recent_via_client(dm, codes, now):
 
 
 def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
-    """刷新 watch 集合的实时分钟帧，返回 ``(prices, bar_dt)``。
+    """刷新 watch 集合的实时分钟帧，返回 ``(prices, bar_dt, price_ts)``。
 
     - prices: ``{code: 截至 now 最新 bar 收盘价}``；
     - bar_dt: 全场最新 bar 时刻（``pd.Timestamp``；全部无数据时为 None）；
+    - price_ts: ``{code: 该 code 现价对应 bar 时刻字符串}``（逐股行情时间，
+      停牌/无新数据标的为旧帧时刻）；
     - loader: 取数函数 ``(dm, codes, now) -> {code: df}``，默认走网络客户端
       ``dm.client.current_snapshot``（见 :func:`_load_recent_via_client`）；
     - fresh_acc: 可选 dict，收集本轮原始帧（``persist_real`` 现为空操作，
@@ -42,7 +44,7 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
     except Exception as e:  # noqa: BLE001
         log.warning("[live_feed] 实时帧拉取失败，本轮无更新: %s", e)
         fresh_frames = {}
-    prices, latest = {}, None
+    prices, latest, price_ts = {}, None, {}
     for code in dict.fromkeys(codes):
         try:
             fresh = fresh_frames.get(code)
@@ -68,9 +70,11 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
             continue
         prices[code] = float(sub["close"].iloc[-1])
         bar = sub.index[-1]
+        ts_str = str(bar)
+        price_ts[code] = ts_str[:-3] if ts_str.endswith(":00") else ts_str
         if latest is None or bar > latest:
             latest = bar
-    return prices, latest
+    return prices, latest, price_ts
 
 
 def persist_real(dm, fresh_frames):
