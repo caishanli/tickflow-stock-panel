@@ -1,5 +1,6 @@
 """mootdx (通达信) 数据源实现。"""
 
+import datetime as _dt_mod
 import socket
 
 import pandas as pd
@@ -58,6 +59,19 @@ _TDX_SOCKET_READ_TIMEOUT = 10.0
 # 外层守护超时需覆盖内层整轮服务器轮换的最坏耗时（_TDX_SERVERS 各一次 + 兜底），
 # 否则会在轮换中途被掐断、永远到不了可用服务器（08-19 长跑回源每只 30s 超时根因）。
 _TDX_FETCH_GUARD_TIMEOUT = len(_TDX_SERVERS) * _TDX_SOCKET_READ_TIMEOUT + 30.0
+
+
+def _weekday_days(since, today):
+    """[since, today] 两端含的工作日数（分页初始估算用；日历误差由循环终止条件兜底）。"""
+    if today < since:
+        return 0
+    days = 0
+    d = since
+    while d <= today:
+        if d.weekday() < 5:
+            days += 1
+        d += _dt_mod.timedelta(days=1)
+    return days
 
 
 def _probe(ip, port, timeout=2.0):
@@ -318,12 +332,12 @@ class MootdxSource(DataSource):
         df.attrs["adj"] = "qfq"
         return df
 
-    def get_minute(self, code, date="", max_bars=30000):
-        """历史 1 分钟 K 线：mootdx 单次最多约 800 根，按 ``start`` 分页回看。
+    def get_minute(self, code, date="", max_bars=30000, since: _dt_mod.date | None = None):
+        """历史 1 分钟 K 线分页拉取。
 
-        ``max_bars`` 上限防止对"无数据/长期停牌"标的空转 400 页（每页一次
-        阻塞式 socket 调用，单只可卡数分钟）；达到上限即停止分页。
-        取数超时/返回空时自动按 _TDX_SERVERS 轮询换服务器重试。
+        ``since`` 给定时只回看到覆盖 [since, today]：按工作日×240÷800 估算
+        初始页数上限，并在累计帧最老 bar ≤ since 时提前停止（节假日/停牌
+        导致估算偏少时由该精确条件兜底）。None = 全量（首次初始化用）。
         """
         sym = _to_symbol(code)
         box = {}
@@ -341,10 +355,21 @@ class MootdxSource(DataSource):
         c = box.get("c")
         frames = [first]
         fetched = len(first)
+        oldest_seen = first.index.min()
         start = 800
         offset = 800
-        for _ in range(399):
+        if since is not None:
+            # est_pages 为总页数（含循环外已取的首页）；严格早于 since 再停，
+            # 停在 since 当天会丢该日更早的 bar（短页/半日）
+            est_pages = -((_weekday_days(since, _dt_mod.date.today()) * 240)
+                          // -800) + 2
+            max_pages = max(1, min(int(max_bars // offset), est_pages))
+        else:
+            max_pages = int(max_bars // offset)
+        for _ in range(min(399, max_pages - 1)):
             if fetched >= max_bars:
+                break
+            if since is not None and pd.Timestamp(oldest_seen).date() < since:
                 break
             try:
                 df = c.bars(symbol=sym, frequency=8, start=start, offset=offset)
@@ -354,6 +379,7 @@ class MootdxSource(DataSource):
                 break
             frames.append(df)
             fetched += len(df)
+            oldest_seen = min(oldest_seen, df.index.min())
             if len(df) < offset:
                 break
             start += offset
