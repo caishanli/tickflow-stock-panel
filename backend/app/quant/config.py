@@ -37,6 +37,8 @@ class QuantConfig:
     fee_rate: float = 0.0003
     slippage: float = 0.001
     default_stop_loss: float = 0.03
+    sim_account_mem_mb: float = 400.0
+    sim_account_mem_min_mb: float = 300.0
     db_path: str = ""
     bundle_dir: str = ""
     strategies_dir: str = ""
@@ -52,6 +54,8 @@ def load_config() -> QuantConfig:
         fee_rate=float(_env("QUANT_FEE_RATE", "0.0003") or "0.0003"),
         slippage=float(_env("QUANT_SLIPPAGE", "0.001") or "0.001"),
         default_stop_loss=float(_env("QUANT_DEFAULT_STOP_LOSS", "0.03") or "0.03"),
+        sim_account_mem_mb=float(_env("SIM_ACCOUNT_MEM_MB", "400.0") or "400.0"),
+        sim_account_mem_min_mb=float(_env("SIM_ACCOUNT_MEM_MIN_MB", "300.0") or "300.0"),
         db_path=_env("QUANT_DB_PATH", _data_path("quant.db")),
         bundle_dir=_env("QUANT_BUNDLE_DIR", _data_path("quant_bundle")),
         strategies_dir=_env("QUANT_STRATEGIES_DIR", _data_path("quant_strategies")),

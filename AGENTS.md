@@ -40,6 +40,7 @@ uv run --extra dev mypy app               # 类型检查
 - 策略系统：`backend/app/strategy/`，18 个内置策略在 `builtin/`。扩展方式见 `docs/strategy.md` 与 `backend/app/strategy/prompts/strategy-guide.md`（AI 生成与手写规范）。
 - 插件/数据源：`backend/app/plugins/`（内置 `stocksdk`）。第三方数据接入走 YAML，见 `docs/custom-data-source.md` 与 `docs/plugin-development.md`。
 - 多数 `/api/*` 需鉴权（未登录返回 401）。
+- 模拟盘启动内存守卫：`account_start`（手动）与 SimDaemon 自动重拉（`account_ensure_running`）spawn 前都检查系统空闲内存（`simulate/memory.py`），不足则拦截——手动启动返回 400 提示，daemon 本轮跳过下轮重试。单账户估算 = `max(活模拟盘进程 RSS 均值, SIM_ACCOUNT_MEM_MIN_MB)`，无活进程样本回退 `SIM_ACCOUNT_MEM_MB`（默认 400MB/下限 300MB，env 可调）。
 
 ## stock data 服务（网络行情数据服务，quant/回测侧唯一取数入口）
 

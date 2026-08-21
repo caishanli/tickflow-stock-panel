@@ -281,7 +281,10 @@ def sim_accounts_post(body: AccountIn):
 
 @router.post("/sim/accounts/{aid}/start")
 def sim_start(aid: str):
-    account_start(aid)
+    try:
+        account_start(aid)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     return {"data": None}
 
 
