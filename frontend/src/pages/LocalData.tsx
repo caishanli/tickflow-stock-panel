@@ -14,8 +14,8 @@ const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 const TASK_LABELS: Record<string, string> = {
   backfill: '启动回源 backfill',
   sync: '收盘/手动同步 sync',
-  check_day: '单日检验 check_day',
-  check_full: '全量检验 check_full',
+  check_day: '单日校验 check_day',
+  check_full: '全量校验 check_full',
   full_scan: '00:00 全量巡检',
 }
 
@@ -200,8 +200,8 @@ function StockdataStatusPanel() {
             <div className="divide-y divide-border/60">
               <TaskRow label="启动回源 backfill" time={data?.last_backfill} note={statusNote(data, 'backfill_result')} />
               <TaskRow label="收盘/手动同步 sync" time={data?.last_sync} note={statusNote(data, 'sync_result')} />
-              <TaskRow label="单日检验 check_day" time={data?.last_check_day} note={statusNote(data, 'check_day_result')} />
-              <TaskRow label="全量检验 check_full" time={data?.last_check_full} />
+              <TaskRow label="单日校验 check_day" time={data?.last_check_day} note={statusNote(data, 'check_day_result')} />
+              <TaskRow label="全量校验 check_full" time={data?.last_check_full} />
               <TaskRow label="00:00 全量巡检" time={data?.last_full_scan} note={data?.full_scan_date} />
             </div>
           </div>
@@ -270,7 +270,7 @@ export function LocalData() {
   const checkDayMut = useMutation({
     mutationFn: (date: string) => api.checkDay(date),
     onSuccess: (_data, date) => {
-      toast(`已触发 ${date} 检验补齐`, 'success', 'top')
+      toast(`已触发 ${date} 校验补齐`, 'success', 'top')
       setTimeout(refreshStats, 3000)
     },
   })
@@ -278,7 +278,7 @@ export function LocalData() {
   const checkFullMut = useMutation({
     mutationFn: () => api.checkFull(),
     onSuccess: () => {
-      toast('已触发全量检验补齐', 'success', 'top')
+      toast('已触发全量校验补齐', 'success', 'top')
       setTimeout(refreshStats, 3000)
     },
   })
@@ -400,7 +400,7 @@ export function LocalData() {
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 disabled:opacity-40 transition-all duration-150"
               >
                 <Wrench className="h-3 w-3" />
-                {checkFullMut.isPending ? '校验中...' : '全量检验补齐'}
+                {checkFullMut.isPending ? '校验中...' : '全量校验补齐'}
               </button>
             </div>
           </div>
@@ -465,7 +465,7 @@ export function LocalData() {
                           disabled={checkDayMut.isPending}
                           className="px-2 py-1 ml-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
                         >
-                          检验
+                          校验
                         </button>
                       </td>
                     </tr>
