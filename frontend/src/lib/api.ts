@@ -1544,6 +1544,7 @@ export const api = {
   }),
   checkFull: () => request<{ ok: boolean }>('/api/data/check-full', { method: 'POST' }),
   stockdataStatus: () => request<StockdataStatus>('/api/data/stockdata-status'),
+  mootdxServers: () => request<{ servers: MootdxServerRow[]; ts: string }>('/api/data/mootdx-servers'),
   dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),
@@ -2332,6 +2333,13 @@ export interface StockdataStatus {
   last_full_scan?: string | null
   full_scan_result?: Record<string, unknown> | null
   full_scan_date?: string | null
+}
+
+export interface MootdxServerRow {
+  ip: string
+  port: number
+  ok: boolean
+  latency_ms: number | null
 }
 
 export interface EnrichedField {

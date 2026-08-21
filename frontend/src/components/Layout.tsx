@@ -76,7 +76,7 @@ const nav = [
   { to: '/backtest',   label: '回测',   icon: History },
   { to: '/quant-backtest', label: '量化回测', icon: LineChart },
   { to: '/quant-sim',     label: '量化模拟盘', icon: Wallet },
-  { to: '/local-data', label: '本地股市数据', icon: HardDrive },
+  { to: '/local-data', label: '本地数据', icon: HardDrive },
   { to: '/stock-analysis',    label: '个股分析', icon: TrendingUp },
   { to: '/limit-ladder', label: '连板梯队', icon: Flame },
   { to: '/concept-analysis', label: '概念分析', icon: Layers3 },

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, RefreshCw, Wrench, ChevronDown, Server, Activity, Inbox, Clock, CheckCircle2, Loader2 } from 'lucide-react'
+import { HardDrive, RefreshCw, Wrench, Server, Activity, Inbox, Clock, CheckCircle2, Loader2, Wifi } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/data/Skeleton'
@@ -11,13 +11,11 @@ import { QK } from '@/lib/queryKeys'
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 
-type TabKey = 'stats' | 'status'
-
 const TASK_LABELS: Record<string, string> = {
   backfill: '启动回源 backfill',
   sync: '收盘/手动同步 sync',
-  check_day: '单日检验 check_day',
-  check_full: '全量检验 check_full',
+  check_day: '单日校验 check_day',
+  check_full: '全量校验 check_full',
   full_scan: '00:00 全量巡检',
 }
 
@@ -81,6 +79,12 @@ function StockdataStatusPanel() {
     refetchInterval: 5000,
   })
 
+  const mx = useQuery({
+    queryKey: ['mootdx-servers'],
+    queryFn: () => api.mootdxServers(),
+    refetchInterval: 10000,
+  })
+
   const active = data?.active_tasks ?? []
   const missing = data ? extractMissing(data) : []
 
@@ -111,6 +115,35 @@ function StockdataStatusPanel() {
         <EmptyState icon={Server} title="服务不可达" hint="无法获取 stockdata 服务状态，请检查服务是否存活。" />
       ) : (
         <>
+          <div className="rounded-card border border-border bg-surface overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
+              <div className="flex items-center gap-2">
+                <Wifi className="h-3.5 w-3.5 text-sky-500" />
+                mootdx 服务器
+              </div>
+              <span className="text-muted font-normal">每 10 秒刷新</span>
+            </div>
+            <div className="p-3">
+              {mx.isLoading ? (
+                <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-6 w-full" />)}</div>
+              ) : mx.isError ? (
+                <div className="text-xs text-muted">无法获取 mootdx 服务器状态</div>
+              ) : (
+                <ul className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                  {mx.data?.servers.map(s => (
+                    <li key={s.ip} className="flex items-center gap-2 text-xs">
+                      <span className={`inline-block h-2 w-2 rounded-full ${s.ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                      <span className="w-36 shrink-0 font-mono text-foreground">{s.ip}:{s.port}</span>
+                      <span className={`${s.ok ? 'text-secondary' : 'text-red-500'}`}>
+                        {s.ok ? `${s.latency_ms}ms` : '—'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
           <div className="rounded-card border border-border bg-surface overflow-hidden">
             <div className="flex items-center gap-2 px-3 py-2 border-b border-border/60 text-xs font-medium text-foreground">
               <Activity className="h-3.5 w-3.5 text-accent" />
@@ -167,8 +200,8 @@ function StockdataStatusPanel() {
             <div className="divide-y divide-border/60">
               <TaskRow label="启动回源 backfill" time={data?.last_backfill} note={statusNote(data, 'backfill_result')} />
               <TaskRow label="收盘/手动同步 sync" time={data?.last_sync} note={statusNote(data, 'sync_result')} />
-              <TaskRow label="单日检验 check_day" time={data?.last_check_day} note={statusNote(data, 'check_day_result')} />
-              <TaskRow label="全量检验 check_full" time={data?.last_check_full} />
+              <TaskRow label="单日校验 check_day" time={data?.last_check_day} note={statusNote(data, 'check_day_result')} />
+              <TaskRow label="全量校验 check_full" time={data?.last_check_full} />
               <TaskRow label="00:00 全量巡检" time={data?.last_full_scan} note={data?.full_scan_date} />
             </div>
           </div>
@@ -214,7 +247,6 @@ export function LocalData() {
   const [endDate, setEndDate] = useState('')
   const [refreshNonce, setRefreshNonce] = useState(0)
   const [refreshingRow, setRefreshingRow] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<TabKey>('stats')
   const qc = useQueryClient()
 
   const start = startDate || undefined
@@ -238,7 +270,7 @@ export function LocalData() {
   const checkDayMut = useMutation({
     mutationFn: (date: string) => api.checkDay(date),
     onSuccess: (_data, date) => {
-      toast(`已触发 ${date} 检验补齐`, 'success', 'top')
+      toast(`已触发 ${date} 校验补齐`, 'success', 'top')
       setTimeout(refreshStats, 3000)
     },
   })
@@ -246,7 +278,7 @@ export function LocalData() {
   const checkFullMut = useMutation({
     mutationFn: () => api.checkFull(),
     onSuccess: () => {
-      toast('已触发全量检验补齐', 'success', 'top')
+      toast('已触发全量校验补齐', 'success', 'top')
       setTimeout(refreshStats, 3000)
     },
   })
@@ -267,7 +299,7 @@ export function LocalData() {
     onSettled: () => setRefreshingRow(null),
   })
 
-  const [logOpen, setLogOpen] = useState(false)
+  const [bottomTab, setBottomTab] = useState<'log' | 'status'>('log')
   const [logLines, setLogLines] = useState<StockdataLogRow[]>([])
   const [logOffset, setLogOffset] = useState(0)
   const [logLoadingMore, setLogLoadingMore] = useState(false)
@@ -290,15 +322,15 @@ export function LocalData() {
     }
   }, [])
 
-  // 打开时首次加载 + 每 5s 轮询最新一屏
+  const logVisible = bottomTab === 'log'
   useEffect(() => {
-    if (!logOpen) return
+    if (!logVisible) return
     setLogLines([])
     setLogOffset(0)
     loadLogPage(0)
     const t = setInterval(() => loadLogPage(0), 5000)
     return () => clearInterval(t)
-  }, [logOpen, loadLogPage])
+  }, [logVisible, loadLogPage])
 
   // 滚动到底加载更早日志
   const onLogScroll = useCallback(() => {
@@ -332,33 +364,10 @@ export function LocalData() {
   return (
     <div className="flex flex-col h-full">
       <PageHeader
-        title="本地股市数据"
-        subtitle={activeTab === 'stats' ? (total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数') : 'stockdata 服务运行状态 · 每 5 秒自动刷新'}
-        right={
-          <div className="inline-flex rounded-btn border border-border bg-surface/80 p-0.5 shadow-sm">
-            {(['stats', 'status'] as const).map(tab => {
-              const active = activeTab === tab
-              return (
-                <button
-                  key={tab}
-                  onClick={() => setActiveTab(tab)}
-                  className={`inline-flex items-center gap-1.5 rounded-[5px] px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
-                    active ? 'bg-accent text-white shadow-sm' : 'text-secondary hover:bg-elevated hover:text-foreground'
-                  }`}
-                >
-                  {tab === 'stats' ? <HardDrive className="h-3.5 w-3.5" /> : <Server className="h-3.5 w-3.5" />}
-                  {tab === 'stats' ? '数据统计' : '服务状态'}
-                </button>
-              )
-            })}
-          </div>
-        }
+        title="本地数据"
+        subtitle={total > 0 ? `本地 Parquet 各日期去重标的数 · 共 ${total} 天` : '本地 Parquet 各日期去重标的数'}
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
-        {activeTab === 'status' ? (
-          <StockdataStatusPanel />
-        ) : (
-        <>
         {!isLoading && !isError && total > 0 && (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -379,7 +388,7 @@ export function LocalData() {
               <button
                 onClick={() => setRefreshNonce(n => n + 1)}
                 disabled={isFetching}
-                className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150 disabled:opacity-40 disabled:pointer-events-none"
                 title="刷新当前页统计"
               >
                 <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
@@ -388,10 +397,10 @@ export function LocalData() {
               <button
                 onClick={() => checkFullMut.mutate()}
                 disabled={checkFullMut.isPending}
-                className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 disabled:opacity-40 transition-all duration-150"
               >
                 <Wrench className="h-3 w-3" />
-                {checkFullMut.isPending ? '校验中...' : '全量检验补齐'}
+                {checkFullMut.isPending ? '校验中...' : '全量校验补齐'}
               </button>
             </div>
           </div>
@@ -456,7 +465,7 @@ export function LocalData() {
                           disabled={checkDayMut.isPending}
                           className="px-2 py-1 ml-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
                         >
-                          检验
+                          校验
                         </button>
                       </td>
                     </tr>
@@ -486,18 +495,28 @@ export function LocalData() {
             </div>
 
             <div className="rounded-card border border-border bg-surface overflow-hidden mt-3">
-              <button
-                onClick={() => setLogOpen(v => !v)}
-                className="w-full flex items-center justify-between px-3 py-2 text-xs text-foreground hover:bg-elevated/40 transition-colors"
-              >
-                <span className="font-medium">stockdata 日志</span>
-                <ChevronDown className={`h-3.5 w-3.5 text-muted transition-transform ${logOpen ? 'rotate-180' : ''}`} />
-              </button>
-              {logOpen && (
+              <div className="flex items-center border-b border-border/60">
+                {(['log', 'status'] as const).map(tab => {
+                  const active = bottomTab === tab
+                  return (
+                    <button
+                      key={tab}
+                      onClick={() => setBottomTab(tab)}
+                      className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors border-b-2 ${
+                        active ? 'text-accent border-accent' : 'text-secondary border-transparent hover:text-foreground'
+                      }`}
+                    >
+                      {tab === 'log' ? <Activity className="h-3.5 w-3.5" /> : <Server className="h-3.5 w-3.5" />}
+                      {tab === 'log' ? '日志' : '服务状态'}
+                    </button>
+                  )
+                })}
+              </div>
+              {bottomTab === 'log' ? (
                 <div
                   ref={logScrollRef}
                   onScroll={onLogScroll}
-                  className="h-[30vh] overflow-y-auto border-t border-border/60 p-2 font-mono text-[11px] leading-relaxed text-muted"
+                  className="h-[30vh] overflow-y-auto p-2 font-mono text-[11px] leading-relaxed text-muted"
                 >
                   {logLines.length === 0 ? (
                     <div className="text-center py-6 text-muted/60">暂无日志</div>
@@ -510,11 +529,13 @@ export function LocalData() {
                   )}
                   {logLoadingMore && <div className="text-center py-2 text-muted/50">加载更早日志...</div>}
                 </div>
+              ) : (
+                <div className="h-[30vh] overflow-y-auto p-3">
+                  <StockdataStatusPanel />
+                </div>
               )}
             </div>
           </>
-        )}
-        </>
         )}
       </div>
     </div>
