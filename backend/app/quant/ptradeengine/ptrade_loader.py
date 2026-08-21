@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 
@@ -18,9 +19,10 @@ class StrategyBundle:
         self.init_fn = init_fn      # 用户 initialize(context)
         self.ctx = ctx
         ns = ns or {}
-        # PTrade 钩子：handle_data/before_trading_start/after_trading_end 需
-        # (context, data) 签名（官方 API），runner 只传 (context)，这里包装并注入
-        # build_data_snapshot 快照（after_trading_end 的 data 为保留字段，注入空快照即可）。
+        # PTrade 钩子：handle_data/before_trading_start 为 (context, data) 签名；
+        # after_trading_end 官方仅 (context)（部分移植版仍写 (context, data)）。
+        # runner 只传 (context)，这里按函数签名自适应包装并注入 build_data_snapshot 快照
+        # （after_trading_end 的 data 为保留字段，注入空快照即可）。
         self.handle_data = _wrap_with_data(ns.get("handle_data"))
         self.before_trading_start = _wrap_with_data(ns.get("before_trading_start"))
         self.after_trading_end = _wrap_with_data(ns.get("after_trading_end"))
@@ -50,9 +52,19 @@ class StrategyBundle:
 
 
 def _wrap_with_data(fn):
-    """把 (context, data) 钩子包装为 runner 的 (context) 签名，注入行情快照。"""
+    """把 (context, data) 钩子包装为 runner 的 (context) 签名，注入行情快照。
+
+    官方 PTrade 中 after_trading_end(context) 仅 1 参（无 data）；按函数签名自适应：
+    接受 2 参才注入 data 快照，1 参只传 context（对齐 wufu-v5.4.ptrade.py 等移植版）。
+    """
     if fn is None:
         return None
+    try:
+        nargs = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        nargs = 2  # 签名不可得时保守按 (context, data) 传
+    if nargs < 2:
+        return lambda ctx: fn(ctx)
 
     def wrapped(ctx):
         data = ptrade_api.build_data_snapshot(ctx)

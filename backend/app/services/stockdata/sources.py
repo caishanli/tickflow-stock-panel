@@ -13,6 +13,7 @@ import json as _json
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypeVar
@@ -163,6 +164,72 @@ class MinuteMemoryStore:
             return df
 
 
+class DayFileCache:
+    """日线日期文件缓存：键=(subdir, date) → 该日全市场整帧（原始单位）。
+
+    日线分区按日存储、每日期文件含全市场标的：读取时整文件载入内存，同文件
+    其他标的的后续请求直接命中。后台清扫线程每 10s 卸载超时（默认 60s）未
+    访问的文件，并执行容量上限（默认 60 文件）淘汰。不预载、不驻留 400 天
+    全市场整帧（spec 2026-08-21-stockdata-daily-dayfile-lru-design）。
+    """
+
+    def __init__(self, ttl: float = 60.0, cap: int = 60) -> None:
+        self._ttl = ttl
+        self._cap = cap
+        self._items: dict[tuple[str, str], tuple[float, pl.DataFrame]] = {}
+        self._lock = threading.Lock()
+        self._single = SingleFlight()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def get(self, subdir: str, date: str) -> pl.DataFrame | None:
+        """命中返回帧并刷新该文件最后访问时间；未命中返回 None（不加载）。"""
+        with self._lock:
+            item = self._items.get((subdir, date))
+            if item is None:
+                return None
+            _ts, frame = item
+            self._items[(subdir, date)] = (time.monotonic(), frame)
+            return frame
+
+    def get_or_load(self, subdir: str, date: str,
+                    loader: Callable[[], pl.DataFrame | None]) -> pl.DataFrame | None:
+        """缓存命中直接返回；未命中日期文件级 single-flight 读盘（同键并发只读一次）。"""
+        hit = self.get(subdir, date)
+        if hit is not None:
+            return hit
+        return self._single.run(
+            f"{subdir}:{date}",
+            lambda: self._insert(subdir, date, loader()))
+
+    def _insert(self, subdir: str, date: str,
+                frame: pl.DataFrame | None) -> pl.DataFrame | None:
+        if frame is None or frame.is_empty():
+            return None
+        with self._lock:
+            # double-check：single-flight 期间可能已有其他线程载入
+            if (subdir, date) not in self._items:
+                self._items[(subdir, date)] = (time.monotonic(), frame)
+        return frame
+
+    def sweep(self) -> int:
+        """卸载超时未访问文件；仍超容量上限时按最后访问时间从旧到新踢。返回卸载数。"""
+        now = time.monotonic()
+        evicted = 0
+        with self._lock:
+            for k in [k for k, (ts, _f) in self._items.items() if now - ts > self._ttl]:
+                del self._items[k]
+                evicted += 1
+            if len(self._items) > self._cap:
+                oldest = sorted(self._items.items(), key=lambda kv: kv[1][0])
+                for k, _v in oldest[: len(self._items) - self._cap]:
+                    del self._items[k]
+                    evicted += 1
+        return evicted
+
+
 class NetworkPuller:
     """服务端共享网络拉取线程池：有界并发 + 每线程独立数据源 + 标的级 single-flight。
 
@@ -272,6 +339,7 @@ class DataSources:
                 fetch_workers = 16
         self.dedup = DedupCache()
         self.minute_store = MinuteMemoryStore()
+        self.dayfile_cache = DayFileCache()
         self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
         self._names_map: dict[str, str] | None = None
         self._names_cache_file = os.path.join(self.data_root, ".stock_names_cache.json")
@@ -310,61 +378,92 @@ class DataSources:
         lo = end - _dt.timedelta(days=lookback_days * 2)  # 余量覆盖非交易日
         return lo.isoformat(), end.isoformat()
 
-    def _load_daily(self, lookback_days: int, asof: _dt.date | None) -> pl.DataFrame:
-        lo, hi = self._daily_days(lookback_days, asof)
-        cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-        parts = []
-        # 批量预载只含股票+ETF：指数（kline_index_daily）会污染下游 ETF 宇宙
-        # （_is_jq_etf_code 放行 932xxx 等指数代码，如 932000.XSHG）。指数日线
-        # 仍走 get_daily 按需服务（策略 get_price 指数等），不入预载。
-        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
-            df = self._scan_partitions(subdir, lo, hi, None, cols)
-            if df.is_empty():
+    def _read_day_file(self, subdir: str, date: str,
+                       cols: list[str] | None = None) -> pl.DataFrame | None:
+        """读单个日期分区（含全市场标的）→ 原始帧；分区不存在返回 None。
+
+        cols 缺省为日线 8 列；分钟分区传 _MINUTE_COLS。
+        """
+        root = os.path.join(self.data_root, subdir, f"date={date}")
+        if not os.path.isdir(root):
+            return None
+        import glob as _glob
+        paths = _glob.glob(os.path.join(root, "*.parquet"))
+        if not paths:
+            return None
+        if cols is None:
+            cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+        lf = pl.scan_parquet(paths, hive_partitioning=True)
+        return _as_datetime(lf.select(cols).collect())
+
+    def _existing_day_files(self, subdir: str, lo: str | None,
+                            hi: str | None) -> list[str]:
+        """区间内已存在的日期分区名（升序，ISO 字符串）。"""
+        root = os.path.join(self.data_root, subdir)
+        if not os.path.isdir(root):
+            return []
+        out = []
+        for name in sorted(os.listdir(root)):
+            if not name.startswith("date="):
                 continue
-            if is_stock:
-                df = df.with_columns((pl.col("volume") * 100).alias("volume"))
-            parts.append(df)
+            ds = name[len("date="):]
+            if lo and ds < lo:
+                continue
+            if hi and ds > hi:
+                continue
+            out.append(ds)
+        return out
+
+    def preload_daily(self, lookback_days: int = 400, asof: _dt.date | None = None) -> pl.DataFrame:
+        """预载全市场日线（只含股票+ETF，不含指数）：逐日文件经 LRU 拼帧返回。
+
+        帧不驻留（LRU 按 60s/60 文件自然淘汰）——spec
+        2026-08-21-stockdata-daily-dayfile-lru-design 第 3 节。
+        """
+        lo, hi = self._daily_days(lookback_days, asof)
+        parts = []
+        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
+            for day in self._existing_day_files(subdir, lo, hi):
+                frame = self.dayfile_cache.get_or_load(
+                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                if frame is None or frame.is_empty():
+                    continue
+                if is_stock:
+                    frame = frame.with_columns((pl.col("volume") * 100).alias("volume"))
+                parts.append(frame)
         if not parts:
             return pl.DataFrame()
-        out = pl.concat(parts)
-        out = _normalize_etf_volume_unit(out)
+        out = _normalize_etf_volume_unit(pl.concat(parts))
         if asof is not None:
             out = out.filter(pl.col("date") <= asof)
         return out
 
-    def preload_daily(self, lookback_days: int = 400, asof: _dt.date | None = None) -> pl.DataFrame:
-        key = f"preload_daily:{lookback_days}:{asof or ''}"
-        return self.get_or_fetch(key, _HIST_TTL,
-                                 lambda: self._load_daily(lookback_days, asof))
-
     def get_daily(self, codes: list[str], start_date: str, end_date: str) -> pl.DataFrame:
         # 日期规范化：兼容 %Y%m%d（模拟盘 jqcompat _DayBarStore 传入）与 ISO
         # （rqalpha_bridge 传入）两种格式。分区名恒为 ISO（date=YYYY-MM-DD），
-        # _scan_partitions 用字符串比较；'20260601' 与 '2026-06-01' 比较恒 False
-        # 会把全部分区跳过 → 指数走弱期判断「数据不足」/全球池成交额过滤静默失效。
+        # 字符串比较；'20260601' 与 '2026-06-01' 比较恒 False 会把全部分区跳过。
         # 统一转 ISO 再比较。
         start_date = str(pd_to_date(start_date)) if start_date else None
         end_date = str(pd_to_date(end_date)) if end_date else None
 
-        def _load():
-            syms = {_tf_symbol(c) for c in codes}
-            cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
-            parts = []
-            for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
-                                     ("kline_index_daily", False)):
-                df = self._scan_partitions(subdir, start_date, end_date, syms, cols)
-                if df.is_empty():
+        syms = {_tf_symbol(c) for c in codes}
+        parts = []
+        for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
+                                 ("kline_index_daily", False)):
+            for day in self._existing_day_files(subdir, start_date, end_date):
+                frame = self.dayfile_cache.get_or_load(
+                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                if frame is None or frame.is_empty():
+                    continue
+                sub = frame.filter(pl.col("symbol").is_in(syms))
+                if sub.is_empty():
                     continue
                 if is_stock:
-                    df = df.with_columns((pl.col("volume") * 100).alias("volume"))
-                parts.append(df)
-            if not parts:
-                return pl.DataFrame()
-            return _normalize_etf_volume_unit(pl.concat(parts))
-
-        # 短 TTL 仅突发去重，不驻留内存（历史数据每轮仍按需读盘）
-        key = f"daily:{','.join(sorted(codes))}:{start_date}:{end_date}"
-        return self.get_or_fetch(key, _HIST_TTL, _load)
+                    sub = sub.with_columns((pl.col("volume") * 100).alias("volume"))
+                parts.append(sub)
+        if not parts:
+            return pl.DataFrame()
+        return _normalize_etf_volume_unit(pl.concat(parts))
 
     def get_etf_nav(self, codes: list[str], date: str | None = None) -> pl.DataFrame:
         """读 etf_nav 分区（date 给定用该日，None 用最新分区）。"""
@@ -424,12 +523,14 @@ class DataSources:
         tf_syms = {_tf_symbol(c) for c in codes}
         self.minute_store.ensure_day(today)
 
-        # 基础帧：当日分区（收盘同步/重启场景）+ 内存库（网络实时）
+        # 基础帧：当日分区（收盘同步/重启场景，经日期文件 LRU 缓存避免逐请求重扫）
+        # + 内存库（网络实时）。spec 2026-08-21-stockdata-realtime-cache-design。
         base_parts = []
-        part = self._scan_partitions("kline_etf_minute", today.isoformat(),
-                                     today.isoformat(), tf_syms, _MINUTE_COLS)
-        if not part.is_empty():
-            base_parts.append(part)
+        part = self.dayfile_cache.get_or_load(
+            "kline_etf_minute", today.isoformat(),
+            lambda: self._read_day_file("kline_etf_minute", today.isoformat(), _MINUTE_COLS))
+        if part is not None and not part.is_empty():
+            base_parts.append(part.filter(pl.col("symbol").is_in(tf_syms)))
         mem = self.minute_store.get_slice(tf_syms, f"{today} 00:00:00", str(asof_ts))
         if not mem.is_empty():
             base_parts.append(mem)
@@ -588,6 +689,11 @@ class DataSources:
         return {c: n for c, n in self._names_map.items() if c in set(codes)}
 
     def get_adj_factors(self) -> pl.DataFrame:
+        # 因子表仅除权事件/15:35 同步后变化：TTL 300s 去重即可，
+        # 避免每次调用 recursive glob + 全量 scan_parquet（含 lf.columns schema 解析）。
+        return self.get_or_fetch("adj_factors", 300.0, self._load_adj_factors)
+
+    def _load_adj_factors(self) -> pl.DataFrame:
         root = os.path.join(self.data_root, "adj_factor_etf")
         if not os.path.isdir(root):
             return pl.DataFrame()

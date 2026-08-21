@@ -397,3 +397,38 @@ def test_fallback_price_uses_string_code_and_attribute_access(monkeypatch):
     # 涨跌停同样用属性访问
     assert sd.high_limit == float(raw["limit_up"])
     assert sd.low_limit == float(raw["limit_down"])
+
+
+# ---------------------------------------------------------------------------
+# PTrade 源重写：after_trading_end 签名自适应（1 参官方版 vs 2 参移植版）
+# ---------------------------------------------------------------------------
+
+def test_ptrade_rewrite_source_after_trading_signature_adaptive():
+    """桥接层 _ptrade_call 按运行时签名传参，1 参 after_trading_end 不炸 TypeError。
+
+    回归：wufu-v5.4.ptrade.py 用官方 1 参签名 after_trading_end(context)，
+    重写桥接后 rqalpha after_trading 回调必须只传 context。
+    """
+    code = (
+        "def initialize(context):\n"
+        "    pass\n"
+        "def after_trading_end(context):\n"
+        "    pass\n"
+    )
+    out = bridge._ptrade_rewrite_source(code)
+    assert "def after_trading(context):" in out
+    assert "_ptrade_call(after_trading_end, context, None)" in out
+
+    ns: dict = {}
+    exec(compile(out, "<strategy>", "exec"), ns)
+    calls: list = []
+    ns["after_trading_end"] = lambda context: calls.append(("ate", context))
+    ctx = object()
+    ns["after_trading"](ctx)
+    assert calls == [("ate", ctx)]
+
+    # 2 参钩子（70978ed5 原生版风格）仍走 (context, data)
+    calls.clear()
+    ns["after_trading_end"] = lambda context, data: calls.append(("ate2", context, data))
+    ns["after_trading"](ctx)
+    assert calls == [("ate2", ctx, None)]

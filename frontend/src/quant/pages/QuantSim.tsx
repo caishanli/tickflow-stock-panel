@@ -19,6 +19,12 @@ function cssVar(name: string, fallback: string) {
   return v || fallback
 }
 
+/** 从 api 抛错（`quant api 400: {"detail":"..."}`）解析 detail 用于 toast */
+function errDetail(e: any) {
+  const m = String(e?.message ?? e).match(/\{"detail":"(.*)"\}/)
+  return m ? m[1] : String(e?.message ?? e)
+}
+
 function statusTone(s: string | undefined) {
   if (s === 'running') return 'text-accent'
   if (s === 'failed') return 'text-bear'
@@ -184,7 +190,11 @@ export function QuantSim() {
     qc.invalidateQueries({ queryKey: ['quant', 'sim', 'accounts'] })
     if (sel) qc.invalidateQueries({ queryKey: ['quant', 'sim', sel, 'status'] })
   }
-  const startMut = useMutation({ mutationFn: () => api.startAccount(sel!), onSuccess: invalidate })
+  const startMut = useMutation({
+    mutationFn: () => api.startAccount(sel!),
+    onSuccess: invalidate,
+    onError: (e: any) => toast(errDetail(e), 'error'),
+  })
   const pauseMut = useMutation({ mutationFn: () => api.pauseAccount(sel!), onSuccess: invalidate })
   const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: invalidate })
   const deleteMut = useMutation({

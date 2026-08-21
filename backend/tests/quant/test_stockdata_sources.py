@@ -140,6 +140,28 @@ def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
     assert df["close"].to_list() == [1.0]
 
 
+def test_realtime_snapshot_uses_dayfile_cache(src, monkeypatch):
+    """当日分钟分区经 DayFileCache：二次调用不再读盘（删源文件仍命中）。"""
+    import os
+    import shutil
+
+    day = _dt.date.today().isoformat()
+    _write_minute(str(src.data_root), "kline_etf_minute", day, [
+        {"symbol": "512670.SH", "datetime": f"{day} 00:00:01", "open": 1.0,
+         "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1000, "amount": 1000.0},
+    ])
+    # 非交易时段门控：不触网，只验读路径
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
+    got1 = src.get_realtime_snapshot(["512670.XSHG"])
+    assert not got1.is_empty()
+    assert src.dayfile_cache.get("kline_etf_minute", day) is not None
+    # 删掉底层分区文件后二次调用仍命中缓存（证明未重扫）
+    shutil.rmtree(os.path.join(str(src.data_root), "kline_etf_minute", f"date={day}"))
+    got2 = src.get_realtime_snapshot(["512670.XSHG"])
+    assert not got2.is_empty()
+    assert got2["close"].to_list() == got1["close"].to_list()
+
+
 def test_realtime_snapshot_mixed_ns_us_datetime(src, monkeypatch):
     """回归：分区帧 datetime 为 Datetime('us')（parquet 落盘口径），实时回源
     pl.from_pandas 为 Datetime('ns')；两者经 _as_datetime 应统一单位，pl.concat
@@ -370,6 +392,24 @@ def test_get_stock_names_etf_from_local_parquet(tmp_path, monkeypatch):
         os.environ.pop("PARTITION_DATA_ROOT", None)
 
 
+def test_get_daily_serves_via_dayfile_cache(src):
+    """get_daily 走日线日期文件 LRU：结果与直读分区一致，且日期文件入缓存。"""
+    day = _dt.date.today().isoformat()
+    df = src.get_daily(["600000.XSHG"], day, day)
+    assert df["symbol"].to_list() == ["600000.SH"]
+    assert df["volume"].to_list() == [100000]  # 股票手→股 ×100
+    assert len(src.dayfile_cache) >= 1
+    assert src.dayfile_cache.get("kline_daily", day) is not None
+
+
+def test_preload_daily_uses_dayfile_cache(src):
+    df = src.preload_daily(lookback_days=400)
+    assert not df.is_empty()
+    assert df["symbol"].to_list() == ["600000.SH"]
+    assert df["volume"].to_list() == [100000]
+    assert len(src.dayfile_cache) >= 1
+
+
 def test_get_stock_names_writes_cache_when_etf_ok(tmp_path, monkeypatch):
     """ETF 段成功（含 517xxx 等非前缀列表内代码）时缓存应落盘。"""
     import json
@@ -393,4 +433,27 @@ def test_get_stock_names_writes_cache_when_etf_ok(tmp_path, monkeypatch):
         assert cached.get("517900") == "银行AH价格优选ETF"
     finally:
         s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_get_adj_factors_cached(tmp_path):
+    """adj_factors 走 DedupCache：TTL 内二次调用不重扫（删源文件仍返回）。"""
+    import os
+    import shutil
+
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    d = os.path.join(str(tmp_path), "adj_factor_etf")
+    os.makedirs(d, exist_ok=True)
+    pl.DataFrame({"symbol": ["512670.SH"], "trade_date": ["2026-08-20"],
+                  "ex_factor": [1.05]}).write_parquet(os.path.join(d, "all.parquet"))
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
+    try:
+        got1 = s.get_adj_factors()
+        assert got1["symbol"].to_list() == ["512670.SH"]
+        assert got1["ex_factor"].to_list() == [1.05]
+        # 删源文件后 TTL 内二次调用仍命中缓存
+        shutil.rmtree(d)
+        got2 = s.get_adj_factors()
+        assert got2["symbol"].to_list() == ["512670.SH"]
+    finally:
         os.environ.pop("PARTITION_DATA_ROOT", None)

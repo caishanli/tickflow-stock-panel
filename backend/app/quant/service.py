@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import glob
 import json
+import logging
 import os
 import shutil
 import signal
@@ -16,6 +17,9 @@ import uuid
 from . import db
 from .config import CONFIG
 from .datasource.manager import QuantDataProvider
+from .simulate import memory as sim_memory
+
+logger = logging.getLogger("app.quant.service")
 
 
 def _script(name: str) -> str:
@@ -120,6 +124,17 @@ def account_create(name: str, capital: float, stop_loss: float, strategy_id: str
     return aid
 
 
+def _guard_memory(aid: str) -> None:
+    """手动启动的内存门禁：不足则 raise，不改状态、不写 pause。"""
+    mem = sim_memory.memory_check(extra=1)
+    if mem["ok"]:
+        return
+    raise ValueError(
+        f"内存不足: 可用 {mem['available_mb']:.0f}MB < 需要 {mem['needed_mb']:.0f}MB"
+        f"（每账户约 {mem['estimate_mb']:.0f}MB），已跳过启动"
+    )
+
+
 def account_start(aid: str) -> None:
     with _spawn_lock:
         acct = db.get_sim_account(aid)
@@ -127,6 +142,7 @@ def account_start(aid: str) -> None:
             raise ValueError(f"account not found: {aid}")
         if acct.get("status") == "running":
             return  # M4：幂等，运行中重复 start 不再拉起第二个进程
+        _guard_memory(aid)
         pause = os.path.join(CONFIG.runtime_dir, f"{aid}.pause")
         if os.path.exists(pause):
             os.remove(pause)
@@ -165,6 +181,15 @@ def account_ensure_running(aid: str) -> None:
         from .simulate.daemon import _alive  # 延迟导入避免 daemon↔service 循环依赖
 
         if _alive(aid, acct.get("pid")):
+            return
+        mem = sim_memory.memory_check(extra=1)
+        if not mem["ok"]:
+            msg = (
+                f"内存不足: 可用 {mem['available_mb']:.0f}MB < 需要 {mem['needed_mb']:.0f}MB"
+                f"（每账户约 {mem['estimate_mb']:.0f}MB），未自动重启，稍后重试"
+            )
+            db.insert_sim_log(aid, str(datetime.datetime.now()), "warn", msg)
+            logger.warning("sim account %s: %s", aid, msg)
             return
         os.makedirs(CONFIG.runtime_dir, exist_ok=True)
         db.update_sim_account(aid, started_at=datetime.datetime.now().isoformat())

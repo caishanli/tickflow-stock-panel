@@ -169,3 +169,30 @@ def test_trigger_sync_check_kinds_spawn_thread(monkeypatch):
     assert sch.trigger_sync("check_day", day="2026-08-05") == {"ok": True}
     assert sch.trigger_sync("check_full") == {"ok": True}
     assert len(spawned) == 2
+
+
+def test_dayfile_sweep_loop_evicts_expired(monkeypatch):
+    """清扫线程循环：每 interval 秒 sweep 一次，过期文件被卸载。"""
+    import threading as _th
+    import time as _t
+    import polars as pl
+    from app.services.stockdata import scheduler as sch
+    from app.services.stockdata.sources import DayFileCache
+
+    c = DayFileCache(ttl=0.02, cap=10)
+    c.get_or_load("kline_daily", "2026-08-19", lambda: pl.DataFrame({
+        "symbol": ["600000.SH"], "date": ["2026-08-19"],
+        "open": [10.0], "high": [11.0], "low": [9.0],
+        "close": [10.5], "volume": [1000], "amount": [105000.0],
+    }))
+    assert len(c) == 1
+
+    stop = _th.Event()
+    monkeypatch.setattr(sch, "_stop", stop)
+    ds = type("DS", (), {"dayfile_cache": c})()
+    t = _th.Thread(target=sch._dayfile_sweep_loop, args=(ds, 0.01), daemon=True)
+    t.start()
+    _t.sleep(0.1)
+    stop.set()
+    t.join(timeout=2)
+    assert len(c) == 0

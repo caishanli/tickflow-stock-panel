@@ -1738,17 +1738,27 @@ def _ptrade_rewrite_source(strategy_text: str) -> str:
 
     rqalpha 策略钩子名为 init / before_trading / handle_bar / after_trading；
     PTrade 钩子名为 initialize / before_trading_start / handle_data / after_trading_end，
-    且 data 参数是 SecurityUnitData 快照而非 rqalpha BarDict。这里补桥接函数。"""
+    且 data 参数是 SecurityUnitData 快照而非 rqalpha BarDict。这里补桥接函数。
+
+    after_trading_end 官方为 (context) 1 参（部分移植版写 (context, data)），
+    桥接按运行时签名自适应（_ptrade_call），避免 1 参钩子被强传 2 参 TypeError。"""
     strategy_code = strategy_text
     if not _re.search(r"def init\s*\(", strategy_code):
         strategy_code += "\ninit = initialize\n"
     bridge = (
+        "\ndef _ptrade_call(fn, context, data):\n"
+        "    import inspect\n"
+        "    try:\n"
+        "        n = len(inspect.signature(fn).parameters)\n"
+        "    except Exception:\n"
+        "        n = 2\n"
+        "    return fn(context) if n < 2 else fn(context, data)\n"
         "\ndef before_trading(context, bar_dict):\n"
-        "    before_trading_start(context, _ptrade_adapt_bar_dict(bar_dict))\n"
+        "    _ptrade_call(before_trading_start, context, _ptrade_adapt_bar_dict(bar_dict))\n"
         "\ndef handle_bar(context, bar_dict):\n"
-        "    handle_data(context, _ptrade_adapt_bar_dict(bar_dict))\n"
+        "    _ptrade_call(handle_data, context, _ptrade_adapt_bar_dict(bar_dict))\n"
         "\ndef after_trading(context):\n"
-        "    after_trading_end(context, None)\n"
+        "    _ptrade_call(after_trading_end, context, None)\n"
     )
     if not _re.search(r"def before_trading\s*\(", strategy_code):
         strategy_code += bridge

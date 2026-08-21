@@ -303,10 +303,9 @@ def _make_dm():
     # 盘中分钟取数诊断：SIM_MINUTE_DIAG=1 时记录每次取数 bar 数/缺失/回源，
     # 用于排查"当日分钟缺失被误判临时停牌"（08-13 159768 案例）。默认关闭。
     dm._diag_minute = os.getenv("SIM_MINUTE_DIAG", "") == "1"
-    try:
-        dm.preload_daily()
-    except Exception as e:  # noqa: BLE001
-        log.warning("[runner] 日线预加载失败（策略取数将按需回源）: %s", e)
+    # 在线模式不预载全市场日线：日线按需读，stockdata 服务端经日线日期文件 LRU
+    # 命中后逐块 chunk 请求秒级（spec 2026-08-21-stockdata-daily-dayfile-lru-design
+    # 第 3 节）。离线回测才需要 preload_daily（rqalpha_bridge，offline 未命中即抛错）。
     return dm
 
 
@@ -555,13 +554,8 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
             ctx.previous_date = pd.Timestamp(prev[-1]).date()
     except Exception:  # noqa: BLE001
         pass
-    # 盘前刷新最新交易日的日线数据（策略 get_price('1d') 会用到）
-    dm = aux.get("dm") if aux is not None else None
-    if dm is not None:
-        try:
-            dm.preload_daily()
-        except Exception:  # noqa: BLE001
-            pass
+    # 盘前日线新鲜度由按需取数保证（get_price/get_history 走网络批量读最新分区，
+    # 服务端 LRU 命中），不再整体预载全市场日线（见 _make_dm 注释）。
     for func, t in bundle.daily:
         if str(t) == "before_open":
             fired.add((id(func), "before_open"))
