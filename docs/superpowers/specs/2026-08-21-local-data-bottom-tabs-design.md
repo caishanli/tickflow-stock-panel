@@ -97,3 +97,53 @@ Main content (flex-1, 滚动):
 
 - 日志 useEffect 依赖改写时如果条件写错可能导致频繁重载日志。需确保只在 `bottomTab` 从非 `'log'` 切到 `'log'` 时重新初始化日志加载，从 `'log'` 切走时清理定时器。
 - 底部卡片固定 `40vh` 在小屏可能挤压表格空间，但当前页面已有 `flex-1 overflow-auto`，表格区域会自适应。
+
+---
+
+# 追加需求（2026-08-21 二次）
+
+用户批准底部多标签设计后新增两个需求：
+
+## 需求 A：菜单改名
+
+侧边栏菜单「本地股市数据」→「本地数据」，页面标题同步改为「本地数据」。
+
+涉及文件：
+- `frontend/src/components/Layout.tsx:79`（侧边栏菜单 label）
+- `frontend/src/pages/LocalData.tsx`（`PageHeader` 的 `title`）
+
+路由 `/local-data` 不变，组件文件名 `LocalData.tsx` 不变。
+
+## 需求 B：mootdx 服务器连通状态展示
+
+在 `StockdataStatusPanel`（服务状态标签页）里新增「mootdx 服务器」卡片，展示 mootdx 全部显式服务器 IP 的 TCP 连通状态与延迟，**每 10s 轮询刷新**（与主状态面板 5s 轮询解耦）。
+
+### 后端
+
+1. **`backend/app/quant/jqengine/datasource/mootdx_src.py`**：新增公共函数 `probe_servers(timeout=1.5) -> list[dict]`
+   - 用 `ThreadPoolExecutor` 并发探测 `_TDX_SERVERS` 全部 16 个 IP（端口 7709）
+   - 每个返回 `{ip, port, ok, latency_ms}`：`ok` 为 TCP 探测结果，`latency_ms` 为连接建立耗时（毫秒，整数，失败为 `None`）
+   - 复用已有 `_probe(ip, port, timeout)` 函数作为探测实现
+
+2. **`backend/app/api/data.py`**：新增端点 `GET /api/data/mootdx-servers`
+   - 调用 `probe_servers()` 并返回 `{"servers": [ {ip, port, ok, latency_ms}, ... ], "ts": "..."}`
+   - 加 ~10s TTL 模块级缓存（避免每 5s 主轮询时反复探测 16 个 IP）
+   - 依赖 mootdx/pandas：主后端 venv 已验证 `import pandas, mootdx` 可用
+
+3. **测试**：`backend/app/quant/jqengine/datasource/mootdx_src.py` 的 `probe_servers` 用 `monkeypatch` mock `_probe`，验证并发返回正确；`data.py` 端点测试 mock `probe_servers`，验证响应形态与 TTL 缓存。
+
+### 前端
+
+1. **`frontend/src/lib/api.ts`**：加 `MootdxServerRow` 类型（`{ip, port, ok, latency_ms}`）+ `mootdxServers()` API 函数（`GET /api/data/mootdx-servers`）
+
+2. **`frontend/src/pages/LocalData.tsx`** 的 `StockdataStatusPanel`：
+   - 新增「mootdx 服务器」卡片，**独立 `useQuery({ queryKey: ['mootdx-servers'], queryFn: ..., refetchInterval: 10000 })`**
+   - 每行：状态点（绿=可达 `ok=true` / 红=不可达 `ok=false`）+ `ip:port` + 延迟 ms（不可达显示 `—`）
+   - 布局放在「当前正在执行」卡片上方，与主状态查询互不影响
+
+### 不在范围内
+
+- mootdx 服务器列表来源不变（仍用 `_TDX_SERVERS`）
+- 不改 mootdx 连接逻辑、轮换逻辑、超时逻辑
+- 不改 `StockdataStatus` 已有字段（mootdx 服务器用独立端点，不塞进主状态响应）
+- 后端 `stockdata-status` 端点行为不变
