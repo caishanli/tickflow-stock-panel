@@ -260,15 +260,14 @@ class MootdxSource(DataSource):
         """
         if sym in self._xdxr_cache:
             return self._xdxr_cache[sym]
-        rows = None
-        for _ in range(2):  # 整轮轮换失败后再补一轮；仍失败才算真失败
+        try:
             rows, _err = self._with_server_retry(
                 lambda c: c.client.get_xdxr_info(int(get_stock_market(sym)), sym),
                 empty_ok=True)
-            if rows is not None:
-                break
+        except Exception:
+            rows = None
         if rows is None:
-            return None  # 不缓存失败
+            return None  # 不缓存失败——下次调用自动重试
         self._xdxr_cache[sym] = rows
         return rows
 
