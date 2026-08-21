@@ -46,6 +46,18 @@ function fmtStopLoss(v: any) {
   return `${(v * 100).toFixed(2)}%`
 }
 
+function fmtPriceTs(ts: unknown): string | null {
+  if (!ts) return null
+  const m = String(ts).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/)
+  if (!m) return null
+  const now = new Date()
+  const isToday =
+    Number(m[1]) === now.getFullYear() &&
+    Number(m[2]) === now.getMonth() + 1 &&
+    Number(m[3]) === now.getDate()
+  return isToday ? `${m[4]}:${m[5]}` : `${m[2]}-${m[3]} ${m[4]}:${m[5]}`
+}
+
 /** 从 "YYYY-MM-DD HH:MM:SS"（可省略秒）提取日期 + HH:MM，供分时标记定位 */
 function parseTradeTime(ts: unknown): { date: string; time: string } | null {
   const s = String(ts ?? '')
@@ -724,7 +736,14 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
                         <td className="px-3 py-1.5 text-right num">{p.amount}</td>
                         <td className="px-3 py-1.5 text-right num">{fmtNum(p.avg_cost, 3)}</td>
-                        <td className="px-3 py-1.5 text-right num">{fmtNum(p.price, 3)}</td>
+                        <td className="px-3 py-1.5 text-right num">
+                          {fmtNum(p.price, 3)}
+                          {fmtPriceTs(p.price_ts) && (
+                            <span className="ml-1 text-[10px] text-muted font-normal">
+                              {fmtPriceTs(p.price_ts)}
+                            </span>
+                          )}
+                        </td>
                         <td className="px-3 py-1.5 text-right num">{fmtNum(value)}</td>
                         <td className={`px-3 py-1.5 text-right num ${pnlAmt == null ? '' : pnlAmt >= 0 ? 'text-bull' : 'text-bear'}`}>
                           {pnlAmt == null ? '—' : fmtNum(pnlAmt)}
