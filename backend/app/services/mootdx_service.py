@@ -921,12 +921,138 @@ def check_and_repair_full(content_recent: int | None = None) -> dict:
     return scan_and_backfill_full(content_recent=content_recent)
 
 
+def _normalize_xdxr_rows(rows) -> list[dict]:
+    """原始 xdxr 行 → 可持久化的精简事件 dict 列表（解析失败的行丢弃）。"""
+    out = []
+    for r in rows or []:
+        try:
+            out.append({
+                "category": int(r.get("category")),
+                "year": int(r["year"]), "month": int(r["month"]),
+                "day": int(r["day"]),
+                "suogu": float(r.get("suogu") or 0),
+                "fenhong": float(r.get("fenhong") or 0),
+                "songzhuangu": float(r.get("songzhuangu") or 0),
+                "peigu": float(r.get("peigu") or 0),
+                "peigujia": float(r.get("peigujia") or 0),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _load_xdxr_events(path) -> dict:
+    """读本地事件表 → {sym6: [事件dict]}；文件不存在返回 {}。"""
+    import polars as pl
+    if not path.exists():
+        return {}
+    df = pl.read_parquet(path)
+    keys = ("category", "year", "month", "day", "suogu", "fenhong",
+            "songzhuangu", "peigu", "peigujia")
+    out: dict[str, list[dict]] = {}
+    for r in df.iter_rows(named=True):
+        out.setdefault(r["symbol"], []).append({k: r[k] for k in keys})
+    return out
+
+
+def _save_xdxr_events(path, events_map) -> None:
+    import polars as pl
+    rows = [{"symbol": s, **e} for s, evs in sorted(events_map.items()) for e in evs]
+    df = pl.DataFrame(rows) if rows else pl.DataFrame({
+        "symbol": [], "category": [], "year": [], "month": [], "day": [],
+        "suogu": [], "fenhong": [], "songzhuangu": [], "peigu": [], "peigujia": []})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / "xdxr_events.tmp.parquet"
+    df.write_parquet(tmp)
+    tmp.rename(path)
+
+
+def _audit_uncovered_breakpoints(daily, factor_df, threshold: float = 0.2) -> list:
+    """断点审计：因子调整后序列仍含 >threshold 单日跳变的标的（升序）。
+
+    只负责发现缺口驱动回源，不合成数据。20cm ETF 恰好 ±20% 属合法涨跌，
+    用严格大于排除。
+    """
+    fmap: dict[str, dict] = {}
+    if factor_df is not None and not factor_df.is_empty():
+        for r in factor_df.iter_rows(named=True):
+            fmap.setdefault(r["symbol"], {})[r["trade_date"]] = r["ex_factor"]
+    flagged = []
+    for jq, pdf in daily.items():
+        closes = pdf["close"].dropna()
+        if len(closes) < 2:
+            continue
+        frows = fmap.get(jq) or {}
+        fac = pd.Series([frows.get(d.date(), 1.0) for d in closes.index],
+                        index=closes.index)
+        ret = (closes * fac).pct_change().dropna()
+        if (ret.abs() > threshold).any():
+            flagged.append(jq)
+    return sorted(flagged)
+
+
+def _symbol_factor_frame(jq: str, closes: pd.Series,
+                         rows: list[dict] | None) -> pl.DataFrame | None:
+    """单标的：本地事件 rows × 日线 close → 逐日因子帧；无有效事件返回 None。
+
+    数学与历史版本完全一致（cat==11: 1/suogu；cat==1 含红利/配股摊薄）。
+    """
+    events = []
+    for r in (rows or []):
+        cat = r.get("category")
+        year = r.get("year")
+        if not year or int(year) < _SINCE_YEAR:
+            continue
+        try:
+            ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
+        except Exception:
+            continue
+        if cat == 11:
+            suogu = float(r.get("suogu") or 0)
+            if suogu <= 0:
+                continue
+            events.append((ex_dt, 1.0 / suogu))
+        elif cat == 1:
+            fh = float(r.get("fenhong") or 0) / 10.0      # 每股现金红利(元)
+            sg = float(r.get("songzhuangu") or 0) / 10.0  # 每股送转
+            pg = float(r.get("peigu") or 0) / 10.0        # 每股配股
+            pgj = float(r.get("peigujia") or 0)           # 配股价
+            if fh == 0 and sg == 0 and pg == 0:
+                continue
+            prev = closes.loc[closes.index < ex_dt].dropna()
+            if prev.empty:
+                continue
+            prev_close = float(prev.iloc[-1])
+            if prev_close <= 0:
+                continue
+            ex_price = (prev_close - fh + pgj * pg) / (1.0 + sg + pg)
+            if ex_price <= 0:
+                continue
+            events.append((ex_dt, ex_price / prev_close))
+    if not events:
+        return None
+    events = [(e, f) for e, f in events if e < closes.index.max()]
+    if not events:
+        return None
+    adj = pd.Series(1.0, index=closes.index)
+    for ex_dt, f in events:
+        adj.loc[adj.index < ex_dt] *= f
+    return pl.DataFrame({
+        "symbol": jq,
+        "trade_date": [d.isoformat() for d in closes.index.date],
+        "ex_factor": adj.values,
+    })
+
+
 def sync_adj_factor() -> dict:
-    """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建）。
+    """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建，三层加固）。
 
     对宇宙内每只有除权事件的标的，用 xdxr 记录 + 日线 close 重建逐日
     ex_factor 序列，覆盖该标的在 ``all.parquet`` 中的行（全量重算该标的，
-    幂等）。返回 {written_symbols, rows, total_symbols}。
+    幂等）。xdxr 原始事件落本地 ``xdxr_events.parquet``（查询失败沿用本地
+    事件）；写表后跑断点审计（调整后序列仍含 >20% 单日跳变即缺口），
+    查询失败 ∪ 审计缺口用新 MootdxSource 实例重试一轮，仍有缺口 WARNING。
+    返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}。
     """
     src = MootdxSource()
     dm = DataManager()
@@ -936,83 +1062,87 @@ def sync_adj_factor() -> dict:
         return {"written_symbols": 0, "rows": 0, "total_symbols": 0}
     # 只保留宇宙内的标的
     daily = {k: v for k, v in daily.items() if k in set(codes)}
+    # 第2层：xdxr 原始事件落本地。查询失败（None）沿用本地已有事件，
+    # 因子重建纯本地计算——socket 只影响"发现新事件"，不影响既有因子。
+    events_path = ADJ_FACTOR_PATH.parent / "xdxr_events.parquet"
+    events_map = _load_xdxr_events(events_path)
+    query_failed = []
     frames = []
     for jq, pdf in daily.items():
         closes = pdf["close"].dropna()
         if closes.empty:
             continue
-        rows = src._xdxr_rows(jq.split(".")[0])
-        events = []
-        for r in (rows or []):
-            cat = r.get("category")
-            year = r.get("year")
-            if not year or int(year) < _SINCE_YEAR:
-                continue
-            try:
-                ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
-            except Exception:
-                continue
-            if cat == 11:
-                suogu = float(r.get("suogu") or 0)
-                if suogu <= 0:
+        sym6 = jq.split(".")[0]
+        rows = src._xdxr_rows(sym6)
+        if rows is None:
+            if sym6 not in query_failed:
+                query_failed.append(sym6)
+            logger.warning("mootdx_service: %s xdxr 查询失败，沿用本地事件", sym6)
+        else:
+            events_map[sym6] = _normalize_xdxr_rows(rows)
+        fr = _symbol_factor_frame(jq, closes, events_map.get(sym6))
+        if fr is not None:
+            frames.append(fr)
+    _save_xdxr_events(events_path, events_map)
+
+    def _merge_write(frames_):
+        """合并写入因子表；frames_ 为空时保留既有表。返回最新表内容。"""
+        ADJ_FACTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        out = pl.concat(frames_) if frames_ else None
+        if out is not None:
+            out = out.with_columns(pl.col("trade_date").cast(pl.Date))
+            out = out.unique(subset=["symbol", "trade_date"], keep="last").sort(
+                ["symbol", "trade_date"])
+        if ADJ_FACTOR_PATH.exists():
+            old = pl.read_parquet(ADJ_FACTOR_PATH)
+            out = old if out is None else pl.concat([old, out]).unique(
+                subset=["symbol", "trade_date"], keep="last").sort(
+                ["symbol", "trade_date"])
+        if out is None or out.is_empty():
+            return pl.DataFrame({"symbol": [], "trade_date": [], "ex_factor": []})
+        tmp = ADJ_FACTOR_PATH.parent / "all.tmp.parquet"
+        out.write_parquet(tmp)
+        tmp.rename(ADJ_FACTOR_PATH)
+        logger.info("mootdx_service: 因子表更新 %d 行 / %d 只 → %s",
+                    out.height, out["symbol"].n_unique(), ADJ_FACTOR_PATH)
+        return out
+
+    out = _merge_write(frames)
+    audit_uncovered = _audit_uncovered_breakpoints(daily, out)
+
+    # 第3层：查询失败 ∪ 审计缺口 → 新实例（新缓存+换服务器）重试一轮
+    retry_syms = sorted(set(query_failed)
+                        | {s.split(".")[0] for s in audit_uncovered})
+    if retry_syms:
+        logger.warning("mootdx_service: 因子缺口重试 %d 只: %s",
+                       len(retry_syms), retry_syms[:10])
+        src2 = MootdxSource()
+        got = []
+        for sym6 in retry_syms:
+            rows = src2._xdxr_rows(sym6)
+            if rows is not None:
+                events_map[sym6] = _normalize_xdxr_rows(rows)
+                got.append(sym6)
+        if got:
+            _save_xdxr_events(events_path, events_map)
+            frames = []
+            for jq, pdf in daily.items():
+                closes = pdf["close"].dropna()
+                if closes.empty:
                     continue
-                events.append((ex_dt, 1.0 / suogu))
-            elif cat == 1:
-                # 除权参考价公式与 mootdx_src._to_qfq 同口径：
-                # ex_price = (prev_close - fh + pgj*pg) / (1+sg+pg)
-                # factor = ex_price / prev_close。现金红利(fh)/配股会摊薄价格，
-                # 纯送转比例式 1/(1+sg+pg) 会漏掉这两项（对齐 bug：510880 等
-                # 有年度现金分红，漏算导致前复权价偏离聚宽）。
-                fh = float(r.get("fenhong") or 0) / 10.0      # 每股现金红利(元)
-                sg = float(r.get("songzhuangu") or 0) / 10.0  # 每股送转
-                pg = float(r.get("peigu") or 0) / 10.0        # 每股配股
-                pgj = float(r.get("peigujia") or 0)           # 配股价
-                if fh == 0 and sg == 0 and pg == 0:
-                    continue
-                prev = closes.loc[closes.index < ex_dt].dropna()
-                if prev.empty:
-                    continue  # 除权日前一收盘价不在帧内，因子无法计算
-                prev_close = float(prev.iloc[-1])
-                if prev_close <= 0:
-                    continue
-                ex_price = (prev_close - fh + pgj * pg) / (1.0 + sg + pg)
-                if ex_price <= 0:
-                    continue
-                events.append((ex_dt, ex_price / prev_close))
-        if not events:
-            continue
-        events = [(e, f) for e, f in events if e < closes.index.max()]
-        if not events:
-            continue
-        adj = pd.Series(1.0, index=closes.index)
-        for ex_dt, f in events:
-            adj.loc[adj.index < ex_dt] *= f
-        frames.append(pl.DataFrame({
-            "symbol": jq,
-            "trade_date": [d.isoformat() for d in closes.index.date],
-            "ex_factor": adj.values,
-        }))
-    if not frames:
-        logger.info("mootdx_service: 无除权事件，因子表无更新")
-        return {"written_symbols": 0, "rows": 0, "total_symbols": len(codes)}
-    out = pl.concat(frames)
-    out = out.with_columns(pl.col("trade_date").cast(pl.Date))
-    out = out.unique(subset=["symbol", "trade_date"], keep="last").sort(
-        ["symbol", "trade_date"])
-    ADJ_FACTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # 合并既有表（幂等）：同 symbol+date 覆盖，其余保留
-    if ADJ_FACTOR_PATH.exists():
-        old = pl.read_parquet(ADJ_FACTOR_PATH)
-        out = pl.concat([old, out]).unique(
-            subset=["symbol", "trade_date"], keep="last").sort(["symbol", "trade_date"])
-    tmp = ADJ_FACTOR_PATH.parent / "all.tmp.parquet"
-    out.write_parquet(tmp)
-    tmp.rename(ADJ_FACTOR_PATH)
-    n_syms = out["symbol"].n_unique()
-    logger.info("mootdx_service: 因子表更新 %d 行 / %d 只 → %s",
-                out.height, n_syms, ADJ_FACTOR_PATH)
+                fr = _symbol_factor_frame(jq, closes,
+                                          events_map.get(jq.split(".")[0]))
+                if fr is not None:
+                    frames.append(fr)
+            out = _merge_write(frames)
+            audit_uncovered = _audit_uncovered_breakpoints(daily, out)
+
+    if audit_uncovered:
+        logger.warning("mootdx_service: 因子断点审计未覆盖 %d 只: %s",
+                       len(audit_uncovered), audit_uncovered[:10])
     return {"written_symbols": len(frames), "rows": out.height,
-            "total_symbols": len(codes)}
+            "total_symbols": len(codes),
+            "query_failed": query_failed, "audit_uncovered": audit_uncovered}
 
 
 # ---------------------------------------------------------------------------

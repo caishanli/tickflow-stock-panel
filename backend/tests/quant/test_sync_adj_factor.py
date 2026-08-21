@@ -183,6 +183,15 @@ def test_audit_retries_and_warns(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj" / "all.parquet")
     sym = "159667.XSHE"
     daily, _ = _mk_daily(sym)
+    # 隔离真实数据：宇宙只含测试标的，日线用构造帧（否则审计会扫到
+    # 本地全市场分区里真实的大幅波动，误报断点缺口）
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [sym])
+
+    class _FakeDM:
+        def _load_daily_from_partitions(self, asof=None):
+            return daily
+
+    monkeypatch.setattr(ms, "DataManager", lambda: _FakeDM())
 
     class _SeqSrc:
         insts = []
