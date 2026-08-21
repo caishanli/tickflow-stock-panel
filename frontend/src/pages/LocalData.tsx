@@ -129,7 +129,7 @@ function StockdataStatusPanel() {
               ) : mx.isError ? (
                 <div className="text-xs text-muted">无法获取 mootdx 服务器状态</div>
               ) : (
-                <ul className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                <ul className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1.5">
                   {mx.data?.servers.map(s => (
                     <li key={s.ip} className="flex items-center gap-2 text-xs">
                       <span className={`inline-block h-2 w-2 rounded-full ${s.ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
@@ -369,7 +369,7 @@ export function LocalData() {
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
         {!isLoading && !isError && total > 0 && (
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-y-2">
             <div className="flex items-center gap-2">
               <DatePicker value={startDate} onChange={v => { setStartDate(v); onFilterChange() }} placeholder="起始日期" />
               <span className="text-muted text-xs">~</span>
@@ -421,7 +421,7 @@ export function LocalData() {
           />
         ) : (
           <>
-            <div className="rounded-card border border-border bg-surface overflow-hidden relative">
+            <div className="hidden md:block rounded-card border border-border bg-surface overflow-hidden relative">
               {isFetching && !isLoading && (
                 <div className="absolute inset-0 bg-elevated/30 flex items-center justify-center z-10">
                   <div className="text-xs text-muted flex items-center gap-2">
@@ -472,6 +472,44 @@ export function LocalData() {
                   ))}
                 </tbody>
               </table>
+            </div>
+
+            {/* 移动端卡片布局：日期在上，各数据集标的数网格排布 */}
+            <div className="md:hidden space-y-2">
+              {rows.map(row => (
+                <div key={row.date} className="rounded-card border border-border bg-surface p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono num text-sm text-foreground">{row.date}</span>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => { setRefreshingRow(row.date); refreshRowMut.mutate(row.date) }}
+                        disabled={refreshRowMut.isPending}
+                        className="px-1.5 py-0.5 rounded-btn border border-border text-[11px] text-secondary hover:text-foreground disabled:opacity-40 transition-colors inline-flex items-center gap-0.5"
+                      >
+                        {refreshingRow === row.date
+                          ? <RefreshCw className="h-3 w-3 animate-spin" />
+                          : <RefreshCw className="h-3 w-3" />}
+                        刷新
+                      </button>
+                      <button
+                        onClick={() => checkDayMut.mutate(row.date)}
+                        disabled={checkDayMut.isPending}
+                        className="px-1.5 py-0.5 rounded-btn border border-border text-[11px] text-secondary hover:text-foreground disabled:opacity-40 transition-colors"
+                      >
+                        校验
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-2 grid grid-cols-3 gap-x-2 gap-y-2">
+                    {COLUMNS.map(c => (
+                      <div key={c.key} className="min-w-0">
+                        <div className="text-[10px] text-muted truncate">{c.label}</div>
+                        <div className="text-xs num">{fmtCount(row[c.key])}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
             </div>
 
             <div className="flex items-center justify-between mt-3 text-xs text-muted">
