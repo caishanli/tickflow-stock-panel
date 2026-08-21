@@ -165,8 +165,9 @@ def sync_etf_minute(day: _date | None = None) -> int:
         return 0
     historical = (day < _date.today() - _dt.timedelta(days=5))
     frames = []
-    for i, jq in enumerate(codes):
-        _throttle_backfill(i)
+
+    def _pull_one(jq: str) -> pl.DataFrame | None:
+        """单标的拉取+当日过滤，返回可落盘帧；失败/无数据返回 None。"""
         try:
             if historical:
                 df = src.get_minute(jq, max_bars=40000)
@@ -174,9 +175,9 @@ def sync_etf_minute(day: _date | None = None) -> int:
                 df = src.get_minute_recent(jq, pages=2)
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
-            continue
+            return None
         if df is None or df.empty:
-            continue
+            return None
         df = df.copy()
         df["symbol"] = _to_tf_symbol(jq)
         df = df.reset_index()
@@ -187,21 +188,45 @@ def sync_etf_minute(day: _date | None = None) -> int:
         df = df[keep]
         df = df[pd.to_datetime(df["datetime"]).dt.date == day]
         if df.empty:
+            return None
+        return pl.from_pandas(df)
+
+    failed: list[str] = []
+    for i, jq in enumerate(codes):
+        _throttle_backfill(i)
+        fr = _pull_one(jq)
+        if fr is None:
+            failed.append(jq)
             continue
-        frames.append(pl.from_pandas(df))
+        frames.append(fr)
         if (i + 1) % 500 == 0:
             try:
                 src._client = None
                 src._server_idx = -1
             except Exception:  # noqa: BLE001
                 pass
+    # 第3层：失败标的换实例当轮重试一轮
+    if failed:
+        logger.warning("mootdx_service: ETF 分钟回源失败重试 %d 只: %s",
+                       len(failed), failed[:10])
+        src = MootdxSource()
+        failed2 = []
+        for jq in failed:
+            fr = _pull_one(jq)
+            if fr is None:
+                failed2.append(jq)
+                continue
+            frames.append(fr)
+        failed = failed2
     if not frames:
-        return 0
+        logger.warning("mootdx_service: ETF 分钟回源 %s 全部失败", day)
+        return {"rows": 0, "query_failed": failed}
     out = pl.concat(frames).unique(
         subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
     out = out.with_columns(
         pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
-    return _write_minute_partition(out, ETF_MINUTE_ROOT, day)
+    n = _write_minute_partition(out, ETF_MINUTE_ROOT, day)
+    return {"rows": n, "query_failed": failed}
 
 
 # mootdx 源错标的 13:00:00 假bar 判定（真实分钟数据下午从 13:01 起，13:00:00 恒为假）
@@ -529,31 +554,25 @@ def sync_stock_minute(limit: int | None = None) -> int:
     total = 0
     chunk: list[pl.DataFrame] = []
     _t0 = time.time()
-    for i, sym in enumerate(todo):
-        _throttle_backfill(i)
-        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
-            logger.info("mootdx_service: 股票分钟回源进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
-                        i + 1, len(todo), sym, total, time.time() - _t0)
-        # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
-        sym_start = STOCK_MINUTE_START
-        ld = listing.get(sym)
-        if ld is not None and ld > sym_start:
-            sym_start = ld
+    failed: list[str] = []
+
+    def _pull_stock(sym: str, sym_start: _date) -> pl.DataFrame | None:
+        """单标的分钟拉取+清洗；失败记 _append_failure 并返回 None。"""
+        nonlocal src
         try:
             df = _guarded_get_minute(src, sym, max_bars=40000)
         except TimeoutError:
             # 超时：坏连接状态，整个重建 src（避免坏 socket/server 索引残留）
             src = MootdxSource()
             _append_failure(sym, "timeout")
-            continue
+            return None
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
-            continue
+            return None
         if df is None or df.empty:
             _append_failure(sym, "empty")
-            continue
+            return None
         df = df.copy()
         df["symbol"] = sym
         df = df.reset_index()
@@ -570,10 +589,30 @@ def sync_stock_minute(limit: int | None = None) -> int:
             df = df[pd.to_datetime(df["datetime"]).dt.date < _date.today()]
         if df.empty:
             _append_failure(sym, f"no_data_since_{sym_start}")
-            continue
+            return None
         sub = pl.from_pandas(df)
         sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
+        return sub
+
+    def _sym_start(sym: str) -> _date:
+        # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
+        s = STOCK_MINUTE_START
+        ld = listing.get(sym)
+        if ld is not None and ld > s:
+            s = ld
+        return s
+
+    for i, sym in enumerate(todo):
+        _throttle_backfill(i)
+        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
+            logger.info("mootdx_service: 股票分钟回源进度 %d/%d 只"
+                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        i + 1, len(todo), sym, total, time.time() - _t0)
+        sub = _pull_stock(sym, _sym_start(sym))
+        if sub is None:
+            failed.append(sym)
+            continue
         chunk.append(sub)
         total += sub.height
         if len(chunk) >= _STOCK_MINUTE_BATCH:
@@ -585,8 +624,30 @@ def sync_stock_minute(limit: int | None = None) -> int:
             src = MootdxSource()
     if chunk:
         _flush_stock_minute_chunk(chunk)
+    # 第3层：失败标的换实例当轮重试一轮
+    if failed:
+        logger.warning("mootdx_service: 股票分钟回源失败重试 %d 只: %s",
+                       len(failed), failed[:10])
+        src = MootdxSource()
+        chunk2: list[pl.DataFrame] = []
+        still: list[str] = []
+        for sym in failed:
+            sub = _pull_stock(sym, _sym_start(sym))
+            if sub is None:
+                still.append(sym)
+                continue
+            chunk2.append(sub)
+            total += sub.height
+            if len(chunk2) >= _STOCK_MINUTE_BATCH:
+                _flush_stock_minute_chunk(chunk2)
+                chunk2 = []
+                src = MootdxSource()
+        if chunk2:
+            _flush_stock_minute_chunk(chunk2)
+        failed = still
     logger.info("mootdx_service: 股票分钟回源完成, 累计 %d 行", total)
-    return range_rows + total + fragment_rows
+    return {"rows": range_rows + total + fragment_rows,
+            "query_failed": failed}
 
 
 def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
@@ -1631,14 +1692,22 @@ def sync_daily(day: _date) -> dict:
     frames_stock: list[pl.DataFrame] = []
     frames_etf: list[pl.DataFrame] = []
 
-    def _fetch(syms: list[str]) -> pl.DataFrame | None:
+    def _fetch(syms: list[str]) -> tuple[pl.DataFrame | None, list[str]]:
         out_frames = []
+        failed: list[str] = []
         for i, sym in enumerate(syms):
             _throttle_backfill(i)
             try:
                 df = _guarded_get_daily(src, sym, day_str, day_str)
             except Exception:
+                failed.append(sym)
                 continue
+            if df is None:
+                # 守护超时/查询错误被折叠成 None——必须重试，不能静默跳过
+                failed.append(sym)
+                continue
+            if df.empty:
+                continue  # 正常无数据（停牌/未上市），不算失败
             if df is None or df.empty:
                 continue
             # 只保留目标日那根（索引含 15:00 时间戳）
@@ -1664,15 +1733,31 @@ def sync_daily(day: _date) -> dict:
                 except Exception:
                     pass
         if not out_frames:
-            return None
-        return pl.concat(out_frames)
+            return None, failed
+        return pl.concat(out_frames), failed
 
-    sdf = _fetch(stocks)
+    query_failed: list[str] = []
+    sdf, failed_s = _fetch(stocks)
+    # 第3层：失败标的换实例当轮重试一轮
+    if failed_s:
+        logger.warning("mootdx_service: 日线回源股票失败重试 %d 只: %s",
+                       len(failed_s), failed_s[:10])
+        src = MootdxSource()
+        sdf2, failed_s = _fetch(failed_s)
+        if sdf2 is not None:
+            sdf = sdf2
     if sdf is not None:
         sdf = sdf.with_columns((pl.col("volume") / 100.0).alias("volume"))
         frames_stock.append(sdf)
         written["stock"] = sdf.height
-    edf = _fetch(etfs)
+    edf, failed_e = _fetch(etfs)
+    if failed_e:
+        logger.warning("mootdx_service: 日线回源 ETF 失败重试 %d 只: %s",
+                       len(failed_e), failed_e[:10])
+        src = MootdxSource()
+        edf2, failed_e = _fetch(failed_e)
+        if edf2 is not None:
+            edf = edf2
     if edf is not None:
         frames_etf.append(edf)
         written["etf"] = edf.height
@@ -1689,7 +1774,11 @@ def sync_daily(day: _date) -> dict:
     if frames_etf:
         _write_daily_partition(pl.concat(frames_etf), ETF_DAILY_ROOT)
     logger.info("mootdx_service: 日线回源 %s 完成: %s", day, written)
-    return written
+    query_failed = failed_s + failed_e
+    if query_failed:
+        logger.warning("mootdx_service: 日线回源 %s 重试后仍失败 %d 只: %s",
+                       day, len(query_failed), query_failed[:10])
+    return {**written, "query_failed": query_failed}
 
 
 def _write_daily_partition(df: pl.DataFrame, root: Path) -> None:

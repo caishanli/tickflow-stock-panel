@@ -211,3 +211,32 @@ def test_audit_retries_and_warns(monkeypatch, tmp_path, caplog):
     tab = _factor_table(result, sym)
     assert any(abs(v - 1 / 3) < 1e-6 for v in tab.values()), "重试轮应补回拆分因子"
     assert result["audit_uncovered"] == [], "重试后不应再有未覆盖断点"
+
+
+def test_sync_daily_query_failed_and_retry(monkeypatch):
+    """日线链路：首轮查询失败（守护折叠为 None）→ 计入失败并当轮重试成功。"""
+    from datetime import date as _d
+    from app.services import mootdx_service as ms
+    calls = {"n": 0}
+
+    class _FlakySrc:
+        def get_daily(self, code, start, end):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("socket down")
+            import pandas as pd
+            return pd.DataFrame(
+                {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+                 "volume": [100.0], "amount": [100.0]},
+                index=pd.to_datetime(["2026-08-20 15:00"]))
+
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.XSHG"])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [])
+    monkeypatch.setattr(ms, "MootdxSource", _FlakySrc)
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: None)
+    res = ms.sync_daily(_d(2026, 8, 20))
+    assert calls["n"] == 2, f"失败标的应被重试: {calls}"
+    assert res["stock"] == 1
+    assert res["query_failed"] == []
