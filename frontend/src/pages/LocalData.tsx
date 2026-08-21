@@ -388,7 +388,7 @@ export function LocalData() {
               <button
                 onClick={() => setRefreshNonce(n => n + 1)}
                 disabled={isFetching}
-                className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150 disabled:opacity-40 disabled:pointer-events-none"
                 title="刷新当前页统计"
               >
                 <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
@@ -397,7 +397,7 @@ export function LocalData() {
               <button
                 onClick={() => checkFullMut.mutate()}
                 disabled={checkFullMut.isPending}
-                className="px-3 py-1.5 rounded-btn border border-border bg-elevated text-secondary hover:text-foreground disabled:opacity-40 transition-colors flex items-center gap-1.5"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 disabled:opacity-40 transition-all duration-150"
               >
                 <Wrench className="h-3 w-3" />
                 {checkFullMut.isPending ? '校验中...' : '全量检验补齐'}
