@@ -115,6 +115,8 @@ ignore = ["E501"]   # 长行交给 fmt
 "app/services/stockdata/sources.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 "app/quant/simulate/memory.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 "tests/quant/test_sim_memory.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
+"app/quant/jqengine/datasource/mootdx_src.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
+"tests/quant/test_mootdx_paging.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 
 # quant extra 的 mootdx==0.11.7 硬锁 httpx<0.26，与基础依赖 httpx>=0.27 冲突。
 # 用 override 强制 httpx>=0.27（mootdx 仅作多源降级备用，内部 httpx 用法兼容）。

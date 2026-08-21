@@ -377,11 +377,28 @@ class MootdxSource(DataSource):
                 break
             if df is None or df.empty:
                 break
+            if len(df) < offset:
+                # 短页二义性：历史尽头 OR 限速截断。补发一页验证：
+                probe = None
+                try:
+                    probe = c.bars(symbol=sym, frequency=8,
+                                   start=start + len(df), offset=offset)
+                except Exception:
+                    probe = None
+                if probe is not None and not probe.empty:
+                    # 截断：探测页有数据 → 继续拉（丢掉的老段由后续分页覆盖）
+                    frames.append(df)
+                    frames.append(probe)
+                    fetched += len(df) + len(probe)
+                    oldest_seen = min(oldest_seen, probe.index.min())
+                    start += len(df) + len(probe)
+                    continue
+                frames.append(df)
+                fetched += len(df)
+                break  # 真·历史尽头
             frames.append(df)
             fetched += len(df)
             oldest_seen = min(oldest_seen, df.index.min())
-            if len(df) < offset:
-                break
             start += offset
         if not frames:
             raise DataSourceError("mootdx 无分钟数据")
