@@ -167,7 +167,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
     frames = []
 
     def _pull_one(jq: str) -> pl.DataFrame | None:
-        """单标的拉取+当日过滤，返回可落盘帧；失败/无数据返回 None。"""
+        """单标的拉取+当日过滤, 返回可落盘帧; 失败/无数据返回 None. """
         try:
             if historical:
                 df = src.get_minute(jq, max_bars=40000)
@@ -205,7 +205,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
                 src._server_idx = -1
             except Exception:  # noqa: BLE001
                 pass
-    # 第3层：失败标的换实例当轮重试一轮
+    # 第3层: 失败标的换实例当轮重试一轮
     if failed:
         logger.warning("mootdx_service: ETF 分钟回源失败重试 %d 只: %s",
                        len(failed), failed[:10])
@@ -557,7 +557,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     failed: list[str] = []
 
     def _pull_stock(sym: str, sym_start: _date) -> pl.DataFrame | None:
-        """单标的分钟拉取+清洗；失败记 _append_failure 并返回 None。"""
+        """单标的分钟拉取+清洗; 失败记 _append_failure 并返回 None. """
         nonlocal src
         try:
             df = _guarded_get_minute(src, sym, max_bars=40000)
@@ -596,7 +596,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
         return sub
 
     def _sym_start(sym: str) -> _date:
-        # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
+        # 回源起点 = max(全局起点, 该股上市日); 新股上市前无数据, 不提前拉
         s = STOCK_MINUTE_START
         ld = listing.get(sym)
         if ld is not None and ld > s:
@@ -607,7 +607,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
         _throttle_backfill(i)
         if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
             logger.info("mootdx_service: 股票分钟回源进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        "(当前 %s), 累计 %d 行, 耗时 %.0fs",
                         i + 1, len(todo), sym, total, time.time() - _t0)
         sub = _pull_stock(sym, _sym_start(sym))
         if sub is None:
@@ -624,7 +624,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
             src = MootdxSource()
     if chunk:
         _flush_stock_minute_chunk(chunk)
-    # 第3层：失败标的换实例当轮重试一轮
+    # 第3层: 失败标的换实例当轮重试一轮
     if failed:
         logger.warning("mootdx_service: 股票分钟回源失败重试 %d 只: %s",
                        len(failed), failed[:10])
@@ -686,7 +686,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
         _throttle_backfill(i)
         if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
             logger.info("mootdx_service: 股票分钟按日回源 %s 进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        "(当前 %s), 累计 %d 行, 耗时 %.0fs",
                         day, i + 1, len(stocks), sym, total, time.time() - _t0)
         ld = listing.get(sym)
         if ld is not None and ld > day:
@@ -762,7 +762,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
         _throttle_backfill(i)
         if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
             logger.info("mootdx_service: 股票分钟批量回源进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
+                        "(当前 %s), 累计 %d 行, 耗时 %.0fs",
                         i + 1, len(stocks), sym, total, time.time() - _t0)
         ld = listing.get(sym)
         if ld is not None and ld > window_end:
@@ -983,7 +983,7 @@ def check_and_repair_full(content_recent: int | None = None) -> dict:
 
 
 def _normalize_xdxr_rows(rows) -> list[dict]:
-    """原始 xdxr 行 → 可持久化的精简事件 dict 列表（解析失败的行丢弃）。"""
+    """原始 xdxr 行 -> 可持久化的精简事件 dict 列表(解析失败的行丢弃). """
     out = []
     for r in rows or []:
         try:
@@ -1003,7 +1003,7 @@ def _normalize_xdxr_rows(rows) -> list[dict]:
 
 
 def _load_xdxr_events(path) -> dict:
-    """读本地事件表 → {sym6: [事件dict]}；文件不存在返回 {}。"""
+    """读本地事件表 -> {sym6: [事件dict]}; 文件不存在返回 {}. """
     import polars as pl
     if not path.exists():
         return {}
@@ -1029,10 +1029,9 @@ def _save_xdxr_events(path, events_map) -> None:
 
 
 def _audit_uncovered_breakpoints(daily, factor_df, threshold: float = 0.2) -> list:
-    """断点审计：因子调整后序列仍含 >threshold 单日跳变的标的（升序）。
-
-    只负责发现缺口驱动回源，不合成数据。20cm ETF 恰好 ±20% 属合法涨跌，
-    用严格大于排除。
+    """断点审计: 因子调整后序列仍含 >threshold 单日跳变的标的(升序). 
+    只负责发现缺口驱动回源, 不合成数据. 20cm ETF 恰好 ±20% 属合法涨跌, 
+    用严格大于排除. 
     """
     fmap: dict[str, dict] = {}
     if factor_df is not None and not factor_df.is_empty():
@@ -1054,9 +1053,8 @@ def _audit_uncovered_breakpoints(daily, factor_df, threshold: float = 0.2) -> li
 
 def _symbol_factor_frame(jq: str, closes: pd.Series,
                          rows: list[dict] | None) -> pl.DataFrame | None:
-    """单标的：本地事件 rows × 日线 close → 逐日因子帧；无有效事件返回 None。
-
-    数学与历史版本完全一致（cat==11: 1/suogu；cat==1 含红利/配股摊薄）。
+    """单标的: 本地事件 rows x 日线 close -> 逐日因子帧; 无有效事件返回 None. 
+    数学与历史版本完全一致(cat==11: 1/suogu; cat==1 含红利/配股摊薄). 
     """
     events = []
     for r in (rows or []):
@@ -1106,14 +1104,13 @@ def _symbol_factor_frame(jq: str, closes: pd.Series,
 
 
 def sync_adj_factor() -> dict:
-    """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建，三层加固）。
-
+    """增量更新 ETF 前复权因子表(mootdx xdxr 事件重建, 三层加固). 
     对宇宙内每只有除权事件的标的，用 xdxr 记录 + 日线 close 重建逐日
     ex_factor 序列，覆盖该标的在 ``all.parquet`` 中的行（全量重算该标的，
-    幂等）。xdxr 原始事件落本地 ``xdxr_events.parquet``（查询失败沿用本地
-    事件）；写表后跑断点审计（调整后序列仍含 >20% 单日跳变即缺口），
-    查询失败 ∪ 审计缺口用新 MootdxSource 实例重试一轮，仍有缺口 WARNING。
-    返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}。
+    幂等). xdxr 原始事件落本地 ``xdxr_events.parquet``(查询失败沿用本地
+    事件); 写表后跑断点审计(调整后序列仍含 >20% 单日跳变即缺口), 
+    查询失败 ∪ 审计缺口用新 MootdxSource 实例重试一轮, 仍有缺口 WARNING. 
+    返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}. 
     """
     src = MootdxSource()
     dm = DataManager()
@@ -1123,8 +1120,8 @@ def sync_adj_factor() -> dict:
         return {"written_symbols": 0, "rows": 0, "total_symbols": 0}
     # 只保留宇宙内的标的
     daily = {k: v for k, v in daily.items() if k in set(codes)}
-    # 第2层：xdxr 原始事件落本地。查询失败（None）沿用本地已有事件，
-    # 因子重建纯本地计算——socket 只影响"发现新事件"，不影响既有因子。
+    # 第2层: xdxr 原始事件落本地. 查询失败(None)沿用本地已有事件, 
+    # 因子重建纯本地计算--socket 只影响"发现新事件", 不影响既有因子. 
     events_path = ADJ_FACTOR_PATH.parent / "xdxr_events.parquet"
     events_map = _load_xdxr_events(events_path)
     query_failed = []
@@ -1138,7 +1135,7 @@ def sync_adj_factor() -> dict:
         if rows is None:
             if sym6 not in query_failed:
                 query_failed.append(sym6)
-            logger.warning("mootdx_service: %s xdxr 查询失败，沿用本地事件", sym6)
+            logger.warning("mootdx_service: %s xdxr 查询失败, 沿用本地事件", sym6)
         else:
             events_map[sym6] = _normalize_xdxr_rows(rows)
         fr = _symbol_factor_frame(jq, closes, events_map.get(sym6))
@@ -1147,7 +1144,7 @@ def sync_adj_factor() -> dict:
     _save_xdxr_events(events_path, events_map)
 
     def _merge_write(frames_):
-        """合并写入因子表；frames_ 为空时保留既有表。返回最新表内容。"""
+        """合并写入因子表; frames_ 为空时保留既有表. 返回最新表内容. """
         ADJ_FACTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
         out = pl.concat(frames_) if frames_ else None
         if out is not None:
@@ -1164,14 +1161,14 @@ def sync_adj_factor() -> dict:
         tmp = ADJ_FACTOR_PATH.parent / "all.tmp.parquet"
         out.write_parquet(tmp)
         tmp.rename(ADJ_FACTOR_PATH)
-        logger.info("mootdx_service: 因子表更新 %d 行 / %d 只 → %s",
+        logger.info("mootdx_service: 因子表更新 %d 行 / %d 只 -> %s",
                     out.height, out["symbol"].n_unique(), ADJ_FACTOR_PATH)
         return out
 
     out = _merge_write(frames)
     audit_uncovered = _audit_uncovered_breakpoints(daily, out)
 
-    # 第3层：查询失败 ∪ 审计缺口 → 新实例（新缓存+换服务器）重试一轮
+    # 第3层: 查询失败 ∪ 审计缺口 -> 新实例(新缓存+换服务器)重试一轮
     retry_syms = sorted(set(query_failed)
                         | {s.split(".")[0] for s in audit_uncovered})
     if retry_syms:
@@ -1703,11 +1700,11 @@ def sync_daily(day: _date) -> dict:
                 failed.append(sym)
                 continue
             if df is None:
-                # 守护超时/查询错误被折叠成 None——必须重试，不能静默跳过
+                # 守护超时/查询错误被折叠成 None--必须重试, 不能静默跳过
                 failed.append(sym)
                 continue
             if df.empty:
-                continue  # 正常无数据（停牌/未上市），不算失败
+                continue  # 正常无数据(停牌/未上市), 不算失败
             if df is None or df.empty:
                 continue
             # 只保留目标日那根（索引含 15:00 时间戳）
@@ -1738,7 +1735,7 @@ def sync_daily(day: _date) -> dict:
 
     query_failed: list[str] = []
     sdf, failed_s = _fetch(stocks)
-    # 第3层：失败标的换实例当轮重试一轮
+    # 第3层: 失败标的换实例当轮重试一轮
     if failed_s:
         logger.warning("mootdx_service: 日线回源股票失败重试 %d 只: %s",
                        len(failed_s), failed_s[:10])

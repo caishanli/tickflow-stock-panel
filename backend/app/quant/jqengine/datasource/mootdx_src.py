@@ -253,10 +253,10 @@ class MootdxSource(DataSource):
         songzhuangu=每10股送转、peigu=每10股配股、peigujia=配股价）。
         无记录返回 []、失败返回 None，调用方据此保持 raw 口径。
 
-        失败（整轮服务器轮换耗尽）返回 None 且**不缓存**——下次调用重试；
-        只有成功结果（[] 或事件列表）才进缓存。否则一次 socket 抖动会把
-        None 钉进缓存，该标的当轮被静默跳过且进程内再无自愈机会
-        （159667 拆分事件漏采数周的根因）。
+        失败(整轮服务器轮换耗尽)返回 None 且**不缓存**--下次调用重试; 
+        只有成功结果([] 或事件列表)才进缓存. 否则一次 socket 抖动会把
+        None 钉进缓存, 该标的当轮被静默跳过且进程内再无自愈机会
+        (159667 拆分事件漏采数周的根因). 
         """
         if sym in self._xdxr_cache:
             return self._xdxr_cache[sym]
@@ -267,7 +267,7 @@ class MootdxSource(DataSource):
         except Exception:
             rows = None
         if rows is None:
-            return None  # 不缓存失败——下次调用自动重试
+            return None  # 不缓存失败--下次调用自动重试
         self._xdxr_cache[sym] = rows
         return rows
 
