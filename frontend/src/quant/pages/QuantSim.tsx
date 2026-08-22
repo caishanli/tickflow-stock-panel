@@ -100,6 +100,19 @@ function toMarkerAction(action: unknown): IntradayMarker['action'] {
   return 'SELL'
 }
 
+/** 该标的全部成交 → 分时标记 (弹窗按选中日期过滤渲染) */
+function buildSymbolMarkers(trades: any[], sym: string): IntradayMarker[] {
+  if (!sym) return []
+  const out: IntradayMarker[] = []
+  for (const t of trades) {
+    if ((t.code ?? '') !== sym || typeof t.price !== 'number') continue
+    const parsed = parseTradeTime(t.ts)
+    if (!parsed) continue
+    out.push({ date: parsed.date, time: parsed.time, price: t.price, action: toMarkerAction(t.action) })
+  }
+  return out
+}
+
 const RANGES: { label: string; days: number | null }[] = [
   { label: '全部', days: null },
   { label: '一星期', days: 7 },
@@ -873,13 +886,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     return (
                       <tr key={sym}
                         onClick={() => {
-                          const t = parseTradeTime(p.entry_ts)
                           setPreview({
                             symbol: sym,
                             name: p.name ?? '',
-                            markers: t && Number(p.avg_cost) > 0
-                              ? [{ date: t.date, time: t.time, price: Number(p.avg_cost), action: 'BUY' }]
-                              : [],
+                            date: parseTradeTime(p.entry_ts)?.date,
+                            markers: buildSymbolMarkers(sortedTrades, sym),
                           })
                         }}
                         className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
@@ -954,14 +965,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     return (
                     <tr key={i}
                       onClick={() => {
-                        const parsed = parseTradeTime(t.ts)
                         setPreview({
                           symbol: t.code ?? '',
                           name: t.name ?? '',
                           date: String(t.ts ?? '').slice(0, 10),
-                          markers: parsed && typeof t.price === 'number'
-                            ? [{ date: parsed.date, time: parsed.time, price: t.price, action: toMarkerAction(t.action) }]
-                            : [],
+                          markers: buildSymbolMarkers(sortedTrades, t.code ?? ''),
                         })
                       }}
                       className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
