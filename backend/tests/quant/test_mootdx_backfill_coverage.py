@@ -6,8 +6,47 @@ import os
 
 import pandas as pd
 import polars as pl
-
 from app.services import mootdx_service as ms
+
+
+class _StubPool:
+    """串行单 worker 假池（保持 BackfillPool.map 接口契约）。
+
+    sync_* 三路径接池后，测试以本桩替换 ``ms.BackfillPool``，把既有
+    ``_Src`` 假源直接喂给 map 的 fn，保持原断言不变。
+    """
+
+    def __init__(self, src, workers=None, source_factory=None):
+        self.src = src
+
+    def effective_workers(self, task_size):
+        return 1
+
+    def map(self, fn, symbols, batch_size=100, on_batch_done=None,
+                keep_frames=True):
+        ok, failed, batch = [], {}, []
+        for s in symbols:
+            try:
+                out = fn(self.src, s)
+            except Exception as e:  # noqa: BLE001
+                failed[s] = str(e)[:120]
+                continue
+            if out is not None:
+                ok.append(out)
+                batch.append(out)
+            if on_batch_done is not None and len(batch) >= batch_size:
+                on_batch_done(batch)
+                batch = []
+        if on_batch_done is not None and batch:
+            on_batch_done(batch)
+        return {"ok": ok, "ok_count": len(ok), "failed": failed}
+
+
+def _patch_pool(monkeypatch, src):
+    """把 ms.BackfillPool 替换为持有 ``src`` 的串行假池。"""
+    monkeypatch.setattr(ms, "BackfillPool", lambda workers=None,
+                        source_factory=None: _StubPool(src))
+
 
 
 class _FakeSrc:
@@ -534,6 +573,8 @@ def test_sync_daily_warns_when_etf_zero(caplog, monkeypatch, tmp_path):
             return None
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _EmptySrc())
+    _patch_pool(monkeypatch, _EmptySrc())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
     monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ"])
     monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
@@ -801,6 +842,8 @@ def test_sync_etf_minute_normalizes_phantom_noon_bar(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
         lambda: _dt.date(2026, 8, 5))})())
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     n = ms.sync_etf_minute(_dt.date(2026, 8, 5))
     part = tmp_path / "kline_etf_minute" / "date=2026-08-05" / "part.parquet"
     assert part.exists()
@@ -1036,7 +1079,7 @@ def test_sync_stock_minute_day_filters_listing_and_writes(tmp_path, monkeypatch)
     failures: list[str] = []
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             fetched.append(sym)
             if sym == "000001.SZ":  # 停牌：无该日 bar
                 idx = pd.DatetimeIndex([_dt.datetime(2026, 6, 16, 9, 31)])
@@ -1050,6 +1093,9 @@ def test_sync_stock_minute_day_filters_listing_and_writes(tmp_path, monkeypatch)
                                 index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     monkeypatch.setattr(ms, "_append_failure",
                         lambda sym, reason: failures.append(sym))
     n = ms.sync_stock_minute_day(_dt.date(2026, 6, 15))
@@ -1079,7 +1125,7 @@ def test_sync_stock_minute_range_writes_all_missing_days(tmp_path, monkeypatch):
     })
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             idx = pd.DatetimeIndex([
                 _dt.datetime(2026, 6, 15, 9, 31),
                 _dt.datetime(2026, 6, 15, 9, 32),
@@ -1090,6 +1136,9 @@ def test_sync_stock_minute_range_writes_all_missing_days(tmp_path, monkeypatch):
                                 index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     n = ms.sync_stock_minute_range([_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)])
     # 2 只 × 3 根（两日）= 6 行；600000 上市过滤跳过
     assert n == 6
@@ -1115,7 +1164,7 @@ def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
 
     class _Src:
-        def get_minute(self, code, max_bars=30000):
+        def get_minute(self, code, max_bars=30000, since=None):
             idx = pd.DatetimeIndex([
                 _dt.datetime(2026, 6, 15, 10, 30), _dt.datetime(2026, 6, 15, 10, 31)])
             idx.name = "datetime"  # 与真实 MootdxSource.get_minute 一致（reset_index 得 datetime 列）
@@ -1127,6 +1176,8 @@ def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
         lambda: _dt.date(2026, 8, 6))})())
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     n = ms.sync_etf_minute(_dt.date(2026, 6, 15))
     assert n["rows"] == 2
     part = tmp_path / "kline_etf_minute" / "date=2026-06-15" / "part.parquet"
@@ -1181,99 +1232,6 @@ def test_backfill_missing_partitions_survives_per_day_error(monkeypatch):
     res = ms.backfill_missing_partitions(missing)
     assert len(res["errors"]) == 2  # 两日都失败，但 index 仍补了
     assert "2026-06-17" in res["index_daily_days"]
-
-
-# ---------------------------------------------------------------------------
-# 后台回源节流（客户端请求优先）
-# ---------------------------------------------------------------------------
-
-def test_throttle_backfill_sleeps_every_n(monkeypatch):
-    """非盘中：每 _BACKFILL_THROTTLE_EVERY 个 symbol 后 sleep _BACKFILL_THROTTLE_SLEEP。"""
-    sleeps = []
-    monkeypatch.setattr(ms, "_is_market_open", lambda: False)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 3)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.05)
-    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
-    for i in range(6):
-        ms._throttle_backfill(i)
-    assert sleeps == [0.05, 0.05]  # i=2(第3个) 和 i=5(第6个) 触发
-
-
-def test_throttle_backfill_disabled_when_every_zero(monkeypatch):
-    """非盘中：_BACKFILL_THROTTLE_EVERY<=0 时完全不禁流。"""
-    sleeps = []
-    monkeypatch.setattr(ms, "_is_market_open", lambda: False)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 0)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.05)
-    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
-    for i in range(10):
-        ms._throttle_backfill(i)
-    assert sleeps == []
-
-
-def test_throttle_backfill_intraday_slows_down(monkeypatch):
-    """盘中：使用独立降速参数，每 _BACKFILL_INTRADAY_EVERY 个 symbol 睡 1s。"""
-    sleeps = []
-    monkeypatch.setattr(ms, "_is_market_open", lambda: True)
-    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_EVERY", 2)
-    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_SLEEP", 0.05)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 5)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.2)
-    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
-    for i in range(4):
-        ms._throttle_backfill(i)
-    # 盘中每 2 个 symbol 触发（i=1, i=3），且不受非盘中参数影响
-    assert sleeps == [0.05, 0.05]
-
-
-def test_throttle_backfill_intraday_disabled_when_every_zero(monkeypatch):
-    """盘中：_BACKFILL_INTRADAY_EVERY<=0 时盘中不禁流。"""
-    sleeps = []
-    monkeypatch.setattr(ms, "_is_market_open", lambda: True)
-    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_EVERY", 0)
-    monkeypatch.setattr(ms, "_BACKFILL_INTRADAY_SLEEP", 0.05)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 5)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.2)
-    monkeypatch.setattr(ms.time, "sleep", lambda s: sleeps.append(s))
-    for i in range(4):
-        ms._throttle_backfill(i)
-    assert sleeps == []
-
-
-def test_throttle_backfill_called_in_sync_daily_loop(tmp_path, monkeypatch):
-    """sync_daily 循环逐 symbol 调用节流（证明接入点存在且生效）。"""
-    calls = {"throttle": []}
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_EVERY", 2)
-    monkeypatch.setattr(ms, "_BACKFILL_THROTTLE_SLEEP", 0.0)
-    monkeypatch.setattr(ms.time, "sleep", lambda s: None)
-    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
-    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", tmp_path / "kline_daily")
-    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
-    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
-    monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ", "600000.SH", "000002.SZ"])
-    monkeypatch.setattr(ms, "_etf_universe", lambda: [])
-    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
-    monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: None)
-
-    class _Src:
-        def get_daily(self, code, start, end):
-            import pandas as pd
-            ts = pd.Timestamp("2026-08-05 15:00:00")
-            return pd.DataFrame(
-                {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
-                 "volume": [1000.0], "amount": [10000.0]},
-                index=pd.DatetimeIndex([ts]))
-
-    monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
-    # 统计 throttle 调用次数：monkeypatch 包装
-    orig = ms._throttle_backfill
-    def _spy(i):
-        calls["throttle"].append(i)
-        orig(i)
-    monkeypatch.setattr(ms, "_throttle_backfill", _spy)
-
-    ms.sync_daily(_dt.date(2026, 8, 5))
-    assert len(calls["throttle"]) >= 3  # 每只股票都调用
 
 
 # ---------------------------------------------------------------------------
@@ -1506,7 +1464,7 @@ def test_sync_stock_minute_skips_today_intraday_bars(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_market_closed", lambda now=None: False)  # 盘中
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             idx = pd.DatetimeIndex([
                 _dt.datetime(2026, 8, 4, 9, 31),   # 昨日（完整）
                 _dt.datetime(2026, 8, 5, 9, 31),   # 今天（盘中半程）
@@ -1517,7 +1475,9 @@ def test_sync_stock_minute_skips_today_intraday_bars(tmp_path, monkeypatch):
                                 index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     monkeypatch.setattr(ms, "STOCK_MINUTE_START", _dt.date(2026, 4, 1))
     monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
 
@@ -1548,7 +1508,7 @@ def test_sync_stock_minute_writes_today_after_close(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)  # 已收盘
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             idx = pd.DatetimeIndex([
                 _dt.datetime(2026, 8, 4, 9, 31),
                 _dt.datetime(2026, 8, 5, 15, 0)])
@@ -1558,7 +1518,9 @@ def test_sync_stock_minute_writes_today_after_close(tmp_path, monkeypatch):
                                 index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     monkeypatch.setattr(ms, "STOCK_MINUTE_START", _dt.date(2026, 4, 1))
     monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
 
@@ -1607,7 +1569,7 @@ def test_sync_stock_minute_ignores_limit_when_latest_partial_after_close(tmp_pat
     fetched: list[str] = []
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             fetched.append(sym)
             idx = pd.DatetimeIndex([_dt.datetime(2026, 8, 19, 15, 0)])
             idx.name = "datetime"
@@ -1616,7 +1578,9 @@ def test_sync_stock_minute_ignores_limit_when_latest_partial_after_close(tmp_pat
                                  "amount": [100.0]}, index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     monkeypatch.setattr(ms, "STOCK_MINUTE_START", _dt.date(2026, 4, 1))
     monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
     monkeypatch.setattr(ms, "STOCK_MINUTE_BATCH_LIMIT", 1)
@@ -1646,7 +1610,7 @@ def test_sync_stock_minute_day_with_symbols_subset(tmp_path, monkeypatch):
     fetched: list[str] = []
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             fetched.append(sym)
             idx = pd.DatetimeIndex([_dt.datetime(2026, 6, 15, 9, 31)])
             idx.name = "datetime"
@@ -1654,6 +1618,9 @@ def test_sync_stock_minute_day_with_symbols_subset(tmp_path, monkeypatch):
                                  "volume": [100.0], "amount": [100.0]}, index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     n = ms.sync_stock_minute_day(_dt.date(2026, 6, 15),
                                  symbols=["999999.SZ"])
 
@@ -1674,7 +1641,6 @@ def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_stock_universe", lambda: list(universe))
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {
         s: _dt.date(2020, 1, 1) for s in universe})
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
     monkeypatch.setattr(ms, "_append_failure", lambda s, r: None)
     # 测试规模小, 阈值降到 2
     monkeypatch.setattr(ms, "_MINUTE_FRAGMENT_THRESHOLD", 2)
@@ -1705,7 +1671,7 @@ def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
     fetched: list[str] = []
 
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             fetched.append(sym)
             idx = pd.DatetimeIndex([_dt.datetime(2026, 8, 12, 9, 31)])
             idx.name = "datetime"
@@ -1714,6 +1680,9 @@ def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
                                 index=idx)
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        tmp_path / "backfill_state.json")  # 隔离真实 manifest
     n = ms.sync_stock_minute()
 
     # 残片补齐: 只拉 08-12 缺失的 3 只（000002/000003/000004），各 1 根；

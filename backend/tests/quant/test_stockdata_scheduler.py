@@ -5,6 +5,24 @@ import threading
 from app.services.stockdata import scheduler as sch
 
 
+class _FakeLock:
+    """_sync_lock() 惰性解析的桩：call() 返回自身作上下文管理器。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
 def test_get_status_returns_json_safe_snapshot(monkeypatch):
     """get_status 返回 scheduler 状态快照，date 等非 JSON 类型需转字符串。"""
     monkeypatch.setattr(sch, "_lock", threading.Lock())
@@ -30,7 +48,7 @@ def test_run_sync_tracks_active_task(monkeypatch):
     from app.services import mootdx_service
 
     monkeypatch.setattr(sch, "_lock", threading.Lock())
-    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sch, "_scheduler_state", {})
     observed = []
 
@@ -76,7 +94,7 @@ def test_run_sync_full_stock_minute_syncs_daily_and_index_daily(monkeypatch):
         calls["index_day"] = day
         return {"written": 1}
 
-    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sch, "_lock", threading.Lock())
     monkeypatch.setattr(mootdx_service, "sync_etf_minute", fake_etf_minute)
     monkeypatch.setattr(mootdx_service, "sync_adj_factor", fake_adj)
@@ -107,7 +125,7 @@ def test_run_sync_incremental_keeps_limit(monkeypatch):
         calls["stock_limit"] = limit
         return 0
 
-    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sch, "_lock", threading.Lock())
     monkeypatch.setattr(mootdx_service, "sync_etf_minute", lambda: 0)
     monkeypatch.setattr(mootdx_service, "sync_adj_factor", lambda: {})
@@ -130,7 +148,7 @@ def test_run_check_day_runs_repair(monkeypatch):
     from datetime import date as _d
     from app.services import mootdx_service
     calls = []
-    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sch, "_lock", threading.Lock())
     monkeypatch.setattr(mootdx_service, "check_and_repair_day",
                         lambda day: calls.append(day) or {"day": str(day), "results": {}})
@@ -143,7 +161,7 @@ def test_run_check_full_runs_repair(monkeypatch):
     """check_full 后台执行体：调 check_and_repair_full 并记录汇总。"""
     from app.services import mootdx_service
     calls = []
-    monkeypatch.setattr(sch, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sch, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sch, "_lock", threading.Lock())
     monkeypatch.setattr(mootdx_service, "check_and_repair_full",
                         lambda content_recent=None: calls.append(content_recent)

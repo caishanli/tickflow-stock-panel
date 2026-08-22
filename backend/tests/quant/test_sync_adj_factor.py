@@ -234,8 +234,37 @@ def test_sync_daily_query_failed_and_retry(monkeypatch):
     monkeypatch.setattr(ms, "_etf_universe", lambda: [])
     monkeypatch.setattr(ms, "MootdxSource", _FlakySrc)
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
     monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: None)
+    # 池架构：经 source_factory 取 ms.MootdxSource(已 patch 为 flaky)；
+    # 首轮失败→当轮换实例重试一轮，语义与串行实现一致。
+    from tests.quant.test_sync_stock_minute_pool import _StubPool
+
+    class _RetryPool:
+        def __init__(self, workers=None, source_factory=None):
+            self._factory = source_factory or (lambda: _FlakySrc())
+            self._round = 0
+
+        def map(self, fn, symbols, batch_size=100,
+                on_batch_done=None, keep_frames=True):
+            # 第1轮用 flaky 实例；第2轮（重试）用新实例——类计数器使
+            # 第二次调用成功，模拟"socket 恢复"
+            self._round += 1
+            ok, failed, batch = [], {}, []
+            src = self._factory() if self._round == 1 else type(
+                "OK", (), {})()  # 重试轮由 fn 内部计数器放行
+            for s in symbols:
+                try:
+                    out = fn(src if self._round == 1 else _FlakySrc(), s)
+                except Exception as e:  # noqa: BLE001
+                    failed[s] = str(e)[:120]
+                    continue
+                if out is not None:
+                    ok.append(out)
+                    batch.append(out)
+            return {"ok": ok, "ok_count": len(ok), "failed": failed}
+
+    monkeypatch.setattr(ms, "BackfillPool", lambda workers=None,
+                        source_factory=None: _RetryPool(source_factory))
     res = ms.sync_daily(_d(2026, 8, 20))
     assert calls["n"] == 2, f"失败标的应被重试: {calls}"
     assert res["stock"] == 1
@@ -262,9 +291,35 @@ def test_sync_etf_minute_retry_round(monkeypatch):
             return out
 
     monkeypatch.setattr(ms, "_etf_universe", lambda: ["159667.XSHE"])
-    monkeypatch.setattr(ms, "MootdxSource", _Src)
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
-    monkeypatch.setattr(ms, "_write_minute_partition", lambda df, root, day=None: df.height)
+    # 池架构：每轮 map 新建 source 实例（第 2 轮"换实例"），类计数器使
+    # 第 1 次调用失败、第 2 次成功——与串行实现的换实例重试语义一致。
+    from tests.quant.test_sync_stock_minute_pool import _StubPool
+
+    class _RoundPool:
+        def __init__(self, workers=None, source_factory=None):
+            self._factory = source_factory or (lambda: _Src())
+
+        def map(self, fn, symbols, batch_size=100,
+                on_batch_done=None, keep_frames=True):
+            ok, failed = [], {}
+            src = self._factory()
+            for s in symbols:
+                try:
+                    out = fn(src, s)
+                except Exception as e:  # noqa: BLE001
+                    failed[s] = str(e)[:120]
+                    continue
+                if out is not None:
+                    ok.append(out)
+            if on_batch_done is not None and ok:
+                on_batch_done(ok)
+            return {"ok": ok, "ok_count": len(ok), "failed": failed}
+
+    monkeypatch.setattr(ms, "BackfillPool",
+                        lambda workers=None,
+                        source_factory=None: _RoundPool(source_factory=_Src))
+    monkeypatch.setattr(ms, "_write_minute_partition",
+                        lambda df, root, day=None: df.height)
     from datetime import date as _d
     res = ms.sync_etf_minute(_d(2026, 8, 20))
     assert calls["n"] == 2, "失败标的应被重试"
@@ -278,8 +333,24 @@ def test_sync_stock_minute_retry_round(monkeypatch):
     from app.services import mootdx_service as ms
     calls = {"n": 0}
 
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.XSHG"])
+    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    monkeypatch.setattr(ms, "_flush_stock_minute_chunk", lambda chunk: None)
+    monkeypatch.setattr(ms, "_guarded_get_minute",
+                        lambda src, sym, max_bars=40000, since=None:
+                        src.get_minute(sym, max_bars=max_bars))
+    # manifest 隔离：断点记账不得污染真实 backfill_state.json
+    import tempfile as _tf
+    import pathlib as _pl
+    monkeypatch.setattr(ms, "MANIFEST_PATH",
+                        _pl.Path(_tf.mkdtemp()) / "backfill_state.json")
+
     class _Src:
-        def get_minute(self, sym, max_bars=40000):
+        def get_minute(self, sym, max_bars=40000, since=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise TimeoutError("down")
@@ -290,17 +361,31 @@ def test_sync_stock_minute_retry_round(monkeypatch):
             out.index.name = "datetime"
             return out
 
-    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.XSHG"])
-    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
-    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda: [])
-    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
-    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
-    monkeypatch.setattr(ms, "_market_closed", lambda: True)
-    monkeypatch.setattr(ms, "_flush_stock_minute_chunk", lambda chunk: None)
-    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
-    monkeypatch.setattr(ms, "_guarded_get_minute",
-                        lambda src, sym, max_bars=40000: src.get_minute(sym, max_bars=max_bars))
-    monkeypatch.setattr(ms, "MootdxSource", _Src)
+    from tests.quant.test_sync_stock_minute_pool import _StubPool
+
+    class _RoundPool:
+        def __init__(self, workers=None, source_factory=None):
+            self._factory = source_factory or (lambda: _Src())
+
+        def map(self, fn, symbols, batch_size=100,
+                on_batch_done=None, keep_frames=True):
+            ok, failed = [], {}
+            src = self._factory()
+            for s in symbols:
+                try:
+                    out = fn(src, s)
+                except Exception as e:  # noqa: BLE001
+                    failed[s] = str(e)[:120]
+                    continue
+                if out is not None:
+                    ok.append(out)
+            if on_batch_done is not None and ok:
+                on_batch_done(ok)
+            return {"ok": ok, "ok_count": len(ok), "failed": failed}
+
+    monkeypatch.setattr(ms, "BackfillPool",
+                        lambda workers=None,
+                        source_factory=None: _RoundPool(source_factory=_Src))
     res = ms.sync_stock_minute(limit=None)
     assert calls["n"] == 2, "失败标的应被重试"
     assert res["rows"] == 2 and res["query_failed"] == []

@@ -1,12 +1,17 @@
 """mootdx (通达信) 数据源实现。"""
 
+import datetime as _dt_mod
+import logging
 import socket
+import time
 
 import pandas as pd
 from mootdx.quotes import Quotes
 from mootdx.utils import get_stock_market
 
 from .base import DataSource, DataSourceError
+
+logger = logging.getLogger(__name__)
 
 
 def _to_symbol(code):
@@ -60,6 +65,19 @@ _TDX_SOCKET_READ_TIMEOUT = 10.0
 _TDX_FETCH_GUARD_TIMEOUT = len(_TDX_SERVERS) * _TDX_SOCKET_READ_TIMEOUT + 30.0
 
 
+def _weekday_days(since, today):
+    """[since, today] 两端含的工作日数（分页初始估算用；日历误差由循环终止条件兜底）。"""
+    if today < since:
+        return 0
+    days = 0
+    d = since
+    while d <= today:
+        if d.weekday() < 5:
+            days += 1
+        d += _dt_mod.timedelta(days=1)
+    return days
+
+
 def _probe(ip, port, timeout=2.0):
     """TCP 握手探测，判断服务器是否可达。"""
     try:
@@ -102,12 +120,16 @@ _STOCK_NAMES_CACHE = None
 class MootdxSource(DataSource):
     name = "mootdx"
 
-    def __init__(self, token=""):
+    def __init__(self, token="", server=None):
         self._client = None
-        self._server_idx = -1  # 当前使用的 _TDX_SERVERS 下标（-1=尚未显式选定）
+        self._server_idx = -1  # 当前使用的排名列表下标（-1=尚未显式选定）
+        self._pinned_server = server   # 显式指定则不参与自动排名
         # xdxr 除权除息记录进程内缓存（code -> rows/None）：除权信息在回测
         # 期间不变，避免同一标的重复网络往返；查询失败缓存 None（保持 raw）
         self._xdxr_cache = {}
+        # 运行时健康统计：滚动页延迟窗口 + 连续空响应连击（note_page 喂入）
+        self._page_latencies: list[float] = []
+        self._empty_streak = 0
 
     def _api(self):
         if self._client is None:
@@ -117,7 +139,8 @@ class MootdxSource(DataSource):
     def _make_client(self, server=None):
         """创建 mootdx 客户端并用 pytdx 替换底层 tdxpy（tdxpy 0.2.7 协议不兼容）。
 
-        顺序：1) 显式 _TDX_SERVERS 探测 → 2) 裸 factory 兜底。
+        顺序：1) 显式指定/固定服务器 → 2) rank_servers() 实测延迟排名序探测
+        （排名为空时回退裸 _TDX_SERVERS 列表）→ 3) 裸 factory 兜底。
         返回 StdQuotes 实例（client.client 已替换为 pytdx.TdxHq_API）。
         """
         import pytdx.hq as _pytdx_hq
@@ -136,8 +159,10 @@ class MootdxSource(DataSource):
                 pass
             return quotes_client
 
-        # 1) 显式列表探测
-        servers = [server] if server else _TDX_SERVERS
+        # 1) 显式指定/固定服务器优先；否则按实测延迟排名顺序探测
+        target = server if server else self._pinned_server
+        servers = [target] if target else (
+            [tuple(x) for x in rank_servers()] or list(_TDX_SERVERS))
         for ip, port in servers:
             if not _probe(ip, port):
                 continue
@@ -160,18 +185,19 @@ class MootdxSource(DataSource):
     def _rotate_server(self, to_bestip=False):
         """换服务器重建客户端（运行时取数超时/失败兜底）。
 
-        按 _TDX_SERVERS 顺序轮换，每次都用 pytdx 替换底层 tdxpy。
-        列表用尽时**回绕到 -1**（下次取数从首个可达服务器重新探测），
-        而不是停在末位 —— 否则批量取数时一次"全服务器超时"会让后续所有
-        请求都钉在坏服务器上快速失败（实测 1660 只批量同步 921 只失败）。
-        返回新客户端；全部失败返回 None。
+        按 rank_servers() 实测延迟排名顺序轮换（排名为空回退裸列表），每次都
+        用 pytdx 替换底层 tdxpy。列表用尽时**回绕到 -1**（下次取数从首个可达
+        服务器重新探测），而不是停在末位 —— 否则批量取数时一次"全服务器超时"
+        会让后续所有请求都钉在坏服务器上快速失败（实测 1660 只批量同步 921 只
+        失败）。返回新客户端；全部失败返回 None。
         """
+        ranked = [tuple(x) for x in rank_servers()] or list(_TDX_SERVERS)
         self._server_idx += 1
-        if self._server_idx >= len(_TDX_SERVERS):
+        if self._server_idx >= len(ranked):
             self._server_idx = -1  # 回绕：下次从首地址重新探测
             self._client = None    # 同时丢弃坏客户端，_api() 将重建探测
             return None
-        ip, port = _TDX_SERVERS[self._server_idx]
+        ip, port = ranked[self._server_idx]
         if not _probe(ip, port):
             return self._rotate_server(to_bestip)
         try:
@@ -179,6 +205,42 @@ class MootdxSource(DataSource):
             return self._client
         except Exception:
             return self._rotate_server(to_bestip)
+
+    # ---- 运行时健康统计 + 降级切换（get_minute 分页循环每页喂入）----
+
+    _PAGE_LAT_WINDOW = 8          # 滚动窗口页数
+    _PAGE_SLOW_MS = 800.0         # 健康值 ~55ms 的 ~15 倍即判劣化
+    _EMPTY_STREAK_LIMIT = 3       # 连续空响应次数阈值
+
+    def note_page(self, latency_ms: float, empty: bool) -> None:
+        """分页循环每页调用：记录延迟与空响应连击。"""
+        self._page_latencies.append(latency_ms)
+        self._page_latencies = self._page_latencies[-self._PAGE_LAT_WINDOW:]
+        self._empty_streak = self._empty_streak + 1 if empty else 0
+
+    def unhealthy(self) -> bool:
+        """最近 8 页均速 >800ms 或连续 ≥3 次空响应 → 应切换服务器。"""
+        if self._empty_streak >= self._EMPTY_STREAK_LIMIT:
+            return True
+        if len(self._page_latencies) >= self._PAGE_LAT_WINDOW:
+            avg = sum(self._page_latencies) / len(self._page_latencies)
+            return avg > self._PAGE_SLOW_MS
+        return False
+
+    def rotate_if_unhealthy(self) -> bool:
+        """不健康则按排名重建连接；返回是否发生了切换。"""
+        if not self.unhealthy():
+            return False
+        logger.warning("mootdx 服务器劣化(均速%.0fms/空%d)，切换",
+                       sum(self._page_latencies) / max(1, len(self._page_latencies)),
+                       self._empty_streak)
+        self._page_latencies = []
+        self._empty_streak = 0
+        try:
+            self._rotate_server()
+        except Exception:  # noqa: BLE001
+            self._client = None
+        return True
 
     def _with_server_retry(self, fn, empty_ok=False):
         """执行取数 ``fn``，超时/返回空时按 _TDX_SERVERS 轮询换服务器重试。
@@ -325,12 +387,12 @@ class MootdxSource(DataSource):
         df.attrs["adj"] = "qfq"
         return df
 
-    def get_minute(self, code, date="", max_bars=30000):
-        """历史 1 分钟 K 线：mootdx 单次最多约 800 根，按 ``start`` 分页回看。
+    def get_minute(self, code, date="", max_bars=30000, since: _dt_mod.date | None = None):
+        """历史 1 分钟 K 线分页拉取。
 
-        ``max_bars`` 上限防止对"无数据/长期停牌"标的空转 400 页（每页一次
-        阻塞式 socket 调用，单只可卡数分钟）；达到上限即停止分页。
-        取数超时/返回空时自动按 _TDX_SERVERS 轮询换服务器重试。
+        ``since`` 给定时只回看到覆盖 [since, today]：按工作日×240÷800 估算
+        初始页数上限，并在累计帧最老 bar ≤ since 时提前停止（节假日/停牌
+        导致估算偏少时由该精确条件兜底）。None = 全量（首次初始化用）。
         """
         sym = _to_symbol(code)
         box = {}
@@ -348,21 +410,55 @@ class MootdxSource(DataSource):
         c = box.get("c")
         frames = [first]
         fetched = len(first)
+        oldest_seen = first.index.min()
         start = 800
         offset = 800
-        for _ in range(399):
+        if since is not None:
+            # est_pages 为总页数（含循环外已取的首页）；严格早于 since 再停，
+            # 停在 since 当天会丢该日更早的 bar（短页/半日）
+            est_pages = -((_weekday_days(since, _dt_mod.date.today()) * 240)
+                          // -800) + 2
+            max_pages = max(1, min(int(max_bars // offset), est_pages))
+        else:
+            max_pages = int(max_bars // offset)
+        for _ in range(min(399, max_pages - 1)):
             if fetched >= max_bars:
                 break
+            if since is not None and pd.Timestamp(oldest_seen).date() < since:
+                break
+            t0 = time.perf_counter()
             try:
                 df = c.bars(symbol=sym, frequency=8, start=start, offset=offset)
             except Exception:
                 break
+            self.note_page((time.perf_counter() - t0) * 1000,
+                           df is None or df.empty)
+            if self.rotate_if_unhealthy():
+                c = self._api()   # 已切新服务器，继续同一 start 分页
             if df is None or df.empty:
                 break
+            if len(df) < offset:
+                # 短页二义性：历史尽头 OR 限速截断。补发一页验证：
+                probe = None
+                try:
+                    probe = c.bars(symbol=sym, frequency=8,
+                                   start=start + len(df), offset=offset)
+                except Exception:
+                    probe = None
+                if probe is not None and not probe.empty:
+                    # 截断：探测页有数据 → 继续拉（丢掉的老段由后续分页覆盖）
+                    frames.append(df)
+                    frames.append(probe)
+                    fetched += len(df) + len(probe)
+                    oldest_seen = min(oldest_seen, probe.index.min())
+                    start += len(df) + len(probe)
+                    continue
+                frames.append(df)
+                fetched += len(df)
+                break  # 真·历史尽头
             frames.append(df)
             fetched += len(df)
-            if len(df) < offset:
-                break
+            oldest_seen = min(oldest_seen, df.index.min())
             start += offset
         if not frames:
             raise DataSourceError("mootdx 无分钟数据")
@@ -524,3 +620,60 @@ def probe_servers(timeout: float = 1.5) -> list[dict]:
 
     with ThreadPoolExecutor(max_workers=len(_TDX_SERVERS)) as ex:
         return list(ex.map(_one, _TDX_SERVERS))
+
+
+# ---- 实测延迟服务器排名（选服依据，进程级 TTL 缓存）----
+# 背景：TCP 可达 ≠ 服务质量好。实测列表位次 #1 每页 1529ms 而 #6 仅 53ms，
+# 且 16 台中 9 台对有效标的返回空响应——裸列表顺序选服会长期钉在劣质节点。
+_RANK_TTL = 1800.0
+_RANK_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+def _measure_server(ip, port, timeout=5.0):
+    """对服务器发一次真实日线请求：(延迟 ms, 行数)。失败返回 (inf, 0)。"""
+    import time as _t
+    from pytdx.hq import TdxHq_API
+    api = TdxHq_API()
+    try:
+        t0 = _t.perf_counter()
+        if not api.connect(ip, port, time_out=timeout):
+            return float("inf"), 0
+        df = api.get_security_bars(9, 1, "600519", 0, 10)
+        dt_ms = (_t.perf_counter() - t0) * 1000
+        rows = 0 if df is None else len(df)
+        return dt_ms, rows
+    except Exception:
+        return float("inf"), 0
+    finally:
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+
+
+def _rank_servers_uncached():
+    probes = {p["ip"]: p for p in probe_servers()}
+    scored = []
+    for ip, port in _TDX_SERVERS:
+        p = probes.get(ip)
+        if not p or not p.get("ok"):
+            continue
+        lat_ms, rows = _measure_server(ip, port)
+        if rows == 0:
+            lat_ms += 10_000.0  # 空响应节点沉底（不硬黑名单：空可能瞬时）
+        scored.append((lat_ms, ip, port))
+    scored.sort()
+    return [(ip, port) for _, ip, port in scored]
+
+
+def rank_servers(force: bool = False) -> list[tuple[str, int]]:
+    """按实测请求延迟的服务器排名（进程级缓存 TTL 30min）。"""
+    import time as _t
+    now = _t.monotonic()
+    if not force and _RANK_CACHE["data"] and now - _RANK_CACHE["ts"] < _RANK_TTL:
+        return list(_RANK_CACHE["data"])
+    data = _rank_servers_uncached()
+    if data:
+        _RANK_CACHE["ts"] = now
+        _RANK_CACHE["data"] = list(data)
+    return list(data)
