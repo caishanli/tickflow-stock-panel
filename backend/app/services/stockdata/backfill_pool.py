@@ -97,7 +97,10 @@ class BackfillPool:
                     if keep_frames:
                         results.append(out)
                     ok_count += 1
-                    batch.append(out)
+                    # 仅在确有回调时攒批：否则 keep_frames=False 下 batch
+                    # 会全程驻留帧（潜在 OOM 脚枪，评审复审指出）
+                    if on_batch_done is not None:
+                        batch.append(out)
                 if on_batch_done is not None and len(batch) >= batch_size:
                     on_batch_done(batch)
                     batch = []
