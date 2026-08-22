@@ -228,6 +228,12 @@ export function QuantSim() {
           onNew={() => setDialog(true)}
           onOpen={openDetail}
           onDelete={(id) => { if (window.confirm('确定删除该模拟账户？此操作不可恢复。')) deleteMut.mutate(id) }}
+          onDeleteMany={(ids) => {
+            if (!window.confirm(`确定删除选中的 ${ids.length} 个模拟账户？此操作不可恢复。`)) return
+            Promise.all(ids.map(id => api.deleteAccount(id)))
+              .then(() => invalidate())
+              .catch((e: any) => toast(errDetail(e), 'error'))
+          }}
         />
       ) : (
         <SimDetail
@@ -250,20 +256,58 @@ export function QuantSim() {
 // 列表视图
 // ---------------------------------------------------------------------------
 
-function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
+function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany }: {
   accounts: any[]
   strategyName: (id: string) => string
   onNew: () => void
   onOpen: (id: string) => void
   onDelete: (id: string) => void
+  onDeleteMany: (ids: string[]) => void
 }) {
+  const [selectMode, setSelectMode] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const ids = accounts.map(a => a.id)
+  const allSelected = ids.length > 0 && ids.every(id => selected.has(id))
+  const toggle = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+  const toggleAll = () => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (allSelected) ids.forEach(id => next.delete(id))
+      else ids.forEach(id => next.add(id))
+      return next
+    })
+  }
+  const switchSelectMode = () => {
+    setSelectMode(v => {
+      if (v) setSelected(new Set())
+      return !v
+    })
+  }
   return (
     <div className="flex-1 overflow-auto p-4 space-y-3">
-      <div className="flex items-center">
+      <div className="flex items-center gap-2">
         <button onClick={onNew}
           className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent text-white text-xs">
           <Plus size={14} />新建模拟
         </button>
+        {accounts.length > 0 && (
+          <button onClick={switchSelectMode}
+            className={`inline-flex items-center px-3 h-9 rounded-lg border text-xs transition-colors ${selectMode ? 'border-accent/50 text-accent bg-accent/10' : 'border-border text-secondary hover:text-foreground'}`}>
+            {selectMode ? '退出管理' : '批量管理'}
+          </button>
+        )}
+        {selected.size > 0 && (
+          <button onClick={() => onDeleteMany([...selected])}
+            className="inline-flex items-center gap-1.5 h-9 px-3 rounded-btn bg-danger/15 text-danger text-xs font-medium hover:bg-danger/25 transition-colors">
+            <Trash2 className="h-3.5 w-3.5" />删除选中({selected.size})
+          </button>
+        )}
       </div>
       {accounts.length === 0 ? (
         <EmptyState title="暂无模拟账户" hint="点击左上角「新建模拟」创建一个" />
@@ -274,6 +318,12 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
             <thead className="text-muted border-b border-border">
               <tr className="text-left">
                 <th className="px-3 py-2.5 font-normal w-10">#</th>
+                {selectMode && (
+                  <th className="px-3 py-2.5 w-8 text-center">
+                    <input type="checkbox" checked={allSelected} onChange={toggleAll}
+                      className="accent-accent cursor-pointer align-middle" />
+                  </th>
+                )}
                 <th className="px-3 py-2.5 font-normal">编号</th>
                 <th className="px-3 py-2.5 font-normal">名称</th>
                 <th className="px-3 py-2.5 font-normal">策略</th>
@@ -293,6 +343,12 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
                   <tr key={a.id}
                     className="border-t border-border/60 hover:bg-elevated/60">
                     <td className="px-3 py-2.5 text-muted">{i + 1}</td>
+                    {selectMode && (
+                      <td className="px-3 py-2.5 text-center">
+                        <input type="checkbox" checked={selected.has(a.id)} onChange={() => toggle(a.id)}
+                          className="accent-accent cursor-pointer align-middle" />
+                      </td>
+                    )}
                     <td className="px-3 py-2.5 text-muted font-mono" onClick={(e) => {
                       const target = e.target as HTMLElement
                       if (target.closest('.copy-id')) return
@@ -339,7 +395,7 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
             </table>
         </div>
 
-        {/* 移动端卡片布局：名称在上，其余信息纵向排列 */}
+        {/* 移动端卡片布局：名称+编号在上，净值/收益率横向排列 */}
         <div className="md:hidden space-y-2">
           {accounts.map((a: any) => {
             const ret = typeof a.net_value === 'number' && a.capital
@@ -347,45 +403,50 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete }: {
             return (
               <div key={a.id} onClick={() => onOpen(a.id)}
                 className="rounded-card border border-border bg-surface p-3 cursor-pointer transition-colors hover:bg-elevated/60">
-                <div className="flex items-center gap-2">
-                  <span className="flex-1 min-w-0 truncate text-sm font-medium text-foreground">{a.name}</span>
+                <div className="flex items-center gap-2 min-w-0">
+                  {selectMode && (
+                    <input type="checkbox" checked={selected.has(a.id)} onChange={() => toggle(a.id)}
+                      onClick={e => e.stopPropagation()}
+                      className="accent-accent cursor-pointer align-middle shrink-0" />
+                  )}
+                  <div className="flex items-baseline gap-1.5 flex-1 min-w-0">
+                    <span className="min-w-0 truncate text-sm font-medium text-foreground">{a.name}</span>
+                    <span className="copy-id shrink-0 font-mono text-[11px] text-muted cursor-pointer hover:text-accent transition-colors"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        const ta = document.createElement('textarea')
+                        ta.value = a.id
+                        ta.style.position = 'fixed'
+                        ta.style.left = '-9999px'
+                        document.body.appendChild(ta)
+                        ta.select()
+                        try { document.execCommand('copy'); toast('已复制', 'success', 'top') }
+                        catch { toast('复制失败', 'error') }
+                        document.body.removeChild(ta)
+                      }}>
+                      {a.id}
+                    </span>
+                  </div>
                   <button onClick={(e) => { e.stopPropagation(); if (window.confirm(`确定删除「${a.name}」？`)) onDelete(a.id) }}
-                    className="p-1 rounded hover:bg-bear/10 text-muted hover:text-bear transition-colors shrink-0"
+                    className="ml-2 p-1 rounded hover:bg-bear/10 text-muted hover:text-bear transition-colors shrink-0"
                     title="删除">
                     <Trash2 size={13} />
                   </button>
                 </div>
-                <div className="mt-1.5 font-mono text-[11px] text-muted">
-                  <span className="copy-id inline-flex items-center gap-1 cursor-pointer hover:text-accent transition-colors"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      const ta = document.createElement('textarea')
-                      ta.value = a.id
-                      ta.style.position = 'fixed'
-                      ta.style.left = '-9999px'
-                      document.body.appendChild(ta)
-                      ta.select()
-                      try { document.execCommand('copy'); toast('已复制', 'success', 'top') }
-                      catch { toast('复制失败', 'error') }
-                      document.body.removeChild(ta)
-                    }}>
-                    {a.id}
-                  </span>
-                </div>
                 <div className="mt-1 text-[11px] text-muted flex flex-wrap gap-x-2 gap-y-0.5">
                   <span>{strategyName(a.strategy_id)}</span>
                   <span>{FREQ_LABEL[a.frequency] ?? a.frequency ?? '分钟级'}</span>
-                  <span className={statusTone(a.status)}>{STATUS_LABEL[a.status] ?? a.status}</span>
                   {a.start_date && <span>{a.start_date}</span>}
+                  <span className={statusTone(a.status)}>{STATUS_LABEL[a.status] ?? a.status}</span>
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2">
-                  <div>
-                    <div className="text-[10px] text-muted">净值</div>
-                    <div className="text-xs num font-medium">{fmtNum(a.net_value)}</div>
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-[10px] text-muted shrink-0">净值</span>
+                    <span className="text-xs num font-medium">{fmtNum(a.net_value)}</span>
                   </div>
-                  <div>
-                    <div className="text-[10px] text-muted">收益率</div>
-                    <div className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</div>
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-[10px] text-muted shrink-0">收益率</span>
+                    <span className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</span>
                   </div>
                 </div>
               </div>
