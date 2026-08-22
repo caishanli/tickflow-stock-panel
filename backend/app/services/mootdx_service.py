@@ -25,6 +25,7 @@ import polars as pl
 
 from app.quant.jqengine.datasource.manager import DataManager
 from app.quant.jqengine.datasource.mootdx_src import MootdxSource
+from app.services.stockdata.backfill_pool import BackfillPool
 
 logger = logging.getLogger("app.services.mootdx_service")
 
@@ -118,19 +119,6 @@ def _manifest_done(dataset: str) -> set[str]:
     return set(_manifest_load().get(dataset, {}).get("done") or [])
 
 
-# 后台回源节流：客户端请求优先占用 mootdx socket/CPU，backfill 每取 N 个 symbol
-# 主动 sleep 一小段让出资源。默认开启（每 5 个 symbol 睡 0.2s），环境变量可调。
-_BACKFILL_THROTTLE_EVERY = int(os.getenv("BACKFILL_THROTTLE_EVERY", "5"))
-_BACKFILL_THROTTLE_SLEEP = float(os.getenv("BACKFILL_THROTTLE_SLEEP", "0.2"))
-# 盘中让路降速（A 股交易时段）：服务器侧连接/频率配额是共享瓶颈，历史回源
-# 密集请求会把实时拉取挤到 30s 墙钟超时（08-13 盘中回源致活跃 ETF 分钟取数
-# 失败被误判停牌）。盘中每 1 个 symbol 睡 1s（约 1 req/s），把配额让给实时
-# 16-worker 共享池；收盘后恢复原节奏。环境变量可调（BACKFILL_INTRADAY_EVERY=0
-# 完全禁流，等价旧行为）。
-_BACKFILL_INTRADAY_EVERY = int(os.getenv("BACKFILL_INTRADAY_EVERY", "1"))
-_BACKFILL_INTRADAY_SLEEP = float(os.getenv("BACKFILL_INTRADAY_SLEEP", "1.0"))
-
-
 def _is_market_open(now: _dt.datetime | None = None) -> bool:
     """A 股交易时段判定（口径同 stockdata.sources._in_trading）。"""
     now = now or _dt.datetime.now()
@@ -140,27 +128,37 @@ def _is_market_open(now: _dt.datetime | None = None) -> bool:
                  or _dt.time(13, 0) <= t <= _dt.time(15, 0)))
 
 
-def _throttle_backfill(i: int) -> None:
-    """后台回源节流：每 ``_BACKFILL_THROTTLE_EVERY`` 个 symbol 后 sleep 一小段。
+# 进度日志间隔（秒）：时间驱动替代按只数打点——服务器劣化时单只可达 190s，
+# 按 25 只打点会出现 68 分钟零输出黑洞（08-21 Run B），无法区分卡死与正常。
+_PROGRESS_LOG_INTERVAL_S = 60.0
 
-    ``i`` 为当前循环序号（0-based）。``sleep`` 主动释放 GIL 与 mootdx socket
-    占用，给客户端实时请求让路（客户端走共享线程池，不受本函数影响）。
-    仅在后台回源路径调用（sync_daily/sync_index_daily/sync_stock_minute/…）。
 
-    盘中（交易时段）使用独立的降速参数：mootdx 服务器对每 IP 的连接/请求
-    频率有限制，历史回源密集请求会把实时拉取挤到墙钟超时（08-13 13:55 事故
-    根因），盘中每只 symbol 睡 ``_BACKFILL_INTRADAY_SLEEP`` 秒让出配额。
+def _mk_progress_logger(total: int, label: str):
+    """时间驱动的进度日志器：每 60s 打一条（处理数/速率/ETA）。
+
+    返回 ``tick(done_now, current="")``；内部按首次调用计时。速率/ETA 基于
+    首次 tick 以来的平均值，供长回源全程可观测。
     """
-    if _is_market_open():
-        if _BACKFILL_INTRADAY_EVERY <= 0:
+    state = {"t0": None, "last": None, "n": 0}
+
+    def tick(done_now: int, current: str = "") -> None:
+        now = time.time()
+        if state["t0"] is None:
+            state["t0"] = now
+            state["last"] = now
+            state["n"] = done_now
             return
-        if (i + 1) % _BACKFILL_INTRADAY_EVERY == 0:
-            time.sleep(_BACKFILL_INTRADAY_SLEEP)
-        return
-    if _BACKFILL_THROTTLE_EVERY <= 0:
-        return
-    if (i + 1) % _BACKFILL_THROTTLE_EVERY == 0:
-        time.sleep(_BACKFILL_THROTTLE_SLEEP)
+        state["n"] = done_now
+        if now - state["last"] < _PROGRESS_LOG_INTERVAL_S:
+            return
+        state["last"] = now
+        elapsed = max(1e-9, now - state["t0"])
+        rate = done_now / elapsed
+        eta = (total - done_now) / rate if rate > 0 else 0.0
+        logger.info("%s 进度 %d/%d（当前 %s）速率 %.1f只/s ETA %.0fmin",
+                    label, done_now, total, current, rate, eta / 60)
+
+    return tick
 
 
 def _to_tf_symbol(code: str) -> str:
@@ -206,7 +204,6 @@ def sync_etf_minute(day: _date | None = None) -> int:
     historical = (day < _date.today() - _dt.timedelta(days=5))
     frames = []
     for i, jq in enumerate(codes):
-        _throttle_backfill(i)
         try:
             if historical:
                 df = src.get_minute(jq, max_bars=40000)
@@ -513,10 +510,10 @@ def sync_stock_minute(limit: int | None = None) -> int:
     分块批量写：避免每只股票逐分区读-改-写（5205 只 × 84 分区 IO 巨大），
     批量合并把写盘次数降一个量级。返回写入行数。
 
-    注意：全市场 ~5200 只 × 3 个月历史约 1.5-2 小时，建议后台线程调用；
-    调度场景传 ``limit`` 分批慢跑。
+    取数经 :class:`BackfillPool` 并发（每线程独立连接，见模块说明），
+    ``since`` 按需分页把单只页数从 ~29 页降到覆盖起点所需的最少页数。
+    全量初始化（4/1 起全历史）仍属长任务，manifest 断点续传兜底重启。
     """
-    src = MootdxSource()
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
@@ -531,7 +528,6 @@ def sync_stock_minute(limit: int | None = None) -> int:
         range_rows = sync_stock_minute_range(missing_days)
         logger.info("mootdx_service: 股票分钟补齐缺失交易日 %s 共 %d 行",
                     [d.isoformat() for d in missing_days], range_rows)
-        src = MootdxSource()  # 长批后重建连接
     # 残片自愈: 回源中断会留下中间分区 symbol 数严重不足的残片(如 08-12 凌晨
     # pytdx 崩溃留下 3640/5208), resume 只按最新分区判断会永久跳过这些日子。
     # 先补残片日缺失的 symbol, 再做正常增量回源。
@@ -542,8 +538,8 @@ def sync_stock_minute(limit: int | None = None) -> int:
         fragment_rows += n
         logger.info("mootdx_service: 分钟残片日 %s 补齐 %d 行 (%d 只)",
                     day, n, len(missing))
-    # resume：收集已落盘的 symbol，跳过（中断后续跑不重拉）
-    done_syms = _existing_minute_symbols()
+    # resume：收集已落盘的 symbol + manifest 断点，跳过（中断后续跑不重拉）
+    done_syms = _existing_minute_symbols() | _manifest_done("stock_minute")
     todo = [s for s in stocks if s not in done_syms]
     if not todo:
         logger.info("mootdx_service: 股票分钟已全部覆盖（%d 只），无需回源", len(done_syms))
@@ -563,37 +559,38 @@ def sync_stock_minute(limit: int | None = None) -> int:
         logger.info("mootdx_service: 跳过 %d 只退市/异常标的（上市日期占位）: %s",
                     len(pre_delisted), pre_delisted[:10])
         todo = [s for s in todo if s not in set(pre_delisted)]
+    if not todo:
+        return range_rows + fragment_rows
+    _manifest_reset("stock_minute", todo,
+                    mode="full" if limit is None else "recent")
     logger.info("mootdx_service: 股票分钟回源 %d/%d（跳过已覆盖 %d）",
                 len(todo), len(stocks), len(done_syms))
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-    total = 0
-    chunk: list[pl.DataFrame] = []
-    _t0 = time.time()
-    for i, sym in enumerate(todo):
-        _throttle_backfill(i)
-        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
-            logger.info("mootdx_service: 股票分钟回源进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
-                        i + 1, len(todo), sym, total, time.time() - _t0)
+    tick = _mk_progress_logger(len(todo), "股票分钟回源")
+    counter = {"n": 0}
+    pending: list[pl.DataFrame] = []
+
+    def _fetch_one(src, sym):
+        counter["n"] += 1
+        tick(counter["n"], sym)
         # 回源起点 = max(全局起点, 该股上市日)；新股上市前无数据，不提前拉
         sym_start = STOCK_MINUTE_START
         ld = listing.get(sym)
         if ld is not None and ld > sym_start:
             sym_start = ld
         try:
-            df = _guarded_get_minute(src, sym, max_bars=40000)
+            df = _guarded_get_minute(src, sym, max_bars=40000, since=sym_start)
         except TimeoutError:
-            # 超时：坏连接状态，整个重建 src（避免坏 socket/server 索引残留）
-            src = MootdxSource()
+            # 超时：pool 已重建该 worker source（坏 socket 不残留）
             _append_failure(sym, "timeout")
-            continue
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
-            continue
+            return None
         if df is None or df.empty:
             _append_failure(sym, "empty")
-            continue
+            return None
         df = df.copy()
         df["symbol"] = sym
         df = df.reset_index()
@@ -602,30 +599,41 @@ def sync_stock_minute(limit: int | None = None) -> int:
                 df[c] = None
         df = df[keep]
         df = df[pd.to_datetime(df["datetime"]).dt.date >= sym_start]
-        # 盘中排除今天的半程 bar：get_minute 全量历史含今天盘中数据，写入
-        # date=today 分区即污染（且会让 resume 误判"最新分区已覆盖"而跳过
-        # 今天完整回源）。与 _missing_stock_minute_days 的盘中约定一致；
-        # 收盘后今天整日数据可正常落盘。
+        # 盘中排除今天的半程 bar：get_minute 历史含今天盘中数据，写入
+        # date=today 分区即污染。与 _missing_stock_minute_days 的盘中约定一致。
         if not _market_closed():
             df = df[pd.to_datetime(df["datetime"]).dt.date < _date.today()]
         if df.empty:
             _append_failure(sym, f"no_data_since_{sym_start}")
-            continue
+            return None
         sub = pl.from_pandas(df)
         sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
-        chunk.append(sub)
-        total += sub.height
-        if len(chunk) >= _STOCK_MINUTE_BATCH:
-            _flush_stock_minute_chunk(chunk)
-            chunk = []
-            logger.info("mootdx_service: 股票分钟 %d/%d 处理, 累计 %d 行",
-                        i + 1, len(todo), total)
-            # 每批换新连接：彻底刷新 socket/server 状态，防长批连接劣化
-            src = MootdxSource()
-    if chunk:
-        _flush_stock_minute_chunk(chunk)
-    logger.info("mootdx_service: 股票分钟回源完成, 累计 %d 行", total)
+        return sub
+
+    def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
+        """主线程批回调：攒满一批统一写分区 + manifest 记账（单线程写盘）。"""
+        pending.extend(batch_frames)
+        if len(pending) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(pending.copy())
+            _manifest_mark_done("stock_minute",
+                                [f["symbol"][0] for f in pending])
+            pending.clear()
+
+    result = BackfillPool().map(_fetch_one, todo,
+                                batch_size=_STOCK_MINUTE_BATCH,
+                                on_batch_done=_on_batch)
+    if pending:
+        _flush_stock_minute_chunk(pending)
+        _manifest_mark_done("stock_minute", [f["symbol"][0] for f in pending])
+        pending.clear()
+    total = sum(f.height for f in result["ok"])
+    if result["failed"]:
+        logger.warning("mootdx_service: 股票分钟回源失败 %d 只: %s",
+                       len(result["failed"]),
+                       list(result["failed"].items())[:10])
+    logger.info("mootdx_service: 股票分钟回源完成 %d 行 (ok=%d failed=%d)",
+                total, len(result["ok"]), len(result["failed"]))
     return range_rows + total + fragment_rows
 
 
@@ -639,7 +647,6 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
     过滤到 ``day`` 后批量写分区（复用 ``_flush_stock_minute_chunk``）。
     返回写入行数。
     """
-    src = MootdxSource()
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
@@ -658,31 +665,28 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
                     len(pre_delisted), pre_delisted[:10])
         stocks = [s for s in stocks if s not in set(pre_delisted)]
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-    total = 0
-    chunk: list[pl.DataFrame] = []
-    _t0 = time.time()
-    for i, sym in enumerate(stocks):
-        _throttle_backfill(i)
-        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
-            logger.info("mootdx_service: 股票分钟按日回源 %s 进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
-                        day, i + 1, len(stocks), sym, total, time.time() - _t0)
+    tick = _mk_progress_logger(len(stocks), f"股票分钟按日回源 {day}")
+    counter = {"n": 0}
+    pending: list[pl.DataFrame] = []
+
+    def _fetch_one(src, sym):
+        counter["n"] += 1
+        tick(counter["n"], sym)
         ld = listing.get(sym)
         if ld is not None and ld > day:
-            continue  # 上市晚于目标日，该日无数据
+            return None  # 上市晚于目标日，该日无数据
         try:
-            df = _guarded_get_minute(src, sym, max_bars=40000)
+            df = _guarded_get_minute(src, sym, max_bars=40000, since=day)
         except TimeoutError:
-            src = MootdxSource()
             _append_failure(sym, "timeout")
-            continue
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
-            continue
+            return None
         if df is None or df.empty:
             _append_failure(sym, "empty")
-            continue
+            return None
         df = df.copy()
         df["symbol"] = sym
         df = df.reset_index()
@@ -692,19 +696,27 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
         df = df[keep]
         df = df[pd.to_datetime(df["datetime"]).dt.date == day]
         if df.empty:
-            continue  # 当日停牌/无 bar，跳过
+            return None  # 当日停牌/无 bar，跳过
         sub = pl.from_pandas(df)
         sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
-        chunk.append(sub)
-        total += sub.height
-        if len(chunk) >= _STOCK_MINUTE_BATCH:
-            _flush_stock_minute_chunk(chunk)
-            chunk = []
-            src = MootdxSource()
-    if chunk:
-        _flush_stock_minute_chunk(chunk)
-    logger.info("mootdx_service: 股票分钟按日回源 %s 完成, %d 行", day, total)
+        return sub
+
+    def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
+        pending.extend(batch_frames)
+        if len(pending) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(pending.copy())
+            pending.clear()
+
+    result = BackfillPool().map(_fetch_one, stocks,
+                                batch_size=_STOCK_MINUTE_BATCH,
+                                on_batch_done=_on_batch)
+    if pending:
+        _flush_stock_minute_chunk(pending)
+        pending.clear()
+    total = sum(f.height for f in result["ok"])
+    logger.info("mootdx_service: 股票分钟按日回源 %s 完成, %d 行 (failed=%d)",
+                day, total, len(result["failed"]))
     return total
 
 
@@ -720,7 +732,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     """
     day_set = set(days)
     window_end = max(days)
-    src = MootdxSource()
+    since_day = min(days)  # 只回看到最早缺失日（get_minute since 分页）
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
@@ -734,31 +746,29 @@ def sync_stock_minute_range(days: list[_date]) -> int:
                     len(pre_delisted), pre_delisted[:10])
         stocks = [s for s in stocks if s not in set(pre_delisted)]
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-    total = 0
-    chunk: list[pl.DataFrame] = []
-    _t0 = time.time()
-    for i, sym in enumerate(stocks):
-        _throttle_backfill(i)
-        if (i + 1) % _STOCK_MINUTE_PROGRESS_STEP == 0:
-            logger.info("mootdx_service: 股票分钟批量回源进度 %d/%d 只"
-                        "（当前 %s）, 累计 %d 行, 耗时 %.0fs",
-                        i + 1, len(stocks), sym, total, time.time() - _t0)
+    tick = _mk_progress_logger(len(stocks),
+                               f"股票分钟批量回源 {len(days)} 日")
+    counter = {"n": 0}
+    pending: list[pl.DataFrame] = []
+
+    def _fetch_one(src, sym):
+        counter["n"] += 1
+        tick(counter["n"], sym)
         ld = listing.get(sym)
         if ld is not None and ld > window_end:
-            continue  # 上市晚于整个缺失窗口，窗口内无数据
+            return None  # 上市晚于整个缺失窗口，窗口内无数据
         try:
-            df = _guarded_get_minute(src, sym, max_bars=40000)
+            df = _guarded_get_minute(src, sym, max_bars=40000, since=since_day)
         except TimeoutError:
-            src = MootdxSource()
             _append_failure(sym, "timeout")
-            continue
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
-            continue
+            return None
         if df is None or df.empty:
             _append_failure(sym, "empty")
-            continue
+            return None
         df = df.copy()
         df["symbol"] = sym
         df = df.reset_index()
@@ -768,19 +778,27 @@ def sync_stock_minute_range(days: list[_date]) -> int:
         df = df[keep]
         df = df[pd.to_datetime(df["datetime"]).dt.date.isin(day_set)]
         if df.empty:
-            continue  # 缺失窗口内无 bar，跳过
+            return None  # 缺失窗口内无 bar，跳过
         sub = pl.from_pandas(df)
         sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
-        chunk.append(sub)
-        total += sub.height
-        if len(chunk) >= _STOCK_MINUTE_BATCH:
-            _flush_stock_minute_chunk(chunk)
-            chunk = []
-            src = MootdxSource()
-    if chunk:
-        _flush_stock_minute_chunk(chunk)
-    logger.info("mootdx_service: 股票分钟批量回源 %d 个缺失日, %d 行", len(days), total)
+        return sub
+
+    def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
+        pending.extend(batch_frames)
+        if len(pending) >= _STOCK_MINUTE_BATCH:
+            _flush_stock_minute_chunk(pending.copy())
+            pending.clear()
+
+    result = BackfillPool().map(_fetch_one, stocks,
+                                batch_size=_STOCK_MINUTE_BATCH,
+                                on_batch_done=_on_batch)
+    if pending:
+        _flush_stock_minute_chunk(pending)
+        pending.clear()
+    total = sum(f.height for f in result["ok"])
+    logger.info("mootdx_service: 股票分钟批量回源 %d 个缺失日, %d 行 (failed=%d)",
+                len(days), total, len(result["failed"]))
     return total
 
 
@@ -1480,11 +1498,13 @@ def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
 
 
 def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
-                        timeout: float | None = None) -> pd.DataFrame | None:
+                        timeout: float | None = None,
+                        since=None) -> pd.DataFrame | None:
     """带墙钟超时的 mootdx 分钟取数，防长批回源时单只卡死整批。
 
-    ``get_minute`` 分页拉取（单只最多 50 页），正常 ~2s、慢标的 ~15s；服务器
-    劣化时底层 socket 可能永久挂起。这里外包线程守护，超时**抛异常**让调用方
+    ``get_minute`` 分页拉取（``since`` 给定时只回看到覆盖 [since, today]，
+    见 mootdx_src.get_minute），正常 ~2s、慢标的 ~15s；服务器劣化时底层
+    socket 可能永久挂起。这里外包线程守护，超时**抛异常**让调用方
     重建 MootdxSource（彻底刷新连接状态，避免坏 socket/坏 server 索引残留）。
 
     默认超时须覆盖内层 ``_with_server_retry`` 整轮服务器轮换的最坏耗时
@@ -1497,7 +1517,7 @@ def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
 
     def _run() -> None:
         try:
-            box["df"] = src.get_minute(sym, max_bars=max_bars)
+            box["df"] = src.get_minute(sym, max_bars=max_bars, since=since)
         except Exception as e:  # noqa: BLE001
             box["err"] = e
 
@@ -1544,7 +1564,6 @@ def sync_daily(day: _date) -> dict:
     def _fetch(syms: list[str]) -> pl.DataFrame | None:
         out_frames = []
         for i, sym in enumerate(syms):
-            _throttle_backfill(i)
             try:
                 df = _guarded_get_daily(src, sym, day_str, day_str)
             except Exception:
@@ -1662,7 +1681,6 @@ def sync_index_daily(day: _date) -> dict:
     day_str = day.strftime("%Y%m%d")
     frames: list[pl.DataFrame] = []
     for i, sym in enumerate(indices):
-        _throttle_backfill(i)
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
             if df is None or df.empty:
