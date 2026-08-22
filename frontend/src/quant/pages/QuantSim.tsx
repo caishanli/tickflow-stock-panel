@@ -863,17 +863,17 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         {posEntries.length > 0 ? (
           <div className="overflow-auto max-h-60">
             <table className="w-full text-xs">
-                <thead className="text-muted sticky top-0 bg-surface">
+                <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">买入时间</th>
-                    <th className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
-                    <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal">数量</th>
-                    <th className="px-3 py-1.5 font-normal">成本</th>
-                    <th className="px-3 py-1.5 font-normal">现价</th>
-                    <th className="px-3 py-1.5 font-normal">市值</th>
-                    <th className="px-3 py-1.5 font-normal">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal">收益率</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">买入时间</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">成本</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">现价</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">市值</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -945,18 +945,18 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           tradeList.length > 0 ? (
             <div className="overflow-auto max-h-64">
               <table className="w-full text-xs">
-                <thead className="text-muted sticky top-0 bg-surface">
+                <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
-                    <th className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
-                    <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal">持仓时长</th>
-                    <th className="px-3 py-1.5 font-normal">方向</th>
-                    <th className="px-3 py-1.5 font-normal">价格</th>
-                    <th className="px-3 py-1.5 font-normal">数量</th>
-                    <th className="px-3 py-1.5 font-normal">手续费</th>
-                    <th className="px-3 py-1.5 font-normal">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal">收益率</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">持仓时长</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">价格</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">手续费</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -1022,17 +1022,17 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           stoplossRows.length > 0 ? (
             <div className="overflow-auto max-h-64">
               <table className="w-full text-xs">
-                <thead className="text-muted sticky top-0 bg-surface">
+                <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
-                    <th className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
-                    <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal">方向</th>
-                    <th className="px-3 py-1.5 font-normal">价格</th>
-                    <th className="px-3 py-1.5 font-normal">数量</th>
-                    <th className="px-3 py-1.5 font-normal">手续费</th>
-                    <th className="px-3 py-1.5 font-normal">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal">收益率</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">价格</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">手续费</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
