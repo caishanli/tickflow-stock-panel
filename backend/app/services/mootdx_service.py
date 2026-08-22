@@ -855,7 +855,7 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
             result["errors"].append(f"daily {day}: {e}")
     for day in missing.get("kline_index_daily", []):
         try:
-            sync_index_daily(day)
+            _repair_index_day(day)
             result["index_daily_days"].append(str(day))
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"index_daily {day}: {e}")
@@ -961,7 +961,8 @@ def check_and_repair_day(day: _date) -> dict:
     for key, root, target, repair in [
         ("stock_daily", STOCK_DAILY_ROOT, set(stocks), lambda: sync_daily(day)),
         ("etf_daily", ETF_DAILY_ROOT, etf_tf, lambda: sync_daily(day)),
-        ("index_daily", INDEX_DAILY_ROOT, set(idx), lambda: sync_index_daily(day)),
+        ("index_daily", INDEX_DAILY_ROOT, set(idx),
+         lambda: _repair_index_day(day)),
         ("etf_minute", ETF_MINUTE_ROOT, etf_tf, lambda: sync_etf_minute(day)),
     ]:
         if not target:
@@ -1736,6 +1737,117 @@ def _missing_index_daily_days() -> list[_date]:
     return _missing_daily_days(INDEX_DAILY_ROOT)
 
 
+# ---------------------------------------------------------------------------
+# 指数日线相对基线检测 + 跨源补齐
+#
+# 背景（08-21 案例）：绝对覆盖率阈值(0.5)只能防灾难性残帧；当日分区 555/609
+# (91%) 通过全部校验，但比近 5 日基线 599 少 44 只——部分缺失需相对基线检测。
+# 且缺的 000xxx.SH 中证/国证系列 mootdx 不提供，须路由 TickFlow 源补齐。
+# ---------------------------------------------------------------------------
+
+_INDEX_SHORTFALL_LOOKBACK = 10
+_INDEX_SHORTFALL_RATIO = 0.95
+
+
+def _partition_symbol_sets(root: Path, lookback: int) -> list[tuple[Path, set]]:
+    """近 lookback 个分区的 (目录, symbol 集) 列表（按日期升序）。"""
+    days = sorted(root.glob("date=*"))[-lookback:]
+    out = []
+    for d in days:
+        p = d / "part.parquet"
+        if not p.exists():
+            continue
+        try:
+            syms = set(pl.read_parquet(p, columns=["symbol"])["symbol"].to_list())
+        except Exception:  # noqa: BLE001
+            continue
+        out.append((d, syms))
+    return out
+
+
+def _index_shortfall_days(
+    lookback: int = _INDEX_SHORTFALL_LOOKBACK,
+    ratio: float = _INDEX_SHORTFALL_RATIO,
+) -> dict[_date, list[str]]:
+    """相对基线检测：近 N 分区以最大 symbol 集为基线，返回显著低于基线的
+    {日期: 缺失清单}。
+
+    - 基线取窗口内最大集（退市/停牌类正常波动 ≤5% 由 ratio 容忍）；
+    - 当日盘中不判（半程数据不可作依据，与既有守卫同口径）；
+    - 分区 <3 个时无基线可比，返回空。
+    """
+    if not INDEX_DAILY_ROOT.is_dir():
+        return {}
+    sets_ = _partition_symbol_sets(INDEX_DAILY_ROOT, lookback)
+    if len(sets_) < 3:
+        return {}
+    base_syms = max((s for _, s in sets_), key=len)
+    if not base_syms:
+        return {}
+    today = _date.today()
+    out: dict[_date, list[str]] = {}
+    for d, syms in sets_:
+        day = _date.fromisoformat(d.name.removeprefix("date="))
+        if day == today and not _market_closed():
+            continue
+        missing = sorted(base_syms - syms)
+        if missing and len(syms) < len(base_syms) * ratio:
+            out[day] = missing
+    return out
+
+
+def _index_missing_vs_baseline(day: _date,
+                               lookback: int = _INDEX_SHORTFALL_LOOKBACK) -> list[str]:
+    """单日相对基线的缺失清单（基线不足时返回空=无法判定）。"""
+    sets_ = _partition_symbol_sets(INDEX_DAILY_ROOT, lookback)
+    base_syms = max((s for _, s in sets_), key=len) if sets_ else set()
+    if not base_syms:
+        return []
+    pdir = INDEX_DAILY_ROOT / f"date={day.isoformat()}" / "part.parquet"
+    if not pdir.exists():
+        return sorted(base_syms)
+    try:
+        syms = set(pl.read_parquet(pdir, columns=["symbol"])["symbol"].to_list())
+    except Exception:  # noqa: BLE001
+        return sorted(base_syms)
+    return sorted(base_syms - syms)
+
+
+def _cross_source_index_repair(day: _date, missing: list[str]) -> int:
+    """TickFlow 源补齐 mootdx 不提供的指数日K（仅缺口清单，按需拉取）。"""
+    from app.services.index_sync import sync_and_persist_index_daily
+    from app.tickflow.policy import detect_capabilities
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    store = DataStore()
+    repo = KlineRepository(store)
+    start = _dt.datetime.combine(day, _dt.time.min)
+    end = _dt.datetime.combine(day + _dt.timedelta(days=1), _dt.time.min)
+    return sync_and_persist_index_daily(
+        repo, detect_capabilities(),
+        start_date=start, end_date=end,
+        symbols_override=sorted(missing))
+
+
+def _repair_index_day(day: _date) -> dict:
+    """指数日线单日两级修复：先 mootdx（快、覆盖主指），复查基线缺口后
+    路由 TickFlow 源补齐 mootdx 不提供的系列。返回 {"mootdx":..., "cross":...}。
+    """
+    w = sync_index_daily(day)
+    n_cross = 0
+    missing = _index_missing_vs_baseline(day)
+    if missing:
+        logger.warning(
+            "mootdx_service: 指数日线 %s 相对基线缺 %d 只，路由 TickFlow 源补齐",
+            day, len(missing))
+        try:
+            n_cross = _cross_source_index_repair(day, missing) or 0
+            logger.info("mootdx_service: 跨源补齐 %s 完成 +%d 行", day, n_cross)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mootdx_service: 跨源补齐 %s 失败: %s", day, e)
+    return {"mootdx": w, "cross": n_cross}
+
+
 def _stale_daily_days(root: Path, now: _dt.datetime | None = None,
                       recent: int | None = None) -> list[_date]:
     """收盘后找出最近日线分区中「早于该分区自身日期收盘」写入的盘中快照。
@@ -1937,15 +2049,20 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             logger.warning("mootdx_service: 日线回源 %s 失败: %s", day, e)
             result["errors"].append(f"daily {day}: {e}")
 
-    # 2b. 指数日线（新增）——空时补最近窗口
-    idx_days = sorted(set(_missing_index_daily_days()) | set(incomplete_index_daily))
+    # 2b. 指数日线——空时补最近窗口；并入相对基线检测（08-21 案例：555/599
+    # 通过绝对阈值校验但缺 44 只中证系，须跨源补齐）
+    shortfall_days = set(_index_shortfall_days())
+    idx_days = sorted(set(_missing_index_daily_days()) | set(incomplete_index_daily)
+                      | shortfall_days)
     if not idx_days and not index_daily_days:
         idx_days = sorted(set(_trade_days_up_to(today))
                           - set(_partition_dates(INDEX_DAILY_ROOT)))
     for day in idx_days:
         try:
-            w = sync_index_daily(day)
+            w = _repair_index_day(day)
             result["index_daily_days"].append(str(day))
+            cross = w.pop("cross", 0)
+            w["cross"] = cross
             for k, v in w.items():
                 result["index_daily_written"][k] = result["index_daily_written"].get(k, 0) + v
         except Exception as e:  # noqa: BLE001
