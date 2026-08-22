@@ -304,3 +304,24 @@ def test_sync_stock_minute_retry_round(monkeypatch):
     res = ms.sync_stock_minute(limit=None)
     assert calls["n"] == 2, "失败标的应被重试"
     assert res["rows"] == 2 and res["query_failed"] == []
+
+
+def test_put_daily_mem_enforces_money_column(monkeypatch):
+    """防御纵深：任何写入方往 _daily_mem 塞无 money 日线帧（如网络批量
+    返回的服务端原始列），入口统一补齐 money/volume——防池过滤/阈值计算
+    被 'Column not found: money' 打断。"""
+    import pandas as pd
+    from app.quant.jqengine.datasource.manager import DataManager
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+    dm._offline = False
+    raw = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+         "volume": [100.0], "amount": [12345.0],
+         "trade_dt": pd.to_datetime(["2026-08-20"]).date},
+        index=pd.to_datetime(["2026-08-20"]))
+    dm._put_daily_mem_protected("get_daily_510300.XSHG", raw)
+    saved = dm._daily_mem["get_daily_510300.XSHG"]
+    assert "money" in saved.columns
+    assert float(saved["money"].iloc[0]) == 12345.0

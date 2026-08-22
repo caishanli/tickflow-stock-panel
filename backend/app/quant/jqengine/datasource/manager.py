@@ -679,7 +679,15 @@ class DataManager:
 
         规则：新帧与已有缓存都有效时，若已有缓存覆盖范围 ⊇ 新帧（起点更早
         或终点更晚），保留已有缓存不覆盖；否则覆盖写入。任意一方无效则直接写。
+
+        防御纵深：日线帧写入前统一补齐 money/volume 列——部分写入方（如
+        批量回源直接透传服务端原始列）会漏带 money，污染后策略
+        groupby('money')/流动性过滤抛 Column not found（960366ab/wufu_v52_sim
+        模拟盘告警根因）。
         """
+        if cache_key.startswith("get_daily") and hasattr(new_df, "columns"):
+            new_df = _ensure_money_yuan(new_df, "mem")
+            new_df = _ensure_volume_shares(new_df, "mem")
         if cache_key in self._daily_mem:
             old = self._daily_mem.get(cache_key)
             old_cov = self._frame_coverage(old)
