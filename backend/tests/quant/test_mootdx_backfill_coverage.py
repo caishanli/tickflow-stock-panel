@@ -1882,7 +1882,7 @@ def test_sync_stock_minute_pulls_missing_day_first(monkeypatch, tmp_path):
     n = ms.sync_stock_minute(limit=None)
 
     assert ranges == [[_d(2026, 8, 5)]], "应先 range 补今天"
-    assert n == 10, "返回值应包含 range 写入行数"
+    assert n["rows"] == 10, "返回值应包含 range 写入行数"
 
 
 def test_sync_stock_minute_no_range_when_current(monkeypatch, tmp_path):
@@ -1911,7 +1911,7 @@ def test_sync_stock_minute_no_range_when_current(monkeypatch, tmp_path):
     n = ms.sync_stock_minute(limit=None)
 
     assert ranges == [], "最新分区已是今天，不应触发 range"
-    assert n == 0, "resume todo 空 → 0 行"
+    assert n["rows"] == 0 and n["query_failed"] == [], "resume todo 空 → 0 行"
 
 
 # ---------------------------------------------------------------------------

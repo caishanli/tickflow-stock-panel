@@ -651,6 +651,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
 
 
 def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
+    # NOTE: 本函数保持 int 契约（行数），不随 sync_stock_minute 改 dict
     """按缺失日补全股票分钟到 ``kline_minute/date={day}``。
 
     ``symbols``：只处理给定列表（残片日只补缺失标的）；None = 全市场。
@@ -664,7 +665,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
-        return {"rows": 0, "query_failed": []}
+        return 0
     if symbols is not None:
         want = set(symbols)
         stocks = [s for s in stocks if s in want]
@@ -745,7 +746,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
-        return {"rows": 0, "query_failed": []}
+        return 0
     listing = _listing_date_map()
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
     # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过。
