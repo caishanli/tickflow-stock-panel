@@ -338,6 +338,17 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         end: 100,
         moveOnMouseMove: true,
         zoomOnMouseWheel: true,
+        filterMode: 'none',
+      },
+    ],
+    dataZoom: [
+      {
+        type: 'inside',
+        xAxisIndex: [0, 1],
+        start: 0,
+        end: 100,
+        moveOnMouseMove: true,
+        zoomOnMouseWheel: true,
       },
     ],
     grid: [
