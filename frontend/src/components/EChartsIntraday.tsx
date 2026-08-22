@@ -87,11 +87,14 @@ function fmtAmt(v: number): string {
   return v.toFixed(0)
 }
 
-/** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交 */
+/** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交。
+ *  标记样式对齐日线图 EChartsCandlestick: arrow 锚定该分钟 high/low, z:100/zlevel:10 保证置顶。 */
 function buildMarkerPoints(
   markers: IntradayMarker[] | undefined,
   chartDate: string | undefined,
   closes: (number | null)[],
+  lows: (number | null)[],
+  highs: (number | null)[],
   timeIndexMap: Map<string, number>,
 ): any[] {
   if (!markers || markers.length === 0) return []
@@ -102,20 +105,29 @@ function buildMarkerPoints(
     if (idx === undefined || !isValidPrice(closes[idx])) continue
     const stop = m.action === 'STOP_LOSS'
     const buy = m.action === 'BUY'
+    if (stop) {
+      out.push({
+        coord: [idx, highs[idx] ?? m.price],
+        symbol: 'circle', symbolSize: 12, symbolOffset: [0, -2],
+        itemStyle: { color: '#F59E0B' },
+        label: { show: true, formatter: '止损', position: 'top', distance: 4, color: '#F59E0B', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
+        z: 100, zlevel: 10,
+      })
+      continue
+    }
     out.push({
-      coord: [idx, m.price],
-      symbol: stop ? 'circle' : 'triangle',
-      symbolSize: stop ? 17 : 12,
+      coord: [idx, buy ? (lows[idx] ?? m.price) : (highs[idx] ?? m.price)],
+      symbol: 'arrow', symbolSize: 12,
       symbolRotate: buy ? 0 : 180,
-      itemStyle: { color: stop ? '#F59E0B' : buy ? '#C74040' : '#2D9B65', borderColor: '#FFFFFF', borderWidth: 0.5 },
+      symbolOffset: buy ? [0, '60%'] : [0, '-60%'],
+      itemStyle: { color: buy ? '#C74040' : '#2D9B65' },
       label: {
-        show: true,
-        position: 'inside',
-        color: '#FFFFFF',
-        fontSize: 7,
-        fontWeight: 'bold',
-        formatter: stop ? '止损' : buy ? 'B' : 'S',
+        show: true, formatter: buy ? 'B' : 'S',
+        position: buy ? 'bottom' : 'top', distance: 6,
+        color: buy ? '#C74040' : '#2D9B65', fontSize: 11, fontWeight: 'bold',
+        fontFamily: 'JetBrains Mono, monospace',
       },
+      z: 100, zlevel: 10,
     })
   }
   return out
@@ -197,7 +209,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     }
   }
 
-  const markerPoints = buildMarkerPoints(markers, chartDate, closes, timeIndexMap)
+  const markerPoints = buildMarkerPoints(markers, chartDate, closes, lows, highs, timeIndexMap)
 
   const areaStyle: any = {
     color: {
@@ -318,6 +330,16 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     axisPointer: {
       link: [{ xAxisIndex: 'all' }],
     },
+    dataZoom: [
+      {
+        type: 'inside',
+        xAxisIndex: [0, 1],
+        start: 0,
+        end: 100,
+        moveOnMouseMove: true,
+        zoomOnMouseWheel: true,
+      },
+    ],
     grid: [
       { left: 60, right: 55, top: 24, bottom: '28%' },
       { left: 60, right: 55, top: '74%', bottom: 20 },
