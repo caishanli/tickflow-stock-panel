@@ -181,3 +181,15 @@ def test_get_history_single_code_field_column_local():
     df = ptrade_api.get_history(3, "1d", "close", security_list="510300.SS")
     assert isinstance(df, pd.DataFrame)
     assert "close" in df.columns, "单标的列名必须是行情字段（官方 get_history）"
+
+
+def test_base_position_has_ptrade_aliases():
+    """恢复持仓路径（_restore_portfolio）构造的是基础 Position，
+    也必须带 PTrade 别名——否则模拟盘重启续跑后 minute_level_stop_loss
+    等策略代码访问 position.enable_amount 直接 AttributeError
+    （960366ab 08-21 14:37 起 117 条错误日志的根因）。"""
+    from app.quant.jqengine.engine.jq.context import Position
+    p = Position(amount=100, avg_cost=3.0, price=3.1)
+    assert p.enable_amount == 100
+    assert p.cost_basis == 3.0
+    assert p.last_sale_price == 3.1

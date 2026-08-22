@@ -27,6 +27,26 @@ class Position:
     def closeable_amount(self):
         return max(0.0, self.amount - float(self.today_amount or 0.0))
 
+    # ---- PTrade 字段别名 ----
+    # 模拟盘重启续跑时 _restore_portfolio 构造的是本基础类；ptrade 移植版策略
+    # （如 a56cb087）按 PTrade 口径访问 enable_amount/cost_basis/last_sale_price，
+    # 缺失即每 bar AttributeError（960366ab 08-21 117 条错误日志根因）。
+
+    @property
+    def enable_amount(self):
+        """PTrade 口径可用数量（T+1：当日买入不可卖）。"""
+        return self.closeable_amount
+
+    @property
+    def cost_basis(self):
+        """PTrade 口径持仓成本。"""
+        return self.avg_cost
+
+    @property
+    def last_sale_price(self):
+        """PTrade/rqalpha 口径最新价。"""
+        return self.price
+
     @property
     def value(self):
         return self.amount * self.price
