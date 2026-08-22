@@ -89,16 +89,16 @@ export function QuantTradeDialog({
     return () => clearFocusSymbol()
   }, [symbol])
 
-  // symbol 切换(弹窗不卸载复用)时重置视图/日期, 重新应用 initialDate
+  // symbol 切换(弹窗不卸载复用)时重置视图/日期
   const prevSymbol = useRef<string | null>(symbol)
-  const initialApplied = useRef(false)
+  const appliedKeyRef = useRef('')
   useEffect(() => {
     if (prevSymbol.current === symbol) return
     prevSymbol.current = symbol
     setView(initialView)
     setSelectedDate(null)
     setDailyResult(null)
-    initialApplied.current = false
+    appliedKeyRef.current = ''
   }, [symbol, initialView])
 
   // 外部 dateRange 变化时同步 (回测切换成交时窗口跟随持仓区间)
@@ -142,14 +142,28 @@ export function QuantTradeDialog({
 
   const rawRows: any[] = dailyResult?.rawRows ?? []
 
-  // initialDate: 日K rows 就绪后优先选中 (仅应用一次, 不在 rows 内回退最新)
+  // 手机屏(≤md)压缩图表高度
+  const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches)
   useEffect(() => {
-    if (initialDate && !initialApplied.current && rawRows.length > 0) {
-      initialApplied.current = true
-      const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
-      setSelectedDate(target ? initialDate : String(rawRows[rawRows.length - 1].date).slice(0, 10))
+    const mq = window.matchMedia('(max-width: 768px)')
+    const onChange = () => setNarrow(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
+  // initialDate: 日K rows 就绪后按 (symbol|date) 定位——同标的换日期点击也会重新应用; 无 date(持仓无入场时间)回退最新
+  useEffect(() => {
+    if (rawRows.length === 0) return
+    const key = `${symbol}|${initialDate ?? ''}`
+    if (appliedKeyRef.current === key) return
+    appliedKeyRef.current = key
+    if (!initialDate) {
+      setSelectedDate(null)
+      return
     }
-  }, [initialDate, rawRows])
+    const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
+    setSelectedDate(target ? initialDate : String(rawRows[rawRows.length - 1].date).slice(0, 10))
+  }, [symbol, initialDate, rawRows])
 
   // 分钟视图无选中日期时自动选中最新交易日
   useEffect(() => {
@@ -196,7 +210,7 @@ export function QuantTradeDialog({
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="relative w-[92vw] max-w-[1100px] max-h-[95vh] rounded-card border border-border bg-base shadow-2xl overflow-hidden flex flex-col"
+            className="relative w-[92vw] max-w-[1100px] max-h-[95vh] max-md:w-full max-md:h-[94dvh] max-md:max-h-none max-md:rounded-none rounded-card border border-border bg-base shadow-2xl overflow-hidden flex flex-col"
           >
             {/* 顶栏 */}
             <div className="flex items-center justify-between px-5 py-3 border-b border-border shrink-0">
@@ -271,7 +285,7 @@ export function QuantTradeDialog({
             </div>
 
             {/* 内容 */}
-            <div className="flex-1 overflow-auto p-4">
+            <div className="flex-1 overflow-auto p-4 max-md:p-2">
               <StockInfoBar
                 symbol={symbol}
                 name={dailyResult?.name}
@@ -323,7 +337,7 @@ export function QuantTradeDialog({
                   dataSource="stockdata"
                   symbol={symbol}
                   date={selectedDate}
-                  height={420}
+                  height={narrow ? 300 : 420}
                   prevClose={prevClose}
                   markers={intradayMarkers}
                   refetchIntervalMs={intradayRefetchMs}
