@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import sys
 
+from app.quant.simulate.runner import run_loop
+
 
 def main():
     args = sys.argv[1:]
@@ -59,7 +61,6 @@ def main():
         print("usage: run_quant_sim.py <account_id> | --create ... | --reset <account_id>",
               file=sys.stderr)
         sys.exit(1)
-    from app.quant.simulate.runner import run_loop
     run_loop(args[0])
 
 
