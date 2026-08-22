@@ -426,10 +426,17 @@ def get_trading_day(count=-1):
 
 
 def get_trade_days(start_date=None, end_date=None, count=None):
-    """PTrade get_trade_days：返回区间内交易日（date 列表）。"""
+    """PTrade get_trade_days：返回区间内交易日（date 列表）。
+
+    end_date 缺省钳到今天——日历本身延伸到 2030，None 直接取尾会得到
+    未来日期（策略拿去做窗口计算会静默失真）。
+    """
     cal = _get_calendar()
+    today = pd.Timestamp.now().normalize()
     if end_date is not None:
         cal = cal[cal <= pd.Timestamp(end_date)]
+    else:
+        cal = cal[cal <= today]
     if start_date is not None:
         cal = cal[cal >= pd.Timestamp(start_date)]
     if count is not None:

@@ -92,6 +92,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
   const [page, setPage] = useState(1)
   const [delIds, setDelIds] = useState<string[] | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [selectMode, setSelectMode] = useState(false)
   const PAGE_SIZE = 15
 
   const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE))
@@ -113,6 +114,12 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
       if (allPageSelected) pageIds.forEach(id => next.delete(id))
       else pageIds.forEach(id => next.add(id))
       return next
+    })
+  }
+  const switchSelectMode = () => {
+    setSelectMode(v => {
+      if (v) setSelected(new Set())
+      return !v
     })
   }
 
@@ -142,10 +149,14 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
         }
       />
       <div className="flex-1 p-4 overflow-auto space-y-3">
-        <div className="flex items-center">
+        <div className="flex items-center gap-2">
           <button onClick={onNew}
             className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-accent text-white text-xs">
-            <Plus size={14} />新建
+            <Plus size={14} />新建策略
+          </button>
+          <button onClick={switchSelectMode}
+            className={`inline-flex items-center px-3 h-9 rounded-lg border text-xs transition-colors ${selectMode ? 'border-accent/50 text-accent bg-accent/10' : 'border-border text-secondary hover:text-foreground'}`}>
+            {selectMode ? '退出管理' : '批量管理'}
           </button>
         </div>
         <div className="hidden md:block rounded-card border border-border bg-surface overflow-hidden">
@@ -153,10 +164,12 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             <thead className="text-muted bg-elevated/40">
               <tr className="text-left">
                 <th className="px-3 py-2 font-normal w-10 text-center">#</th>
-                <th className="px-3 py-2 w-8 text-center">
-                  <input type="checkbox" checked={allPageSelected} onChange={togglePage}
-                    className="accent-accent cursor-pointer align-middle" />
-                </th>
+                {selectMode && (
+                  <th className="px-3 py-2 w-8 text-center">
+                    <input type="checkbox" checked={allPageSelected} onChange={togglePage}
+                      className="accent-accent cursor-pointer align-middle" />
+                  </th>
+                )}
                 <th className="px-3 py-2 font-normal">编号</th>
                 <th className="px-3 py-2 font-normal">策略名称</th>
                 <th className="px-3 py-2 font-normal">最新回测周期</th>
@@ -169,7 +182,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </thead>
             <tbody className="text-foreground">
               {pageItems.length === 0 && (
-                <tr><td colSpan={10} className="px-3 py-10 text-center text-muted">暂无策略，点击左上角新建</td></tr>
+                <tr><td colSpan={selectMode ? 10 : 9} className="px-3 py-10 text-center text-muted">暂无策略，点击左上角新建</td></tr>
               )}
               {pageItems.map((s, i) => {
                 const m = pickMetrics(s.latest?.metrics_json)
@@ -180,10 +193,12 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                   <tr key={s.id} onClick={() => onOpen(s.id)}
                     className={`border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors ${checked ? 'bg-accent/5' : ''}`}>
                     <td className="px-3 py-2 text-center text-muted num">{idx}</td>
-                    <td className="px-3 py-2 text-center" onClick={e => e.stopPropagation()}>
-                      <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
-                        className="accent-accent cursor-pointer align-middle" />
-                    </td>
+                    {selectMode && (
+                      <td className="px-3 py-2 text-center" onClick={e => e.stopPropagation()}>
+                        <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
+                          className="accent-accent cursor-pointer align-middle" />
+                      </td>
+                    )}
                     <td className="px-3 py-2 text-muted font-mono" onClick={(e) => {
                       const target = e.target as HTMLElement
                       if (target.closest('.copy-id')) return
@@ -213,8 +228,9 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
                     <td className={`px-3 py-2 text-right num ${tone(null)}`}>{s.run_count}</td>
                     <td className="px-3 py-2 text-right" onClick={e => e.stopPropagation()}>
                       <button onClick={() => setDelIds([s.id])}
-                        className="inline-flex items-center gap-1 text-bear hover:underline text-xs">
-                        <Trash2 className="h-3.5 w-3.5" />删除
+                        className="p-1 rounded hover:bg-bear/10 text-muted hover:text-bear transition-colors"
+                        title="删除">
+                        <Trash2 size={13} />
                       </button>
                     </td>
                   </tr>
@@ -224,7 +240,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </table>
         </div>
 
-        {/* 移动端卡片布局：策略名称在上，其余信息纵向排列 */}
+        {/* 移动端卡片布局：策略名称+编号在上，其余信息纵向排列 */}
         <div className="md:hidden space-y-2">
           {pageItems.length === 0 && (
             <div className="rounded-card border border-border bg-surface px-3 py-10 text-center text-muted text-xs">
@@ -239,18 +255,37 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
               <div key={s.id} onClick={() => onOpen(s.id)}
                 className={`rounded-card border border-border bg-surface p-3 cursor-pointer transition-colors hover:bg-elevated/60 ${checked ? 'bg-accent/5' : ''}`}>
                 <div className="flex items-center gap-2">
-                  <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
-                    onClick={e => e.stopPropagation()}
-                    className="accent-accent cursor-pointer align-middle shrink-0" />
-                  <span className="flex-1 min-w-0 truncate text-sm font-medium text-foreground">{s.name}</span>
+                  {selectMode && (
+                    <input type="checkbox" checked={checked} onChange={() => toggle(s.id)}
+                      onClick={e => e.stopPropagation()}
+                      className="accent-accent cursor-pointer align-middle shrink-0" />
+                  )}
+                  <div className="flex items-baseline gap-1.5 flex-1 min-w-0">
+                    <span className="min-w-0 truncate text-sm font-medium text-foreground">{s.name}</span>
+                    <span className="copy-id shrink-0 font-mono text-[11px] text-muted cursor-pointer hover:text-accent transition-colors"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        const ta = document.createElement('textarea')
+                        ta.value = s.id
+                        ta.style.position = 'fixed'
+                        ta.style.left = '-9999px'
+                        document.body.appendChild(ta)
+                        ta.select()
+                        try { document.execCommand('copy'); toast('已复制', 'success', 'top') }
+                        catch { toast('复制失败', 'error') }
+                        document.body.removeChild(ta)
+                      }}>
+                      {s.id}
+                    </span>
+                  </div>
                   <button onClick={(e) => { e.stopPropagation(); setDelIds([s.id]) }}
-                    className="inline-flex items-center gap-1 text-bear hover:underline text-xs shrink-0">
-                    <Trash2 className="h-3.5 w-3.5" />删除
+                    className="ml-2 p-1 rounded hover:bg-bear/10 text-muted hover:text-bear transition-colors shrink-0"
+                    title="删除">
+                    <Trash2 size={13} />
                   </button>
                 </div>
-                <div className="mt-1.5 pl-6 font-mono text-[11px] text-muted truncate">{s.id}</div>
-                <div className="mt-1 pl-6 text-[11px] text-muted num truncate">{period}</div>
-                <div className="mt-2 pl-6 grid grid-cols-4 gap-2">
+                <div className={`mt-1.5 text-[11px] text-muted num truncate ${selectMode ? 'pl-6' : ''}`}>{period}</div>
+                <div className={`mt-2 grid grid-cols-4 gap-2 ${selectMode ? 'pl-6' : ''}`}>
                   <div>
                     <div className="text-[10px] text-muted">收益率</div>
                     <div className={`text-xs num font-medium ${tone(m.total_return)}`}>{fmtPct(m.total_return)}</div>
