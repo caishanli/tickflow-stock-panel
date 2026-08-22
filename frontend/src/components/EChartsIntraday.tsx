@@ -341,16 +341,6 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         filterMode: 'none',
       },
     ],
-    dataZoom: [
-      {
-        type: 'inside',
-        xAxisIndex: [0, 1],
-        start: 0,
-        end: 100,
-        moveOnMouseMove: true,
-        zoomOnMouseWheel: true,
-      },
-    ],
     grid: [
       { left: 60, right: 55, top: 24, bottom: '28%' },
       { left: 60, right: 55, top: '74%', bottom: 20 },
