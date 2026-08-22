@@ -1757,6 +1757,26 @@ _INDEX_SHORTFALL_LOOKBACK = 10
 _INDEX_SHORTFALL_RATIO = 0.95
 
 
+_SHORTFILL_PREOPEN_BLOCK_FROM = _dt.time(6, 0)  # 盘前屏蔽起点（06:00 起）
+
+
+def _shortfall_repair_allowed(now: _dt.datetime | None = None) -> bool:
+    """相对基线缺口扫描/修复的时段门控（仅作用于启动回源路径）。
+
+    - 周末：全天允许；
+    - 交易日：<06:00 允许（深夜与 00:00 巡检同属安全窗口）；06:00-15:00
+      （盘前+盘中）一律跳过——缺口修复密集请求已被限速的公共服务器，
+      会挤占盘中实时取数配额，且靠近开盘的修复可能拖进交易时段；
+    - ≥15:00 收盘后允许。
+    - 此类启动跳过后由当日 00:00 全量巡检或下一次收盘后启动兜底。
+    """
+    now = now or _dt.datetime.now()
+    if now.weekday() >= 5:
+        return True
+    t = now.time()
+    return t >= MARKET_CLOSE_TIME or t < _SHORTFILL_PREOPEN_BLOCK_FROM
+
+
 def _partition_symbol_sets(root: Path, lookback: int) -> list[tuple[Path, set]]:
     """近 lookback 个分区的 (目录, symbol 集) 列表（按日期升序）。"""
     days = sorted(root.glob("date=*"))[-lookback:]
@@ -1852,14 +1872,18 @@ def _cross_source_index_repair(day: _date, missing: list[str]) -> int:
         symbols_override=sorted(missing))
 
 
-def _repair_index_day(day: _date) -> dict:
+def _repair_index_day(day: _date,
+                      allow_cross_source: bool = True) -> dict:
     """指数日线单日两级修复：先 mootdx（快、覆盖主指），复查基线缺口后
     路由 TickFlow 源补齐 mootdx 不提供的系列。返回 {"mootdx":..., "cross":...}。
+
+    ``allow_cross_source=False``：启动路径的时段门控——盘前/盘中启动只做
+    mootdx 一级，跨源拉取留待盘后巡检（避免挤占实时配额）。
     """
     w = sync_index_daily(day)
     n_cross = 0
     missing = _missing_vs_baseline(INDEX_DAILY_ROOT, day)
-    if missing:
+    if missing and allow_cross_source:
         logger.warning(
             "mootdx_service: 指数日线 %s 相对基线缺 %d 只，路由 TickFlow 源补齐",
             day, len(missing))
@@ -1868,6 +1892,10 @@ def _repair_index_day(day: _date) -> dict:
             logger.info("mootdx_service: 跨源补齐 %s 完成 +%d 行", day, n_cross)
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: 跨源补齐 %s 失败: %s", day, e)
+    elif missing:
+        logger.warning(
+            "mootdx_service: 指数日线 %s 相对基线缺 %d 只（盘前/盘中不跨源，"
+            "留待当日 00:00 巡检或收盘后补齐）", day, len(missing))
     return {"mootdx": w, "cross": n_cross}
 
 
@@ -1979,6 +2007,9 @@ def backfill_to_now() -> dict[str, Any]:
 
 def _backfill_to_now_locked() -> dict[str, Any]:
     """``backfill_to_now`` 的执行体（调用方须已持 :data:`_SYNC_LOCK`）。"""
+    # 相对基线缺口检测/修复仅在收盘后或周末（交易日 06:00 前）运行：
+    # 盘前 06:00 起与盘中启动一律跳过，由当日 00:00 巡检兜底。
+    shortfall_ok = _shortfall_repair_allowed()
     result: dict[str, Any] = {
         "minute_days": [], "minute_rows": 0,
         "daily_days": [], "daily_written": {},
@@ -2040,8 +2071,10 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     }
 
     # 1. ETF 分钟（含相对基线残缺日）
+    etf_minute_shortfall = (set(_shortfall_days(ETF_MINUTE_ROOT))
+                            if shortfall_ok else set())
     for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute
-                      | set(_shortfall_days(ETF_MINUTE_ROOT))):
+                      | etf_minute_shortfall):
         try:
             n = sync_etf_minute(day)
             result["minute_days"].append(str(day))
@@ -2052,10 +2085,14 @@ def _backfill_to_now_locked() -> dict[str, Any]:
 
     # 2. 日线（股票 + ETF）——统一用一个交易日历；空时补最近窗口
     today = _date.today()
+    stock_daily_shortfall = (set(_shortfall_days(STOCK_DAILY_ROOT))
+                             if shortfall_ok else set())
+    etf_daily_shortfall = (set(_shortfall_days(ETF_DAILY_ROOT))
+                           if shortfall_ok else set())
     daily_days = sorted(set(_missing_daily_days(STOCK_DAILY_ROOT))
                         | set(_missing_daily_days(ETF_DAILY_ROOT))
-                        | set(_shortfall_days(STOCK_DAILY_ROOT))
-                        | set(_shortfall_days(ETF_DAILY_ROOT))
+                        | stock_daily_shortfall
+                        | etf_daily_shortfall
                         | incomplete_etf_daily_full
                         | set(incomplete_stock_daily)
                         | set(incomplete_etf_daily))
@@ -2077,7 +2114,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
 
     # 2b. 指数日线——空时补最近窗口；并入相对基线检测（08-21 案例：555/599
     # 通过绝对阈值校验但缺 44 只中证系，须跨源补齐）
-    shortfall_days = set(_index_shortfall_days())
+    shortfall_days = set(_index_shortfall_days()) if shortfall_ok else set()
     idx_days = sorted(set(_missing_index_daily_days()) | set(incomplete_index_daily)
                       | shortfall_days)
     if not idx_days and not index_daily_days:
@@ -2085,7 +2122,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
                           - set(_partition_dates(INDEX_DAILY_ROOT)))
     for day in idx_days:
         try:
-            w = _repair_index_day(day)
+            w = _repair_index_day(day, allow_cross_source=shortfall_ok)
             result["index_daily_days"].append(str(day))
             cross = w.pop("cross", 0)
             w["cross"] = cross

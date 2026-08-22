@@ -187,3 +187,84 @@ def test_backfill_missing_partitions_routes_shortfall_repair(tmp_path, monkeypat
     assert called["daily"] == [day]
     assert called["etf_min"] == [day]
     assert res["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# 启动回源的缺口修复窗口门控（盘前/盘中不跑，收盘后与周末才跑）
+# ---------------------------------------------------------------------------
+
+def test_shortfall_repair_allowed_window():
+    """交易日 06:00-15:00 屏蔽；<06:00 与 >=15:00 允许；周末全天允许。"""
+    f = ms._shortfall_repair_allowed
+    # 周三盘中 → 禁止
+    assert f(_dt.datetime(2026, 8, 19, 10, 0)) is False
+    assert f(_dt.datetime(2026, 8, 19, 14, 59)) is False
+    # 周三盘前屏蔽段（06:00 起）
+    assert f(_dt.datetime(2026, 8, 19, 6, 1)) is False
+    assert f(_dt.datetime(2026, 8, 19, 8, 30)) is False
+    # 深夜/凌晨（<06:00）与收盘后 → 允许
+    assert f(_dt.datetime(2026, 8, 19, 5, 59)) is True
+    assert f(_dt.datetime(2026, 8, 19, 0, 30)) is True
+    assert f(_dt.datetime(2026, 8, 19, 15, 0)) is True
+    assert f(_dt.datetime(2026, 8, 19, 23, 40)) is True
+    # 周末全天 → 允许
+    assert f(_dt.datetime(2026, 8, 22, 11, 0)) is True   # 周六
+    assert f(_dt.datetime(2026, 8, 23, 8, 0)) is True    # 周日
+
+
+def test_startup_backfill_gates_shortfall_by_window(tmp_path, monkeypatch):
+    """同一缺口：盘前启动跳过检测；收盘后/周末启动才补。"""
+    root = tmp_path / "kline_daily"
+    base = [f"{600000 + i}.SH" for i in range(100)]
+    d0 = _dt.date(2026, 8, 10)
+    _seed_baseline(root, base)
+    short_day = _dt.date(2026, 8, 15)
+    _write_index_part(root, short_day, base[:80])
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", root)
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+
+    # ——环境桩：把回源范围钉在 tmp 分区，杜绝真实宇宙/日历/网络泄漏——
+    cal = [d0 + _dt.timedelta(days=i) for i in range(7)] + [short_day]
+    monkeypatch.setattr(ms, "_trade_days_in_range",
+                        lambda start=None, end=None, **k: cal)
+    monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: cal)
+    for name in ("_missing_minute_days", "_missing_index_daily_days"):
+        monkeypatch.setattr(ms, name, lambda *a, **k: set())
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root_, now=None: [])
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: set())
+    for name in ("_incomplete_etf_minute_days", "_incomplete_stock_daily_days",
+                 "_incomplete_etf_daily_days", "_incomplete_index_daily_days",
+                 "_incomplete_stock_minute_days"):
+        monkeypatch.setattr(ms, name, lambda *a, **k: [])
+    monkeypatch.setattr(ms, "_safe_universe_segment_missing", lambda: [])
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj.parquet")
+    for attr in ("ETF_MINUTE_ROOT", "INDEX_DAILY_ROOT", "ETF_DAILY_ROOT"):
+        r = tmp_path / attr.lower()
+        r.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(ms, attr, r)
+    smr = tmp_path / "smr"
+    smr.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", smr)
+    from app.services import etf_nav_service as _nav
+    monkeypatch.setattr(_nav, "_partition_dates", lambda: [])
+    monkeypatch.setattr(_nav, "_missing_etf_nav_days", lambda: [])
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda day=None: 0)
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 0})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda: {"rows": 0})
+
+    repaired = []
+    monkeypatch.setattr(ms, "sync_daily",
+                        lambda d: repaired.append(d) or {"stock": 1, "etf": 1})
+
+    # 盘前/盘中窗口：不检测、不修复缺口日
+    monkeypatch.setattr(ms, "_shortfall_repair_allowed",
+                        lambda now=None: False)
+    ms.backfill_to_now()
+    assert short_day not in repaired
+
+    # 收盘后窗口：检测并修复缺口日
+    monkeypatch.setattr(ms, "_shortfall_repair_allowed", lambda now=None: True)
+    ms.backfill_to_now()
+    assert short_day in repaired
