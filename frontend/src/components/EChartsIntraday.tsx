@@ -46,14 +46,36 @@ function fmtTime(dt: string): string {
   return `${String(h).padStart(2, '0')}:${match[2]}`
 }
 
+/** 探测分钟数据 volume 单位: 股(×1) / 手(×100)。
+ *  stockdata 与本地 mootdx parquet 为股; TickFlow SDK vol 疑似手。
+ *  依据 amount ≈ volume(股)×price: median(amount/volume) ≈ 100×median(close) 判为手。 */
+function detectVolumeMultiplier(data: MinuteKlineRow[]): number {
+  const ratios: number[] = []
+  const closes: number[] = []
+  for (const d of data) {
+    if (!(d.volume > 0) || !(d.close > 0)) continue
+    ratios.push(d.amount / d.volume)
+    closes.push(d.close)
+    if (ratios.length >= 60) break
+  }
+  if (ratios.length === 0) return 1
+  const med = (arr: number[]) => {
+    const s = [...arr].sort((a, b) => a - b)
+    return s[Math.floor(s.length / 2)]
+  }
+  const ratio = med(ratios) / med(closes)
+  return ratio >= 30 && ratio <= 300 ? 100 : 1
+}
+
 function computeAvgPrice(data: MinuteKlineRow[]): number[] {
-  // 分时均线 = 累计成交额 / 累计成交量(手→股)
+  // 分时均线 = 累计成交额 / 累计成交量(单位自适应: 股×1 / 手×100)
+  const mult = detectVolumeMultiplier(data)
   const result: number[] = []
   let sumAmt = 0
   let sumVol = 0
   for (const d of data) {
     sumAmt += d.amount
-    sumVol += d.volume * 100
+    sumVol += d.volume * mult
     result.push(sumVol > 0 ? sumAmt / sumVol : d.close)
   }
   return result
@@ -202,7 +224,8 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
   let yMax: number | undefined
   let maxDiff = 0
   if (isValidPrice(prevClose) && data.length > 0) {
-    const priceArrays = showAvgLine ? [closes, highs, lows, avgData] : [closes, highs, lows]
+    // 均价线恒在 [minLow, maxHigh] 内, 不参与范围计算(免疫均价单位错误, 范围贴合实际波动)
+    const priceArrays = [closes, highs, lows]
     for (const arr of priceArrays) {
       for (const v of arr) {
         if (!isValidPrice(v)) continue
@@ -236,13 +259,12 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         },
       )
     } else {
-      // 自适应模式: Y 轴按实际涨跌幅对称, 但不超出实际涨跌停范围
+      // 自适应模式: Y 轴贴合实际波动(留 10% 边距), 昨收居中; 涨跌停带仅作上限钳制
       if (showLimitLines) {
         const { limitUp, limitDown } = getLimitPrices(prevClose, priceLimit)
         const limitDiff = Math.max(limitUp - prevClose, prevClose - limitDown)
-        maxDiff = Math.min(maxDiff, limitDiff)
-      }
-      if (!showLimitLines && maxDiff > 0) {
+        maxDiff = Math.min(maxDiff * 1.1, limitDiff)
+      } else if (maxDiff > 0) {
         maxDiff *= 1.1
       }
       // 至少保证一个可视范围 (防止数据平时 maxDiff=0)。指数不使用涨跌停范围，最小范围要更紧，否则低波动指数会被压成横线。
