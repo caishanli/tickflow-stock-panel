@@ -224,7 +224,7 @@ def test_backfill_to_now_includes_index_and_adj(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
     monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     adj = {"written_symbols": 1, "rows": 5, "total_symbols": 2}
     monkeypatch.setattr(ms, "sync_adj_factor", lambda: adj)
     sent = []
@@ -276,7 +276,7 @@ def test_backfill_noop_when_all_current(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(ms, "sync_adj_factor", lambda: calls.__setitem__("n", calls["n"] + 1))
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -316,7 +316,7 @@ def test_backfill_runs_sync_per_gap_day(monkeypatch, tmp_path):
     days = []
     monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -353,7 +353,7 @@ def test_backfill_seeds_window_when_root_empty(monkeypatch, tmp_path):
     days = []
     monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -548,7 +548,7 @@ def test_backfill_to_now_resyncs_sparse_etf_daily(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
     days = []
@@ -1015,7 +1015,7 @@ def test_backfill_to_now_flags_missing_universe_segments(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
     monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
     sent = []
     monkeypatch.setattr(ms, "_notify_missing", lambda m: sent.append(m))
@@ -1426,7 +1426,7 @@ def test_backfill_to_now_resyncs_sparse_stock_minute(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
     monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1000})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
     calls = []
     monkeypatch.setattr(ms, "sync_stock_minute_range",
@@ -1527,6 +1527,35 @@ def test_sync_stock_minute_writes_today_after_close(tmp_path, monkeypatch):
     n = ms.sync_stock_minute(limit=None)
     assert n["rows"] == 2, "收盘后今日整日分钟应落盘"
     assert (tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet").exists()
+
+
+def test_sync_stock_minute_all_pre_delisted_returns_dict(tmp_path, monkeypatch):
+    """todo 全被退市/异常占位过滤后仍须返回 dict 契约。
+
+    回归：过滤 pre_delisted 后 todo 为空走提前返回，曾 ``return range_rows +
+    fragment_rows`` 裸 int，backfill_to_now 取 ``res["rows"]`` 抛
+    'int' object is not subscriptable（08-22 案例：宇宙仅剩 301688/301697
+    两只占位标的时每次启动回源必失败）。
+    """
+    import datetime as _dt
+    from app.services import mootdx_service as ms
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: ["301688.SZ", "301697.SZ"])
+    # 上市日期 1970-01-01 = 退市/异常占位 → todo 全被过滤
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {
+        "301688.SZ": _dt.date(1970, 1, 1),
+        "301697.SZ": _dt.date(1970, 1, 1),
+    })
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
+
+    res = ms.sync_stock_minute(limit=20)
+    assert isinstance(res, dict), f"应返回 dict 契约, 实际 {type(res)}"
+    assert res == {"rows": 0, "query_failed": []}
 
 
 def test_sync_stock_minute_ignores_limit_when_latest_partial_after_close(tmp_path, monkeypatch):
@@ -1957,7 +1986,7 @@ def test_backfill_to_now_resyncs_content_flagged_index(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
     monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
     days = []

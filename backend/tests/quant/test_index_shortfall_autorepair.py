@@ -248,7 +248,7 @@ def test_startup_backfill_gates_shortfall_by_window(tmp_path, monkeypatch):
     from app.services import etf_nav_service as _nav
     monkeypatch.setattr(_nav, "_partition_dates", lambda: [])
     monkeypatch.setattr(_nav, "_missing_etf_nav_days", lambda: [])
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
     monkeypatch.setattr(ms, "sync_etf_minute", lambda day=None: 0)
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 0})

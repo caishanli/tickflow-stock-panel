@@ -53,7 +53,7 @@ def test_backfill_to_now_holds_sync_lock(tmp_path, monkeypatch):
     from app.services import etf_nav_service
     monkeypatch.setattr(etf_nav_service, "_partition_dates", lambda: [])
     monkeypatch.setattr(etf_nav_service, "_missing_etf_nav_days", lambda: [])
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
     monkeypatch.setattr(ms, "sync_daily", lambda day: {"stock": 0, "etf": 0})
     monkeypatch.setattr(ms, "sync_index_daily", lambda day: {"written": 0})
@@ -105,7 +105,7 @@ def test_etf_daily_content_scan_called_once(tmp_path, monkeypatch):
     from app.services import etf_nav_service
     monkeypatch.setattr(etf_nav_service, "_partition_dates", lambda: [])
     monkeypatch.setattr(etf_nav_service, "_missing_etf_nav_days", lambda: [])
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
     monkeypatch.setattr(ms, "sync_daily", lambda day: {"stock": 0, "etf": 0})
     monkeypatch.setattr(ms, "sync_index_daily", lambda day: {"written": 0})

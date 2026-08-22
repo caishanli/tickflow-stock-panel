@@ -256,7 +256,7 @@ def test_backfill_to_now_includes_etf_nav(tmp_path, monkeypatch):
     monkeypatch.setattr(mootdx_service, "sync_daily", lambda day: {"stock": 0, "etf": 0})
     monkeypatch.setattr(mootdx_service, "sync_index_daily", lambda day: {"written": 0})
     monkeypatch.setattr(mootdx_service, "sync_adj_factor", lambda: None)
-    monkeypatch.setattr(mootdx_service, "sync_stock_minute", lambda limit=None: 0)
+    monkeypatch.setattr(mootdx_service, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
     monkeypatch.setattr(mootdx_service, "_notify_missing", lambda m: None)
 
     res = mootdx_service.backfill_to_now()

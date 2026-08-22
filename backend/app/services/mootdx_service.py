@@ -602,7 +602,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
                     len(pre_delisted), pre_delisted[:10])
         todo = [s for s in todo if s not in set(pre_delisted)]
     if not todo:
-        return range_rows + fragment_rows
+        return {"rows": range_rows + fragment_rows, "query_failed": []}
     _manifest_reset("stock_minute", todo,
                     mode="full" if limit is None else "recent")
     logger.info("mootdx_service: 股票分钟回源 %d/%d（跳过已覆盖 %d）",
