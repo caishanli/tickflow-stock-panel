@@ -9,8 +9,16 @@ import logging
 import threading
 import time
 
-# 15:35 cron / 00:00 巡检 / 启动 backfill 共用锁（定义于 mootdx_service）
-from app.services.mootdx_service import _SYNC_LOCK as _sync_lock  # noqa: N811
+def _sync_lock() -> threading.Lock:
+    """15:35 cron / 00:00 巡检 / 启动 backfill 共用锁（惰性解析）。
+
+    锁定义在 mootdx_service（:data:`_SYNC_LOCK`）。调用时取模块属性而非
+    import 期绑定：测试里 ``importlib.reload(mootdx_service)`` 会重建锁对象，
+    惰性解析保证 scheduler 始终与当前模块实例同锁。
+    """
+    from app.services import mootdx_service
+
+    return mootdx_service._SYNC_LOCK
 
 logger = logging.getLogger("app.services.stockdata.scheduler")
 
@@ -81,7 +89,7 @@ def _run_sync(full_stock_minute: bool = False):
     增量慢跑（每轮 limit=20）。手动 trigger_sync 保持增量 + 不落日线
     （盘中触发写半程日线会污染分区）。
     """
-    with _sync_lock:
+    with _sync_lock():
         _mark_active("sync")
         try:
             from app.services import mootdx_service
@@ -118,7 +126,7 @@ def _run_sync(full_stock_minute: bool = False):
 
 def _run_check_day(day: str) -> None:
     """单日检验补齐（后台线程）：解析日期并执行。"""
-    with _sync_lock:
+    with _sync_lock():
         _mark_active("check_day")
         try:
             from app.services import mootdx_service
@@ -137,7 +145,7 @@ def _run_check_day(day: str) -> None:
 
 def _run_check_full() -> None:
     """全量检验补齐（后台线程）：执行并记录汇总。"""
-    with _sync_lock:
+    with _sync_lock():
         _mark_active("check_full")
         try:
             from app.services import mootdx_service
@@ -178,7 +186,7 @@ def _run_full_scan_once() -> None:
     """
     with _lock:
         _scheduler_state["full_scan_started"] = _dt.date.today().isoformat()
-    with _sync_lock:
+    with _sync_lock():
         _mark_active("full_scan")
         try:
             from app.services import mootdx_service

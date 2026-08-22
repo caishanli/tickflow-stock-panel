@@ -1,4 +1,23 @@
 """stockdata scheduler 00:00 全量缺失巡检测试。"""
+import threading
+
+
+class _FakeLock:
+    """_sync_lock() 惰性解析的桩：call() 返回自身作上下文管理器。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
 
 
 def test_midnight_scan_loop_triggers_full_scan(monkeypatch):
@@ -7,7 +26,7 @@ def test_midnight_scan_loop_triggers_full_scan(monkeypatch):
     from app.services.stockdata import scheduler as sched
 
     fired = {"n": 0}
-    monkeypatch.setattr(sched, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sched, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sched, "_lock", threading.Lock())
     monkeypatch.setattr(sched, "_scheduler_state", {"last_full_scan": None, "full_scan_result": None})
     monkeypatch.setattr(sched, "_stop", threading.Event())
@@ -40,7 +59,7 @@ def test_run_full_scan_records_completed_date(monkeypatch):
 
     state = {"last_full_scan": None, "full_scan_result": None,
              "full_scan_date": None}
-    monkeypatch.setattr(sched, "_sync_lock", threading.Lock())
+    monkeypatch.setattr(sched, "_sync_lock", lambda: _FakeLock())
     monkeypatch.setattr(sched, "_lock", threading.Lock())
     monkeypatch.setattr(sched, "_scheduler_state", state)
     monkeypatch.setattr(sched, "_stop", threading.Event())

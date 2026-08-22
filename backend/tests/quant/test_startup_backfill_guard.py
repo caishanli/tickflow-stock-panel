@@ -26,7 +26,7 @@ def test_sync_lock_shared_between_service_and_scheduler():
     """scheduler._sync_lock 与 mootdx_service._SYNC_LOCK 是同一把锁。"""
     from app.services.stockdata import scheduler
 
-    assert scheduler._sync_lock is ms._SYNC_LOCK
+    assert scheduler._sync_lock() is ms._SYNC_LOCK
 
 
 def test_backfill_to_now_holds_sync_lock(tmp_path, monkeypatch):
@@ -70,7 +70,8 @@ def test_backfill_to_now_holds_sync_lock(tmp_path, monkeypatch):
     time.sleep(0.3)
     assert not started.is_set(), "锁被占时 backfill_to_now 应阻塞"
     ms._SYNC_LOCK.release()
-    assert started.wait(timeout=15), "放锁后应完成"
+    # 全量套件下 scheduler 用例可能遗留持锁后台线程，宽限到 60s
+    assert started.wait(timeout=60), "放锁后应完成"
     t.join(timeout=1)
 
 
