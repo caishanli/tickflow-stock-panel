@@ -74,6 +74,8 @@ def test_to_partition_symbol():
     assert _to_partition_symbol("159227.XSHE") == "159227.SZ"
     assert _to_partition_symbol("513360.SH") == "513360.SH"
     assert _to_partition_symbol("920001.BJ") == "920001.SZ"
+    assert _to_partition_symbol("518880.SS") == "518880.SH"  # ptrade 沪市后缀
+    assert _to_partition_symbol("600000.SS") == "600000.SH"  # ptrade 沪市后缀
 
 
 def test_stockdata_is_etf(monkeypatch):

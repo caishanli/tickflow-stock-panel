@@ -44,7 +44,7 @@ def _to_partition_symbol(symbol: str) -> str:
     pure, _, suf = symbol.rpartition(".")
     if not pure:
         return symbol
-    return pure + (".SH" if suf in ("XSHG", "SH") else ".SZ")
+    return pure + (".SH" if suf in ("XSHG", "SH", "SS") else ".SZ")
 
 
 _STOCKDATA_ETF_SET_CACHE: set[str] | None = None
