@@ -150,7 +150,7 @@ def _etf_universe() -> list[str]:
     return sorted(set(out))
 
 
-def sync_etf_minute(day: _date | None = None) -> int:
+def sync_etf_minute(day: _date | None = None) -> dict:
     """收盘后同步指定交易日（默认今天）全部 ETF 分钟到按日分区。
 
     逐标的拉真实 1m：近期日（≤5 天）用 ``get_minute_recent``（含当日盘中），
@@ -162,7 +162,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
     codes = _etf_universe()
     if not codes:
         logger.warning("mootdx_service: ETF 宇宙为空，跳过分钟同步")
-        return 0
+        return {"rows": 0, "query_failed": []}
     historical = (day < _date.today() - _dt.timedelta(days=5))
     frames = []
 
@@ -483,7 +483,7 @@ def _listing_date_map() -> dict[str, _date]:
     return out
 
 
-def sync_stock_minute(limit: int | None = None) -> int:
+def sync_stock_minute(limit: int | None = None) -> dict:
     """回源 4/1 起全市场 A 股分钟到 ``kline_minute`` 分区（一次拉全量多日）。
 
     对每只股票用 mootdx ``get_minute`` 拉一次全量历史 1m（约 3 个月，含
@@ -505,7 +505,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
-        return 0
+        return {"rows": 0, "query_failed": []}
     listing = _listing_date_map()
     # 新交易日整日缺失：resume 只按最新分区判断，最新分区是昨天且完整时会
     # 误判"已覆盖"而跳过今天（08-18 案例）——先 range 补缺失交易日。盘中
@@ -532,7 +532,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     todo = [s for s in stocks if s not in done_syms]
     if not todo:
         logger.info("mootdx_service: 股票分钟已全部覆盖（%d 只），无需回源", len(done_syms))
-        return range_rows + fragment_rows
+        return {"rows": range_rows + fragment_rows, "query_failed": []}
     if limit is not None:
         if _stock_minute_latest_partial(done_syms, stocks):
             logger.info("mootdx_service: 最新分钟分区残缺（覆盖率 %.1f%%），"
@@ -664,7 +664,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
-        return 0
+        return {"rows": 0, "query_failed": []}
     if symbols is not None:
         want = set(symbols)
         stocks = [s for s in stocks if s in want]
@@ -745,7 +745,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
-        return 0
+        return {"rows": 0, "query_failed": []}
     listing = _listing_date_map()
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的已无交易，
     # 回源必然获取不到（每次 8-10s 服务器轮换超时），直接跳过。
@@ -1007,7 +1007,11 @@ def _load_xdxr_events(path) -> dict:
     import polars as pl
     if not path.exists():
         return {}
-    df = pl.read_parquet(path)
+    try:
+        df = pl.read_parquet(path)
+    except Exception:
+        logger.warning("mootdx_service: 事件表损坏，按空表处理: %s", path)
+        return {}
     keys = ("category", "year", "month", "day", "suogu", "fenhong",
             "songzhuangu", "peigu", "peigujia")
     out: dict[str, list[dict]] = {}
@@ -1117,7 +1121,8 @@ def sync_adj_factor() -> dict:
     daily = dm._load_daily_from_partitions(asof=None)
     codes = _etf_universe()
     if not codes:
-        return {"written_symbols": 0, "rows": 0, "total_symbols": 0}
+        return {"written_symbols": 0, "rows": 0, "total_symbols": 0,
+                "query_failed": [], "audit_uncovered": []}
     # 只保留宇宙内的标的
     daily = {k: v for k, v in daily.items() if k in set(codes)}
     # 第2层: xdxr 原始事件落本地. 查询失败(None)沿用本地已有事件, 
@@ -1742,7 +1747,8 @@ def sync_daily(day: _date) -> dict:
         src = MootdxSource()
         sdf2, failed_s = _fetch(failed_s)
         if sdf2 is not None:
-            sdf = sdf2
+            # 合并而非替换：首轮成功行不能被重试轮丢弃
+            sdf = pl.concat([sdf, sdf2]) if sdf is not None else sdf2
     if sdf is not None:
         sdf = sdf.with_columns((pl.col("volume") / 100.0).alias("volume"))
         frames_stock.append(sdf)
@@ -1754,7 +1760,7 @@ def sync_daily(day: _date) -> dict:
         src = MootdxSource()
         edf2, failed_e = _fetch(failed_e)
         if edf2 is not None:
-            edf = edf2
+            edf = pl.concat([edf, edf2]) if edf is not None else edf2
     if edf is not None:
         frames_etf.append(edf)
         written["etf"] = edf.height
@@ -2038,9 +2044,11 @@ def backfill_to_now() -> dict[str, Any]:
     # 1. ETF 分钟
     for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute):
         try:
-            n = sync_etf_minute(day)
+            res = sync_etf_minute(day)
             result["minute_days"].append(str(day))
-            result["minute_rows"] += n
+            result["minute_rows"] += res["rows"]
+            result.setdefault("query_failed", []).extend(
+                [f"etf_minute:{x}" for x in res["query_failed"]])
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: 分钟回源 %s 失败: %s", day, e)
             result["errors"].append(f"minute {day}: {e}")
@@ -2105,8 +2113,10 @@ def backfill_to_now() -> dict[str, Any]:
                            sorted(incomplete_minute), e)
             result["errors"].append(f"stock_minute_range {sorted(incomplete_minute)}: {e}")
     try:
-        n = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
-        result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
+        res = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
+        result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + res["rows"]
+        result.setdefault("query_failed", []).extend(
+            [f"stock_minute:{x}" for x in res["query_failed"]])
     except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")

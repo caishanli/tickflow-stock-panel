@@ -240,3 +240,67 @@ def test_sync_daily_query_failed_and_retry(monkeypatch):
     assert calls["n"] == 2, f"失败标的应被重试: {calls}"
     assert res["stock"] == 1
     assert res["query_failed"] == []
+
+
+def test_sync_etf_minute_retry_round(monkeypatch):
+    """ETF 分钟链路：首轮失败标的进 query_failed，重试轮成功后正常落盘。"""
+    import pandas as pd
+    from app.services import mootdx_service as ms
+    calls = {"n": 0}
+
+    class _Src:
+        def get_minute_recent(self, jq, pages=2):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("down")
+            out = pd.DataFrame(
+                {"close": [1.0], "volume": [10], "amount": [10.0],
+                 "open": [1.0], "high": [1.0], "low": [1.0]},
+                index=pd.to_datetime(["2026-08-20 09:31:00"]))
+            # mootdx 真实帧的 DatetimeIndex 名为 datetime，reset_index 后列名才是 datetime
+            out.index.name = "datetime"
+            return out
+
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159667.XSHE"])
+    monkeypatch.setattr(ms, "MootdxSource", _Src)
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_write_minute_partition", lambda df, root, day=None: df.height)
+    from datetime import date as _d
+    res = ms.sync_etf_minute(_d(2026, 8, 20))
+    assert calls["n"] == 2, "失败标的应被重试"
+    assert res["rows"] == 1 and res["query_failed"] == []
+
+
+def test_sync_stock_minute_retry_round(monkeypatch):
+    """股票分钟链路：首轮失败→重试轮成功，query_failed 收敛为空。"""
+    import pandas as pd
+    from datetime import date as _d
+    from app.services import mootdx_service as ms
+    calls = {"n": 0}
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("down")
+            out = pd.DataFrame(
+                {"close": [1.0, 1.1], "volume": [10, 20], "amount": [10.0, 22.0],
+                 "open": [1.0, 1.0], "high": [1.1, 1.1], "low": [1.0, 1.0]},
+                index=pd.to_datetime(["2026-08-19 15:00", "2026-08-20 15:00"]))
+            out.index.name = "datetime"
+            return out
+
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.XSHG"])
+    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_market_closed", lambda: True)
+    monkeypatch.setattr(ms, "_flush_stock_minute_chunk", lambda chunk: None)
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_guarded_get_minute",
+                        lambda src, sym, max_bars=40000: src.get_minute(sym, max_bars=max_bars))
+    monkeypatch.setattr(ms, "MootdxSource", _Src)
+    res = ms.sync_stock_minute(limit=None)
+    assert calls["n"] == 2, "失败标的应被重试"
+    assert res["rows"] == 2 and res["query_failed"] == []
