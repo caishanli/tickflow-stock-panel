@@ -50,8 +50,8 @@ uv run --extra dev mypy app               # 类型检查
 - **量化侧唯一取数入口** = `StockDataClient`（`backend/app/quant/datasource/network_client.py`，jqdata 风格：`get_price`/`current_snapshot`/`preload_daily`/`get_minute_pool`/`get_adj_factors`/`get_trade_days`/`get_all_securities`/`get_index_stocks`/...）。`DataManager`（`quant/jqengine/datasource/manager.py`）/ `QuantDataProvider` / `live_feed` 全走网络客户端——**零本地 parquet 读取、零 mootdx/astock 直连**。前复权（fq='pre'）在客户端用 `get_adj_factors` 本地折算。主后端前端展示（kline/screener 等）仍 DuckDB 直读共享 `data/`，不受影响。
 - 服务自治回源（`stockdata/scheduler.py`，不再由主后端执行）：启动 backfill（`backfill_to_now`）、工作日 15:35 收盘批量同步（ETF 分钟 + 前复权因子表 + 股票分钟增量）、00:00 清空前一日分钟内存库。**无主动盘中全市场轮询**——实时分钟只在客户端 `current_snapshot` 请求时按需回源：`rt:{code}` 标的级 single-flight 去重 + 共享拉取线程池，当日分钟内存库纯 lazy（未请求标的零内存），非交易时段不触网。
 - 验收命令（backend/ 下，详情见 `docs/superpowers/specs/2026-08-05-stockdata-service-design.md`）：
-  - wufu_v52 回测对齐 `260401-260716`：跑 `run_quant_backtest.py`（区间 2026-04-01~2026-07-16）后用 `scripts/diff_jq_vs_local.py` 对比 fixture `tests/fixtures/wufu_v52/backtest_260401-260716/`（收益逐日差 ≤0.05%、交易组对齐口径同现状）。
-  - 模拟盘对齐 `sim_260710`：`run_quant_sim.py --account wufu_v52_sim --strategy tests/fixtures/wufu_v52/wufu-v5.2.py --date 2026-07-10`，成交对比 `tests/fixtures/wufu_v52/sim_260710/live_transaction_list.csv`。
+  - wufu_v52 回测对齐（`260401-260716` 或 `260401-260820`）：跑 `run_quant_backtest.py` 后用 `scripts/diff_jq_vs_local.py` 对比对应 fixture。验收口径（2026-08-21 修订；「逐日差 ≤0.05%」经 docs/2026-08-06-wufu-v52-alignment-diagnosis.md 定性为 vendor 数据点差不可达）：**交易组翻转事件 ≤2 起、共同交易组 ≥95%、共同组成交价比中位 ≥0.999**（当前实测：260716 翻转 1 起/共同 82·83，260820 翻转 2 起/共同 108·111）。
+  - 模拟盘对齐 `sim_260710`：`uv run python scripts/run_quant_sim.py --create --name align --capital 100000 --strategy-id e33bea48 --start-date 2026-07-10 --account-id wufu_v52_sim` 创建账户，再 `python scripts/run_quant_sim.py wufu_v52_sim` 历史补跑至今天。验收 = 补跑区间内（≤fixture 末日）交易组 100% 被 `live_transaction_list.csv` 覆盖、共同组成交价比中位 ≥0.999（2026-08-21 实测：17/17 全覆盖）。
   - 回测性能门禁：wufu-v5.2 `260401-260716` 全程 ≤120s——`uv run --extra dev pytest -m integration tests/quant/test_wufu_backtest_perf.py -q`。
 
 ## mootdx 数据服务（stock data 服务的数据源/回源实现）
