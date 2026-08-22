@@ -325,3 +325,21 @@ def test_put_daily_mem_enforces_money_column(monkeypatch):
     saved = dm._daily_mem["get_daily_510300.XSHG"]
     assert "money" in saved.columns
     assert float(saved["money"].iloc[0]) == 12345.0
+
+
+def test_ensure_current_dt_fills_none():
+    """重启续跑首条流水线先于任何 bar：ctx.current_dt 不得为 None
+    （否则 ptrade 移植策略 _today().date() 直接 AttributeError）。"""
+    from app.quant.simulate.runner import _ensure_current_dt
+
+    class _Ctx:
+        current_dt = None
+
+    c = _Ctx()
+    _ensure_current_dt(c)
+    assert c.current_dt is not None
+    # 已有值不覆盖
+    keep = _Ctx()
+    keep.current_dt = pd.Timestamp("2026-08-20 15:00")
+    _ensure_current_dt(keep)
+    assert keep.current_dt == pd.Timestamp("2026-08-20 15:00")

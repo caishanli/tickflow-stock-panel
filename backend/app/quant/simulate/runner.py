@@ -411,6 +411,15 @@ def _seed_universe(ctx) -> None:
         ctx.universe = codes
 
 
+def _ensure_current_dt(ctx) -> None:
+    """ctx.current_dt 为 None 时填当前时间（重启续跑首条流水线先于任何 bar）。
+
+    只在缺失时填充，不覆盖引擎已推进的 bar 时间。
+    """
+    if getattr(ctx, "current_dt", None) is None:
+        ctx.current_dt = pd.Timestamp.now()
+
+
 def _restore_portfolio(ctx, st: dict) -> None:
     """从 sim_state 恢复持仓与现金（崩溃续跑）。无持仓时保持初始组合。"""
     pf = ctx.portfolio
@@ -1101,6 +1110,10 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     ctx = bundle.ctx
     if has_saved:
         _restore_portfolio(ctx, st)
+    # 重启续跑的首条流水线（晨间 09:25 等）先于任何 bar 执行：current_dt
+    # 必须非 None，否则 ptrade 移植策略 _today().date() 直接 AttributeError
+    # （960366ab 08-21 计算全局阈值异常根因之一）。
+    _ensure_current_dt(ctx)
     _emit_log(account_id, "info", "策略编译完成，正在初始化数据与指标…")
     try:
         bundle.init_fn(ctx)
