@@ -28,6 +28,12 @@ from app.quant.jqengine.datasource.manager import DataManager
 from app.quant.jqengine.datasource.mootdx_src import MootdxSource
 from app.services.stockdata.backfill_pool import BackfillPool
 
+
+def _backfill_pool() -> BackfillPool:
+    """新建回源池。source_factory 取调用时的模块属性而非 import 期绑定，
+    测试 monkeypatch ``ms.MootdxSource`` 即可注入假源。"""
+    return BackfillPool(source_factory=MootdxSource)
+
 logger = logging.getLogger("app.services.mootdx_service")
 
 _env_root = os.getenv("PARTITION_DATA_ROOT", "").strip()
@@ -194,7 +200,7 @@ def _etf_universe() -> list[str]:
     return sorted(set(out))
 
 
-def sync_etf_minute(day: _date | None = None) -> int:
+def sync_etf_minute(day: _date | None = None) -> dict:
     """收盘后同步指定交易日（默认今天）全部 ETF 分钟到按日分区。
 
     逐标的拉真实 1m：近期日（≤5 天）用 ``get_minute_recent``（含当日盘中），
@@ -206,7 +212,7 @@ def sync_etf_minute(day: _date | None = None) -> int:
     codes = _etf_universe()
     if not codes:
         logger.warning("mootdx_service: ETF 宇宙为空，跳过分钟同步")
-        return 0
+        return {"rows": 0, "query_failed": []}
     historical = (day < _date.today() - _dt.timedelta(days=5))
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
 
@@ -236,15 +242,34 @@ def sync_etf_minute(day: _date | None = None) -> int:
         return out.with_columns(
             pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
 
-    result = BackfillPool().map(_fetch_one, codes)
-    if result["failed"]:
-        logger.warning("mootdx_service: ETF 分钟回源失败 %d 只: %s",
-                       len(result["failed"]), list(result["failed"])[:10])
-    if not result["ok"]:
-        return 0
-    out = pl.concat(result["ok"]).unique(
+    def _pool_pass(symbols):
+        """一轮并发拉取；返回 (ok_frames, failed)。每次调用新建 BackfillPool
+        即新 MootdxSource 集合——第 3 层"换实例当轮重试"语义。
+
+        失败判定：凡未产出当日帧的标的（异常/空响应/服务器限速）都算失败
+        纳入重试——与串行实现语义一致。"""
+        res = _backfill_pool().map(_fetch_one, symbols)
+        ok_tf = {f["symbol"][0] for f in res["ok"]}
+        failed = [jq for jq in symbols if _to_tf_symbol(jq) not in ok_tf]
+        if failed:
+            logger.warning("mootdx_service: ETF 分钟 %d 只未产出帧: %s",
+                           len(failed), failed[:10])
+        return res["ok"], failed
+
+    ok1, failed = _pool_pass(codes)
+    # 第3层: 失败标的换实例当轮重试一轮
+    if failed:
+        logger.warning("mootdx_service: ETF 分钟回源失败重试 %d 只: %s",
+                       len(failed), failed[:10])
+        frames2, failed = _pool_pass(failed)
+        ok1.extend(frames2)
+    if not ok1:
+        logger.warning("mootdx_service: ETF 分钟回源 %s 全部失败", day)
+        return {"rows": 0, "query_failed": failed}
+    out = pl.concat(ok1).unique(
         subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
-    return _write_minute_partition(out, ETF_MINUTE_ROOT, day)
+    n = _write_minute_partition(out, ETF_MINUTE_ROOT, day)
+    return {"rows": n, "query_failed": failed}
 
 
 # mootdx 源错标的 13:00:00 假bar 判定（真实分钟数据下午从 13:01 起，13:00:00 恒为假）
@@ -501,7 +526,7 @@ def _listing_date_map() -> dict[str, _date]:
     return out
 
 
-def sync_stock_minute(limit: int | None = None) -> int:
+def sync_stock_minute(limit: int | None = None) -> dict:
     """回源 4/1 起全市场 A 股分钟到 ``kline_minute`` 分区（一次拉全量多日）。
 
     对每只股票用 mootdx ``get_minute`` 拉一次全量历史 1m（约 3 个月，含
@@ -523,7 +548,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     if not stocks:
         logger.warning("mootdx_service: 股票宇宙为空，跳过分钟同步")
-        return 0
+        return {"rows": 0, "query_failed": []}
     listing = _listing_date_map()
     # 新交易日整日缺失：resume 只按最新分区判断，最新分区是昨天且完整时会
     # 误判"已覆盖"而跳过今天（08-18 案例）——先 range 补缺失交易日。盘中
@@ -549,7 +574,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     todo = [s for s in stocks if s not in done_syms]
     if not todo:
         logger.info("mootdx_service: 股票分钟已全部覆盖（%d 只），无需回源", len(done_syms))
-        return range_rows + fragment_rows
+        return {"rows": range_rows + fragment_rows, "query_failed": []}
     if limit is not None:
         if _stock_minute_latest_partial(done_syms, stocks):
             cov_pct = len(done_syms & set(stocks)) / len(stocks) * 100
@@ -586,6 +611,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     tick = _mk_progress_logger(len(todo), "股票分钟回源")
     counter = {"n": 0}
     total_holder = {"rows": 0}
+    ok_syms: set[str] = set()
     pending: list[pl.DataFrame] = []
 
     def _fetch_one(src, sym):
@@ -627,6 +653,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
         sub = pl.from_pandas(df)
         sub = sub.with_columns(pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
+        ok_syms.add(sym)
         return sub
 
     def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
@@ -642,25 +669,40 @@ def sync_stock_minute(limit: int | None = None) -> int:
                                 [f["symbol"][0] for f in pending])
             pending.clear()
 
-    result = BackfillPool().map(_fetch_one, todo,
-                                batch_size=_STOCK_MINUTE_BATCH,
-                                on_batch_done=_on_batch, keep_frames=False)
+    def _run_round(symbols):
+        """一轮并发拉取；每次调用新建 BackfillPool 即新 MootdxSource 集合
+        （新缓存+换服务器），承载第 3 层"换实例当轮重试"语义。"""
+        return _backfill_pool().map(_fetch_one, symbols,
+                                  batch_size=_STOCK_MINUTE_BATCH,
+                                  on_batch_done=_on_batch, keep_frames=False)
+
+    _run_round(todo)
+    # 第3层: 失败/空返回标的换实例当轮重试一轮（服务器限速也会以空响应
+    # 表现，故空返回同样纳入重试，与串行实现语义一致）
+    retry_syms = sorted(set(todo) - ok_syms)
+    if retry_syms:
+        logger.warning("mootdx_service: 股票分钟回源失败重试 %d 只: %s",
+                       len(retry_syms), retry_syms[:10])
+        _run_round(retry_syms)
+        retry_syms = sorted(set(retry_syms) - ok_syms)
     if pending:
         total_holder["rows"] += sum(f.height for f in pending)
         _flush_stock_minute_chunk(pending)
         _manifest_mark_done("stock_minute", [f["symbol"][0] for f in pending])
         pending.clear()
     total = total_holder["rows"]
-    if result["failed"]:
-        logger.warning("mootdx_service: 股票分钟回源失败 %d 只: %s",
-                       len(result["failed"]),
-                       list(result["failed"].items())[:10])
+    if retry_syms:
+        logger.warning("mootdx_service: 股票分钟回源重试后仍失败 %d 只: %s",
+                       len(retry_syms), retry_syms[:10])
     logger.info("mootdx_service: 股票分钟回源完成 %d 行 (ok=%d failed=%d)",
-                total, result["ok_count"], len(result["failed"]))
-    return range_rows + total + fragment_rows
+                total, len(ok_syms), len(retry_syms))
+    return {"rows": range_rows + total + fragment_rows,
+            "query_failed": retry_syms}
+
 
 
 def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
+    # NOTE: 本函数保持 int 契约（行数），不随 sync_stock_minute 改 dict
     """按缺失日补全股票分钟到 ``kline_minute/date={day}``。
 
     ``symbols``：只处理给定列表（残片日只补缺失标的）；None = 全市场。
@@ -734,7 +776,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
             _flush_stock_minute_chunk(pending.copy())
             pending.clear()
 
-    result = BackfillPool().map(_fetch_one, stocks,
+    result = _backfill_pool().map(_fetch_one, stocks,
                                 batch_size=_STOCK_MINUTE_BATCH,
                                 on_batch_done=_on_batch, keep_frames=False)
     if pending:
@@ -820,7 +862,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
             _flush_stock_minute_chunk(pending.copy())
             pending.clear()
 
-    result = BackfillPool().map(_fetch_one, stocks,
+    result = _backfill_pool().map(_fetch_one, stocks,
                                 batch_size=_STOCK_MINUTE_BATCH,
                                 on_batch_done=_on_batch, keep_frames=False)
     if pending:
@@ -1011,98 +1053,230 @@ def check_and_repair_full(content_recent: int | None = None) -> dict:
     return scan_and_backfill_full(content_recent=content_recent)
 
 
-def sync_adj_factor() -> dict:
-    """增量更新 ETF 前复权因子表（mootdx xdxr 事件重建）。
+def _normalize_xdxr_rows(rows) -> list[dict]:
+    """原始 xdxr 行 -> 可持久化的精简事件 dict 列表(解析失败的行丢弃). """
+    out = []
+    for r in rows or []:
+        try:
+            out.append({
+                "category": int(r.get("category")),
+                "year": int(r["year"]), "month": int(r["month"]),
+                "day": int(r["day"]),
+                "suogu": float(r.get("suogu") or 0),
+                "fenhong": float(r.get("fenhong") or 0),
+                "songzhuangu": float(r.get("songzhuangu") or 0),
+                "peigu": float(r.get("peigu") or 0),
+                "peigujia": float(r.get("peigujia") or 0),
+            })
+        except Exception:
+            continue
+    return out
 
+
+def _load_xdxr_events(path) -> dict:
+    """读本地事件表 -> {sym6: [事件dict]}; 文件不存在返回 {}. """
+    import polars as pl
+    if not path.exists():
+        return {}
+    try:
+        df = pl.read_parquet(path)
+    except Exception:
+        logger.warning("mootdx_service: 事件表损坏，按空表处理: %s", path)
+        return {}
+    keys = ("category", "year", "month", "day", "suogu", "fenhong",
+            "songzhuangu", "peigu", "peigujia")
+    out: dict[str, list[dict]] = {}
+    for r in df.iter_rows(named=True):
+        out.setdefault(r["symbol"], []).append({k: r[k] for k in keys})
+    return out
+
+
+def _save_xdxr_events(path, events_map) -> None:
+    import polars as pl
+    rows = [{"symbol": s, **e} for s, evs in sorted(events_map.items()) for e in evs]
+    df = pl.DataFrame(rows) if rows else pl.DataFrame({
+        "symbol": [], "category": [], "year": [], "month": [], "day": [],
+        "suogu": [], "fenhong": [], "songzhuangu": [], "peigu": [], "peigujia": []})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / "xdxr_events.tmp.parquet"
+    df.write_parquet(tmp)
+    tmp.rename(path)
+
+
+def _audit_uncovered_breakpoints(daily, factor_df, threshold: float = 0.2) -> list:
+    """断点审计: 因子调整后序列仍含 >threshold 单日跳变的标的(升序). 
+    只负责发现缺口驱动回源, 不合成数据. 20cm ETF 恰好 ±20% 属合法涨跌, 
+    用严格大于排除. 
+    """
+    fmap: dict[str, dict] = {}
+    if factor_df is not None and not factor_df.is_empty():
+        for r in factor_df.iter_rows(named=True):
+            fmap.setdefault(r["symbol"], {})[r["trade_date"]] = r["ex_factor"]
+    flagged = []
+    for jq, pdf in daily.items():
+        closes = pdf["close"].dropna()
+        if len(closes) < 2:
+            continue
+        frows = fmap.get(jq) or {}
+        fac = pd.Series([frows.get(d.date(), 1.0) for d in closes.index],
+                        index=closes.index)
+        ret = (closes * fac).pct_change().dropna()
+        if (ret.abs() > threshold).any():
+            flagged.append(jq)
+    return sorted(flagged)
+
+
+def _symbol_factor_frame(jq: str, closes: pd.Series,
+                         rows: list[dict] | None) -> pl.DataFrame | None:
+    """单标的: 本地事件 rows x 日线 close -> 逐日因子帧; 无有效事件返回 None. 
+    数学与历史版本完全一致(cat==11: 1/suogu; cat==1 含红利/配股摊薄). 
+    """
+    events = []
+    for r in (rows or []):
+        cat = r.get("category")
+        year = r.get("year")
+        if not year or int(year) < _SINCE_YEAR:
+            continue
+        try:
+            ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
+        except Exception:
+            continue
+        if cat == 11:
+            suogu = float(r.get("suogu") or 0)
+            if suogu <= 0:
+                continue
+            events.append((ex_dt, 1.0 / suogu))
+        elif cat == 1:
+            fh = float(r.get("fenhong") or 0) / 10.0      # 每股现金红利(元)
+            sg = float(r.get("songzhuangu") or 0) / 10.0  # 每股送转
+            pg = float(r.get("peigu") or 0) / 10.0        # 每股配股
+            pgj = float(r.get("peigujia") or 0)           # 配股价
+            if fh == 0 and sg == 0 and pg == 0:
+                continue
+            prev = closes.loc[closes.index < ex_dt].dropna()
+            if prev.empty:
+                continue
+            prev_close = float(prev.iloc[-1])
+            if prev_close <= 0:
+                continue
+            ex_price = (prev_close - fh + pgj * pg) / (1.0 + sg + pg)
+            if ex_price <= 0:
+                continue
+            events.append((ex_dt, ex_price / prev_close))
+    if not events:
+        return None
+    events = [(e, f) for e, f in events if e < closes.index.max()]
+    if not events:
+        return None
+    adj = pd.Series(1.0, index=closes.index)
+    for ex_dt, f in events:
+        adj.loc[adj.index < ex_dt] *= f
+    return pl.DataFrame({
+        "symbol": jq,
+        "trade_date": [d.isoformat() for d in closes.index.date],
+        "ex_factor": adj.values,
+    })
+
+
+def sync_adj_factor() -> dict:
+    """增量更新 ETF 前复权因子表(mootdx xdxr 事件重建, 三层加固). 
     对宇宙内每只有除权事件的标的，用 xdxr 记录 + 日线 close 重建逐日
     ex_factor 序列，覆盖该标的在 ``all.parquet`` 中的行（全量重算该标的，
-    幂等）。返回 {written_symbols, rows, total_symbols}。
+    幂等). xdxr 原始事件落本地 ``xdxr_events.parquet``(查询失败沿用本地
+    事件); 写表后跑断点审计(调整后序列仍含 >20% 单日跳变即缺口), 
+    查询失败 ∪ 审计缺口用新 MootdxSource 实例重试一轮, 仍有缺口 WARNING. 
+    返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}. 
     """
     src = MootdxSource()
     dm = DataManager()
     daily = dm._load_daily_from_partitions(asof=None)
     codes = _etf_universe()
     if not codes:
-        return {"written_symbols": 0, "rows": 0, "total_symbols": 0}
+        return {"written_symbols": 0, "rows": 0, "total_symbols": 0,
+                "query_failed": [], "audit_uncovered": []}
     # 只保留宇宙内的标的
     daily = {k: v for k, v in daily.items() if k in set(codes)}
+    # 第2层: xdxr 原始事件落本地. 查询失败(None)沿用本地已有事件, 
+    # 因子重建纯本地计算--socket 只影响"发现新事件", 不影响既有因子. 
+    events_path = ADJ_FACTOR_PATH.parent / "xdxr_events.parquet"
+    events_map = _load_xdxr_events(events_path)
+    query_failed = []
     frames = []
     for jq, pdf in daily.items():
         closes = pdf["close"].dropna()
         if closes.empty:
             continue
-        rows = src._xdxr_rows(jq.split(".")[0])
-        events = []
-        for r in (rows or []):
-            cat = r.get("category")
-            year = r.get("year")
-            if not year or int(year) < _SINCE_YEAR:
-                continue
-            try:
-                ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
-            except Exception:
-                continue
-            if cat == 11:
-                suogu = float(r.get("suogu") or 0)
-                if suogu <= 0:
+        sym6 = jq.split(".")[0]
+        rows = src._xdxr_rows(sym6)
+        if rows is None:
+            if sym6 not in query_failed:
+                query_failed.append(sym6)
+            logger.warning("mootdx_service: %s xdxr 查询失败, 沿用本地事件", sym6)
+        else:
+            events_map[sym6] = _normalize_xdxr_rows(rows)
+        fr = _symbol_factor_frame(jq, closes, events_map.get(sym6))
+        if fr is not None:
+            frames.append(fr)
+    _save_xdxr_events(events_path, events_map)
+
+    def _merge_write(frames_):
+        """合并写入因子表; frames_ 为空时保留既有表. 返回最新表内容. """
+        ADJ_FACTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        out = pl.concat(frames_) if frames_ else None
+        if out is not None:
+            out = out.with_columns(pl.col("trade_date").cast(pl.Date))
+            out = out.unique(subset=["symbol", "trade_date"], keep="last").sort(
+                ["symbol", "trade_date"])
+        if ADJ_FACTOR_PATH.exists():
+            old = pl.read_parquet(ADJ_FACTOR_PATH)
+            out = old if out is None else pl.concat([old, out]).unique(
+                subset=["symbol", "trade_date"], keep="last").sort(
+                ["symbol", "trade_date"])
+        if out is None or out.is_empty():
+            return pl.DataFrame({"symbol": [], "trade_date": [], "ex_factor": []})
+        tmp = ADJ_FACTOR_PATH.parent / "all.tmp.parquet"
+        out.write_parquet(tmp)
+        tmp.rename(ADJ_FACTOR_PATH)
+        logger.info("mootdx_service: 因子表更新 %d 行 / %d 只 -> %s",
+                    out.height, out["symbol"].n_unique(), ADJ_FACTOR_PATH)
+        return out
+
+    out = _merge_write(frames)
+    audit_uncovered = _audit_uncovered_breakpoints(daily, out)
+
+    # 第3层: 查询失败 ∪ 审计缺口 -> 新实例(新缓存+换服务器)重试一轮
+    retry_syms = sorted(set(query_failed)
+                        | {s.split(".")[0] for s in audit_uncovered})
+    if retry_syms:
+        logger.warning("mootdx_service: 因子缺口重试 %d 只: %s",
+                       len(retry_syms), retry_syms[:10])
+        src2 = MootdxSource()
+        got = []
+        for sym6 in retry_syms:
+            rows = src2._xdxr_rows(sym6)
+            if rows is not None:
+                events_map[sym6] = _normalize_xdxr_rows(rows)
+                got.append(sym6)
+        if got:
+            _save_xdxr_events(events_path, events_map)
+            frames = []
+            for jq, pdf in daily.items():
+                closes = pdf["close"].dropna()
+                if closes.empty:
                     continue
-                events.append((ex_dt, 1.0 / suogu))
-            elif cat == 1:
-                # 除权参考价公式与 mootdx_src._to_qfq 同口径：
-                # ex_price = (prev_close - fh + pgj*pg) / (1+sg+pg)
-                # factor = ex_price / prev_close。现金红利(fh)/配股会摊薄价格，
-                # 纯送转比例式 1/(1+sg+pg) 会漏掉这两项（对齐 bug：510880 等
-                # 有年度现金分红，漏算导致前复权价偏离聚宽）。
-                fh = float(r.get("fenhong") or 0) / 10.0      # 每股现金红利(元)
-                sg = float(r.get("songzhuangu") or 0) / 10.0  # 每股送转
-                pg = float(r.get("peigu") or 0) / 10.0        # 每股配股
-                pgj = float(r.get("peigujia") or 0)           # 配股价
-                if fh == 0 and sg == 0 and pg == 0:
-                    continue
-                prev = closes.loc[closes.index < ex_dt].dropna()
-                if prev.empty:
-                    continue  # 除权日前一收盘价不在帧内，因子无法计算
-                prev_close = float(prev.iloc[-1])
-                if prev_close <= 0:
-                    continue
-                ex_price = (prev_close - fh + pgj * pg) / (1.0 + sg + pg)
-                if ex_price <= 0:
-                    continue
-                events.append((ex_dt, ex_price / prev_close))
-        if not events:
-            continue
-        events = [(e, f) for e, f in events if e < closes.index.max()]
-        if not events:
-            continue
-        adj = pd.Series(1.0, index=closes.index)
-        for ex_dt, f in events:
-            adj.loc[adj.index < ex_dt] *= f
-        frames.append(pl.DataFrame({
-            "symbol": jq,
-            "trade_date": [d.isoformat() for d in closes.index.date],
-            "ex_factor": adj.values,
-        }))
-    if not frames:
-        logger.info("mootdx_service: 无除权事件，因子表无更新")
-        return {"written_symbols": 0, "rows": 0, "total_symbols": len(codes)}
-    out = pl.concat(frames)
-    out = out.with_columns(pl.col("trade_date").cast(pl.Date))
-    out = out.unique(subset=["symbol", "trade_date"], keep="last").sort(
-        ["symbol", "trade_date"])
-    ADJ_FACTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # 合并既有表（幂等）：同 symbol+date 覆盖，其余保留
-    if ADJ_FACTOR_PATH.exists():
-        old = pl.read_parquet(ADJ_FACTOR_PATH)
-        out = pl.concat([old, out]).unique(
-            subset=["symbol", "trade_date"], keep="last").sort(["symbol", "trade_date"])
-    tmp = ADJ_FACTOR_PATH.parent / "all.tmp.parquet"
-    out.write_parquet(tmp)
-    tmp.rename(ADJ_FACTOR_PATH)
-    n_syms = out["symbol"].n_unique()
-    logger.info("mootdx_service: 因子表更新 %d 行 / %d 只 → %s",
-                out.height, n_syms, ADJ_FACTOR_PATH)
+                fr = _symbol_factor_frame(jq, closes,
+                                          events_map.get(jq.split(".")[0]))
+                if fr is not None:
+                    frames.append(fr)
+            out = _merge_write(frames)
+            audit_uncovered = _audit_uncovered_breakpoints(daily, out)
+
+    if audit_uncovered:
+        logger.warning("mootdx_service: 因子断点审计未覆盖 %d 只: %s",
+                       len(audit_uncovered), audit_uncovered[:10])
     return {"written_symbols": len(frames), "rows": out.height,
-            "total_symbols": len(codes)}
+            "total_symbols": len(codes),
+            "query_failed": query_failed, "audit_uncovered": audit_uncovered}
 
 
 # ---------------------------------------------------------------------------
@@ -1599,13 +1773,18 @@ def sync_daily(day: _date) -> dict:
         stocks = [s for s in stocks if _active(s)]
     written = {"stock": 0, "etf": 0}
 
+    class _QueryFailedError(Exception):
+        """守护超时/查询错误被折叠成 None——必须重试，不能静默跳过。"""
+
     def _fetch_one(src, sym):
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
-        except Exception:  # noqa: BLE001
-            return None
-        if df is None or df.empty:
-            return None
+        except Exception as e:  # noqa: BLE001
+            raise _QueryFailedError(sym) from e
+        if df is None:
+            raise _QueryFailedError(sym)
+        if df.empty:
+            return None  # 正常无数据(停牌/未上市), 不算失败
         # 只保留目标日那根（索引含 15:00 时间戳）
         hit = df[[x.date() == day for x in df.index]]
         if hit.empty:
@@ -1622,12 +1801,37 @@ def sync_daily(day: _date) -> dict:
             "amount": [float(row["amount"])],
         })
 
-    pool = BackfillPool()
-    stock_res = pool.map(_fetch_one, stocks)
-    etf_res = pool.map(_fetch_one, etfs)
-    sdf = pl.concat(stock_res["ok"]) if stock_res["ok"] else None
-    edf = pl.concat(etf_res["ok"]) if etf_res["ok"] else None
+    def _run_round(symbols):
+        """一轮并发拉取；新建 BackfillPool 即新 MootdxSource 集合——第 3 层
+        "换实例当轮重试"语义。"""
+        return _backfill_pool().map(_fetch_one, symbols)
+
+    def _round_frames(res):
+        """一轮结果 -> (帧列表, 查询失败清单)。"""
+        return res["ok"], sorted(res["failed"])
+
+    # 第3层: 失败标的换实例当轮重试一轮; 两轮 ok 帧合并而非替换
+    r_stock = _run_round(stocks)
+    frames_s, failed_s = _round_frames(r_stock)
+    if failed_s:
+        logger.warning("mootdx_service: 日线回源股票失败重试 %d 只: %s",
+                       len(failed_s), failed_s[:10])
+        r2, failed_s = _round_frames(_run_round(failed_s))
+        frames_s += r2
+    sdf = pl.concat(frames_s) if frames_s else None
+
+    r_etf = _run_round(etfs)
+    frames_e, failed_e = _round_frames(r_etf)
+    if failed_e:
+        logger.warning("mootdx_service: 日线回源 ETF 失败重试 %d 只: %s",
+                       len(failed_e), failed_e[:10])
+        r2e, failed_e = _round_frames(_run_round(failed_e))
+        frames_e += r2e
+    edf = pl.concat(frames_e) if frames_e else None
+
     if sdf is not None:
+        # 股票 volume 换手（mootdx 股 ÷100），ETF 保持股——解冲突时曾遗漏，
+        # 表现为 written["stock"] 恒 0（08-22 合并回归，测试当场抓住）
         sdf = sdf.with_columns((pl.col("volume") / 100.0).alias("volume"))
         written["stock"] = sdf.height
     if edf is not None:
@@ -1645,7 +1849,11 @@ def sync_daily(day: _date) -> dict:
     if edf is not None:
         _write_daily_partition(edf, ETF_DAILY_ROOT)
     logger.info("mootdx_service: 日线回源 %s 完成: %s", day, written)
-    return written
+    query_failed = failed_s + failed_e
+    if query_failed:
+        logger.warning("mootdx_service: 日线回源 %s 重试后仍失败 %d 只: %s",
+                       day, len(query_failed), query_failed[:10])
+    return {**written, "query_failed": query_failed}
 
 
 def _write_daily_partition(df: pl.DataFrame, root: Path) -> None:
@@ -1728,7 +1936,7 @@ def sync_index_daily(day: _date) -> dict:
         except Exception:  # noqa: BLE001
             return None
 
-    result = BackfillPool().map(_fetch_one, indices)
+    result = _backfill_pool().map(_fetch_one, indices)
     frames = result["ok"]
     if not frames:
         logger.warning("mootdx_service: 指数日线回源 %s 全部失败（%d 只尝试）",
@@ -2076,9 +2284,11 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute
                       | etf_minute_shortfall):
         try:
-            n = sync_etf_minute(day)
+            res = sync_etf_minute(day)
             result["minute_days"].append(str(day))
-            result["minute_rows"] += n
+            result["minute_rows"] += res["rows"]
+            result.setdefault("query_failed", []).extend(
+                [f"etf_minute:{x}" for x in res["query_failed"]])
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: 分钟回源 %s 失败: %s", day, e)
             result["errors"].append(f"minute {day}: {e}")
@@ -2106,8 +2316,12 @@ def _backfill_to_now_locked() -> dict[str, Any]:
         try:
             w = sync_daily(day)
             result["daily_days"].append(str(day))
+            query_failed = w.pop("query_failed", [])
             for k, v in w.items():
                 result["daily_written"][k] = result["daily_written"].get(k, 0) + v
+            if query_failed:
+                result.setdefault("query_failed", []).extend(
+                    [f"daily:{x}" for x in query_failed])
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: 日线回源 %s 失败: %s", day, e)
             result["errors"].append(f"daily {day}: {e}")
@@ -2154,8 +2368,10 @@ def _backfill_to_now_locked() -> dict[str, Any]:
                            sorted(incomplete_minute), e)
             result["errors"].append(f"stock_minute_range {sorted(incomplete_minute)}: {e}")
     try:
-        n = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
-        result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
+        res = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
+        result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + res["rows"]
+        result.setdefault("query_failed", []).extend(
+            [f"stock_minute:{x}" for x in res["query_failed"]])
     except Exception as e:  # noqa: BLE001
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")

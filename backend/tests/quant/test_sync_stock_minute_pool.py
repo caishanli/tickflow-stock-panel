@@ -77,8 +77,8 @@ def test_sync_stock_minute_uses_pool_since_and_manifest(tmp_path, monkeypatch):
         return _StubPool(fake)
 
     monkeypatch.setattr(ms, "BackfillPool", fake_pool)
-    n = ms.sync_stock_minute(limit=None)
-    assert n == 4  # 2 只 × 2 根 bar
+    res = ms.sync_stock_minute(limit=None)
+    assert res["rows"] == 4 and res["query_failed"] == []
     assert created.get("pool")  # 走了池
     codes = {c for c, _ in fake.since_calls}
     assert codes == {"600000.SH", "600001.SH"}
@@ -100,8 +100,8 @@ def test_sync_stock_minute_resume_skips_manifest_done(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ms, "BackfillPool",
         lambda workers=None, source_factory=None: _StubPool(fake))
-    n = ms.sync_stock_minute(limit=None)
-    assert n == 2  # 只拉了未完成的一只
+    res = ms.sync_stock_minute(limit=None)
+    assert res["rows"] == 2  # 只拉了未完成的一只
     assert {c for c, _ in fake.since_calls} == {"600001.SH"}
 
 
@@ -122,8 +122,8 @@ def test_sync_stock_minute_limit_respected(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ms, "BackfillPool",
         lambda workers=None, source_factory=None: _StubPool(fake))
-    n = ms.sync_stock_minute(limit=20)  # 全覆盖 → todo 空 → 直接返回 0
-    assert n == 0
+    res = ms.sync_stock_minute(limit=20)  # 全覆盖 → todo 空 → 直接返回 0
+    assert res["rows"] == 0
     assert fake.since_calls == []
 
 

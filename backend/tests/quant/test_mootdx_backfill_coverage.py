@@ -850,7 +850,7 @@ def test_sync_etf_minute_normalizes_phantom_noon_bar(tmp_path, monkeypatch):
     df = pl.read_parquet(part)
     times = sorted(str(t) for t in df["datetime"].to_list())
     assert times == ["2026-08-05 10:30:00", "2026-08-05 11:30:00"], times
-    assert n == 2
+    assert n["rows"] == 2
 
 
 def test_clean_phantom_noon_partitions_relabels_etf(tmp_path, monkeypatch):
@@ -1179,7 +1179,7 @@ def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
     monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     n = ms.sync_etf_minute(_dt.date(2026, 6, 15))
-    assert n == 2
+    assert n["rows"] == 2
     part = tmp_path / "kline_etf_minute" / "date=2026-06-15" / "part.parquet"
     assert part.exists()
     df = pl.read_parquet(part)
@@ -1483,7 +1483,7 @@ def test_sync_stock_minute_skips_today_intraday_bars(tmp_path, monkeypatch):
 
     n = ms.sync_stock_minute(limit=None)
     # 昨日 2 只 × 1 根 = 2；今天盘中 2 只 × 2 根被排除
-    assert n == 2
+    assert n["rows"] == 2
     yesterday = tmp_path / "kline_minute" / "date=2026-08-04" / "part.parquet"
     assert yesterday.exists(), "昨日完整分钟应落盘"
     today = tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet"
@@ -1525,7 +1525,7 @@ def test_sync_stock_minute_writes_today_after_close(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_STOCK_MINUTE_BATCH", 10)
 
     n = ms.sync_stock_minute(limit=None)
-    assert n == 2, "收盘后今日整日分钟应落盘"
+    assert n["rows"] == 2, "收盘后今日整日分钟应落盘"
     assert (tmp_path / "kline_minute" / "date=2026-08-05" / "part.parquet").exists()
 
 
@@ -1588,7 +1588,7 @@ def test_sync_stock_minute_ignores_limit_when_latest_partial_after_close(tmp_pat
     n = ms.sync_stock_minute(limit=1)
     # 残缺分区覆盖率 1/3 < 阈值：应忽略 limit 全量补齐缺失的 2 只
     assert set(fetched) == {"600000.SH", "601398.SH"}, f"应全量补齐, 实际 {fetched}"
-    assert n == 2
+    assert n["rows"] == 2
 
 
 def test_sync_stock_minute_day_with_symbols_subset(tmp_path, monkeypatch):
@@ -1687,7 +1687,7 @@ def test_sync_stock_minute_repairs_fragment_day(tmp_path, monkeypatch):
 
     # 残片补齐: 只拉 08-12 缺失的 3 只（000002/000003/000004），各 1 根；
     # resume 再补最新日 08-14 缺失的同 3 只 → 共拉 6 次
-    assert n == 6
+    assert n["rows"] == 6
     assert sorted(fetched) == sorted(universe[1:] * 2), \
         f"残片+resume 应各拉缺失标的, 实际 {sorted(fetched)}"
     df12 = pl.read_parquet(root / "date=2026-08-12" / "part.parquet")
@@ -1851,7 +1851,7 @@ def test_sync_stock_minute_pulls_missing_day_first(monkeypatch, tmp_path):
     n = ms.sync_stock_minute(limit=None)
 
     assert ranges == [[_d(2026, 8, 5)]], "应先 range 补今天"
-    assert n == 10, "返回值应包含 range 写入行数"
+    assert n["rows"] == 10, "返回值应包含 range 写入行数"
 
 
 def test_sync_stock_minute_no_range_when_current(monkeypatch, tmp_path):
@@ -1880,7 +1880,7 @@ def test_sync_stock_minute_no_range_when_current(monkeypatch, tmp_path):
     n = ms.sync_stock_minute(limit=None)
 
     assert ranges == [], "最新分区已是今天，不应触发 range"
-    assert n == 0, "resume todo 空 → 0 行"
+    assert n["rows"] == 0 and n["query_failed"] == [], "resume todo 空 → 0 行"
 
 
 # ---------------------------------------------------------------------------

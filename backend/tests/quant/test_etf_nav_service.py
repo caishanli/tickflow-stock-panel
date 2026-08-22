@@ -262,3 +262,25 @@ def test_backfill_to_now_includes_etf_nav(tmp_path, monkeypatch):
     res = mootdx_service.backfill_to_now()
     assert "etf_nav_days" in res
     assert "etf_nav" in res.get("missing", {})
+
+
+def test_sync_retries_empty_once(tmp_path, monkeypatch):
+    """NAV 链路：akshare 偶发空结果重试一次，第二次成功即正常落盘。"""
+    monkeypatch.setenv("PARTITION_DATA_ROOT", str(tmp_path))
+    import importlib
+    importlib.reload(svc)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return pl.DataFrame()
+        return pl.DataFrame({
+            "基金代码": ["510300"],
+            "2026-08-06-单位净值": [4.7111],
+            "2026-08-06-累计净值": [4.7111],
+        })
+
+    monkeypatch.setattr(svc, "_fund_etf_fund_daily_em", flaky)
+    n = svc.sync_etf_nav(date(2026, 8, 6))
+    assert calls["n"] == 2 and n == 1

@@ -91,6 +91,6 @@ def test_sync_etf_minute_concurrent(tmp_path, monkeypatch):
         return _StubPool(_FakeDailySrc())
 
     monkeypatch.setattr(ms, "BackfillPool", fake_pool)
-    n = ms.sync_etf_minute(day)
+    res = ms.sync_etf_minute(day)
     assert created.get("pool")  # 走了池
-    assert n == 1
+    assert res["rows"] == 1 and res["query_failed"] == []
