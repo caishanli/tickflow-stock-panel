@@ -107,3 +107,83 @@ def test_repair_index_day_skips_cross_source_when_mootdx_covers(tmp_path, monkey
                         lambda d, m: called.__setitem__("n", called["n"] + 1))
     ms._repair_index_day(day)
     assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 泛化：其余数据集的相对基线检测
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from app.services import mootdx_service as ms
+
+
+def _seed_baseline(root, base_syms, days=5, d0=_dt.date(2026, 8, 10)):
+    for i in range(days):
+        _write_index_part(root, d0 + _dt.timedelta(days=i), base_syms)
+
+
+@pytest.mark.parametrize("attr", ["STOCK_DAILY_ROOT", "ETF_DAILY_ROOT",
+                                  "ETF_MINUTE_ROOT"])
+def test_shortfall_generalizes_to_other_datasets(tmp_path, monkeypatch, attr):
+    """股票日线/ETF 日线/ETF 分钟：基线 100 只，某日 85 只(<95%) → 检出。"""
+    root = tmp_path / attr.lower()
+    monkeypatch.setattr(ms, attr, root)
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    base = [f"{600000 + i}.SH" for i in range(100)]
+    _seed_baseline(root, base)
+    short_day = _dt.date(2026, 8, 15)
+    _write_index_part(root, short_day, base[:85])
+
+    got = ms._shortfall_days(root)
+    assert got and short_day in got
+    assert len(got[short_day]) == 15
+
+
+def test_scan_missing_partitions_merges_shortfall(tmp_path, monkeypatch):
+    """巡检扫描把各数据集相对基线缺口并入对应缺失清单。"""
+    import pandas as pd
+
+    # 交易日历：只认 08-11~08-16
+    cal = [_dt.date(2026, 8, d) for d in range(11, 17)]
+    monkeypatch.setattr(ms, "_trade_days_in_range",
+                        lambda start=None, end=None, **k: cal)
+
+    roots = {}
+    base = [f"{600000 + i}.SH" for i in range(100)]
+    for attr in ("INDEX_DAILY_ROOT", "STOCK_DAILY_ROOT", "ETF_DAILY_ROOT",
+                 "ETF_MINUTE_ROOT", "STOCK_MINUTE_ROOT"):
+        r = tmp_path / attr.lower()
+        monkeypatch.setattr(ms, attr, r)
+        roots[attr] = r
+        _seed_baseline(r, base, days=4, d0=_dt.date(2026, 8, 11))
+        # 每类都写一个 08-14 的"完整"日 + 把 08-15 缺 20 只
+        _write_index_part(r, _dt.date(2026, 8, 14), base)
+        _write_index_part(r, _dt.date(2026, 8, 15), base[:80])
+    # 股票分钟走残片逻辑（≥500），80 只缺失不触发——从其缺口中排除
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    import app.services.etf_nav_service as nav
+    monkeypatch.setattr(nav, "_missing_etf_nav_days", lambda: [])
+    monkeypatch.setattr(ms, "_safe_universe_segment_missing", lambda: [])
+
+    missing = ms.scan_missing_partitions()
+    assert _dt.date(2026, 8, 15) in [d for d in missing["kline_daily"]]
+    assert _dt.date(2026, 8, 15) in [d for d in missing["kline_etf_daily"]]
+    assert _dt.date(2026, 8, 15) in [d for d in missing["kline_etf_minute"]]
+
+
+def test_backfill_missing_partitions_routes_shortfall_repair(tmp_path, monkeypatch):
+    """00:00 巡检补全对缺口日调用 sync_daily / sync_etf_minute。"""
+    called = {"daily": [], "etf_min": []}
+    day = _dt.date(2026, 8, 15)
+    monkeypatch.setattr(ms, "sync_daily",
+                        lambda d: called["daily"].append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: called["etf_min"].append(d))
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 0})
+    missing = {"kline_daily": [day], "kline_etf_daily": [],
+               "kline_index_daily": [], "kline_etf_minute": [day],
+               "kline_minute": [], "etf_nav": [], "etf_universe_segments": []}
+    res = ms.backfill_missing_partitions(missing)
+    assert called["daily"] == [day]
+    assert called["etf_min"] == [day]
+    assert res["errors"] == []

@@ -1208,13 +1208,21 @@ def scan_missing_partitions(start: _date | None = None,
     # 盘中半程快照自愈（08-11 案例）：昨日/历史日分区 mtime 早于自身日期
     # 15:00 即判残缺重写。00:00 巡检跨天也能识别（旧实现只查今天）。
     missing_etf_daily |= set(_stale_daily_days(ETF_DAILY_ROOT))
+    # 相对基线检测（08-21 案例：555/599 过绝对阈值但缺 44 只中证系）
+    for _d in _shortfall_days(ETF_DAILY_ROOT):
+        missing_etf_daily.add(_d)
     missing_stock_daily = set(_missing_days_in(calendar, STOCK_DAILY_ROOT))
     missing_stock_daily |= set(_stale_daily_days(STOCK_DAILY_ROOT))
     missing_stock_daily |= set(_incomplete_stock_daily_days(recent=content))
+    for _d in _shortfall_days(STOCK_DAILY_ROOT):
+        missing_stock_daily.add(_d)
     missing_index_daily = set(_missing_days_in(calendar, INDEX_DAILY_ROOT))
     missing_index_daily |= set(_incomplete_index_daily_days(recent=content))
+    missing_index_daily |= set(_index_shortfall_days())
     missing_etf_minute = set(_missing_days_in(calendar, ETF_MINUTE_ROOT))
     missing_etf_minute |= set(_incomplete_etf_minute_days(recent=content))
+    for _d in _shortfall_days(ETF_MINUTE_ROOT):
+        missing_etf_minute.add(_d)
     missing_stock_minute = set(_missing_days_in(calendar, STOCK_MINUTE_ROOT))
     missing_stock_minute |= set(_incomplete_stock_minute_days(recent=content))
     seg_missing = _safe_universe_segment_missing()
@@ -1765,20 +1773,21 @@ def _partition_symbol_sets(root: Path, lookback: int) -> list[tuple[Path, set]]:
     return out
 
 
-def _index_shortfall_days(
+def _shortfall_days(
+    root: Path,
     lookback: int = _INDEX_SHORTFALL_LOOKBACK,
     ratio: float = _INDEX_SHORTFALL_RATIO,
 ) -> dict[_date, list[str]]:
     """相对基线检测：近 N 分区以最大 symbol 集为基线，返回显著低于基线的
-    {日期: 缺失清单}。
+    {日期: 缺失清单}。适用于任一按日分区数据集。
 
     - 基线取窗口内最大集（退市/停牌类正常波动 ≤5% 由 ratio 容忍）；
     - 当日盘中不判（半程数据不可作依据，与既有守卫同口径）；
     - 分区 <3 个时无基线可比，返回空。
     """
-    if not INDEX_DAILY_ROOT.is_dir():
+    if not root.is_dir():
         return {}
-    sets_ = _partition_symbol_sets(INDEX_DAILY_ROOT, lookback)
+    sets_ = _partition_symbol_sets(root, lookback)
     if len(sets_) < 3:
         return {}
     base_syms = max((s for _, s in sets_), key=len)
@@ -1796,14 +1805,22 @@ def _index_shortfall_days(
     return out
 
 
-def _index_missing_vs_baseline(day: _date,
-                               lookback: int = _INDEX_SHORTFALL_LOOKBACK) -> list[str]:
+def _index_shortfall_days(
+    lookback: int = _INDEX_SHORTFALL_LOOKBACK,
+    ratio: float = _INDEX_SHORTFALL_RATIO,
+) -> dict[_date, list[str]]:
+    """指数日线相对基线检测（泛化入口的 index 包装）。"""
+    return _shortfall_days(INDEX_DAILY_ROOT, lookback=lookback, ratio=ratio)
+
+
+def _missing_vs_baseline(root: Path, day: _date,
+                         lookback: int = _INDEX_SHORTFALL_LOOKBACK) -> list[str]:
     """单日相对基线的缺失清单（基线不足时返回空=无法判定）。"""
-    sets_ = _partition_symbol_sets(INDEX_DAILY_ROOT, lookback)
+    sets_ = _partition_symbol_sets(root, lookback)
     base_syms = max((s for _, s in sets_), key=len) if sets_ else set()
     if not base_syms:
         return []
-    pdir = INDEX_DAILY_ROOT / f"date={day.isoformat()}" / "part.parquet"
+    pdir = root / f"date={day.isoformat()}" / "part.parquet"
     if not pdir.exists():
         return sorted(base_syms)
     try:
@@ -1811,6 +1828,12 @@ def _index_missing_vs_baseline(day: _date,
     except Exception:  # noqa: BLE001
         return sorted(base_syms)
     return sorted(base_syms - syms)
+
+
+def _index_missing_vs_baseline(day: _date,
+                               lookback: int = _INDEX_SHORTFALL_LOOKBACK) -> list[str]:
+    """指数日线单日缺失清单（泛化入口的 index 包装）。"""
+    return _missing_vs_baseline(INDEX_DAILY_ROOT, day, lookback)
 
 
 def _cross_source_index_repair(day: _date, missing: list[str]) -> int:
@@ -1835,7 +1858,7 @@ def _repair_index_day(day: _date) -> dict:
     """
     w = sync_index_daily(day)
     n_cross = 0
-    missing = _index_missing_vs_baseline(day)
+    missing = _missing_vs_baseline(INDEX_DAILY_ROOT, day)
     if missing:
         logger.warning(
             "mootdx_service: 指数日线 %s 相对基线缺 %d 只，路由 TickFlow 源补齐",
@@ -2016,8 +2039,9 @@ def _backfill_to_now_locked() -> dict[str, Any]:
                                "empty": not etf_nav_days, "missing": bool(missing_nav_days)},
     }
 
-    # 1. ETF 分钟
-    for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute):
+    # 1. ETF 分钟（含相对基线残缺日）
+    for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute
+                      | set(_shortfall_days(ETF_MINUTE_ROOT))):
         try:
             n = sync_etf_minute(day)
             result["minute_days"].append(str(day))
@@ -2030,6 +2054,8 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     today = _date.today()
     daily_days = sorted(set(_missing_daily_days(STOCK_DAILY_ROOT))
                         | set(_missing_daily_days(ETF_DAILY_ROOT))
+                        | set(_shortfall_days(STOCK_DAILY_ROOT))
+                        | set(_shortfall_days(ETF_DAILY_ROOT))
                         | incomplete_etf_daily_full
                         | set(incomplete_stock_daily)
                         | set(incomplete_etf_daily))
