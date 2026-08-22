@@ -20,6 +20,13 @@ from ..config import CONFIG, REPO_ROOT
 
 SOURCES = {"network": NetworkSource}
 
+# fetch("get_daily") 单参兜底 / 批量回源的默认回看窗口(天), 对齐
+# preload_daily(400). money 明细等内部消费只需近期窗口; 全历史起点会让
+# 服务端 get_daily 按日分区顺序全扫(~6300 文件/次, DayFileCache cap=60
+# 几乎全 miss), 是 stockdata CPU 风暴的根源. 下游 DataCache._covers 发现
+# 覆盖不足时会带显式日期重取, 不丢数据. 
+_DAILY_FETCH_LOOKBACK_DAYS = 400
+
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
 
@@ -610,10 +617,16 @@ class DataManager:
                     # fetch("get_daily", code) 单参（_build_money_full 等）缺
                     # start/end → 补全量窗口，避免 NetworkSource.get_daily 缺参抛
                     # 错导致全球池成交额过滤静默失效（模拟盘补跑 _daily_mem 空时
-                    # 触发）。显式传了日期则原样透传。
+                    # 触发）. 显式传了日期则原样透传. 
                     _fetch_args = list(args)
                     if len(_fetch_args) < 3:
-                        _fetch_args += ["2000-01-01", _dt.datetime.now().strftime("%Y-%m-%d")]
+                        # 缺参补窗口: 单参调用(_build_money_full 等)只需近期
+                        # 数据, 收窄到回看窗口而非 2000-01-01 全历史(服务端
+                        # 逐日文件全扫的 CPU 风暴源). 显式传了日期则原样透传. 
+                        _start = (_dt.datetime.now()
+                                  - _dt.timedelta(days=_DAILY_FETCH_LOOKBACK_DAYS)
+                                  ).strftime("%Y-%m-%d")
+                        _fetch_args += [_start, _dt.datetime.now().strftime("%Y-%m-%d")]
                         _fetch_args = _fetch_args[:3]
                     df = getattr(self.sources["network"], method)(*_fetch_args, **kwargs)
                     if df is None or (hasattr(df, "empty") and df.empty):
@@ -1230,15 +1243,21 @@ class DataManager:
         列：``code`` / ``time``(Timestamp) / ``money``，按 (code, time) 升序，
         仅含成交额>0 的行。H7 修复：此处不再 ``tail(count)`` 截断——截断推迟
         到 get_daily_money_cached 按 end_date 过滤之后 per-code 进行。
+
+        两阶段取数: 先逐只走 _daily_mem/磁盘 peek 就地解析; 仍缺失的合并为
+        **一次** get_daily_batch 批量回源(服务端日文件只扫一遍, 避免逐只
+        全区间扫描把 stockdata CPU 打满), 批量失败/源不支持再降级逐只 fetch. 
         """
         frames = []
+        resolved = {}
+        missing = []
         for code in codes:
             try:
-                # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘。
+                # C3：daily 必须真实，本地优先，本地全源缺失即回源并落盘. 
                 ddf = self._daily_mem.get("get_daily_" + code)
-                # 覆盖检查：_daily_mem 可能来自 preload_daily() 加载的旧缓存。
-                # 离线回测中数据静态、不会过期，跳过 _is_stale 的 pandas 日期
-                # 计算（全市场 1600+ 只 × 每次 3.5s，回测流动性过滤的头号热点）。
+                # 覆盖检查：_daily_mem 可能来自 preload_daily() 加载的旧缓存. 
+                # 离线回测中数据静态, 不会过期，跳过 _is_stale 的 pandas 日期
+                # 计算（全市场 1600+ 只 × 每次 3.5s，回测流动性过滤的头号热点）. 
                 if (ddf is not None and not (hasattr(ddf, "empty") and ddf.empty)
                         and not self._offline and self.cache._is_stale(ddf)):
                     ddf = None
@@ -1251,56 +1270,23 @@ class DataManager:
                             ddf = _ensure_volume_shares(ddf, src)
                             break
                 if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
-                    # 本地全源缺失 -> 回源获取（C3：daily 必须真实，不得跳过）
-                    try:
-                        ddf = self.fetch("get_daily", code)
-                    except Exception:
-                        continue
-                if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
-                    continue
-                # daily_mem/preload 已预存 trade_dt 列（date 对象），直接复用。
-                if "trade_dt" not in ddf.columns:
-                    ddf = ddf.copy()
-                    if "trade_date" in ddf.columns:
-                        ddf["trade_dt"] = pd.to_datetime(
-                            ddf["trade_date"].astype(str)).dt.date
-                    elif "datetime" in ddf.columns:
-                        ddf["trade_dt"] = pd.to_datetime(
-                            ddf["datetime"]).dt.date
-                    else:
-                        continue
-                money_col = ddf["money"] if "money" in ddf.columns else None
-                amt_col = ddf["amount"] if "amount" in ddf.columns else None
-                if money_col is None:
-                    money_col = amt_col
-                elif amt_col is not None:
-                    money_col = money_col.fillna(amt_col)
-                if money_col is None:
-                    continue
-                # 统一转 numpy 再组帧，避免 ddf 非 RangeIndex 时索引对齐错位。
-                # trade_dt 是 datetime 列时直接取 .to_numpy()，跳过重复
-                # pd.to_datetime（1600+ 只 × 11 次调用，回测流动性热点）。
-                _td = ddf["trade_dt"]
-                if _td.dtype.kind == "M":
-                    _td_arr = _td.to_numpy()
+                    missing.append(code)  # 留给批量/逐只回源
                 else:
-                    _td_arr = pd.to_datetime(_td).to_numpy()
-                money_arr = money_col.astype(float).to_numpy()
-                # 停牌/退市标的分区里 amount 为 2**-127（≈0 sentinel）占位值，
-                # ``> 0`` 会把它计入"有成交"，导致全市场 ETF 总成交额出现
-                # "0.00亿元 (1只ETF有成交)" 的误导日志。低于 1 元视为无成交剔除。
-                mask = money_arr > 1.0
-                if not mask.any():
-                    continue
-                # 用 numpy 数组直接拼，避免逐 code 建 DataFrame + concat（130万行）
-                n = int(mask.sum())
-                frames.append({
-                    "code": np.full(n, code, dtype=object),
-                    "time": _td_arr[mask],
-                    "money": money_arr[mask],
-                })
+                    resolved[code] = ddf
             except Exception:
                 continue
+        if missing and not self._offline:
+            # 本地全源缺失 -> 回源获取（C3：daily 必须真实，不得跳过）
+            self._resolve_missing_daily_batch(missing, resolved)
+        for code in codes:
+            ddf = resolved.get(code)
+            if ddf is None or (hasattr(ddf, "empty") and ddf.empty):
+                continue
+            try:
+                frames.append(self._extract_money_rows(code, ddf))
+            except Exception:
+                continue
+        frames = [f for f in frames if f is not None]
         if not frames:
             return pd.DataFrame(columns=["code", "time", "money"])
         full = pd.DataFrame({
@@ -1309,6 +1295,81 @@ class DataManager:
             "money": np.concatenate([f["money"] for f in frames]),
         })
         return full.sort_values(["code", "time"], kind="stable").reset_index(drop=True)
+
+    def _resolve_missing_daily_batch(self, missing, resolved):
+        """缺失标的合并为一次批量日线请求; 失败/不支持时降级逐只 fetch. 
+
+        批量成功的结果同时回填 ``_daily_mem``(与 fetch 同口径, 供后续
+        get_price 等路径命中); 逐只降级保留 fetch 内置的源失败计数/降级语义. 
+        """
+        batch_fn = getattr(self.sources.get("network"), "get_daily_batch", None)
+        got = {}
+        if batch_fn is not None:
+            try:
+                end = _dt.datetime.now().strftime("%Y-%m-%d")
+                start = (_dt.datetime.now()
+                         - _dt.timedelta(days=_DAILY_FETCH_LOOKBACK_DAYS)
+                         ).strftime("%Y-%m-%d")
+                out = batch_fn(list(missing), start, end)
+                if isinstance(out, dict):
+                    got = {c: df for c, df in out.items()
+                           if df is not None and not (hasattr(df, "empty") and df.empty)}
+            except Exception as e:
+                logger.warning("[DataManager] 批量日线回源失败, 降级逐只: %s", e)
+        for code, df in got.items():
+            resolved[code] = df
+            self._put_daily_mem_protected(f"get_daily_{code}", df)
+        for code in missing:
+            if code in resolved:
+                continue
+            try:
+                ddf = self.fetch("get_daily", code)
+            except Exception:
+                continue
+            if ddf is not None and not (hasattr(ddf, "empty") and ddf.empty):
+                resolved[code] = ddf
+
+    def _extract_money_rows(self, code, ddf):
+        """从单只日线帧提取成交额明细行(dict of numpy 数组), 无有效行返回 None."""
+        # daily_mem/preload 已预存 trade_dt 列（date 对象），直接复用。
+        if "trade_dt" not in ddf.columns:
+            ddf = ddf.copy()
+            if "trade_date" in ddf.columns:
+                ddf["trade_dt"] = pd.to_datetime(
+                    ddf["trade_date"].astype(str)).dt.date
+            elif "datetime" in ddf.columns:
+                ddf["trade_dt"] = pd.to_datetime(
+                    ddf["datetime"]).dt.date
+            else:
+                return None
+        money_col = ddf["money"] if "money" in ddf.columns else None
+        amt_col = ddf["amount"] if "amount" in ddf.columns else None
+        if money_col is None:
+            money_col = amt_col
+        elif amt_col is not None:
+            money_col = money_col.fillna(amt_col)
+        if money_col is None:
+            return None
+        # 统一转 numpy 再组帧，避免 ddf 非 RangeIndex 时索引对齐错位。
+        # trade_dt 是 datetime 列时直接取 .to_numpy()，跳过重复
+        # pd.to_datetime（1600+ 只 × 11 次调用，回测流动性热点）。
+        _td = ddf["trade_dt"]
+        _td_arr = _td.to_numpy() if _td.dtype.kind == "M" \
+            else pd.to_datetime(_td).to_numpy()
+        money_arr = money_col.astype(float).to_numpy()
+        # 停牌/退市标的分区里 amount 为 2**-127（≈0 sentinel）占位值，
+        # ``> 0`` 会把它计入"有成交"，导致全市场 ETF 总成交额出现
+        # "0.00亿元 (1只ETF有成交)" 的误导日志。低于 1 元视为无成交剔除。
+        mask = money_arr > 1.0
+        if not mask.any():
+            return None
+        # 用 numpy 数组直接拼，避免逐 code 建 DataFrame + concat（130万行）
+        n = int(mask.sum())
+        return {
+            "code": np.full(n, code, dtype=object),
+            "time": _td_arr[mask],
+            "money": money_arr[mask],
+        }
 
     def set_priority(self, order):
         CONFIG["DATASOURCE_PRIORITY"] = [o for o in order if o in SOURCES]

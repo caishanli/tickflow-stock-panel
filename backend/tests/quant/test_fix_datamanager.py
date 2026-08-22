@@ -679,6 +679,135 @@ def test_preload_pool_intraday_falls_back_to_realtime_batch(tmp_path, monkeypatc
     assert CODE not in dm._minute_empty
 
 
+# ---------------- 批量回源 + 默认窗口收窄（stockdata CPU 风暴修复） ----------------
+#
+# 背景：_build_money_full 对缓存缺失的标的逐只 fetch("get_daily", code)，
+# 单参调用被补 "2000-01-01"→今天 的全区间 → 服务端 get_daily 每次顺序扫
+# 全部日分区文件（~6300 个），DayFileCache(cap=60) 几乎全 miss，1600 只
+# × 全历史扫描把 stockdata CPU 打满数小时。修复：
+# 1) 缺失标的合并为一次 get_daily_batch 批量请求（服务端日文件只扫一遍）；
+# 2) 单参兜底窗口收窄为回看 400 天（对齐 preload_daily 口径；覆盖不足时
+#    下游 _covers 会带显式日期重取，不丢数据）。
+
+BATCH_CODES = ["510300.XSHG", "511880.XSHG", "159915.XSHE"]
+
+
+def _fresh_dates():
+    """截至今天的合成交易日序列（避开 _is_stale 判过期）。"""
+    return pd.bdate_range("2026-07-01", pd.Timestamp.today().normalize())
+
+
+class _PerCodeOnlySource:
+    """只有逐只 get_daily 的网络源替身（模拟不支持批量的旧源/降级路径）。"""
+
+    def __init__(self, daily_dates):
+        self.daily_dates = daily_dates
+        self.daily_calls = []
+
+    def _frame(self, code):
+        idx = self.daily_dates.get(code)
+        if idx is None:
+            return pd.DataFrame()
+        return _daily_df(idx, 2e6)
+
+    def get_daily(self, code, start, end):
+        self.daily_calls.append((code, start, end))
+        return self._frame(code)
+
+
+class _BatchSource(_PerCodeOnlySource):
+    """支持 get_daily_batch 的网络源替身：记录批量调用，可注入失败。"""
+
+    def __init__(self, daily_dates, fail_batch=False):
+        super().__init__(daily_dates)
+        self.batch_calls = []
+        self.fail_batch = fail_batch
+
+    def get_daily_batch(self, codes, start, end):
+        self.batch_calls.append((list(codes), start, end))
+        if self.fail_batch:
+            raise RuntimeError("batch down")
+        return {c: self._frame(c) for c in codes}
+
+
+def _live_dm(tmp_path, source):
+    dm = DataManager(token="", cache=DataCache(root=str(tmp_path)))
+    dm.sources = {"network": source}
+    dm._offline = False
+    return dm
+
+
+def test_build_money_full_batches_missing_codes(tmp_path):
+    """缓存全缺：N 只缺失标的合并为一次批量请求，不逐只回源。"""
+    src = _BatchSource({c: _fresh_dates() for c in BATCH_CODES})
+    dm = _live_dm(tmp_path, src)
+    res = dm.get_daily_money_cached(BATCH_CODES, "2026-07-20", count=3)
+    assert len(src.batch_calls) == 1, f"应只发一次批量请求: {src.batch_calls}"
+    assert sorted(src.batch_calls[0][0]) == sorted(BATCH_CODES)
+    assert src.daily_calls == [], "批量成功时不得降级逐只"
+    for c in BATCH_CODES:
+        assert c in set(res["code"])
+
+
+def test_build_money_full_batch_only_requests_missing(tmp_path):
+    """Phase A 已命中的标的不进批量请求。"""
+    dates = _fresh_dates()
+    src = _BatchSource({BATCH_CODES[1]: dates})
+    dm = _live_dm(tmp_path, src)
+    dm._daily_mem[f"get_daily_{BATCH_CODES[0]}"] = _daily_df(dates, 1e6)
+    dm.get_daily_money_cached(BATCH_CODES[:2], "2026-07-20", count=3)
+    assert len(src.batch_calls) == 1
+    assert src.batch_calls[0][0] == [BATCH_CODES[1]]
+
+
+def test_build_money_full_falls_back_per_code_on_batch_failure(tmp_path):
+    """批量失败：降级逐只 fetch，结果仍正确。"""
+    src = _BatchSource({c: _fresh_dates() for c in BATCH_CODES}, fail_batch=True)
+    dm = _live_dm(tmp_path, src)
+    res = dm.get_daily_money_cached(BATCH_CODES, "2026-07-20", count=3)
+    assert len(src.batch_calls) == 1          # 试过批量
+    assert len(src.daily_calls) == len(BATCH_CODES)  # 逐只降级
+    for c in BATCH_CODES:
+        assert c in set(res["code"])
+
+
+def test_build_money_full_without_batch_support_falls_back(tmp_path):
+    """旧源不支持 get_daily_batch：直接走逐只，行为与改造前一致。"""
+    src = _PerCodeOnlySource({c: _fresh_dates() for c in BATCH_CODES})
+    dm = _live_dm(tmp_path, src)
+    res = dm.get_daily_money_cached(BATCH_CODES, "2026-07-20", count=3)
+    assert len(src.daily_calls) == len(BATCH_CODES)
+    for c in BATCH_CODES:
+        assert c in set(res["code"])
+
+
+def test_fetch_daily_single_arg_default_window_narrowed(tmp_path):
+    """fetch("get_daily", code) 单参兜底窗口：回看 400 天，而非 2000-01-01。"""
+    src = _PerCodeOnlySource({CODE: _fresh_dates()})
+    dm = _live_dm(tmp_path, src)
+    dm.fetch("get_daily", CODE)
+    assert len(src.daily_calls) == 1
+    _, start, end = src.daily_calls[0]
+    today = pd.Timestamp.today().normalize()
+    lo = (today - pd.Timedelta(days=401)).strftime("%Y-%m-%d")
+    hi = (today - pd.Timedelta(days=399)).strftime("%Y-%m-%d")
+    assert lo <= start <= hi, f"start 应为回看 ~400 天: {start}"
+    assert end == today.strftime("%Y-%m-%d"), f"end 应为今天: {end}"
+
+
+def test_build_money_full_batch_window_narrowed(tmp_path):
+    """批量请求窗口同样收窄为回看 ~400 天（不再传 2000-01-01）。"""
+    src = _BatchSource({c: _fresh_dates() for c in BATCH_CODES})
+    dm = _live_dm(tmp_path, src)
+    dm.get_daily_money_cached(BATCH_CODES, "2026-07-20", count=3)
+    assert len(src.batch_calls) == 1
+    _, start, _ = src.batch_calls[0]
+    today = pd.Timestamp.today().normalize()
+    lo = (today - pd.Timedelta(days=401)).strftime("%Y-%m-%d")
+    hi = (today - pd.Timedelta(days=399)).strftime("%Y-%m-%d")
+    assert lo <= start <= hi, f"批量 start 应为回看 ~400 天: {start}"
+
+
 def test_minute_diag_logs_on_today_missing(tmp_path, monkeypatch, caplog):
     """开启 _diag_minute 后，盘中取数空应输出可定位的诊断日志（不进 _minute_empty）。
 

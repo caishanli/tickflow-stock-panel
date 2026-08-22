@@ -113,3 +113,194 @@ def test_cat1_no_dividend_no_send_skipped(monkeypatch, tmp_path):
     ev = {sym: [_xdxr(1, 2026, 1, 21, fenhong=0.0)]}
     result = _run_sync_adj_factor(monkeypatch, ev, daily, [sym])
     assert result["written_symbols"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 三层加固：原始事件落本地 / 查询失败不缓存不丢标的 / 断点审计兜底
+# ---------------------------------------------------------------------------
+
+def _mk_daily(sym="159667.XSHE", pre=3.0, post=1.0):
+    days = pd.date_range("2026-05-25", "2026-06-15", freq="B")
+    n_pre = sum(1 for d in days if d < pd.Timestamp("2026-06-10"))
+    closes = [pre] * n_pre + [post] * (len(days) - n_pre)
+    return {sym: pd.DataFrame({"close": closes}, index=pd.to_datetime(days))}, days
+
+
+def test_raw_events_persisted(monkeypatch, tmp_path):
+    """第2层：xdxr 原始事件行落 xdxr_events.parquet。"""
+    import polars as pl
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj" / "all.parquet")
+    sym = "159667.XSHE"
+    daily, _ = _mk_daily(sym)
+    _run_sync_adj_factor(monkeypatch, {sym: [_xdxr(11, 2026, 6, 10, suogu=3.0)]},
+                         daily, [sym])
+    ev_path = tmp_path / "adj" / "xdxr_events.parquet"
+    assert ev_path.exists(), "事件表未落盘"
+    df = pl.read_parquet(ev_path)
+    row = df.filter(pl.col("symbol") == "159667").row(0, named=True)
+    assert row["category"] == 11 and abs(row["suogu"] - 3.0) < 1e-9
+
+
+def test_query_failure_keeps_local_events(monkeypatch, tmp_path):
+    """第2层：次轮查询全失败 → 沿用本地事件重建，因子不丢。"""
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj" / "all.parquet")
+    sym = "159667.XSHE"
+    daily, _ = _mk_daily(sym)
+    _run_sync_adj_factor(monkeypatch, {sym: [_xdxr(11, 2026, 6, 10, suogu=3.0)]},
+                         daily, [sym])
+
+    class _DeadSrc:
+        def _xdxr_rows(self, s):
+            return None
+
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _DeadSrc())
+    result = ms.sync_adj_factor()
+    assert result["query_failed"] == ["159667"]
+    tab = _factor_table(result, sym)
+    assert any(abs(v - 1 / 3) < 1e-6 for v in tab.values()), "本地事件应保住拆分因子"
+
+
+def test_xdxr_failure_not_cached(monkeypatch):
+    """第1层：整轮轮换失败返回 None 且不缓存，下次调用重试。"""
+    from app.quant.jqengine.datasource.mootdx_src import MootdxSource
+    src = MootdxSource.__new__(MootdxSource)
+    src._xdxr_cache = {}
+    calls = {"n": 0}
+
+    def fake_retry(fn, empty_ok=False):
+        calls["n"] += 1
+        return (None, "down") if calls["n"] == 1 else ([], None)
+
+    monkeypatch.setattr(src, "_with_server_retry", fake_retry)
+    assert src._xdxr_rows("159667") is None
+    assert src._xdxr_rows("159667") == []
+    assert calls["n"] == 2
+
+
+def test_audit_retries_and_warns(monkeypatch, tmp_path, caplog):
+    """第3层：首轮源漏事件 → 审计发现断点 → 重试轮补回 → 因子齐；仍缺则告警。"""
+    import logging
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj" / "all.parquet")
+    sym = "159667.XSHE"
+    daily, _ = _mk_daily(sym)
+    # 隔离真实数据：宇宙只含测试标的，日线用构造帧（否则审计会扫到
+    # 本地全市场分区里真实的大幅波动，误报断点缺口）
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [sym])
+
+    class _FakeDM:
+        def _load_daily_from_partitions(self, asof=None):
+            return daily
+
+    monkeypatch.setattr(ms, "DataManager", lambda: _FakeDM())
+
+    class _SeqSrc:
+        insts = []
+
+        def __init__(self):
+            self.n = 0
+            _SeqSrc.insts.append(self)
+
+        def _xdxr_rows(self, s):
+            self.n += 1
+            # 第一个实例（首轮）返回空；重试轮实例给出事件
+            return [] if len(_SeqSrc.insts) == 1 else [_xdxr(11, 2026, 6, 10, suogu=3.0)]
+
+    monkeypatch.setattr(ms, "MootdxSource", _SeqSrc)
+    with caplog.at_level(logging.WARNING, logger="mootdx_service"):
+        result = ms.sync_adj_factor()
+    tab = _factor_table(result, sym)
+    assert any(abs(v - 1 / 3) < 1e-6 for v in tab.values()), "重试轮应补回拆分因子"
+    assert result["audit_uncovered"] == [], "重试后不应再有未覆盖断点"
+
+
+def test_sync_daily_query_failed_and_retry(monkeypatch):
+    """日线链路：首轮查询失败（守护折叠为 None）→ 计入失败并当轮重试成功。"""
+    from datetime import date as _d
+    from app.services import mootdx_service as ms
+    calls = {"n": 0}
+
+    class _FlakySrc:
+        def get_daily(self, code, start, end):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("socket down")
+            import pandas as pd
+            return pd.DataFrame(
+                {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+                 "volume": [100.0], "amount": [100.0]},
+                index=pd.to_datetime(["2026-08-20 15:00"]))
+
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.XSHG"])
+    monkeypatch.setattr(ms, "_etf_universe", lambda: [])
+    monkeypatch.setattr(ms, "MootdxSource", _FlakySrc)
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_write_daily_partition", lambda df, root: None)
+    res = ms.sync_daily(_d(2026, 8, 20))
+    assert calls["n"] == 2, f"失败标的应被重试: {calls}"
+    assert res["stock"] == 1
+    assert res["query_failed"] == []
+
+
+def test_sync_etf_minute_retry_round(monkeypatch):
+    """ETF 分钟链路：首轮失败标的进 query_failed，重试轮成功后正常落盘。"""
+    import pandas as pd
+    from app.services import mootdx_service as ms
+    calls = {"n": 0}
+
+    class _Src:
+        def get_minute_recent(self, jq, pages=2):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("down")
+            out = pd.DataFrame(
+                {"close": [1.0], "volume": [10], "amount": [10.0],
+                 "open": [1.0], "high": [1.0], "low": [1.0]},
+                index=pd.to_datetime(["2026-08-20 09:31:00"]))
+            # mootdx 真实帧的 DatetimeIndex 名为 datetime，reset_index 后列名才是 datetime
+            out.index.name = "datetime"
+            return out
+
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["159667.XSHE"])
+    monkeypatch.setattr(ms, "MootdxSource", _Src)
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_write_minute_partition", lambda df, root, day=None: df.height)
+    from datetime import date as _d
+    res = ms.sync_etf_minute(_d(2026, 8, 20))
+    assert calls["n"] == 2, "失败标的应被重试"
+    assert res["rows"] == 1 and res["query_failed"] == []
+
+
+def test_sync_stock_minute_retry_round(monkeypatch):
+    """股票分钟链路：首轮失败→重试轮成功，query_failed 收敛为空。"""
+    import pandas as pd
+    from datetime import date as _d
+    from app.services import mootdx_service as ms
+    calls = {"n": 0}
+
+    class _Src:
+        def get_minute(self, sym, max_bars=40000):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("down")
+            out = pd.DataFrame(
+                {"close": [1.0, 1.1], "volume": [10, 20], "amount": [10.0, 22.0],
+                 "open": [1.0, 1.0], "high": [1.1, 1.1], "low": [1.0, 1.0]},
+                index=pd.to_datetime(["2026-08-19 15:00", "2026-08-20 15:00"]))
+            out.index.name = "datetime"
+            return out
+
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.XSHG"])
+    monkeypatch.setattr(ms, "_existing_minute_symbols", lambda: set())
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ms, "_market_closed", lambda: True)
+    monkeypatch.setattr(ms, "_flush_stock_minute_chunk", lambda chunk: None)
+    monkeypatch.setattr(ms, "_throttle_backfill", lambda i: None)
+    monkeypatch.setattr(ms, "_guarded_get_minute",
+                        lambda src, sym, max_bars=40000: src.get_minute(sym, max_bars=max_bars))
+    monkeypatch.setattr(ms, "MootdxSource", _Src)
+    res = ms.sync_stock_minute(limit=None)
+    assert calls["n"] == 2, "失败标的应被重试"
+    assert res["rows"] == 2 and res["query_failed"] == []

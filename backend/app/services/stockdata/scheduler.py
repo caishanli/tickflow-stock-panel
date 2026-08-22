@@ -106,7 +106,7 @@ def _run_sync(full_stock_minute: bool = False):
                 _scheduler_state["sync_result"] = {
                     "minute_rows": minutes, "adj": adj, "stock_minute_rows": stock,
                     "nav_rows": nav, "daily": daily, "index_daily": index_daily}
-            logger.info("scheduled mootdx sync done: minute=%d rows, adj=%s, stock_minute_rows=%d, nav_rows=%d, daily=%s, index_daily=%s",
+            logger.info("scheduled mootdx sync done: minute=%s, adj=%s, stock_minute=%s, nav_rows=%s, daily=%s, index_daily=%s",
                         minutes, adj, stock, nav, daily, index_daily)
         except Exception:  # noqa: BLE001
             logger.exception("scheduled mootdx sync failed")

@@ -89,6 +89,9 @@ def sync_etf_nav(day: _date | None = None) -> int:
     fallback = day or _date.today()
     raw = _fund_etf_fund_daily_em()
     if raw.is_empty():
+        # 第3层: 空结果重试一次(akshare 偶发抖动), 仍空才记录失败
+        raw = _fund_etf_fund_daily_em()
+    if raw.is_empty():
         from app.services.mootdx_service import _append_failure
         _append_failure(f"etf_nav:{fallback}", "empty_akshare")
         return 0
