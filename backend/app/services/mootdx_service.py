@@ -193,51 +193,51 @@ def sync_etf_minute(day: _date | None = None) -> int:
 
     逐标的拉真实 1m：近期日（≤5 天）用 ``get_minute_recent``（含当日盘中），
     历史日（>5 天）用 ``get_minute`` 全量拉再过滤当日（支持 4/1 起缺失日回补）。
+    取数经 :class:`BackfillPool` 并发（每 worker 独立连接，坏连接由池自愈重建）。
     以 ``date={day}/part.parquet`` 原子写盘。返回写入行数。
     """
     day = day or _date.today()
-    src = MootdxSource()
     codes = _etf_universe()
     if not codes:
         logger.warning("mootdx_service: ETF 宇宙为空，跳过分钟同步")
         return 0
     historical = (day < _date.today() - _dt.timedelta(days=5))
-    frames = []
-    for i, jq in enumerate(codes):
+    keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+    def _fetch_one(src, jq):
         try:
             if historical:
-                df = src.get_minute(jq, max_bars=40000)
+                # since=day 分页：只回看到覆盖目标日，不拉全历史
+                df = src.get_minute(jq, max_bars=40000, since=day)
             else:
                 df = src.get_minute_recent(jq, pages=2)
         except Exception as e:  # noqa: BLE001
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
-            continue
+            return None
         if df is None or df.empty:
-            continue
+            return None
         df = df.copy()
         df["symbol"] = _to_tf_symbol(jq)
         df = df.reset_index()
-        keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
         for c in keep:
             if c not in df.columns:
                 df[c] = None
         df = df[keep]
         df = df[pd.to_datetime(df["datetime"]).dt.date == day]
         if df.empty:
-            continue
-        frames.append(pl.from_pandas(df))
-        if (i + 1) % 500 == 0:
-            try:
-                src._client = None
-                src._server_idx = -1
-            except Exception:  # noqa: BLE001
-                pass
-    if not frames:
+            return None
+        out = pl.from_pandas(df)
+        return out.with_columns(
+            pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
+
+    result = BackfillPool().map(_fetch_one, codes)
+    if result["failed"]:
+        logger.warning("mootdx_service: ETF 分钟回源失败 %d 只: %s",
+                       len(result["failed"]), list(result["failed"])[:10])
+    if not result["ok"]:
         return 0
-    out = pl.concat(frames).unique(
+    out = pl.concat(result["ok"]).unique(
         subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
-    out = out.with_columns(
-        pl.col("datetime").cast(pl.Datetime("us")).alias("datetime"))
     return _write_minute_partition(out, ETF_MINUTE_ROOT, day)
 
 
@@ -1537,14 +1537,14 @@ def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
 def sync_daily(day: _date) -> dict:
     """回源指定交易日全市场日线（股票 kline_daily + ETF kline_etf_daily）。
 
-    逐只标的用 mootdx ``get_daily`` 拉最近日线，取 ``day`` 那根写分区：
+    取数经 :class:`BackfillPool` 并发（每 worker 独立连接，坏连接由池自愈
+    重建），逐标的用 mootdx ``get_daily`` 拉最近日线，取 ``day`` 那根写分区：
     股票 volume 换手（mootdx 股 ÷100），ETF volume 保持股。返回统计。
     """
     # 北交所（920xxx.BJ）mootdx 通达信接口无数据（每只轮换全服务器 ~8-11s 超时），
     # 全量回源时跳过，避免 331 只累积 ~50 分钟纯失败。
     stocks = [s for s in _stock_universe() if not s.endswith(".BJ")]
     etfs = [_to_tf_symbol(c) for c in _etf_universe()]
-    src = MootdxSource()
     day_str = day.strftime("%Y%m%d")
     # 跳过上市日晚于目标日的标的（新股在该日前无数据）；上市日期占位
     # （1970-01-01 = 退市/异常）的标的 4/1 前已无交易，一并跳过免超时。
@@ -1558,65 +1558,52 @@ def sync_daily(day: _date) -> dict:
             return ld > _date(1970, 1, 1) and ld <= day
         stocks = [s for s in stocks if _active(s)]
     written = {"stock": 0, "etf": 0}
-    frames_stock: list[pl.DataFrame] = []
-    frames_etf: list[pl.DataFrame] = []
 
-    def _fetch(syms: list[str]) -> pl.DataFrame | None:
-        out_frames = []
-        for i, sym in enumerate(syms):
-            try:
-                df = _guarded_get_daily(src, sym, day_str, day_str)
-            except Exception:
-                continue
-            if df is None or df.empty:
-                continue
-            # 只保留目标日那根（索引含 15:00 时间戳）
-            hit = df[[x.date() == day for x in df.index]]
-            if hit.empty:
-                continue
-            row = hit.iloc[-1]
-            out_frames.append(pl.DataFrame({
-                "symbol": [sym],
-                "date": [day],
-                "open": [float(row["open"])],
-                "high": [float(row["high"])],
-                "low": [float(row["low"])],
-                "close": [float(row["close"])],
-                "volume": [float(row["volume"])],
-                "amount": [float(row["amount"])],
-            }))
-            # 周期性重建连接：避免服务器轮换状态劣化导致长批卡死
-            if (i + 1) % 500 == 0:
-                try:
-                    src._client = None
-                    src._server_idx = -1
-                except Exception:
-                    pass
-        if not out_frames:
+    def _fetch_one(src, sym):
+        try:
+            df = _guarded_get_daily(src, sym, day_str, day_str)
+        except Exception:  # noqa: BLE001
             return None
-        return pl.concat(out_frames)
+        if df is None or df.empty:
+            return None
+        # 只保留目标日那根（索引含 15:00 时间戳）
+        hit = df[[x.date() == day for x in df.index]]
+        if hit.empty:
+            return None
+        row = hit.iloc[-1]
+        return pl.DataFrame({
+            "symbol": [sym],
+            "date": [day],
+            "open": [float(row["open"])],
+            "high": [float(row["high"])],
+            "low": [float(row["low"])],
+            "close": [float(row["close"])],
+            "volume": [float(row["volume"])],
+            "amount": [float(row["amount"])],
+        })
 
-    sdf = _fetch(stocks)
+    pool = BackfillPool()
+    stock_res = pool.map(_fetch_one, stocks)
+    etf_res = pool.map(_fetch_one, etfs)
+    sdf = pl.concat(stock_res["ok"]) if stock_res["ok"] else None
+    edf = pl.concat(etf_res["ok"]) if etf_res["ok"] else None
     if sdf is not None:
         sdf = sdf.with_columns((pl.col("volume") / 100.0).alias("volume"))
-        frames_stock.append(sdf)
         written["stock"] = sdf.height
-    edf = _fetch(etfs)
     if edf is not None:
-        frames_etf.append(edf)
         written["etf"] = edf.height
     # 防御：回源结果为空不能静默——否则分区缺口无声累积（曾因过滤 bug 让
     # ETF 日线数月未落盘而不自知）。全市场全失败通常意味着数据源/过滤异常。
-    if frames_stock and not frames_etf:
+    if sdf is not None and edf is None:
         logger.warning("mootdx_service: 日线回源 %s 股票 %d 只但 ETF 全部失败，"
                        "请检查 ETF 宇宙/过滤逻辑", day, written["stock"])
-    if not frames_stock and not frames_etf:
+    if sdf is None and edf is None:
         logger.warning("mootdx_service: 日线回源 %s 股票与 ETF 全部失败", day)
 
-    if frames_stock:
-        _write_daily_partition(pl.concat(frames_stock), STOCK_DAILY_ROOT)
-    if frames_etf:
-        _write_daily_partition(pl.concat(frames_etf), ETF_DAILY_ROOT)
+    if sdf is not None:
+        _write_daily_partition(sdf, STOCK_DAILY_ROOT)
+    if edf is not None:
+        _write_daily_partition(edf, ETF_DAILY_ROOT)
     logger.info("mootdx_service: 日线回源 %s 完成: %s", day, written)
     return written
 
@@ -1677,19 +1664,18 @@ def sync_index_daily(day: _date) -> dict:
     返回 {"written": 写入指数数, "symbols": 尝试数}。
     """
     indices = [s for s in _index_universe() if not s.endswith(".BJ")]
-    src = MootdxSource()
     day_str = day.strftime("%Y%m%d")
-    frames: list[pl.DataFrame] = []
-    for i, sym in enumerate(indices):
+
+    def _fetch_one(src, sym):
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
             if df is None or df.empty:
-                continue
+                return None
             hit = df[[x.date() == day for x in df.index]]
             if hit.empty:
-                continue
+                return None
             row = hit.iloc[-1]
-            frames.append(pl.DataFrame({
+            return pl.DataFrame({
                 "symbol": [sym],
                 "date": [day],
                 "open": [float(row["open"])],
@@ -1698,21 +1684,19 @@ def sync_index_daily(day: _date) -> dict:
                 "close": [float(row["close"])],
                 "volume": [float(row["volume"])],
                 "amount": [float(row["amount"])],
-            }))
+            })
         except Exception:  # noqa: BLE001
-            continue
-        if (i + 1) % 500 == 0:
-            try:
-                src._client = None
-                src._server_idx = -1
-            except Exception:  # noqa: BLE001
-                pass
+            return None
+
+    result = BackfillPool().map(_fetch_one, indices)
+    frames = result["ok"]
     if not frames:
         logger.warning("mootdx_service: 指数日线回源 %s 全部失败（%d 只尝试）",
                        day, len(indices))
         return {"written": 0, "symbols": len(indices)}
     _write_daily_partition(pl.concat(frames), INDEX_DAILY_ROOT)
-    logger.info("mootdx_service: 指数日线回源 %s 完成: %d 只", day, len(frames))
+    logger.info("mootdx_service: 指数日线回源 %s 完成: %d 只 (failed=%d)",
+                day, len(frames), len(result["failed"]))
     return {"written": len(frames), "symbols": len(indices)}
 
 

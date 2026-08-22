@@ -572,6 +572,8 @@ def test_sync_daily_warns_when_etf_zero(caplog, monkeypatch, tmp_path):
             return None
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _EmptySrc())
+    _patch_pool(monkeypatch, _EmptySrc())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
     monkeypatch.setattr(ms, "_stock_universe", lambda: ["000001.SZ"])
     monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
@@ -839,6 +841,8 @@ def test_sync_etf_minute_normalizes_phantom_noon_bar(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
         lambda: _dt.date(2026, 8, 5))})())
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     n = ms.sync_etf_minute(_dt.date(2026, 8, 5))
     part = tmp_path / "kline_etf_minute" / "date=2026-08-05" / "part.parquet"
     assert part.exists()
@@ -1159,7 +1163,7 @@ def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_etf_universe", lambda: ["159518.XSHE"])
 
     class _Src:
-        def get_minute(self, code, max_bars=30000):
+        def get_minute(self, code, max_bars=30000, since=None):
             idx = pd.DatetimeIndex([
                 _dt.datetime(2026, 6, 15, 10, 30), _dt.datetime(2026, 6, 15, 10, 31)])
             idx.name = "datetime"  # 与真实 MootdxSource.get_minute 一致（reset_index 得 datetime 列）
@@ -1171,6 +1175,8 @@ def test_sync_etf_minute_historical_day_uses_get_minute(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(
         lambda: _dt.date(2026, 8, 6))})())
     monkeypatch.setattr(ms, "MootdxSource", lambda: _Src())
+    _patch_pool(monkeypatch, _Src())  # 接池后经假池取数
+    monkeypatch.setattr(ms, "MANIFEST_PATH", tmp_path / "backfill_state.json")
     n = ms.sync_etf_minute(_dt.date(2026, 6, 15))
     assert n == 2
     part = tmp_path / "kline_etf_minute" / "date=2026-06-15" / "part.parquet"
