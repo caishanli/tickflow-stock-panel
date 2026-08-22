@@ -222,6 +222,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
 
   let yMin: number | undefined
   let yMax: number | undefined
+  let yInterval: number | undefined
   let maxDiff = 0
   if (isValidPrice(prevClose) && data.length > 0) {
     // 均价线恒在 [minLow, maxHigh] 内, 不参与范围计算(免疫均价单位错误, 范围贴合实际波动)
@@ -243,6 +244,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
       maxDiff = limitDiff
       yMin = prevClose - maxDiff
       yMax = prevClose + maxDiff
+      yInterval = maxDiff
       // 加 markLine 标注涨停价和跌停价 (仅虚线, 不显示文字)
       markLineData.push(
         {
@@ -259,19 +261,19 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         },
       )
     } else {
-      // 自适应模式: Y 轴贴合实际波动(留 10% 边距), 昨收居中; 涨跌停带仅作上限钳制
-      if (showLimitLines) {
-        const { limitUp, limitDown } = getLimitPrices(prevClose, priceLimit)
-        const limitDiff = Math.max(limitUp - prevClose, prevClose - limitDown)
-        maxDiff = Math.min(maxDiff * 1.1, limitDiff)
-      } else if (maxDiff > 0) {
-        maxDiff *= 1.1
+      // 自适应模式: Y 轴贴合当日实际高低点, 上下各留 15% 边距——单边行情(如 +1%~+3%)不强制显示昨收对侧区域
+      let lo: number | null = null
+      let hi: number | null = null
+      for (const v of lows) if (isValidPrice(v) && (lo == null || v < lo)) lo = v
+      for (const v of highs) if (isValidPrice(v) && (hi == null || v > hi)) hi = v
+      if (lo != null && hi != null && isValidPrice(prevClose)) {
+        const span = hi - lo
+        // 至少保证可视范围(防零波动过度放大); 指数地板更紧, 否则低波动指数会被压成横线
+        const pad = Math.max(span * 0.15, showLimitLines ? prevClose * 0.004 : prevClose * 0.001)
+        yMin = lo - pad
+        yMax = hi + pad
+        yInterval = (hi - lo) / 2 + pad
       }
-      // 至少保证一个可视范围 (防止数据平时 maxDiff=0)。指数不使用涨跌停范围，最小范围要更紧，否则低波动指数会被压成横线。
-      const minDiff = showLimitLines ? prevClose * 0.01 : prevClose * 0.001
-      if (maxDiff < minDiff) maxDiff = minDiff
-      yMin = prevClose - maxDiff
-      yMax = prevClose + maxDiff
     }
   }
 
@@ -372,7 +374,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         type: 'value',
         min: yMin,
         max: yMax,
-        interval: maxDiff || undefined,
+        interval: yInterval,
         splitArea: { show: false },
         axisLine: { show: false },
         axisTick: { show: false },
@@ -407,7 +409,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         gridIndex: 0,
         min: yMin,
         max: yMax,
-        interval: maxDiff || undefined,
+        interval: yInterval,
         splitArea: { show: false },
         axisLine: { show: false },
         axisTick: { show: false },

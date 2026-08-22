@@ -29,12 +29,11 @@
 ### §1 Y轴自适应修复（frontend/src/components/EChartsIntraday.tsx）
 
 1. **maxDiff 剔除均价线**：`buildOption` 中参与范围计算的 `priceArrays` 由 `[closes, highs, lows, avgData]` 改为 `[closes, highs, lows]`。均价线数学上恒在 `[minLow, maxHigh]` 内，不可能合法地撑大范围；剔除后 Y 轴严格贴合真实价格波动，且免疫均价计算错误。
-2. **自适应统一边距**：×1.1 padding 从 `!showLimitLines` 分支改为自适应模式统一生效。处理顺序：
-   - raw maxDiff = max(|high − prevClose|, |low − prevClose|)（仅有效 bar）
-   - 若超出涨跌停带则钳制到 limitDiff（保留上限语义）
-   - 否则 ×1.1 留边
-   - minDiff 地板兜底（showLimitLines ? 1% : 0.1%，防零波动除零）
-   - 昨收居中对称（yMin/yMax = prevClose ∓ maxDiff）惯例保持不变
+2. **自适应统一边距**：处理顺序（2026-08-22 用户决策修订：废弃「昨收居中对称」惯例，改为**贴合当日实际高低点的非对称范围**——单边行情如 +1%~+3% 不再强制显示对侧/负值区域）：
+   - dataLow = 当日有效 low 最小值，dataHigh = 有效 high 最大值
+   - pad = max(span × 0.15, 地板)；地板 = showLimitLines ? prevClose×0.4% : prevClose×0.1%（防零波动过度放大；指数地板更紧）
+   - yMin = dataLow − pad，yMax = dataHigh + pad；yInterval = span/2 + pad（左右轴刻度对齐三等分）
+   - 涨跌停钳制不再需要（数据本身不会超出涨跌停带）；「涨跌停」模式仍保持昨收居中对称
 3. **均价线 volume 单位自探测**：取 volume>0 且 close>0 的有效 bar，计算 `median(amount/volume)` 与 `median(close)` 的比值——比值落在 [30, 300] 判为「手」（累计股数 = Σvolume×100），否则按「股」（Σvolume）；无有效 bar 回退按股。useMemo 缓存随 data 重算。自动兼容 stockdata(股) / 本地 parquet(股) / TickFlow 回退(疑似手) 三种来源。
 
 不受影响：指数页 `showAvgLine={false}` 不走均价；MiniIntraday（自选/选股迷你分时）按下标画线不经过此逻辑。
