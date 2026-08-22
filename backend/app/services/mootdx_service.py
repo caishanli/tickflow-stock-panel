@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import threading
 import time
 from datetime import date as _date
 from pathlib import Path
@@ -82,6 +83,11 @@ def _append_failure(sym: str, reason: str) -> None:
 # 回源断点续传 manifest：任务启动写 targets，每批 flush 后追加 done。
 # 重启后 todo = targets − done − 最新分区已有 → 精确续跑。
 MANIFEST_PATH = DATA_ROOT / "backfill_state.json"
+
+# 15:35 cron / 00:00 巡检 / 启动 backfill 共用的互斥锁。原 scheduler._sync_lock
+# 上移至此，scheduler 反向导入同一对象——启动 backfill 此前不持锁，会与
+# 00:00 巡检并发轰击同一批被限速的服务器（08-21 深夜案例）。
+_SYNC_LOCK = threading.Lock()
 
 
 def _manifest_load() -> dict:
@@ -546,10 +552,21 @@ def sync_stock_minute(limit: int | None = None) -> int:
         return range_rows + fragment_rows
     if limit is not None:
         if _stock_minute_latest_partial(done_syms, stocks):
-            logger.info("mootdx_service: 最新分钟分区残缺（覆盖率 %.1f%%），"
-                        "忽略 limit=%d 全量补齐 %d 只",
-                        len(done_syms & set(stocks)) / len(stocks) * 100,
-                        limit, len(todo))
+            cov_pct = len(done_syms & set(stocks)) / len(stocks) * 100
+            # 中断感知：guardian 单实例保证无并发写者——最新分区 mtime 距今
+            # <10min 即上个进程刚被杀在中途，措辞用「中断续跑」而非误导性「残缺」。
+            days = sorted(STOCK_MINUTE_ROOT.glob("date=*"))
+            part = days[-1] / "part.parquet" if days else None
+            mt_age = (time.time() - part.stat().st_mtime
+                      if part is not None and part.exists() else 1e9)
+            if mt_age < 600:
+                logger.info("mootdx_service: 上次回源中断于 %s（%.0fmin 前，"
+                            "覆盖率 %.1f%%），从断点继续补齐 %d 只",
+                            days[-1].name, mt_age / 60, cov_pct, len(todo))
+            else:
+                logger.info("mootdx_service: 最新分钟分区残缺（覆盖率 %.1f%%），"
+                            "忽略 limit=%d 全量补齐 %d 只",
+                            cov_pct, limit, len(todo))
         else:
             todo = todo[:limit]
     # 上市日期占位（1970-01-01 = instruments 退市/异常数据）：这些标的 4/1 前
@@ -1797,13 +1814,22 @@ def _notify_missing(missing: dict) -> None:
 
 
 def backfill_to_now() -> dict[str, Any]:
-    """启动回源：补齐到当前时间缺失的全部数据集（幂等）。
+    """启动回源：补齐到当前时间缺失的全部数据集（幂等，持 :data:`_SYNC_LOCK`）。
 
     覆盖：ETF 分钟 + 全市场日线（股票/ETF）+ 指数日线 + 股票分钟一批 +
     ETF 前复权因子表（stale 时）。缺日期分区回溯补窗口；完全空分区也补窗口
     并标记 missing + 钉钉告警。失败标的跳过不阻断。
     返回结果含 index_daily_days/index_daily_written/adj_factor/missing。
+
+    与 15:35 cron、00:00 全量巡检共用 ``_SYNC_LOCK`` 串行——启动 backfill
+    此前不持锁，服务重启时会与在途巡检并发轰击同一批服务器。
     """
+    with _SYNC_LOCK:
+        return _backfill_to_now_locked()
+
+
+def _backfill_to_now_locked() -> dict[str, Any]:
+    """``backfill_to_now`` 的执行体（调用方须已持 :data:`_SYNC_LOCK`）。"""
     result: dict[str, Any] = {
         "minute_days": [], "minute_rows": 0,
         "daily_days": [], "daily_written": {},
@@ -1834,6 +1860,9 @@ def backfill_to_now() -> dict[str, Any]:
     incomplete_etf_minute = set(_incomplete_etf_minute_days(recent=content))
     incomplete_stock_daily = set(_incomplete_stock_daily_days(recent=content))
     incomplete_etf_daily = set(_incomplete_etf_daily_days(recent=content))
+    # 启动全量校验窗口（默认 250）：missing 字典 / daily 缺口集合共用一次扫描
+    # 结果（此前在两处各扫一遍，250 分区 × symbol 列读取 ~12s ×2）。
+    incomplete_etf_daily_full = set(_incomplete_etf_daily_days())
     incomplete_index_daily = set(_incomplete_index_daily_days(recent=content))
     incomplete_stock_minute = set(_incomplete_stock_minute_days(recent=content))
     missing_stock_minute_days = set(_missing_stock_minute_days())
@@ -1847,7 +1876,7 @@ def backfill_to_now() -> dict[str, Any]:
         "kline_etf_daily":    {"latest": etf_daily_days[-1] if etf_daily_days else None,
                                "empty": not etf_daily_days,
                                "missing": bool(_missing_daily_days(ETF_DAILY_ROOT)
-                                               or _incomplete_etf_daily_days()),
+                                               or incomplete_etf_daily_full),
                                "segment_missing": _safe_universe_segment_missing()},
         "kline_index_daily":  {"latest": index_daily_days[-1] if index_daily_days else None,
                                "empty": not index_daily_days,
@@ -1875,14 +1904,14 @@ def backfill_to_now() -> dict[str, Any]:
     today = _date.today()
     daily_days = sorted(set(_missing_daily_days(STOCK_DAILY_ROOT))
                         | set(_missing_daily_days(ETF_DAILY_ROOT))
-                        | set(_incomplete_etf_daily_days())
+                        | incomplete_etf_daily_full
                         | set(incomplete_stock_daily)
                         | set(incomplete_etf_daily))
     # 股票日线根为空时的兜底种子窗口；残缺 ETF 日（内容校验）必须保留，
     # 否则会被空窗分支整体覆盖而漏补。
     if _missing_daily_days(STOCK_DAILY_ROOT) == [] and not stocks_daily:
         seed = set(_trade_days_up_to(today)) - set(_partition_dates(STOCK_DAILY_ROOT))
-        daily_days = sorted(seed | set(_incomplete_etf_daily_days())
+        daily_days = sorted(seed | incomplete_etf_daily_full
                             | set(incomplete_stock_daily) | set(incomplete_etf_daily))
     for day in daily_days:
         try:

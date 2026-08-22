@@ -9,13 +9,15 @@ import logging
 import threading
 import time
 
+# 15:35 cron / 00:00 巡检 / 启动 backfill 共用锁（定义于 mootdx_service）
+from app.services.mootdx_service import _SYNC_LOCK as _sync_lock  # noqa: N811
+
 logger = logging.getLogger("app.services.stockdata.scheduler")
 
 _scheduler_state: dict = {"last_backfill": None, "last_sync": None, "sync_job": None}
 _lock = threading.Lock()
 _stop = threading.Event()
 _threads: list[threading.Thread] = []
-_sync_lock = threading.Lock()  # 15:35 cron 与手动 trigger 串行
 
 # 当前正在执行的后台任务集合（供 get_status 查询"正在干什么"）
 _active_tasks: set[str] = set()
