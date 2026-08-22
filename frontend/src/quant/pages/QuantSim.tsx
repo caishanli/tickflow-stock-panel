@@ -894,11 +894,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                           })
                         }}
                         className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                        <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
+                        <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
                           <div className="num">{p.entry_ts ? entryTs.d : '—'}</div>
                           {p.entry_ts && entryTs.t && <div className="num">{entryTs.t}</div>}
                         </td>
-                        <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
+                        <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
                         <td className="px-3 py-1.5 num">{p.amount}</td>
                         <td className="px-3 py-1.5 num">{fmtNum(p.avg_cost, 3)}</td>
@@ -973,11 +973,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         })
                       }}
                       className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
                       </td>
-                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
+                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       {(() => {
                         const holdDays = t.action === 'BUY'
@@ -1038,11 +1038,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 <tbody className="text-foreground">
                   {[...stoplossRows].reverse().map((t: any, i: number) => (
                     <tr key={i} className="group border-t border-border/60 hover:bg-elevated/60 transition-colors">
-                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
                       </td>
-                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
+                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className="px-3 py-1.5 text-bear">止损</td>
                       <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>
