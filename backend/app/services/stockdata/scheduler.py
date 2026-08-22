@@ -4,10 +4,12 @@
 无主动盘中全市场轮询——实时分钟只在客户端请求时按需回源（见 sources.get_realtime_snapshot）。"""
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import logging
 import threading
 import time
+
 
 def _sync_lock() -> threading.Lock:
     """15:35 cron / 00:00 巡检 / 启动 backfill 共用锁（惰性解析）。
@@ -40,6 +42,32 @@ def _mark_active(name: str) -> None:
 def _mark_idle(name: str) -> None:
     with _lock:
         _active_tasks.discard(name)
+
+
+def _trim_memory() -> None:
+    """gc + glibc malloc_trim：把已释放堆归还 OS，压回回源/大查询后的高水位。
+
+    polars/pandas 大帧释放后 glibc 不主动还页，RSS 停在峰值（7G 级小内存
+    机器会挤压 swap）；trim 只还空闲页，不影响活跃分配。
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    with contextlib.suppress(Exception):
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+
+
+def _idle_trim_loop(interval: float = 600.0) -> None:
+    """周期巡检：无活动任务时执行 :func:`_trim_memory`。"""
+    while not _stop.is_set():
+        if _stop.wait(interval):
+            break
+        with _lock:
+            busy = bool(_active_tasks)
+        if busy:
+            continue
+        _trim_memory()
 
 
 def _json_safe(value):
@@ -80,6 +108,7 @@ def _backfill_loop():
         logger.exception("stockdata startup backfill failed")
     finally:
         _mark_idle("backfill")
+        _trim_memory()
 
 
 def _run_sync(full_stock_minute: bool = False):
@@ -122,6 +151,7 @@ def _run_sync(full_stock_minute: bool = False):
             logger.exception("scheduled mootdx sync failed")
         finally:
             _mark_idle("sync")
+            _trim_memory()
 
 
 def _run_check_day(day: str) -> None:
@@ -141,6 +171,7 @@ def _run_check_day(day: str) -> None:
             logger.exception("stockdata check_day %s failed", day)
         finally:
             _mark_idle("check_day")
+            _trim_memory()
 
 
 def _run_check_full() -> None:
@@ -160,6 +191,7 @@ def _run_check_full() -> None:
             logger.exception("stockdata check_full failed")
         finally:
             _mark_idle("check_full")
+            _trim_memory()
 
 
 def _sync_cron_loop():
@@ -202,6 +234,7 @@ def _run_full_scan_once() -> None:
             logger.exception("stockdata midnight full scan failed")
         finally:
             _mark_idle("full_scan")
+            _trim_memory()
 
 
 def _midnight_scan_loop():
@@ -306,7 +339,7 @@ def start_scheduler(data_sources=None) -> None:
         return
     _stop.clear()
     targets = [_backfill_loop, _sync_cron_loop, _midnight_scan_loop,
-               _full_scan_watchdog_loop]
+               _full_scan_watchdog_loop, _idle_trim_loop]
     if data_sources is not None:
         targets.append(lambda: _midnight_clear_loop(data_sources))
         targets.append(lambda: _dayfile_sweep_loop(data_sources))

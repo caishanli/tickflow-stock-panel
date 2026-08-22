@@ -35,19 +35,15 @@ class StockDataGuardian:
             self.pidfile.unlink(missing_ok=True)
             return
         if old and os.path.exists(f"/proc/{old}"):
-            try:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                 os.killpg(old, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
             for _ in range(50):
                 if not os.path.exists(f"/proc/{old}"):
                     break
                 time.sleep(0.1)
             if os.path.exists(f"/proc/{old}"):
-                try:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                     os.killpg(old, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
                 for _ in range(50):
                     if not os.path.exists(f"/proc/{old}"):
                         break
@@ -56,11 +52,17 @@ class StockDataGuardian:
 
     def _spawn(self) -> None:
         self.pidfile.parent.mkdir(parents=True, exist_ok=True)
-        logf = open(self.logfile, "a")
+        # 句柄需跨 Popen 存活交给子进程，不能随 with 关闭
+        logf = open(self.logfile, "a")  # noqa: SIM115
+        # glibc tunables 仅在子进程启动时解析：arena 上限必须在 spawn env 里传，
+        # 子进程内 os.environ 已无效；多线程回源默认 8×ncores 个 arena 会加剧
+        # 碎片化、RSS 停在高水位。
+        env = dict(os.environ)
+        env.setdefault("MALLOC_ARENA_MAX", "2")
         self.proc = subprocess.Popen(
             [sys.executable, str(self.script)],
             stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True,
+            start_new_session=True, env=env,
         )
         self.pidfile.write_text(str(self.proc.pid))
 

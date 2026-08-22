@@ -2,6 +2,7 @@
 """stock data 服务独立进程：TCP server + 自治调度（FastAPI 主进程托管守护）。"""
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -14,6 +15,15 @@ from app.services.stockdata.sources import DataSources
 HOST = os.getenv("STOCKDATA_HOST", "127.0.0.1")
 
 
+def _limit_malloc_arenas() -> None:
+    """glibc arena 上限压到 2：多线程回源默认 8×ncores 个 arena 会加剧堆碎片、
+    RSS 停在高水位。mallopt 须在拉起线程池前调用；非 glibc 平台静默跳过。"""
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").mallopt(-8, 2)  # M_ARENA_MAX
+
+
 def _port() -> int:
     try:
         return int(os.getenv("STOCKDATA_PORT", "") or 3322)
@@ -22,6 +32,7 @@ def _port() -> int:
 
 
 def main() -> None:
+    _limit_malloc_arenas()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     stop = threading.Event()

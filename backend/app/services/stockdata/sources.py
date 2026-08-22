@@ -370,7 +370,7 @@ class DataSources:
         lf = pl.scan_parquet(paths, hive_partitioning=True)
         if symbols:
             lf = lf.filter(pl.col("symbol").is_in(list(symbols)))
-        out = lf.select(cols).collect()
+        out = lf.select(cols).collect(engine="streaming")
         return _as_datetime(out)
 
     def _daily_days(self, lookback_days: int, asof: _dt.date | None) -> tuple[str | None, str | None]:
