@@ -10,6 +10,7 @@ from app.services.stockdata.sources import (
     NetworkPuller,
     _is_index,
     _pull_recent_guarded,
+    _to_jq,
 )
 
 
@@ -218,8 +219,15 @@ def test_is_index_suffix_based():
     assert _is_index("000001.XSHE") is False   # 深市 000001 平安银行是股票
     assert _is_index("000157.XSHE") is False   # 深市 000157 中联重科是股票
     assert _is_index("000300.XSHG") is True    # 沪市 000xxx 是指数
+    assert _is_index("000300.SS") is True      # ptrade 沪市后缀
     assert _is_index("399006.XSHE") is True    # 399 深证指数，任意市场
     assert _is_index("512670.XSHG") is False   # ETF 不是指数
+
+
+def test_to_jq_accepts_ptrade_ss_suffix():
+    assert _to_jq("518880.SS") == "518880.XSHG"
+    assert _to_jq("600000.SH") == "600000.XSHG"
+    assert _to_jq("000001.SZ") == "000001.XSHE"
 
 
 def test_pull_recent_guarded_timeout_raises():

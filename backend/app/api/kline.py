@@ -36,7 +36,7 @@ def _to_jq_code(symbol: str) -> str:
     pure, _, suf = symbol.rpartition(".")
     if not pure:
         return symbol
-    return pure + (".XSHG" if suf in ("SH", "XSHG") else ".XSHE")
+    return pure + (".XSHG" if suf in ("SH", "SS", "XSHG") else ".XSHE")
 
 
 def _to_partition_symbol(symbol: str) -> str:

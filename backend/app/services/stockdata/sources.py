@@ -41,11 +41,11 @@ def _to_jq(code: str) -> str:
     pure, _, suf = code.rpartition(".")
     if not pure:
         return code
-    return pure + (".XSHG" if suf in ("SH", "XSHG") else ".XSHE")
+    return pure + (".XSHG" if suf in ("SH", "SS", "XSHG") else ".XSHE")
 
 
 def _is_index(code: str) -> bool:
-    """指数判定：399 开头任意市场；000xxx 仅沪市（SH/XSHG）是指数。
+    """指数判定：399 开头任意市场；000xxx 仅沪市（SH/SS/XSHG）是指数。
 
     深市 000xxx（如 000001 平安银行）是股票，不能误走指数通道（mootdx 深市
     000xxx 走 index_bars 返回空）。同 mootdx_src._is_index。
@@ -54,7 +54,7 @@ def _is_index(code: str) -> bool:
     suffix = code.split(".", 1)[1] if "." in code else ""
     if pure.startswith("399"):
         return True
-    return (suffix in ("SH", "XSHG") and pure.startswith("000")
+    return (suffix in ("SH", "SS", "XSHG") and pure.startswith("000")
             and len(pure) == 6 and not pure.startswith("0000"))
 
 

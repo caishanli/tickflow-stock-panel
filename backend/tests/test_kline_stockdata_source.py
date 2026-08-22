@@ -19,6 +19,8 @@ def test_to_jq_code():
     assert _to_jq_code("600000.SH") == "600000.XSHG"
     assert _to_jq_code("600000.XSHG") == "600000.XSHG"
     assert _to_jq_code("920001.BJ") == "920001.XSHE"  # 未知后缀按深市
+    assert _to_jq_code("518880.SS") == "518880.XSHG"  # ptrade 沪市后缀
+    assert _to_jq_code("513360.SS") == "513360.XSHG"  # ptrade 沪市后缀
 
 
 def test_stockdata_frame_restores_datetime_index():
