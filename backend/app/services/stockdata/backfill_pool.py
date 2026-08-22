@@ -58,15 +58,21 @@ class BackfillPool:
     def _reset_source(self):
         self._local.src = None
 
-    def map(self, fn, symbols, batch_size=100, on_batch_done=None) -> dict:
+    def map(self, fn, symbols, batch_size=100, on_batch_done=None,
+            keep_frames: bool = True) -> dict:
         """逐 symbol 执行 fn(src, symbol)；批满主线程回调 on_batch_done。
 
-        失败语义：单只异常记 failed 不阻断；连续异常时重建该 worker 的 source
-        （坏 socket 不残留）。返回 {"ok":[...], "failed":{}}。
+        失败语义：单只异常记 failed 不阻断；异常时重建该 worker 的 source
+        （坏 socket 不残留）。返回 {"ok":[...], "ok_count":int, "failed":{}}。
+
+        ``keep_frames=False``：池不驻留结果帧（分钟级大帧 × 全市场会推高
+        RSS 至 OOM——旧串行实现每批 flush 即弃，本参数保持该峰值形态），
+        "ok" 恒为空列表，成功数看 "ok_count"；调用方经 on_batch_done 消费。
         """
         symbols = list(symbols)
         workers = self.effective_workers(len(symbols))
         results: list = []
+        ok_count = 0
         failed: dict[str, str] = {}
         batch: list = []
 
@@ -88,7 +94,9 @@ class BackfillPool:
                     failed[sym] = str(err)[:120]
                     continue
                 if out is not None:
-                    results.append(out)
+                    if keep_frames:
+                        results.append(out)
+                    ok_count += 1
                     batch.append(out)
                 if on_batch_done is not None and len(batch) >= batch_size:
                     on_batch_done(batch)
@@ -96,5 +104,5 @@ class BackfillPool:
         if on_batch_done is not None and batch:
             on_batch_done(batch)
         logger.info("backfill pool done: ok=%d failed=%d workers=%d",
-                    len(results), len(failed), workers)
-        return {"ok": results, "failed": failed}
+                    ok_count, len(failed), workers)
+        return {"ok": results, "ok_count": ok_count, "failed": failed}

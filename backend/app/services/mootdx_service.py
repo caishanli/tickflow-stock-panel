@@ -585,6 +585,7 @@ def sync_stock_minute(limit: int | None = None) -> int:
     keep = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     tick = _mk_progress_logger(len(todo), "股票分钟回源")
     counter = {"n": 0}
+    total_holder = {"rows": 0}
     pending: list[pl.DataFrame] = []
 
     def _fetch_one(src, sym):
@@ -629,9 +630,13 @@ def sync_stock_minute(limit: int | None = None) -> int:
         return sub
 
     def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
-        """主线程批回调：攒满一批统一写分区 + manifest 记账（单线程写盘）。"""
+        """主线程批回调：攒满一批统一写分区 + manifest 记账（单线程写盘）。
+
+        行数在落盘点累计——池 keep_frames=False 不驻留帧，峰值内存 O(batch)。
+        """
         pending.extend(batch_frames)
         if len(pending) >= _STOCK_MINUTE_BATCH:
+            total_holder["rows"] += sum(f.height for f in pending)
             _flush_stock_minute_chunk(pending.copy())
             _manifest_mark_done("stock_minute",
                                 [f["symbol"][0] for f in pending])
@@ -639,18 +644,19 @@ def sync_stock_minute(limit: int | None = None) -> int:
 
     result = BackfillPool().map(_fetch_one, todo,
                                 batch_size=_STOCK_MINUTE_BATCH,
-                                on_batch_done=_on_batch)
+                                on_batch_done=_on_batch, keep_frames=False)
     if pending:
+        total_holder["rows"] += sum(f.height for f in pending)
         _flush_stock_minute_chunk(pending)
         _manifest_mark_done("stock_minute", [f["symbol"][0] for f in pending])
         pending.clear()
-    total = sum(f.height for f in result["ok"])
+    total = total_holder["rows"]
     if result["failed"]:
         logger.warning("mootdx_service: 股票分钟回源失败 %d 只: %s",
                        len(result["failed"]),
                        list(result["failed"].items())[:10])
     logger.info("mootdx_service: 股票分钟回源完成 %d 行 (ok=%d failed=%d)",
-                total, len(result["ok"]), len(result["failed"]))
+                total, result["ok_count"], len(result["failed"]))
     return range_rows + total + fragment_rows
 
 
@@ -719,19 +725,23 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
         return sub
 
+    total_holder = {"rows": 0}
+
     def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
         pending.extend(batch_frames)
         if len(pending) >= _STOCK_MINUTE_BATCH:
+            total_holder["rows"] += sum(f.height for f in pending)
             _flush_stock_minute_chunk(pending.copy())
             pending.clear()
 
     result = BackfillPool().map(_fetch_one, stocks,
                                 batch_size=_STOCK_MINUTE_BATCH,
-                                on_batch_done=_on_batch)
+                                on_batch_done=_on_batch, keep_frames=False)
     if pending:
+        total_holder["rows"] += sum(f.height for f in pending)
         _flush_stock_minute_chunk(pending)
         pending.clear()
-    total = sum(f.height for f in result["ok"])
+    total = total_holder["rows"]
     logger.info("mootdx_service: 股票分钟按日回源 %s 完成, %d 行 (failed=%d)",
                 day, total, len(result["failed"]))
     return total
@@ -801,19 +811,23 @@ def sync_stock_minute_range(days: list[_date]) -> int:
         sub = sub.unique(subset=["symbol", "datetime"], keep="last")
         return sub
 
+    total_holder = {"rows": 0}
+
     def _on_batch(batch_frames: list[pl.DataFrame]) -> None:
         pending.extend(batch_frames)
         if len(pending) >= _STOCK_MINUTE_BATCH:
+            total_holder["rows"] += sum(f.height for f in pending)
             _flush_stock_minute_chunk(pending.copy())
             pending.clear()
 
     result = BackfillPool().map(_fetch_one, stocks,
                                 batch_size=_STOCK_MINUTE_BATCH,
-                                on_batch_done=_on_batch)
+                                on_batch_done=_on_batch, keep_frames=False)
     if pending:
+        total_holder["rows"] += sum(f.height for f in pending)
         _flush_stock_minute_chunk(pending)
         pending.clear()
-    total = sum(f.height for f in result["ok"])
+    total = total_holder["rows"]
     logger.info("mootdx_service: 股票分钟批量回源 %d 个缺失日, %d 行 (failed=%d)",
                 len(days), total, len(result["failed"]))
     return total

@@ -53,3 +53,18 @@ def test_thread_local_sources_distinct():
     pool = BackfillPool(workers=4)
     pool.map(fn, list("abcdefgh"))
     assert len(sources) > 1  # 每 worker 独立 source 实例
+
+
+def test_keep_frames_false_does_not_retain():
+    """keep_frames=False：池不驻留帧，ok 为空、ok_count 计数正确。"""
+    held = []
+
+    def fn(src, sym):
+        return {"sym": sym, "payload": [0] * 1000}  # 模拟大帧
+
+    pool = BackfillPool(workers=2)
+    res = pool.map(fn, list("abc"), batch_size=2,
+                   on_batch_done=lambda b: held.extend(b), keep_frames=False)
+    assert res["ok"] == []            # 池未驻留
+    assert res["ok_count"] == 3
+    assert len(held) == 3             # 帧仍经批回调全量送达

@@ -34,7 +34,8 @@ class _StubPool:
     def effective_workers(self, task_size):
         return 1
 
-    def map(self, fn, symbols, batch_size=100, on_batch_done=None):
+    def map(self, fn, symbols, batch_size=100, on_batch_done=None,
+                keep_frames=True):
         ok, failed, batch = [], {}, []
         for s in symbols:
             try:
@@ -50,7 +51,7 @@ class _StubPool:
                 batch = []
         if on_batch_done is not None and batch:
             on_batch_done(batch)
-        return {"ok": ok, "failed": failed}
+        return {"ok": ok, "ok_count": len(ok), "failed": failed}
 
 
 def _setup_env(tmp_path, monkeypatch, universe):
