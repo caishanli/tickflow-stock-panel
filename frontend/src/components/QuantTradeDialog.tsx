@@ -7,6 +7,7 @@ import { QK } from '@/lib/queryKeys'
 import { StockInfoBar } from '@/components/StockInfoBar'
 import { StockDailyKChart, getDefaultRange, type StockDailyKChartResult } from '@/components/StockDailyKChart'
 import { StockIntradayChart } from '@/components/StockIntradayChart'
+import { StockFiveDayChart } from '@/components/StockFiveDayChart'
 import { DatePicker } from '@/components/DatePicker'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { useCapabilities, usePreferences, useQuoteStatus } from '@/lib/useSharedQueries'
@@ -16,8 +17,8 @@ import { loadInfoFields, saveInfoFields, buildInfoExtColumnsParam, type ColumnCo
 import type { ChartMarker, ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
 import type { IntradayMarker } from '@/components/EChartsIntraday'
 
-/** 视图模式: 分钟(当天分钟线) / 日线 / 周线 */
-export type QuantViewMode = 'minute' | 'daily' | 'weekly'
+/** 视图模式: 分钟(当天分钟线) / 五日(近5交易日分钟拼接) / 日线 / 周线 */
+export type QuantViewMode = 'minute' | 'fiveDay' | 'daily' | 'weekly'
 
 // 预设快捷范围
 const PRESETS: { label: string; months: number }[] = [
@@ -25,7 +26,7 @@ const PRESETS: { label: string; months: number }[] = [
   { label: '1年', months: 12 },
 ]
 
-const VIEW_LABEL: Record<QuantViewMode, string> = { minute: '分钟', daily: '日线', weekly: '周线' }
+const VIEW_LABEL: Record<QuantViewMode, string> = { minute: '分钟', fiveDay: '五日', daily: '日线', weekly: '周线' }
 
 function boardTag(symbol: string): { label: string; color: string } | null {
   if (/^(300|301)/.test(symbol)) return { label: '创', color: 'text-[#f97316] bg-[#f97316]/12 border-[#f97316]/25' }
@@ -171,6 +172,13 @@ export function QuantTradeDialog({
     const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
     setSelectedDate(target ? initialDate : latest)
   }, [symbol, initialDate, view, selectedDate, rawRows])
+
+  // 五日线: 日K尾部 5 个交易日 + 其首日前一日收盘(作百分比基准)
+  const fiveDates = useMemo(() => rawRows.slice(-5).map((r: any) => String(r.date).slice(0, 10)), [rawRows])
+  const fivePrevClose = useMemo(() => {
+    const i0 = fiveDates.length > 0 ? rawRows.findIndex((r: any) => String(r.date).slice(0, 10) === fiveDates[0]) : -1
+    return i0 > 0 ? Number(rawRows[i0 - 1].close) : undefined
+  }, [fiveDates, rawRows])
 
   // 分钟视图昨收 = 选中日的前一交易日收盘
   const selectedIdx = selectedDate
@@ -318,7 +326,7 @@ export function QuantTradeDialog({
                 dataSource="stockdata"
                 symbol={symbol}
                 height={420}
-                className={view === 'minute' ? 'hidden' : undefined}
+                className={view === 'minute' || view === 'fiveDay' ? 'hidden' : undefined}
                 dateRange={dateRange}
                 period={view === 'weekly' ? 'weekly' : 'daily'}
                 markers={view === 'daily' ? markers : undefined}
@@ -348,6 +356,15 @@ export function QuantTradeDialog({
                 <div className="h-[420px] grid place-items-center text-xs text-muted">
                   加载中…
                 </div>
+              )}
+              {view === 'fiveDay' && fiveDates.length > 0 && (
+                <StockFiveDayChart
+                  symbol={symbol}
+                  dates={fiveDates}
+                  prevClose={fivePrevClose}
+                  height={narrow ? 300 : 420}
+                  markers={intradayMarkers}
+                />
               )}
             </div>
 

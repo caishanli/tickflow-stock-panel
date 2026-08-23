@@ -171,7 +171,8 @@ function generateFullDayTimes(): string[] {
   return times
 }
 
-const FULL_DAY_TIMES = generateFullDayTimes()
+/** 全天分时时间刻度 9:30 ~ 11:30, 13:00 ~ 15:00, 每分钟一个点 (共242个)。五日线等复用 */
+export const FULL_DAY_TIMES: string[] = generateFullDayTimes()
 
 /** 计算实际涨跌停价 (四舍五入到2位小数) 和实际涨跌停幅度 */
 function getLimitPrices(prevClose: number, priceLimit?: PriceLimitInfo): {
