@@ -220,22 +220,23 @@ export function QuantTradeDialog({
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
             className="relative w-[92vw] max-w-[1100px] max-h-[95vh] max-md:w-full max-md:h-[94dvh] max-md:max-h-none max-md:rounded-none rounded-card border border-border bg-base shadow-2xl overflow-hidden flex flex-col"
           >
-            {/* 顶栏 */}
-            <div className="flex items-center justify-between px-5 py-3 border-b border-border shrink-0">
-              <div className="flex items-center gap-2">
+            {/* 顶栏 (手机端: 收窄内边距, 隐藏预设/日期范围控件, 保留刷新+关闭) */}
+            <div className="flex items-center justify-between px-5 max-md:px-3 py-3 border-b border-border shrink-0 gap-2">
+              <div className="flex items-center gap-2 min-w-0">
                 {(() => {
                   const board = symbol ? boardTag(symbol) : null
                   return board ? (
-                    <span className={`inline-flex items-center justify-center w-[18px] h-[18px] rounded text-[9px] font-bold leading-none border ${board.color}`}>
+                    <span className={`inline-flex items-center justify-center w-[18px] h-[18px] shrink-0 rounded text-[9px] font-bold leading-none border ${board.color}`}>
                       {board.label}
                     </span>
                   ) : null
                 })()}
-                <span className="font-mono text-sm font-medium text-foreground">{symbol}</span>
-                {name && <span className="text-xs text-muted">{name}</span>}
+                <span className="font-mono text-sm font-medium text-foreground shrink-0">{symbol}</span>
+                {name && <span className="text-xs text-muted truncate">{name}</span>}
               </div>
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span className="flex items-center gap-1.5 max-md:hidden">
                 {PRESETS.map(p => {
                   const now = new Date()
                   const s = new Date(now)
@@ -272,8 +273,9 @@ export function QuantTradeDialog({
                   onChange={(v) => setDateRange(prev => ({ ...prev, end: v }))}
                   min={dateRange.start}
                 />
+                </span>
 
-                <span className="text-muted/20 mx-0.5">|</span>
+                <span className="text-muted/20 mx-0.5 max-md:hidden">|</span>
 
                 <button
                   onClick={handleRefresh}
