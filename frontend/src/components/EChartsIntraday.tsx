@@ -88,7 +88,7 @@ function fmtAmt(v: number): string {
 }
 
 /** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交。
- *  标记样式对齐日线图 EChartsCandlestick: arrow 锚定该分钟 high/low, z:100/zlevel:10 保证置顶。 */
+ *  样式: 从该分钟 high/low 引一条短竖虚线, 末端挂背景色矩形徽标 B/S/止损。zlevel 置顶。 */
 function buildMarkerPoints(
   markers: IntradayMarker[] | undefined,
   chartDate: string | undefined,
@@ -96,41 +96,54 @@ function buildMarkerPoints(
   lows: (number | null)[],
   highs: (number | null)[],
   timeIndexMap: Map<string, number>,
-): any[] {
-  if (!markers || markers.length === 0) return []
-  const out: any[] = []
+): { points: any[]; lines: any[] } {
+  const points: any[] = []
+  const lines: any[] = []
+  if (!markers || markers.length === 0) return { points, lines }
+  // 用当日有效高低极值估虚线长度(约为振幅的 1/6)
+  let lo: number | null = null
+  let hi: number | null = null
+  for (const arr of [lows, highs]) {
+    for (const v of arr) {
+      if (!isValidPrice(v)) continue
+      if (lo == null || v < lo) lo = v
+      if (hi == null || v > hi) hi = v
+    }
+  }
+  const span = lo != null && hi != null && hi > lo ? hi - lo : 0
   for (const m of markers) {
     if (m.date !== chartDate) continue
     const idx = timeIndexMap.get(m.time)
     if (idx === undefined || !isValidPrice(closes[idx])) continue
     const stop = m.action === 'STOP_LOSS'
     const buy = m.action === 'BUY'
-    if (stop) {
-      out.push({
-        coord: [idx, highs[idx] ?? m.price],
-        symbol: 'circle', symbolSize: 12, symbolOffset: [0, -2],
-        itemStyle: { color: '#F59E0B' },
-        label: { show: true, formatter: '止损', position: 'top', distance: 4, color: '#F59E0B', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
-        z: 100, zlevel: 10,
-      })
-      continue
-    }
-    out.push({
-      coord: [idx, buy ? (lows[idx] ?? m.price) : (highs[idx] ?? m.price)],
-      symbol: 'arrow', symbolSize: 12,
-      symbolRotate: buy ? 0 : 180,
-      symbolOffset: buy ? [0, '60%'] : [0, '-60%'],
-      itemStyle: { color: buy ? '#C74040' : '#2D9B65' },
+    const color = stop ? '#F59E0B' : buy ? '#C74040' : '#2D9B65'
+    const text = stop ? '止损' : buy ? 'B' : 'S'
+    const anchor = stop || !buy ? (highs[idx] ?? m.price) : (lows[idx] ?? m.price)
+    const dash = span > 0 ? span * 0.16 : Math.abs(m.price) * 0.004
+    // 短竖虚线: 买入向下、卖出/止损向上 (两点线段 = 数组包两个点对象)
+    const end = buy && !stop ? anchor - dash : anchor + dash
+    lines.push([
+      { coord: [idx, anchor] },
+      { coord: [idx, end], lineStyle: { color, type: 'dashed', width: 1 } },
+    ])
+    // 背景色矩形徽标挂在虚线末端
+    points.push({
+      coord: [idx, end],
+      symbol: 'circle', symbolSize: 3,
+      itemStyle: { color },
       label: {
-        show: true, formatter: buy ? 'B' : 'S',
-        position: buy ? 'bottom' : 'top', distance: 6,
-        color: buy ? '#C74040' : '#2D9B65', fontSize: 11, fontWeight: 'bold',
+        show: true, formatter: text,
+        position: buy && !stop ? 'bottom' : 'top', distance: 2,
+        color: '#FFFFFF', backgroundColor: color,
+        padding: [3, 5], borderRadius: 3,
+        fontSize: 10, fontWeight: 'bold',
         fontFamily: 'JetBrains Mono, monospace',
       },
       z: 100, zlevel: 10,
     })
   }
-  return out
+  return { points, lines }
 }
 
 function isValidPrice(v: number | null | undefined): v is number {
@@ -209,7 +222,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     }
   }
 
-  const markerPoints = buildMarkerPoints(markers, chartDate, closes, lows, highs, timeIndexMap)
+  const { points: markerPoints, lines: markerLines } = buildMarkerPoints(markers, chartDate, closes, lows, highs, timeIndexMap)
 
   const areaStyle: any = {
     color: {
@@ -471,7 +484,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         lineStyle: { width: 1.2, color: lineColor },
         areaStyle,
         connectNulls: true,
-        markLine: markLineData.length > 0 ? { symbol: 'none', data: markLineData, animation: false, silent: true } : undefined,
+        markLine: (markLineData.length + markerLines.length) > 0 ? { symbol: 'none', data: [...markerLines, ...markLineData], animation: false, silent: true, zlevel: 10 } : undefined,
         markPoint: markerPoints.length > 0 ? { data: markerPoints, animation: false, silent: true } : undefined,
       },
       ...(showAvgLine ? [{
@@ -587,7 +600,9 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
       }
       fullDayToDataIdx.current = mapping
 
-      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), true)
+      // replaceMerge series: 保留 dataZoom 内部状态(用户缩放位置), 且规避 notMerge 全量重建
+      // 反复拆装 InsideZoom 触发的 echarts "_ec_inner" 崩溃
+      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), { replaceMerge: ['series'] })
     } else {
       chart.clear()
     }
