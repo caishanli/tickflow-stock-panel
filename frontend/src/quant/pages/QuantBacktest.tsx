@@ -483,6 +483,11 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
 
   const metrics = pickMetrics(status?.metrics_json)
   const equityData: any[] = Array.isArray(equity) ? equity : []
+  // 交易记录持仓时长用的交易日历：权益曲线日线 dt 序列 = 该回测的真实交易日
+  const btTradeDays = useMemo(
+    () => [...new Set(equityData.map((e: any) => String(e?.dt ?? '').slice(0, 10)).filter(Boolean))],
+    [equity],
+  )
   const runList: any[] = Array.isArray(runs) ? runs : []
 
   // 日期框初始化（只填一次，且不清空用户已输入值）：
@@ -768,7 +773,7 @@ function StrategyEditor({ strategyId, onBack }: { strategyId: string; onBack: ()
                 />
               )}
               {logTab === 'error' && <LogList logs={errLogs} />}
-              {logTab === 'trade' && <TradeTable trades={Array.isArray(trades) ? trades : []} />}
+              {logTab === 'trade' && <TradeTable trades={Array.isArray(trades) ? trades : []} tradeDays={btTradeDays} />}
             </div>
           </div>
         </div>
@@ -921,7 +926,7 @@ function buildDayLookup(trades: any[], tradeDays: string[]): Map<string, number>
   let next = idx.size
   const isWeekday = (d: string) => {
     const t = new Date(`${d}T00:00:00`)
-    const w = t.getUTCDay()
+    const w = t.getDay()
     return !Number.isNaN(t.getTime()) && w >= 1 && w <= 5
   }
   for (const t of trades) {
@@ -977,10 +982,10 @@ function computeHoldDays(trades: any[], tradeDays: string[]): Map<number, { hold
   return out
 }
 
-function TradeTable({ trades }: { trades: any[] }) {
+function TradeTable({ trades, tradeDays = [] }: { trades: any[]; tradeDays?: string[] }) {
   const isBuy = (t: any) => /BUY/i.test(String(t.action ?? t.side ?? ''))
   const sorted = useMemo(() => [...trades].sort((a: any, b: any) => String(a.ts).localeCompare(String(b.ts))), [trades])
-  const holdMap = useMemo(() => computeHoldDays(sorted, []), [sorted])
+  const holdMap = useMemo(() => computeHoldDays(sorted, tradeDays), [sorted, tradeDays])
   const holdOf = (origIdx: number) => holdMap.get(origIdx)
   if (trades.length === 0) return <div className="text-xs text-muted">暂无成交</div>
   return (

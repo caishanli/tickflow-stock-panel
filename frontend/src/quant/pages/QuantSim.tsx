@@ -116,7 +116,7 @@ function buildDayLookup(trades: any[], tradeDays: string[]): Map<string, number>
   let next = idx.size
   const isWeekday = (d: string) => {
     const t = new Date(`${d}T00:00:00`)
-    const w = t.getUTCDay()
+    const w = t.getDay()
     return !Number.isNaN(t.getTime()) && w >= 1 && w <= 5
   }
   for (const t of trades) {
