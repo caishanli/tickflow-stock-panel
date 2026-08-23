@@ -151,26 +151,26 @@ export function QuantTradeDialog({
     return () => mq.removeEventListener('change', onChange)
   }, [])
 
-  // initialDate: 日K rows 就绪后按 (symbol|date) 定位——同标的换日期点击也会重新应用; 无 date(持仓无入场时间)回退最新
+  // 分钟视图日期定位(单一来源防竞态): 日K rows 就绪后按 (symbol|date) 应用一次——同标的
+  // 换日期点击也会重新定位; 无 date(持仓无入场时间)回退最新交易日。
+  // 不可拆成「应用initialDate」+「空则选最新」两个 effect: 同一轮渲染里后者读到旧闭包的
+  // selectedDate=null 会覆盖前者的选择(历史 bug: 点哪天都停在最新日)。
   useEffect(() => {
-    if (rawRows.length === 0) return
+    if (view !== 'minute' || rawRows.length === 0) return
+    const latest = String(rawRows[rawRows.length - 1].date).slice(0, 10)
     const key = `${symbol}|${initialDate ?? ''}`
-    if (appliedKeyRef.current === key) return
+    if (appliedKeyRef.current === key) {
+      if (!selectedDate) setSelectedDate(latest)
+      return
+    }
     appliedKeyRef.current = key
     if (!initialDate) {
-      setSelectedDate(null)
+      setSelectedDate(latest)
       return
     }
     const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
-    setSelectedDate(target ? initialDate : String(rawRows[rawRows.length - 1].date).slice(0, 10))
-  }, [symbol, initialDate, rawRows])
-
-  // 分钟视图无选中日期时自动选中最新交易日
-  useEffect(() => {
-    if (view === 'minute' && !selectedDate && rawRows.length > 0) {
-      setSelectedDate(String(rawRows[rawRows.length - 1].date).slice(0, 10))
-    }
-  }, [view, selectedDate, rawRows])
+    setSelectedDate(target ? initialDate : latest)
+  }, [symbol, initialDate, view, selectedDate, rawRows])
 
   // 分钟视图昨收 = 选中日的前一交易日收盘
   const selectedIdx = selectedDate
