@@ -174,3 +174,103 @@ def test_threshold_excludes_anomaly_and_notifies(monkeypatch):
     assert ns["g"].avg_etf_money_threshold == pytest.approx(4.15e11 / 20000)
     assert any("成交额异常" in m for m in ns["log"].errors)
     assert any("成交额异常" in m for m in ns["log"].notifies)
+
+
+# ---- 数据缺失保护：持仓未参与动量计算时保守保留（08-17~08-21 连续误换仓回归） ----
+
+import numpy as np
+
+
+def _ranking_ns(held_code="518880.XSHG", held_in_pool=True,
+                assessed=("159518.XSHE", "513030.XSHG")):
+    """构造 get_final_ranked_etfs 的执行环境：
+    - 池含 held_code（可关）与 assessed 中标的；
+    - hist_df 只含 assessed（held 取数失败缺席 → 复现 08-21 场景）；
+    - 159518 通过全部过滤得分 0.35，513030 未通过短期风控。"""
+    ns = _load_strategy()
+    pool = list(assessed) + ([held_code] if held_in_pool else [])
+    g = ns["g"]
+    g.merged_etf_pool = pool
+    g.lookback_days = 25
+    g.volume_lookback = 5
+    g.ma_lookback = 10
+    g.is_a_share_weak = True
+    g.holdings_num = 1
+    g.score_threshold_ratio = 0.9
+    g.min_score_threshold = 0
+    g.max_score_threshold = 5
+    g.r2_threshold = 0.4
+    g.ma_threshold = 1.0
+    g.volume_threshold = 1.8
+    g.loss = 0.97
+    g.enable_r2_filter = False   # 走弱期：R² 关、均线开
+    g.enable_ma_filter = True
+    g.enable_volume_check = True
+    g.enable_loss_filter = True
+    g.hold_buffer = 1.0
+
+    days = pd.date_range("2026-06-01", periods=40, freq="D")
+    rows = []
+    for code in assessed:
+        base = 1.0 if code == "159518.XSHE" else 2.0
+        for i, d in enumerate(days):
+            rows.append({"time": d, "code": code, "close": base * (1 + 0.001 * i),
+                         "volume": 1e6})
+    ns["get_price"] = lambda *a, **k: (pd.DataFrame(rows) if k.get("frequency") != "1m"
+                                       else pd.DataFrame())
+    cur = {c: types.SimpleNamespace(paused=False, last_price=float(base))
+           for c, base in [("159518.XSHE", 1.04), ("513030.XSHG", 2.0),
+                           ("518880.XSHG", 9.3)]}
+    ns["get_current_data"] = lambda: cur
+    ns["is_temporarily_suspended"] = lambda *a, **k: False
+    ns["get_security_name"] = lambda c: {"159518.XSHE": "标普油气ETF嘉实",
+                                         "513030.XSHG": "德国ETF",
+                                         "518880.XSHG": "黄金ETF"}.get(c, c)
+
+    def fake_metrics(etf, etf_name, hist_closes, hist_volumes, current_price,
+                     today_vol, context):
+        passed_loss = etf != "513030.XSHG"
+        return {
+            "etf": etf, "etf_name": etf_name,
+            "momentum_score": 0.35 if etf == "159518.XSHE" else 0.20,
+            "annualized_returns": 0.4, "r_squared": 0.6,
+            "current_price": current_price, "volume_ratio": 1.0,
+            "day_ratios": [1.0] if passed_loss else [0.96],
+            "passed_momentum": True, "passed_r2": True, "passed_ma": True,
+            "passed_volume": True, "passed_loss": passed_loss, "ma_value": 1.0,
+        }
+
+    ns["calculate_all_metrics_for_etf"] = fake_metrics
+
+    pos = types.SimpleNamespace(total_amount=12600, avg_cost=9.235)
+    ctx = types.SimpleNamespace(
+        previous_date=pd.Timestamp("2026-08-20"),
+        current_dt=types.SimpleNamespace(date=lambda: pd.Timestamp("2026-08-21").date()),
+        portfolio=types.SimpleNamespace(positions={held_code: pos}))
+    return ns, ctx
+
+
+def test_missing_holding_is_protected_and_retained():
+    """持仓因取数失败缺席动量计算 → 保守保留 + 告警/通知，不得换仓。"""
+    ns, ctx = _ranking_ns()
+    result = ns["get_final_ranked_etfs"](ctx)
+    assert [m["etf"] for m in result] == ["518880.XSHG"], \
+        f"持仓应被数据缺失保护保留，实际最终目标: {[m['etf'] for m in result]}"
+    assert any("数据缺失保护" in w and "518880" in w for w in ns["log"].warnings)
+    assert any("数据缺失保护" in n for n in ns["log"].notifies), "保护动作应推钉钉"
+
+
+def test_assessed_but_filtered_holding_is_not_protected():
+    """持仓参与了计算但被过滤淘汰 → 正常换仓逻辑，不受保护干扰。"""
+    ns, ctx = _ranking_ns(held_code="513030.XSHG")
+    result = ns["get_final_ranked_etfs"](ctx)
+    assert [m["etf"] for m in result] == ["159518.XSHE"]
+    assert not any("数据缺失保护" in n for n in ns["log"].notifies)
+
+
+def test_off_pool_holding_missing_is_not_protected():
+    """防御型持仓不在合并池内（如银华日利）→ 缺席属正常，不得保护锁死。"""
+    ns, ctx = _ranking_ns(held_code="511880.XSHG", held_in_pool=False)
+    result = ns["get_final_ranked_etfs"](ctx)
+    assert [m["etf"] for m in result] == ["159518.XSHE"]
+    assert not any("数据缺失保护" in n for n in ns["log"].notifies)

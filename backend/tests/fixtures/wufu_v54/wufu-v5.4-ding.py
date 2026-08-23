@@ -5,6 +5,8 @@
 # v5.4（胜率导向）：D1 锁盈止损（保护线 1.0→成本×X） / D2 买入过滤收紧 / D3 高位回落止盈，均可独立开关。
 # v5.4 优化（2026-08-12）：A3 退出均线 20→15（弱市反弹更快回补 A 股池，避免错过反弹被锁在全球池）。
 # v5.4-ding（2026-08-13）：克隆 42f91131 版；所有买入/卖出/止损走 log.notify 推钉钉，账户止损见 Matcher。
+# v5.4.1（2026-08-21）：数据缺失保护——持仓在池内但未参与动量计算（取数瞬时失败被
+#   静默跳过，08-17~08-21 连续误换仓根因）时保守保留持仓 + 告警/推钉钉，不基于残缺排名换仓。
 
 import numpy as np
 import math
@@ -1039,6 +1041,8 @@ def get_final_ranked_etfs(context):
             item['momentum_score'] = float('-inf')
     # 按动量得分排序
     all_metrics.sort(key=lambda x: x.get('momentum_score', float('-inf')), reverse=True)
+    # 记录今日实际完成评估的标的集合（供卖出流水线数据缺失保护兜底使用）
+    g._assessed_codes = {m['etf'] for m in all_metrics}
     # ========== 第一步：输出所有ETF排序表格 ==========
     log_buffer = []
     log_buffer.append("")
@@ -1117,6 +1121,24 @@ def get_final_ranked_etfs(context):
     candidate_dict = {item['etf']: item for item in candidate_pool}
     retained = [candidate_dict[etf] for etf in current_holdings if etf in candidate_dict]
     log_buffer.append(f"其中存在于候选池中的持仓ETF：{[item['etf'] for item in retained]}")
+    # ========== 数据缺失保护（v5.4.1）：持仓未参与动量计算时保守保留 ==========
+    # 取数瞬时失败曾让持仓从排名中静默消失并被无警告卖出（08-17~08-21 连续
+    # 误换仓：教育/德国/黄金轮流"被失踪"，每次白付佣金且卖飞上涨标的）。
+    # 持仓在合并池内却不在计算结果中 = 今日无法评估 → 保留持仓、告警并推钉钉，
+    # 不基于残缺排名换仓。防御型ETF（如 511880）不在合并池内，不触发本保护。
+    assessed_codes = {m['etf'] for m in all_metrics}
+    pool_set = set(g.merged_etf_pool)
+    retained_set0 = {r['etf'] for r in retained}
+    for etf in current_holdings:
+        if etf in assessed_codes or etf not in pool_set or etf in retained_set0:
+            continue
+        name = get_security_name(etf)
+        log.warning(f"🛡️ 【数据缺失保护】{etf} {name} 在合并池内但未参与今日动量计算（日线/分钟取数失败），保守保留持仓不换仓")
+        try:
+            log.notify(f"🛡️ 数据缺失保护：{name}({etf}) 今日动量数据缺失，保留持仓不换仓")
+        except Exception:
+            pass
+        retained.append({'etf': etf, 'etf_name': name, 'momentum_score': float('inf')})
     # ========== A2 持仓宽容（v5.3）：持仓未进候选池但得分仍高时保留 ==========
     hold_buffer = getattr(g, 'hold_buffer', 1.0)
     if hold_buffer < 1.0 and len(retained) < g.holdings_num:
@@ -1185,6 +1207,19 @@ def execute_sell_trades(context):
     for security in current_positions:
         position = context.portfolio.positions[security]
         if position.total_amount > 0 and security not in target_set:
+            # 数据缺失保护兜底：排名整体为空（hist_df 取数失败早退）走防御模式时，
+            # 在池内但未参与评估的持仓不卖——宁可少动，不可基于残缺数据清仓。
+            assessed = getattr(g, '_assessed_codes', None)
+            if (assessed is not None
+                    and security in set(getattr(g, 'merged_etf_pool', []) or [])
+                    and security not in assessed):
+                security_name = get_security_name(security)
+                log.warning(f"🛡️ 【数据缺失保护】{security} {security_name} 未参与今日动量计算，跳过卖出（保守保留）")
+                try:
+                    log.notify(f"🛡️ 数据缺失保护：{get_security_name(security)}({security}) 今日动量数据缺失，跳过卖出")
+                except Exception:
+                    pass
+                continue
             security_name = get_security_name(security)
             success = smart_order_target_value(security, 0, context)
             if success:

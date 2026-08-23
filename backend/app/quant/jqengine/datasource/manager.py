@@ -558,6 +558,10 @@ class DataManager:
                 pdf["trade_dt"] = g["_trade_dt"].values
                 pdf = _ensure_money_yuan(pdf, "partition")
                 pdf = _ensure_volume_shares(pdf, "partition")
+                # polars 多文件扫描 concat 不保证全局行序：多分区并发读后行序
+                # 可能乱（实测 tail 取到数月前旧行），动量窗口/覆盖检查全错。
+                # 按 DatetimeIndex 排序后再入缓存。
+                pdf = pdf.sort_index()
                 out[jq] = pdf
                 total_rows += len(pdf)
             print(f"[preload] 日线分区: {len(out)} 只, {total_rows} 行")
@@ -603,8 +607,11 @@ class DataManager:
                 if (DataCache._covers(mem, req_start, req_end)
                         and not (self.cache._is_stale(mem) and _is_live_req)):
                     return mem
-            del self._daily_mem[cache_key]
-            self._daily_ver += 1  # 日线内存有删除，money memo 旧版本键失效
+            # 覆盖不足不预先删除旧帧：先回源，成功才经 _put_daily_mem_protected
+            # 覆盖写入；失败则保留旧帧并抛错。原实现"先删后取"，回源瞬时失败会让
+            # 该标的从缓存彻底消失，批量日线读取静默跳过（08-21 黄金ETF被误换仓的
+            # 根因之一）。陈数据优于无数据；下次显式 fetch 会继续重试回源。
+            self._daily_ver += 1  # 旧帧判定失效，money memo 旧版本键随之失效
         if self._offline:
             # 回测离线：本地缺失即视为无数据，不联网回源（避免 mootdx 选服务器
             # 联网超时卡死；缺数据的标的由策略侧容忍/跳过）。
@@ -650,6 +657,15 @@ class DataManager:
                 self._src_fail[name] = self._src_fail.get(name, 0) + 1
                 self._maybe_demote(name)
                 continue
+        if method == "get_daily":
+            # 日线回源最终失败：保留旧帧（若有）并显式告警，便于排查静默缺数据
+            kept = self._daily_mem.get(cache_key)
+            logger.warning(
+                "[DataManager] %s 日线回源失败(旧缓存%s): %s",
+                cache_key,
+                "保留" if kept is not None else "无旧帧可保留",
+                last_err,
+            )
         raise DataSourceError(f"所有数据源失败: {last_err}")
 
     @staticmethod

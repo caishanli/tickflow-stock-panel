@@ -27,6 +27,10 @@ from .context import Context, G, Position
 from .portfolio import Portfolio
 from ...datasource.base import DataSourceError
 
+import logging
+
+_logger = logging.getLogger("jqengine.api")
+
 # 印花税率（仅卖出，股票 0.05%，ETF 免征；与 simulate.matcher 同口径同环境变量）
 DEFAULT_STAMP_TAX = float(os.environ.get("QUANT_SIM_STAMP_TAX", "0.0005"))
 
@@ -236,12 +240,18 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
     for sec in security:
         df = mgr._daily_mem.get(f"get_daily_{sec}")
         if df is None or (hasattr(df, "empty") and df.empty):
-            # 兜底：走原 fetch 路径（触发加载并缓存到 _daily_mem）
-            try:
-                df = mgr.fetch("get_daily", sec, start_date or "20000101", end_date or "20300101")
-            except Exception:
-                continue
+            # 兜底：走原 fetch 路径（触发加载并缓存到 _daily_mem）。
+            # 重试一次：回源瞬时失败曾导致单标的整体缺席动量计算
+            # （08-21 黄金ETF误换仓根因之一），失败必须留痕告警。
+            for attempt in (1, 2):
+                try:
+                    df = mgr.fetch("get_daily", sec, start_date or "20000101", end_date or "20300101")
+                    break
+                except Exception as e:
+                    _logger.warning("批量日线取数失败(第%d次) %s: %s", attempt, sec, e)
+                    df = None
             if df is None or (hasattr(df, "empty") and df.empty):
+                _logger.warning("批量日线取数最终失败，标的缺席本次历史数据: %s", sec)
                 continue
         idx = df.index
         if not isinstance(idx, pd.DatetimeIndex):
