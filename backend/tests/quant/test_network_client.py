@@ -98,3 +98,10 @@ def test_business_error_raises_runtime_error_and_keeps_connection(server_and_cli
         assert len(connects) == 1
     finally:
         StockDataClient._connect = orig_connect
+
+
+def test_client_to_jq_accepts_ptrade_ss():
+    from app.quant.datasource.network_client import _to_jq
+
+    assert _to_jq("518880.SS") == "518880.XSHG"
+    assert _to_jq("000001.SZ") == "000001.XSHE"

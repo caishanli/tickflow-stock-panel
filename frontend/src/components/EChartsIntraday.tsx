@@ -46,14 +46,36 @@ function fmtTime(dt: string): string {
   return `${String(h).padStart(2, '0')}:${match[2]}`
 }
 
+/** 探测分钟数据 volume 单位: 股(×1) / 手(×100)。
+ *  stockdata 与本地 mootdx parquet 为股; TickFlow SDK vol 疑似手。
+ *  依据 amount ≈ volume(股)×price: median(amount/volume) ≈ 100×median(close) 判为手。 */
+function detectVolumeMultiplier(data: MinuteKlineRow[]): number {
+  const ratios: number[] = []
+  const closes: number[] = []
+  for (const d of data) {
+    if (!(d.volume > 0) || !(d.close > 0)) continue
+    ratios.push(d.amount / d.volume)
+    closes.push(d.close)
+    if (ratios.length >= 60) break
+  }
+  if (ratios.length === 0) return 1
+  const med = (arr: number[]) => {
+    const s = [...arr].sort((a, b) => a - b)
+    return s[Math.floor(s.length / 2)]
+  }
+  const ratio = med(ratios) / med(closes)
+  return ratio >= 30 && ratio <= 300 ? 100 : 1
+}
+
 function computeAvgPrice(data: MinuteKlineRow[]): number[] {
-  // 分时均线 = 累计成交额 / 累计成交量(手→股)
+  // 分时均线 = 累计成交额 / 累计成交量(单位自适应: 股×1 / 手×100)
+  const mult = detectVolumeMultiplier(data)
   const result: number[] = []
   let sumAmt = 0
   let sumVol = 0
   for (const d of data) {
     sumAmt += d.amount
-    sumVol += d.volume * 100
+    sumVol += d.volume * mult
     result.push(sumVol > 0 ? sumAmt / sumVol : d.close)
   }
   return result
@@ -65,38 +87,63 @@ function fmtAmt(v: number): string {
   return v.toFixed(0)
 }
 
-/** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交 */
+/** 将买卖标记映射到全日时间轴: 仅保留与 chartDate 相同的标记, 且该分钟有真实成交。
+ *  样式: 从该分钟 high/low 引一条短竖虚线, 末端挂背景色矩形徽标 B/S/止损。zlevel 置顶。 */
 function buildMarkerPoints(
   markers: IntradayMarker[] | undefined,
   chartDate: string | undefined,
   closes: (number | null)[],
+  lows: (number | null)[],
+  highs: (number | null)[],
   timeIndexMap: Map<string, number>,
-): any[] {
-  if (!markers || markers.length === 0) return []
-  const out: any[] = []
+): { points: any[]; lines: any[] } {
+  const points: any[] = []
+  const lines: any[] = []
+  if (!markers || markers.length === 0) return { points, lines }
+  // 用当日有效高低极值估虚线长度(约为振幅的 1/6)
+  let lo: number | null = null
+  let hi: number | null = null
+  for (const arr of [lows, highs]) {
+    for (const v of arr) {
+      if (!isValidPrice(v)) continue
+      if (lo == null || v < lo) lo = v
+      if (hi == null || v > hi) hi = v
+    }
+  }
+  const span = lo != null && hi != null && hi > lo ? hi - lo : 0
   for (const m of markers) {
     if (m.date !== chartDate) continue
     const idx = timeIndexMap.get(m.time)
     if (idx === undefined || !isValidPrice(closes[idx])) continue
     const stop = m.action === 'STOP_LOSS'
     const buy = m.action === 'BUY'
-    out.push({
-      coord: [idx, m.price],
-      symbol: stop ? 'circle' : 'triangle',
-      symbolSize: stop ? 17 : 12,
-      symbolRotate: buy ? 0 : 180,
-      itemStyle: { color: stop ? '#F59E0B' : buy ? '#C74040' : '#2D9B65', borderColor: '#FFFFFF', borderWidth: 0.5 },
+    const color = stop ? '#F59E0B' : buy ? '#C74040' : '#2D9B65'
+    const text = stop ? '止损' : buy ? 'B' : 'S'
+    const anchor = stop || !buy ? (highs[idx] ?? m.price) : (lows[idx] ?? m.price)
+    const dash = span > 0 ? span * 0.16 : Math.abs(m.price) * 0.004
+    // 短竖虚线: 买入向下、卖出/止损向上 (两点线段 = 数组包两个点对象)
+    const end = buy && !stop ? anchor - dash : anchor + dash
+    lines.push([
+      { coord: [idx, anchor] },
+      { coord: [idx, end], lineStyle: { color, type: 'dashed', width: 1 } },
+    ])
+    // 背景色矩形徽标挂在虚线末端
+    points.push({
+      coord: [idx, end],
+      symbol: 'circle', symbolSize: 3,
+      itemStyle: { color },
       label: {
-        show: true,
-        position: 'inside',
-        color: '#FFFFFF',
-        fontSize: 7,
-        fontWeight: 'bold',
-        formatter: stop ? '止损' : buy ? 'B' : 'S',
+        show: true, formatter: text,
+        position: buy && !stop ? 'bottom' : 'top', distance: 2,
+        color: '#FFFFFF', backgroundColor: color,
+        padding: [3, 5], borderRadius: 3,
+        fontSize: 10, fontWeight: 'bold',
+        fontFamily: 'JetBrains Mono, monospace',
       },
+      z: 100, zlevel: 10,
     })
   }
-  return out
+  return { points, lines }
 }
 
 function isValidPrice(v: number | null | undefined): v is number {
@@ -124,7 +171,8 @@ function generateFullDayTimes(): string[] {
   return times
 }
 
-const FULL_DAY_TIMES = generateFullDayTimes()
+/** 全天分时时间刻度 9:30 ~ 11:30, 13:00 ~ 15:00, 每分钟一个点 (共242个)。五日线等复用 */
+export const FULL_DAY_TIMES: string[] = generateFullDayTimes()
 
 /** 计算实际涨跌停价 (四舍五入到2位小数) 和实际涨跌停幅度 */
 function getLimitPrices(prevClose: number, priceLimit?: PriceLimitInfo): {
@@ -175,7 +223,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     }
   }
 
-  const markerPoints = buildMarkerPoints(markers, chartDate, closes, timeIndexMap)
+  const { points: markerPoints, lines: markerLines } = buildMarkerPoints(markers, chartDate, closes, lows, highs, timeIndexMap)
 
   const areaStyle: any = {
     color: {
@@ -200,9 +248,11 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
 
   let yMin: number | undefined
   let yMax: number | undefined
+  let yInterval: number | undefined
   let maxDiff = 0
   if (isValidPrice(prevClose) && data.length > 0) {
-    const priceArrays = showAvgLine ? [closes, highs, lows, avgData] : [closes, highs, lows]
+    // 均价线恒在 [minLow, maxHigh] 内, 不参与范围计算(免疫均价单位错误, 范围贴合实际波动)
+    const priceArrays = [closes, highs, lows]
     for (const arr of priceArrays) {
       for (const v of arr) {
         if (!isValidPrice(v)) continue
@@ -220,6 +270,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
       maxDiff = limitDiff
       yMin = prevClose - maxDiff
       yMax = prevClose + maxDiff
+      yInterval = maxDiff
       // 加 markLine 标注涨停价和跌停价 (仅虚线, 不显示文字)
       markLineData.push(
         {
@@ -236,20 +287,19 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         },
       )
     } else {
-      // 自适应模式: Y 轴按实际涨跌幅对称, 但不超出实际涨跌停范围
-      if (showLimitLines) {
-        const { limitUp, limitDown } = getLimitPrices(prevClose, priceLimit)
-        const limitDiff = Math.max(limitUp - prevClose, prevClose - limitDown)
-        maxDiff = Math.min(maxDiff, limitDiff)
+      // 自适应模式: Y 轴贴合当日实际高低点, 上下各留 15% 边距——单边行情(如 +1%~+3%)不强制显示昨收对侧区域
+      let lo: number | null = null
+      let hi: number | null = null
+      for (const v of lows) if (isValidPrice(v) && (lo == null || v < lo)) lo = v
+      for (const v of highs) if (isValidPrice(v) && (hi == null || v > hi)) hi = v
+      if (lo != null && hi != null && isValidPrice(prevClose)) {
+        const span = hi - lo
+        // 至少保证可视范围(防零波动过度放大); 指数地板更紧, 否则低波动指数会被压成横线
+        const pad = Math.max(span * 0.15, showLimitLines ? prevClose * 0.004 : prevClose * 0.001)
+        yMin = lo - pad
+        yMax = hi + pad
+        yInterval = (hi - lo) / 2 + pad
       }
-      if (!showLimitLines && maxDiff > 0) {
-        maxDiff *= 1.1
-      }
-      // 至少保证一个可视范围 (防止数据平时 maxDiff=0)。指数不使用涨跌停范围，最小范围要更紧，否则低波动指数会被压成横线。
-      const minDiff = showLimitLines ? prevClose * 0.01 : prevClose * 0.001
-      if (maxDiff < minDiff) maxDiff = minDiff
-      yMin = prevClose - maxDiff
-      yMax = prevClose + maxDiff
     }
   }
 
@@ -294,6 +344,17 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     axisPointer: {
       link: [{ xAxisIndex: 'all' }],
     },
+    dataZoom: [
+      {
+        type: 'inside',
+        xAxisIndex: [0, 1],
+        start: 0,
+        end: 100,
+        moveOnMouseMove: true,
+        zoomOnMouseWheel: true,
+        filterMode: 'none',
+      },
+    ],
     grid: [
       { left: 60, right: 55, top: 24, bottom: '28%' },
       { left: 60, right: 55, top: '74%', bottom: 20 },
@@ -350,7 +411,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         type: 'value',
         min: yMin,
         max: yMax,
-        interval: maxDiff || undefined,
+        interval: yInterval,
         splitArea: { show: false },
         axisLine: { show: false },
         axisTick: { show: false },
@@ -385,7 +446,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         gridIndex: 0,
         min: yMin,
         max: yMax,
-        interval: maxDiff || undefined,
+        interval: yInterval,
         splitArea: { show: false },
         axisLine: { show: false },
         axisTick: { show: false },
@@ -424,7 +485,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         lineStyle: { width: 1.2, color: lineColor },
         areaStyle,
         connectNulls: true,
-        markLine: markLineData.length > 0 ? { symbol: 'none', data: markLineData, animation: false, silent: true } : undefined,
+        markLine: (markLineData.length + markerLines.length) > 0 ? { symbol: 'none', data: [...markerLines, ...markLineData], animation: false, silent: true, zlevel: 10 } : undefined,
         markPoint: markerPoints.length > 0 ? { data: markerPoints, animation: false, silent: true } : undefined,
       },
       ...(showAvgLine ? [{
@@ -540,7 +601,9 @@ export function EChartsIntraday({ data, height = 320, prevClose, date, priceLimi
       }
       fullDayToDataIdx.current = mapping
 
-      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), true)
+      // replaceMerge series: 保留 dataZoom 内部状态(用户缩放位置), 且规避 notMerge 全量重建
+      // 反复拆装 InsideZoom 触发的 echarts "_ec_inner" 崩溃
+      chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, effectiveYMode, ct, priceLimit, showLimitLines, showAvgLine, date, markers), { replaceMerge: ['series'] })
     } else {
       chart.clear()
     }

@@ -100,6 +100,19 @@ function toMarkerAction(action: unknown): IntradayMarker['action'] {
   return 'SELL'
 }
 
+/** 该标的全部成交 → 分时标记 (弹窗按选中日期过滤渲染) */
+function buildSymbolMarkers(trades: any[], sym: string): IntradayMarker[] {
+  if (!sym) return []
+  const out: IntradayMarker[] = []
+  for (const t of trades) {
+    if ((t.code ?? '') !== sym || typeof t.price !== 'number') continue
+    const parsed = parseTradeTime(t.ts)
+    if (!parsed) continue
+    out.push({ date: parsed.date, time: parsed.time, price: t.price, action: toMarkerAction(t.action) })
+  }
+  return out
+}
+
 const RANGES: { label: string; days: number | null }[] = [
   { label: '全部', days: null },
   { label: '一星期', days: 7 },
@@ -850,17 +863,17 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         {posEntries.length > 0 ? (
           <div className="overflow-auto max-h-60">
             <table className="w-full text-xs">
-                <thead className="text-muted sticky top-0 bg-surface">
+                <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-3 py-1.5 font-normal">买入时间</th>
-                    <th className="sticky left-20 z-10 bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
-                    <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal">数量</th>
-                    <th className="px-3 py-1.5 font-normal">成本</th>
-                    <th className="px-3 py-1.5 font-normal">现价</th>
-                    <th className="px-3 py-1.5 font-normal">市值</th>
-                    <th className="px-3 py-1.5 font-normal">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal">收益率</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">买入时间</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">成本</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">现价</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">市值</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -873,21 +886,19 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     return (
                       <tr key={sym}
                         onClick={() => {
-                          const t = parseTradeTime(p.entry_ts)
                           setPreview({
                             symbol: sym,
                             name: p.name ?? '',
-                            markers: t && Number(p.avg_cost) > 0
-                              ? [{ date: t.date, time: t.time, price: Number(p.avg_cost), action: 'BUY' }]
-                              : [],
+                            date: parseTradeTime(p.entry_ts)?.date,
+                            markers: buildSymbolMarkers(sortedTrades, sym),
                           })
                         }}
                         className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                        <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
+                        <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
                           <div className="num">{p.entry_ts ? entryTs.d : '—'}</div>
                           {p.entry_ts && entryTs.t && <div className="num">{entryTs.t}</div>}
                         </td>
-                        <td className="sticky left-20 z-10 bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
+                        <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
                         <td className="px-3 py-1.5 num">{p.amount}</td>
                         <td className="px-3 py-1.5 num">{fmtNum(p.avg_cost, 3)}</td>
@@ -934,18 +945,18 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           tradeList.length > 0 ? (
             <div className="overflow-auto max-h-64">
               <table className="w-full text-xs">
-                <thead className="text-muted sticky top-0 bg-surface">
+                <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-3 py-1.5 font-normal">时间</th>
-                    <th className="sticky left-20 z-10 bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
-                    <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal">持仓时长</th>
-                    <th className="px-3 py-1.5 font-normal">方向</th>
-                    <th className="px-3 py-1.5 font-normal">价格</th>
-                    <th className="px-3 py-1.5 font-normal">数量</th>
-                    <th className="px-3 py-1.5 font-normal">手续费</th>
-                    <th className="px-3 py-1.5 font-normal">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal">收益率</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">持仓时长</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">价格</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">手续费</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
@@ -954,22 +965,19 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     return (
                     <tr key={i}
                       onClick={() => {
-                        const parsed = parseTradeTime(t.ts)
                         setPreview({
                           symbol: t.code ?? '',
                           name: t.name ?? '',
                           date: String(t.ts ?? '').slice(0, 10),
-                          markers: parsed && typeof t.price === 'number'
-                            ? [{ date: parsed.date, time: parsed.time, price: t.price, action: toMarkerAction(t.action) }]
-                            : [],
+                          markers: buildSymbolMarkers(sortedTrades, t.code ?? ''),
                         })
                       }}
                       className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                      <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
                       </td>
-                      <td className="sticky left-20 z-10 bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
+                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       {(() => {
                         const holdDays = t.action === 'BUY'
@@ -1014,27 +1022,27 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           stoplossRows.length > 0 ? (
             <div className="overflow-auto max-h-64">
               <table className="w-full text-xs">
-                <thead className="text-muted sticky top-0 bg-surface">
+                <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight px-3 py-1.5 font-normal">时间</th>
-                    <th className="sticky left-20 z-10 bg-surface px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
-                    <th className="px-3 py-1.5 font-normal">代码</th>
-                    <th className="px-3 py-1.5 font-normal">方向</th>
-                    <th className="px-3 py-1.5 font-normal">价格</th>
-                    <th className="px-3 py-1.5 font-normal">数量</th>
-                    <th className="px-3 py-1.5 font-normal">手续费</th>
-                    <th className="px-3 py-1.5 font-normal">盈亏</th>
-                    <th className="px-3 py-1.5 font-normal">收益率</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">价格</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">手续费</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
                   </tr>
                 </thead>
                 <tbody className="text-foreground">
                   {[...stoplossRows].reverse().map((t: any, i: number) => (
                     <tr key={i} className="group border-t border-border/60 hover:bg-elevated/60 transition-colors">
-                      <td className="sticky left-0 z-10 w-20 min-w-[5rem] bg-surface leading-tight group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
                       </td>
-                      <td className="sticky left-20 z-10 bg-surface group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
+                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className="px-3 py-1.5 text-bear">止损</td>
                       <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>

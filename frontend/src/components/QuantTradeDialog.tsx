@@ -7,6 +7,7 @@ import { QK } from '@/lib/queryKeys'
 import { StockInfoBar } from '@/components/StockInfoBar'
 import { StockDailyKChart, getDefaultRange, type StockDailyKChartResult } from '@/components/StockDailyKChart'
 import { StockIntradayChart } from '@/components/StockIntradayChart'
+import { StockFiveDayChart } from '@/components/StockFiveDayChart'
 import { DatePicker } from '@/components/DatePicker'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { useCapabilities, usePreferences, useQuoteStatus } from '@/lib/useSharedQueries'
@@ -16,8 +17,8 @@ import { loadInfoFields, saveInfoFields, buildInfoExtColumnsParam, type ColumnCo
 import type { ChartMarker, ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
 import type { IntradayMarker } from '@/components/EChartsIntraday'
 
-/** 视图模式: 分钟(当天分钟线) / 日线 / 周线 */
-export type QuantViewMode = 'minute' | 'daily' | 'weekly'
+/** 视图模式: 分钟(当天分钟线) / 五日(近5交易日分钟拼接) / 日线 / 周线 */
+export type QuantViewMode = 'minute' | 'fiveDay' | 'daily' | 'weekly'
 
 // 预设快捷范围
 const PRESETS: { label: string; months: number }[] = [
@@ -25,7 +26,7 @@ const PRESETS: { label: string; months: number }[] = [
   { label: '1年', months: 12 },
 ]
 
-const VIEW_LABEL: Record<QuantViewMode, string> = { minute: '分钟', daily: '日线', weekly: '周线' }
+const VIEW_LABEL: Record<QuantViewMode, string> = { minute: '分钟', fiveDay: '五日', daily: '日线', weekly: '周线' }
 
 function boardTag(symbol: string): { label: string; color: string } | null {
   if (/^(300|301)/.test(symbol)) return { label: '创', color: 'text-[#f97316] bg-[#f97316]/12 border-[#f97316]/25' }
@@ -89,16 +90,16 @@ export function QuantTradeDialog({
     return () => clearFocusSymbol()
   }, [symbol])
 
-  // symbol 切换(弹窗不卸载复用)时重置视图/日期, 重新应用 initialDate
+  // symbol 切换(弹窗不卸载复用)时重置视图/日期
   const prevSymbol = useRef<string | null>(symbol)
-  const initialApplied = useRef(false)
+  const appliedKeyRef = useRef('')
   useEffect(() => {
     if (prevSymbol.current === symbol) return
     prevSymbol.current = symbol
     setView(initialView)
     setSelectedDate(null)
     setDailyResult(null)
-    initialApplied.current = false
+    appliedKeyRef.current = ''
   }, [symbol, initialView])
 
   // 外部 dateRange 变化时同步 (回测切换成交时窗口跟随持仓区间)
@@ -142,21 +143,42 @@ export function QuantTradeDialog({
 
   const rawRows: any[] = dailyResult?.rawRows ?? []
 
-  // initialDate: 日K rows 就绪后优先选中 (仅应用一次, 不在 rows 内回退最新)
+  // 手机屏(≤md)压缩图表高度
+  const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches)
   useEffect(() => {
-    if (initialDate && !initialApplied.current && rawRows.length > 0) {
-      initialApplied.current = true
-      const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
-      setSelectedDate(target ? initialDate : String(rawRows[rawRows.length - 1].date).slice(0, 10))
-    }
-  }, [initialDate, rawRows])
+    const mq = window.matchMedia('(max-width: 768px)')
+    const onChange = () => setNarrow(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
-  // 分钟视图无选中日期时自动选中最新交易日
+  // 分钟视图日期定位(单一来源防竞态): 日K rows 就绪后按 (symbol|date) 应用一次——同标的
+  // 换日期点击也会重新定位; 无 date(持仓无入场时间)回退最新交易日。
+  // 不可拆成「应用initialDate」+「空则选最新」两个 effect: 同一轮渲染里后者读到旧闭包的
+  // selectedDate=null 会覆盖前者的选择(历史 bug: 点哪天都停在最新日)。
   useEffect(() => {
-    if (view === 'minute' && !selectedDate && rawRows.length > 0) {
-      setSelectedDate(String(rawRows[rawRows.length - 1].date).slice(0, 10))
+    if (view !== 'minute' || rawRows.length === 0) return
+    const latest = String(rawRows[rawRows.length - 1].date).slice(0, 10)
+    const key = `${symbol}|${initialDate ?? ''}`
+    if (appliedKeyRef.current === key) {
+      if (!selectedDate) setSelectedDate(latest)
+      return
     }
-  }, [view, selectedDate, rawRows])
+    appliedKeyRef.current = key
+    if (!initialDate) {
+      setSelectedDate(latest)
+      return
+    }
+    const target = rawRows.find((r: any) => String(r.date).slice(0, 10) === initialDate)
+    setSelectedDate(target ? initialDate : latest)
+  }, [symbol, initialDate, view, selectedDate, rawRows])
+
+  // 五日线: 日K尾部 5 个交易日 + 其首日前一日收盘(作百分比基准)
+  const fiveDates = useMemo(() => rawRows.slice(-5).map((r: any) => String(r.date).slice(0, 10)), [rawRows])
+  const fivePrevClose = useMemo(() => {
+    const i0 = fiveDates.length > 0 ? rawRows.findIndex((r: any) => String(r.date).slice(0, 10) === fiveDates[0]) : -1
+    return i0 > 0 ? Number(rawRows[i0 - 1].close) : undefined
+  }, [fiveDates, rawRows])
 
   // 分钟视图昨收 = 选中日的前一交易日收盘
   const selectedIdx = selectedDate
@@ -196,24 +218,25 @@ export function QuantTradeDialog({
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="relative w-[92vw] max-w-[1100px] max-h-[95vh] rounded-card border border-border bg-base shadow-2xl overflow-hidden flex flex-col"
+            className="relative w-[92vw] max-w-[1100px] max-h-[95vh] max-md:w-full max-md:h-[94dvh] max-md:max-h-none max-md:rounded-none rounded-card border border-border bg-base shadow-2xl overflow-hidden flex flex-col"
           >
-            {/* 顶栏 */}
-            <div className="flex items-center justify-between px-5 py-3 border-b border-border shrink-0">
-              <div className="flex items-center gap-2">
+            {/* 顶栏 (手机端: 收窄内边距, 隐藏预设/日期范围控件, 保留刷新+关闭) */}
+            <div className="flex items-center justify-between px-5 max-md:px-3 py-3 border-b border-border shrink-0 gap-2">
+              <div className="flex items-center gap-2 min-w-0">
                 {(() => {
                   const board = symbol ? boardTag(symbol) : null
                   return board ? (
-                    <span className={`inline-flex items-center justify-center w-[18px] h-[18px] rounded text-[9px] font-bold leading-none border ${board.color}`}>
+                    <span className={`inline-flex items-center justify-center w-[18px] h-[18px] shrink-0 rounded text-[9px] font-bold leading-none border ${board.color}`}>
                       {board.label}
                     </span>
                   ) : null
                 })()}
-                <span className="font-mono text-sm font-medium text-foreground">{symbol}</span>
-                {name && <span className="text-xs text-muted">{name}</span>}
+                <span className="font-mono text-sm font-medium text-foreground shrink-0">{symbol}</span>
+                {name && <span className="text-xs text-muted truncate">{name}</span>}
               </div>
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span className="flex items-center gap-1.5 max-md:hidden">
                 {PRESETS.map(p => {
                   const now = new Date()
                   const s = new Date(now)
@@ -250,8 +273,9 @@ export function QuantTradeDialog({
                   onChange={(v) => setDateRange(prev => ({ ...prev, end: v }))}
                   min={dateRange.start}
                 />
+                </span>
 
-                <span className="text-muted/20 mx-0.5">|</span>
+                <span className="text-muted/20 mx-0.5 max-md:hidden">|</span>
 
                 <button
                   onClick={handleRefresh}
@@ -271,7 +295,7 @@ export function QuantTradeDialog({
             </div>
 
             {/* 内容 */}
-            <div className="flex-1 overflow-auto p-4">
+            <div className="flex-1 overflow-auto p-4 max-md:p-2">
               <StockInfoBar
                 symbol={symbol}
                 name={dailyResult?.name}
@@ -304,7 +328,7 @@ export function QuantTradeDialog({
                 dataSource="stockdata"
                 symbol={symbol}
                 height={420}
-                className={view === 'minute' ? 'hidden' : undefined}
+                className={view === 'minute' || view === 'fiveDay' ? 'hidden' : undefined}
                 dateRange={dateRange}
                 period={view === 'weekly' ? 'weekly' : 'daily'}
                 markers={view === 'daily' ? markers : undefined}
@@ -323,7 +347,7 @@ export function QuantTradeDialog({
                   dataSource="stockdata"
                   symbol={symbol}
                   date={selectedDate}
-                  height={420}
+                  height={narrow ? 300 : 420}
                   prevClose={prevClose}
                   markers={intradayMarkers}
                   refetchIntervalMs={intradayRefetchMs}
@@ -334,6 +358,15 @@ export function QuantTradeDialog({
                 <div className="h-[420px] grid place-items-center text-xs text-muted">
                   加载中…
                 </div>
+              )}
+              {view === 'fiveDay' && fiveDates.length > 0 && (
+                <StockFiveDayChart
+                  symbol={symbol}
+                  dates={fiveDates}
+                  prevClose={fivePrevClose}
+                  height={narrow ? 300 : 420}
+                  markers={intradayMarkers}
+                />
               )}
             </div>
 

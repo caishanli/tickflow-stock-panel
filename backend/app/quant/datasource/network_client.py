@@ -37,7 +37,7 @@ def _to_jq(code: str) -> str:
     pure, _, suf = code.rpartition(".")
     if not pure:
         return code
-    return pure + (".XSHG" if suf in ("SH", "XSHG") else ".XSHE")
+    return pure + (".XSHG" if suf in ("SH", "SS", "XSHG") else ".XSHE")
 
 
 class StockDataClient:
