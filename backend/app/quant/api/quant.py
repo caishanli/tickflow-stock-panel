@@ -334,6 +334,17 @@ def _augment_positions_with_cleared_today(state: dict, trades: list[dict]) -> No
     import datetime as _dt
     today = _dt.date.today().isoformat()
     held = set(positions.keys())
+    # 全历史每只代码最近一次买入时间（清仓行 entry_ts 用真实开仓时间，而非今日卖出时间）
+    last_buy: dict[str, str] = {}
+    for t in trades:
+        if str(t.get("action") or "").upper() != "BUY":
+            continue
+        code = t.get("code")
+        if not code:
+            continue
+        ts = str(t.get("ts") or "")
+        if ts > last_buy.get(code, ""):
+            last_buy[code] = ts
     agg: dict[str, dict] = {}
     for t in trades:
         code = t.get("code")
@@ -366,7 +377,8 @@ def _augment_positions_with_cleared_today(state: dict, trades: list[dict]) -> No
         cost_basis = a["sell_notional"] - a["realized"]
         positions[code] = {
             "name": a["name"], "amount": 0, "avg_cost": round(avg_cost, 4),
-            "price": a["price"], "price_ts": a["last_ts"], "entry_ts": a["first_ts"],
+            "price": a["price"], "price_ts": a["last_ts"],
+            "entry_ts": last_buy.get(code) or a["first_ts"],
             "realized_pnl": round(a["realized"], 2),
             "realized_pnl_pct": round(a["realized"] / cost_basis, 6) if cost_basis > 0 else None,
         }
