@@ -457,18 +457,18 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                   {a.start_date && <span>{a.start_date}</span>}
                   <span className={statusTone(a.status)}>{STATUS_LABEL[a.status] ?? a.status}</span>
                 </div>
-                 <div className="mt-2 grid grid-cols-2 gap-2">
+                 <div className="mt-2 grid grid-cols-3 gap-2">
                   <div className="flex items-baseline gap-1.5">
                     <span className="text-[10px] text-muted shrink-0">净值</span>
                     <span className="text-xs num font-medium">{fmtNum(a.net_value)}</span>
                   </div>
                   <div className="flex items-baseline gap-1.5">
-                    <span className="text-[10px] text-muted shrink-0">收益率</span>
-                    <span className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</span>
-                  </div>
-                  <div className="col-start-2 flex items-baseline gap-1.5">
                     <span className="text-[10px] text-muted shrink-0">当日</span>
                     <span className={`text-xs num font-medium ${a.day_pnl == null ? 'text-muted' : a.day_pnl >= 0 ? 'text-bull' : 'text-bear'}`}>{a.day_pnl != null ? fmtNum(a.day_pnl) : '—'}</span>
+                  </div>
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-[10px] text-muted shrink-0">收益率</span>
+                    <span className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</span>
                   </div>
                 </div>
               </div>
