@@ -344,6 +344,7 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                 <th className="px-3 py-2.5 font-normal">频率</th>
                 <th className="px-3 py-2.5 font-normal">状态</th>
                 <th className="px-3 py-2.5 font-normal text-right">净值</th>
+                <th className="px-3 py-2.5 font-normal text-right">当日收益</th>
                 <th className="px-3 py-2.5 font-normal text-right">收益率</th>
                 <th className="px-3 py-2.5 font-normal text-right w-16"></th>
               </tr>
@@ -391,6 +392,10 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                       {STATUS_LABEL[a.status] ?? a.status}
                     </td>
                     <td className="px-3 py-2.5 text-right num cursor-pointer" onClick={() => onOpen(a.id)}>{fmtNum(a.net_value)}</td>
+                    <td className={`px-3 py-2.5 text-right num cursor-pointer ${a.day_pnl == null ? 'text-muted' : a.day_pnl >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
+                      {a.day_pnl != null ? fmtNum(a.day_pnl) : '—'}
+                      {a.day_pnl_pct != null && <div className="text-[10px] opacity-80">{fmtPct(a.day_pnl_pct)}</div>}
+                    </td>
                     <td className={`px-3 py-2.5 text-right num cursor-pointer ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
                       {fmtPct(ret)}
                     </td>
@@ -452,7 +457,7 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                   {a.start_date && <span>{a.start_date}</span>}
                   <span className={statusTone(a.status)}>{STATUS_LABEL[a.status] ?? a.status}</span>
                 </div>
-                <div className="mt-2 grid grid-cols-2 gap-2">
+                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div className="flex items-baseline gap-1.5">
                     <span className="text-[10px] text-muted shrink-0">净值</span>
                     <span className="text-xs num font-medium">{fmtNum(a.net_value)}</span>
@@ -460,6 +465,10 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                   <div className="flex items-baseline gap-1.5">
                     <span className="text-[10px] text-muted shrink-0">收益率</span>
                     <span className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</span>
+                  </div>
+                  <div className="col-start-2 flex items-baseline gap-1.5">
+                    <span className="text-[10px] text-muted shrink-0">当日</span>
+                    <span className={`text-xs num font-medium ${a.day_pnl == null ? 'text-muted' : a.day_pnl >= 0 ? 'text-bull' : 'text-bear'}`}>{a.day_pnl != null ? fmtNum(a.day_pnl) : '—'}</span>
                   </div>
                 </div>
               </div>
@@ -879,8 +888,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 <tbody className="text-foreground">
                   {posEntries.map(([sym, p]: any) => {
                     const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
-                    const pnlPct = Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null
-                    const pnlAmt = pnlPct != null ? pnlPct * (Number(p.amount) || 0) * (Number(p.avg_cost) || 0) : null
+                    const zeroPos = Number(p.amount) === 0
+                    const pnlPct = zeroPos
+                      ? (typeof p.realized_pnl_pct === 'number' ? p.realized_pnl_pct : null)
+                      : (Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null)
+                    const pnlAmt = zeroPos
+                      ? (typeof p.realized_pnl === 'number' ? p.realized_pnl : null)
+                      : (pnlPct != null ? pnlPct * Number(p.amount) * Number(p.avg_cost) : null)
                     const tsLabel = fmtPriceTs(p.price_ts, today)
                     const entryTs = splitTs(p.entry_ts)
                     return (
@@ -889,7 +903,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                           setPreview({
                             symbol: sym,
                             name: p.name ?? '',
-                            date: parseTradeTime(p.entry_ts)?.date,
+                            date: today,
                             markers: buildSymbolMarkers(sortedTrades, sym),
                           })
                         }}

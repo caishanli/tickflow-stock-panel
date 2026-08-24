@@ -440,14 +440,36 @@ def get_sim_account(account_id):
 
 
 def list_sim_accounts():
-    """账户列表：联 sim_state 带最新净值/盈亏（列表页展示用，无状态行为 NULL）。"""
+    """账户列表：联 sim_state 带最新净值/盈亏 + 当日收益（最新净值 vs 前一交易日末净值）。"""
     with get_conn() as c:
         rows = c.execute(
             "SELECT a.*, s.net_value AS net_value, s.pnl AS pnl "
             "FROM sim_accounts a LEFT JOIN sim_state s ON s.account_id = a.id "
             "ORDER BY a.created_at"
         ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["day_pnl"] = None
+        d["day_pnl_pct"] = None
+        nv = d.get("net_value")
+        if isinstance(nv, (int, float)) and nv > 0:
+            snaps = c.execute(
+                "SELECT dt, net_value FROM sim_equity_snapshots "
+                "WHERE account_id=? ORDER BY dt DESC LIMIT 600",
+                (d["id"],),
+            ).fetchall()
+            if snaps:
+                latest_day = str(snaps[0]["dt"])[:10]
+                prev_nv = next(
+                    (s["net_value"] for s in snaps if str(s["dt"])[:10] != latest_day),
+                    None,
+                )
+                if isinstance(prev_nv, (int, float)) and prev_nv > 0:
+                    d["day_pnl_pct"] = nv / prev_nv - 1
+                    d["day_pnl"] = nv - prev_nv
+        out.append(d)
+    return out
 
 
 def get_quant_setting(key: str) -> str | None:

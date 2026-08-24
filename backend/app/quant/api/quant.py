@@ -314,10 +314,62 @@ def sim_status(aid: str):
     sid = acct.get("strategy_id") or ""
     strat = get_strategy(sid) if sid else None
     trades = db.get_sim_trades(aid)
+    state = db.read_sim_state(aid)
+    _augment_positions_with_cleared_today(state, trades)
     return {"data": {"account": acct, "strategy_name": (strat or {}).get("name", ""),
-                     "state": db.read_sim_state(aid),
+                     "state": state,
                      "stop_loss": db.get_sim_stoploss(aid),
                      "trade_days": _build_trade_days(acct, trades)}}
+
+
+def _augment_positions_with_cleared_today(state: dict, trades: list[dict]) -> None:
+    """当日清仓的标的保留在持仓列表（数量 0），对齐普通股票软件。
+
+    从今日成交聚合：现价=末笔卖出价；成本=有效买入基准（Σ卖价×量−Σ盈亏)/Σ卖量；
+    盈亏=今日已实现盈亏。仅补充当前未持有的代码。
+    """
+    positions = state.get("positions")
+    if not isinstance(positions, dict):
+        return
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    held = set(positions.keys())
+    agg: dict[str, dict] = {}
+    for t in trades:
+        code = t.get("code")
+        if not code or code in held:
+            continue
+        ts = str(t.get("ts") or "")
+        if ts[:10] != today:
+            continue
+        a = agg.setdefault(code, {
+            "name": t.get("name") or "", "first_ts": ts, "last_ts": ts,
+            "price": None, "sell_amt": 0.0, "sell_notional": 0.0, "realized": 0.0,
+        })
+        if ts < a["first_ts"]:
+            a["first_ts"] = ts
+        if ts > a["last_ts"]:
+            a["last_ts"] = ts
+        action = str(t.get("action") or "").upper()
+        amt = float(t.get("amount") or 0)
+        price = float(t.get("price") or 0)
+        if action in ("SELL", "STOP_LOSS"):
+            a["price"] = price
+            a["last_ts"] = ts
+            a["sell_amt"] += amt
+            a["sell_notional"] += price * amt
+            a["realized"] += float(t.get("pnl") or 0)
+    for code, a in agg.items():
+        if a["sell_amt"] <= 0:
+            continue
+        avg_cost = (a["sell_notional"] - a["realized"]) / a["sell_amt"]
+        cost_basis = a["sell_notional"] - a["realized"]
+        positions[code] = {
+            "name": a["name"], "amount": 0, "avg_cost": round(avg_cost, 4),
+            "price": a["price"], "price_ts": a["last_ts"], "entry_ts": a["first_ts"],
+            "realized_pnl": round(a["realized"], 2),
+            "realized_pnl_pct": round(a["realized"] / cost_basis, 6) if cost_basis > 0 else None,
+        }
 
 
 def _build_trade_days(account: dict, trades: list[dict]) -> list[str]:
