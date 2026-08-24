@@ -396,8 +396,9 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                       {a.day_pnl != null ? fmtNum(a.day_pnl) : '—'}
                       {a.day_pnl_pct != null && <div className="text-[10px] opacity-80">{fmtPct(a.day_pnl_pct)}</div>}
                     </td>
-                    <td className={`px-3 py-2.5 text-right num cursor-pointer ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
-                      {fmtPct(ret)}
+                    <td className={`px-3 py-2.5 text-right num cursor-pointer ${a.pnl == null ? 'text-muted' : a.pnl >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
+                      {a.pnl != null ? fmtNum(a.pnl) : '—'}
+                      {ret != null && <div className="text-[10px] opacity-80">{fmtPct(ret)}</div>}
                     </td>
                     <td className="px-3 py-2.5 text-right">
                       <button onClick={(e) => { e.stopPropagation(); if (window.confirm(`确定删除「${a.name}」？`)) onDelete(a.id) }}
