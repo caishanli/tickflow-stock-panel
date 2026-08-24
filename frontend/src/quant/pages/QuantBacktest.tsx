@@ -1000,6 +1000,7 @@ function TradeTable({ trades, tradeDays = [] }: { trades: any[]; tradeDays?: str
             <th className="px-2 py-1.5 font-normal">方向</th>
             <th className="px-2 py-1.5 font-normal text-right">价格</th>
             <th className="px-2 py-1.5 font-normal text-right">数量</th>
+            <th className="px-2 py-1.5 font-normal text-right">金额</th>
             <th className="px-2 py-1.5 font-normal text-right">手续费</th>
             <th className="px-2 py-1.5 font-normal text-right">盈亏</th>
             <th className="px-2 py-1.5 font-normal text-right">收益率</th>
@@ -1027,6 +1028,7 @@ function TradeTable({ trades, tradeDays = [] }: { trades: any[]; tradeDays?: str
                 <td className={`px-2 py-1.5 ${buy ? 'text-bull' : 'text-bear'}`}>{buy ? '买入' : '卖出'}</td>
                 <td className="px-2 py-1.5 text-right num">{fmtNum(t.price, 3)}</td>
                 <td className="px-2 py-1.5 text-right">{t.amount ?? t.qty ?? ''}</td>
+                <td className="px-2 py-1.5 text-right num">{fmtNum(Number(t.price) * Number(t.amount ?? t.qty))}</td>
                 <td className="px-2 py-1.5 text-right num">{fmtNum(t.commission, 2)}</td>
                 <td className={`px-2 py-1.5 text-right num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                   {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}

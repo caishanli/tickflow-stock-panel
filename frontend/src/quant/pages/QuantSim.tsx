@@ -954,6 +954,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">价格</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
+                    <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">金额</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">手续费</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">盈亏</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">收益率</th>
@@ -1003,6 +1004,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                       </td>
                       <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>
                       <td className="px-3 py-1.5 num">{t.amount}</td>
+                      <td className="px-3 py-1.5 num">{fmtNum(Number(t.price) * Number(t.amount))}</td>
                       <td className="px-3 py-1.5 num">{fmtNum(t.commission, 2)}</td>
                       <td className={`px-3 py-1.5 num ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
                         {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
