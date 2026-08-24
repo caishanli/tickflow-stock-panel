@@ -545,26 +545,89 @@ def update_sector_pool(context):
         '上海', '黄', '30', '50', '100', '300', '500', '1000', '2000', '大', '新', '四川', '浙江', '湖北',
     ])), key=len, reverse=True)
     
+    # ==================== 分组规则 v5.4.2（2026-08-23 分组算法优化） ====================
+    # 旧版问题（本地 2026-08-21 全 ETF 实测复核）：
+    #   1) 香港组单字母 'H' 关键词误吸 A 股行业 ETF：电力TH/红利GTHT/稀金属PH/AITH/畜牧TH/机器人YH；
+    #   2) 纯数字宽基排除误杀海外/港股 ETF：标普500、纳指100、美国50、港股通科技30、恒生50 等全军覆没
+    #      （美指组仅剩 16 只）；道琼斯/日经/德国/法国/沙特/巴西/亚太等无关键词落入普通组；
+    #   3) '中证/上证' 等编制机构词整词排除误杀行业 ETF：中证军工/中证电力被排而军工ETF/电力ETF保留，
+    #      同一行业是否入池全凭命名风格运气；
+    #   4) REIT/定开混合 LOF 混入分组：盐田港REIT 进香港组、科创板定开混合进科创组、沪港深主动LOF 进香港组。
+
+    def _norm_group_name(n):
+        """归一化：中文数字写法统一（科创五零→科创50），防规避宽基判定。"""
+        return n.replace('五零', '50')
+
+    # ① 产品形态硬排除（最先判）：REITs/定期开放/混合/灵活配置LOF/原油商品基金，非指数 ETF 不入池
+    product_exclude_kws = sorted(['REIT', '定开', '混合', '灵活配置', 'LOF', '原油'], key=len, reverse=True)
+
     SPECIAL_GROUPS = sorted([
-        {'name': '香港组', 'keywords': sorted(['恒生', '恒指', '港股', '港股通', 'H股', '香港', '港', 'HKC', 'HK', 'HGS', 'H', '中概', 'HS科技'], key=len, reverse=True),
-         'remove_words': sorted(['恒生', '恒指', '港股', '港股通', 'H股', '香港', '港', 'HKC', 'HK', 'HGS', 'H', '中概', 'HS'], key=len, reverse=True)},
-        {'name': '科创组', 'keywords': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创'], key=len, reverse=True),
-         'remove_words': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创', '债券', '债汇', '债指', '债沪', '债易', '债基', '债兴', '债摩', '债', 'AAA'], key=len, reverse=True)},
-        {'name': '创业组', 'keywords': sorted(['创业板', '创业', '创板', '创成长'], key=len, reverse=True),
+        {'name': '香港组',
+         'keywords': sorted(['恒生', '恒指', '港股通', '港股', '香港', '港', 'H股', 'HKC', 'HK', 'HS科技', '中概'], key=len, reverse=True),
+         'remove_words': sorted(['恒生', '恒指', '港股通', '港股', '香港', '港', 'H股', 'HKC', 'HK', 'HS', '中概'], key=len, reverse=True)},
+        {'name': '科创组',
+         'keywords': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创'], key=len, reverse=True),
+         'remove_words': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创'], key=len, reverse=True)},
+        {'name': '创业组',
+         'keywords': sorted(['创业板', '创业', '创板', '创成长'], key=len, reverse=True),
          'remove_words': sorted(['创业板', '创业', '创板', '创成长'], key=len, reverse=True)},
-        {'name': '美指组', 'keywords': sorted(['标普', '纳指', '纳斯达克'], key=len, reverse=True),
-         'remove_words': sorted(['标普', '纳指', '纳斯达克'], key=len, reverse=True)}
+        {'name': '美指组',
+         'keywords': sorted(['标普', '纳指', '纳斯达克', '道琼斯', '美国'], key=len, reverse=True),
+         'remove_words': sorted(['标普', '纳指', '纳斯达克', '道琼斯', '美国'], key=len, reverse=True)},
+        {'name': '全球组',
+         'keywords': sorted(['日经', '东证', '德国', '法国', '沙特', '巴西', '印度', '越南', '亚太', '东南亚', '新兴亚洲', '新兴市场', '中韩', '225'], key=len, reverse=True),
+         'remove_words': sorted(['日经', '东证', '德国', '法国', '沙特', '巴西', '印度', '越南', '亚太', '东南亚', '新兴亚洲', '新兴市场', '中韩', '225'], key=len, reverse=True)}
     ], key=lambda x: max(len(kw) for kw in x['keywords']), reverse=True)
-    
+
+    # 关键词修订：去单字母 'H'（误配拉丁后缀 TH/PH/YH/GTHT）、去 'HGS'（沪港深宽基缩写非港股）；
+    # 美指组补 '道琼斯/美国'；新增全球组承接非美 QDII。科创板另按代码前缀 588/589 权威判定。
+    OVERSEAS_GROUP_NAMES = ('香港组', '美指组', '全球组')
+    STAR_CODE_PREFIXES = ('588', '589')
+    # 代码级覆盖：场内简称丢失市场标识、关键词无法判定的已知特例（代码主段 -> 组别名）
+    CODE_GROUP_OVERRIDES = {
+        '513160': '香港组',   # 科技30 = 银华恒生港股通中国科技
+        '513220': '香港组',   # 互联网30 = 招商中证全球中国互联网QDII（约7成港股仓位，与中概互联同族）
+        '517360': '香港组',   # AH科技 = 华安中证沪港深科技100
+    }
+
+    # 行业/主题语境词：出现即视为行业指数，规模数字与宽基编制机构词不再触发排除
+    sector_ctx_kws = sorted(list(set([
+        'TMT', 'AI', '5G', '科技', '信息', '信息技术', '信息安全', '计算机', '软件', '软件开发', '工业软件',
+        '云计算', '数据', '大数据', '数字经济', '人工智能', '智能', '智能车', '智能汽车', '智能网联', '智能驾驶',
+        '机器人', '卫星', '物联网', '芯片', '半导体', '集成电路', '芯', '电子', '消费电子', '消电', '通信',
+        '光伏', '风电', '核电', '储能', '电池', '锂电池', '锂电', '能源', '新能源', '绿电', '绿色电力', '电力',
+        '电网', '公用事业', '碳中和', '双碳', '低碳', '环保', '军工', '国防', '航空', '航天', '航空航天',
+        '通用航空', '通航', '船舶', '机械', '工程机械', '工业母机', '机床', '高端装备', '装备', '制造',
+        '工业互联网', '工业有色', '工业金属', '汽车', '汽车零部件', '电动车', '电动汽车', '有色', '有色金属',
+        '稀有金属', '稀金属', '稀土', '矿业', '黄金股', '钢铁', '煤炭', '化工', '石化', '石油', '油气',
+        '建材', '基建', '地产', '房地产', '农业', '现代农业', '养殖', '畜牧', '农牧', '农牧渔', '粮食',
+        '食品饮料', '食品', '酒', '消费', '可选消费', '线上消费', '在线消费', '旅游', '影视', '文娱', '游戏',
+        '传媒', '医疗', '医疗器械', '医疗设备', '医药', '生物医药', '生物科技', '生物', '创新药', '新药',
+        '中药', '中医药', '疫苗', '保健', '养老', '金融', '证券', '券商', '保险', '银行', '非银',
+        '金融科技', '金科', '交运', '交通运输', '物流', '快递',
+    ])), key=len, reverse=True)
+
+    # 宽基编制机构词：仅无行业语境时排除（沪深300 排除，中证军工 保留）
+    broad_marker_kws = ['沪深', '中证', '上证', '深证', '深成', '国证', '综指', '综合']
+    # 规模数字：无语境时视为宽基信号（医药50 有语境保留；标普500 属海外组直接放行）
+    number_kws = ['1000', '2000', '180', '300', '500', '800', '380', '580', '200', '100', '30', '50']
+
+    # ② 绝对排除：债券/货币/现金流因子/ESG/MSCI（原表去纯数字与编制机构词，改由语境规则处理）
     exclude_keywords = sorted(list(set([
-        '300', '500', '1000', '2000', '800', '30', '50', '100', '180', '200',
-        '沪深', '中证', '上证', '深证', '深成', 'A50', 'A100', 'A500', '深100',
+        'A50', 'A100', 'A500', '深100',
         '短融', '可转债', '转债', '双债', '利率债', '国债', '地债', '政金债', '国开债', '基准国债', '新综债',
         '信用债', '企业债', '公司债', '城投债', '城投', '美元债', '沪公司债', '科创债', '科债', '科创AAA',
         '自由现金流', '现金流', '现金流E', '现金流基', '现金流TF', '现金流全', '300现金流', '800现金流',
         '货币', '现金', '快线', '快钱', '中银现金', '500现金', '800现金', '现金800', '现金自由', '现金指数',
         '全指现金', '现金全指', 'ESG', 'MSCI', 'MS', '债',
     ])), key=len, reverse=True)
+
+    def _has_sector_ctx(nm):
+        return any(w in nm for w in sector_ctx_kws)
+
+    def _has_size_number(nm):
+        return any(t in nm for t in number_kws)
+
     
     try:
         df_etf = get_all_securities(['etf'])
@@ -582,31 +645,49 @@ def update_sector_pool(context):
     
     for code in etf_list:
         try:
-            name = g.etf_names_dict.get(code, str(code))
-            is_special = False
+            raw_name = g.etf_names_dict.get(code, str(code))
+            name = _norm_group_name(raw_name)
+            # ① 产品形态硬排除
+            if any(k in name or k in raw_name for k in product_exclude_kws):
+                excluded_count += 1
+                continue
+            # ② 债券/货币/ESG/MSCI 等绝对排除
+            if any(k in name for k in exclude_keywords):
+                excluded_count += 1
+                continue
+            # ③ 特殊组匹配：关键词 + 科创板代码前缀（588/589 权威判定，命名风格无关）
             matched_group = None
             for group in SPECIAL_GROUPS:
                 for kw in group['keywords']:
                     if kw in name:
-                        is_special = True
                         matched_group = group['name']
                         break
-                if is_special:
+                if matched_group:
                     break
-            is_excluded = False
-            for k in exclude_keywords:
-                if k in name:
-                    is_excluded = True
-                    excluded_count += 1
-                    break
-            if not is_excluded:
-                if is_special:
+            if not matched_group:
+                matched_group = CODE_GROUP_OVERRIDES.get(str(code).split('.')[0])
+            if not matched_group and str(code)[:3] in STAR_CODE_PREFIXES:
+                matched_group = '科创组'
+            if matched_group:
+                # 海外组数字合法（标普500/纳指100/恒生50）；科创/创业组内无行业语境的
+                # 宽基规模数字（科创50/双创50/创业板50/科100…）仍排除，
+                # 科创芯50/AI50双创/创业板人工智能 等带语境行业 ETF 保留
+                if matched_group in OVERSEAS_GROUP_NAMES or not (
+                        _has_size_number(name) and not _has_sector_ctx(name)):
                     special_etfs.append(code)
                     special_group_map[code] = matched_group
                 else:
-                    normal_etfs.append(code)
+                    excluded_count += 1
+                continue
+            # ④ 非特殊组：语境感知宽基排除（有行业语境词则规模数字/编制机构词不触发）
+            if ((_has_size_number(name) or any(m in name for m in broad_marker_kws))
+                    and not _has_sector_ctx(name)):
+                excluded_count += 1
+                continue
+            normal_etfs.append(code)
         except Exception:
             continue
+
     
     group_counts = {}
     for code in special_etfs:
@@ -674,7 +755,9 @@ def update_sector_pool(context):
             money = normal_qualified[code]
             cleaned = clean_name(original_name, is_special=False)
             if cleaned == '':
-                continue
+                # 清洗为空（如 纳指ETF/恒生ETF/黄金ETF易方达）不再整只丢弃，
+                # 回退用原名参与行业聚合，避免旗舰品种漏出动态池
+                cleaned = original_name.replace(' ', '')
             industry_key = cleaned[:2] if len(cleaned) >= 2 else cleaned
             if industry_key not in normal_industry_groups:
                 normal_industry_groups[industry_key] = []
@@ -693,7 +776,7 @@ def update_sector_pool(context):
             money = special_qualified[code]
             cleaned = clean_name(original_name, is_special=True, matched_group_name=matched_group)
             if cleaned == '':
-                continue
+                cleaned = original_name.replace(' ', '')
             industry_key = cleaned[:2] if len(cleaned) >= 2 else cleaned
             group_key = f"{matched_group}_{industry_key}"
             if group_key not in special_industry_groups:
@@ -706,12 +789,25 @@ def update_sector_pool(context):
             continue
     
     final_pool_info = []
+    _group_dropped = []
     for industry_key, items in normal_industry_groups.items():
         sorted_items = sorted(items, key=lambda x: x['money'], reverse=True)
         final_pool_info.append(sorted_items[0])
+        if len(sorted_items) > 1:
+            _group_dropped.append(f"{industry_key}组落选: " + ", ".join(
+                f"{i['original_name']}({i['code']}) {i['money']/1e8:.2f}亿"
+                for i in sorted_items[1:]))
     for group_key, items in special_industry_groups.items():
         sorted_items = sorted(items, key=lambda x: x['money'], reverse=True)
         final_pool_info.append(sorted_items[0])
+        if len(sorted_items) > 1:
+            _group_dropped.append(f"[特]{group_key}: " + ", ".join(
+                f"{i['original_name']}({i['code']}) {i['money']/1e8:.2f}亿"
+                for i in sorted_items[1:]))
+    if _group_dropped:
+        # 分组落选审计：动态池每组只留成交额最大一只，其余静默排除曾导致
+        # 同策略在不同名称映射环境下选出完全不同的候选（08-10 华宝事件）。
+        log.info("【动态池分组审计】" + " | ".join(_group_dropped))
     
     final_pool_info_sorted = sorted(final_pool_info, key=lambda x: x['money'], reverse=True)
     top_300 = final_pool_info_sorted[:300]

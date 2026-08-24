@@ -152,3 +152,23 @@ def test_persist_real_is_noop():
     assert list(dm.cache.store["real_510300.XSHG"].index) == [pd.Timestamp("2026-07-17 09:31")]
     live_feed.persist_real(dm, {"510300.XSHG": pd.DataFrame(), "159915.XSHE": None})
     assert list(dm.cache.store) == ["real_510300.XSHG"]
+
+
+def test_refresh_rejects_stale_prev_day_price_in_session():
+    """盘中陈旧价防护：实时回源拿到截至上一交易日的 bar 时，
+    交易时段内不得把昨收当现价发布（08-17 德国ETF 1.940 成交根因）。"""
+    import datetime
+    dm = _DM(_FakeClient({"513030.XSHG": _frame(
+        ["2026-08-14 15:00"], [1.94])}))
+    # 周一 13:10 盘中，帧只有上周五的 bar → 拒绝发布
+    prices, bar_dt, _ = live_feed.refresh(
+        dm, ["513030.XSHG"],
+        pd.Timestamp(datetime.datetime(2026, 8, 17, 13, 10)))
+    assert prices == {} and bar_dt is None
+
+    # 同样的旧帧，非交易时段（周末）→ 维持旧行为照常发布（估值用）
+    prices2, bar_dt2, price_ts2 = live_feed.refresh(
+        dm, ["513030.XSHG"],
+        pd.Timestamp(datetime.datetime(2026, 8, 16, 10, 0)))
+    assert prices2 == {"513030.XSHG": 1.94}
+    assert bar_dt2 == pd.Timestamp("2026-08-14 15:00")

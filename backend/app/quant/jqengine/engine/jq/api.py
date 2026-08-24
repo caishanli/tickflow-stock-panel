@@ -664,6 +664,22 @@ def order_value(security, value):
     return order(security, amount)
 
 
+def order_target(security, amount):
+    """调整持仓到目标股数（聚宽语义；amount=0 即清仓）。
+
+    此前缺失，策略/桥接注入代码调用即 NameError 且常被静默吞掉
+    （2026-08-22 账户级止损层注入首次暴露）。
+    """
+    ctx = _state["ctx"]
+    p = ctx.portfolio
+    pos = p.get_position(security)
+    current = int(getattr(pos, "amount", 0) or 0)
+    delta = int(amount) - current
+    if delta == 0:
+        return True
+    return order(security, delta)
+
+
 def order_target_percent(security, percent):
     """调整到目标仓位比例（0~1）。"""
     ctx = _state["ctx"]
@@ -883,12 +899,19 @@ def get_trade_days(start_date=None, end_date=None, count=None):
 
 
 def _name_source() -> str:
-    """策略侧名称源：jq=聚宽名 / tdx=通达信名。默认 jq。"""
+    """策略侧名称源：service=数据服务名称映射（默认，覆盖全量在市品种并随
+    行情同步更新）；jq=旧静态 jq_names 表（仅显式设置时兼容使用）。
+
+    2026-08-22 起默认改为 service：静态表长期不更新，缺失次新 ETF 导致其
+    display_name 回退为代码串、行业分组键漂移，同一策略在不同环境选出完全
+    不同的候选（7868a5ca vs ff8320ae 08-10 地产华宝分歧根因）。
+    """
     try:
         from .... import db as _db
-        return (_db.get_quant_setting("sim_strategy_name_source") or "jq")
+        src = (_db.get_quant_setting("sim_strategy_name_source") or "").strip().lower()
+        return src or "service"
     except Exception:
-        return "jq"
+        return "service"
 
 
 def _jq_names() -> dict[str, str]:

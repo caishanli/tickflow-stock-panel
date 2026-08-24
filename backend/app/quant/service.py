@@ -213,6 +213,18 @@ def account_pause(aid: str) -> None:
     os.makedirs(CONFIG.runtime_dir, exist_ok=True)
     with open(os.path.join(CONFIG.runtime_dir, f"{aid}.pause"), "w") as f:
         f.close()
+    # 必须终止进程：只写 pause 文件时旧引擎仍驻留内存（数百MB），且后续
+    # account_start 会另起新进程，形成同账户双进程（2026-08-25 ff8320ae
+    # 双进程事故：新旧进程止损参数不一致，存在双重下单风险）。
+    acct = db.get_sim_account(aid) or {}
+    pid = acct.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), 15)
+        except (ProcessLookupError, ValueError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("account_pause kill %s failed: %s", pid, e)
     db.update_sim_account(aid, status="paused")
 
 

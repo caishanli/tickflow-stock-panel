@@ -1537,6 +1537,48 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     else:
         strategy_code = strategy_text
 
+    # ---- 账户级止损层注入（口径对齐模拟盘 Matcher：成本×(1-stop_loss)）----
+    # 模拟盘每个分钟 bar 由 Matcher 检查账户止损（默认 -3%），触发即全仓卖出；
+    # 此前回测引擎缺这层，亏损单拖到策略内 -5% 止损才离场，系统性低估实盘
+    # 表现（2026-08-22 排查：短窗基线回测 +4.37% vs 实盘 +17.5% 的最大分歧源）。
+    # params["stop_loss"] 缺省 0.03 与 sim_accounts.stop_loss 默认一致；显式传 0 可关闭。
+    _acct_stop = float(params.get("stop_loss", 0.03) or 0)
+    if _acct_stop > 0:
+        # 卖出用 rqalpha 原生 order_shares（负数=卖出）；引擎无裸 order_target
+        strategy_code += (
+            "\n\n# ==== [bridge] 账户级止损注入（对齐模拟盘 Matcher 口径）====\n"
+            f"_ACCOUNT_STOP_LOSS = {_acct_stop!r}\n"
+            "_ACCOUNT_STOP_ERR = set()\n"
+            "\n"
+            "def _account_stop_tick(context):\n"
+            "    # 动态解析下单函数：every_bar 可能被两条调度路径执行，其中一条的\n"
+            "    # 命名空间不含 rqalpha 注入的 API（NameError 曾被静默吞掉）。\n"
+            "    try:\n"
+            "        from rqalpha.api import order as _order\n"
+            "    except Exception as _ie:\n"
+            "        log.warning('账户止损不可用: {}'.format(_ie))\n"
+            "        return\n"
+            "    _cd = get_current_data()\n"
+            "    for _code in list(context.portfolio.positions.keys()):\n"
+            "        _pos = context.portfolio.positions[_code]\n"
+            "        try:\n"
+            "            if _pos.total_amount <= 0 or getattr(_pos, 'closeable_amount', 0) <= 0:\n"
+            "                continue\n"
+            "            _px = _cd[_code].last_price\n"
+            "            if not _px or not _pos.avg_cost:\n"
+            "                continue\n"
+            "            if _px <= _pos.avg_cost * (1 - _ACCOUNT_STOP_LOSS):\n"
+            "                log.info('🚨 【账户止损】{0} 触发-{1:.0%}止损，卖出 {2} 股 @{3}'.format(\n"
+            "                    _code, _ACCOUNT_STOP_LOSS, int(_pos.closeable_amount), _px))\n"
+            "                _order(_code, -int(_pos.closeable_amount))\n"
+            "        except Exception as _e:\n"
+            "            if ('stoperr', _code) not in _ACCOUNT_STOP_ERR:\n"
+            "                _ACCOUNT_STOP_ERR.add(('stoperr', _code))\n"
+            "                log.warning('账户止损下单异常 {0}: {1!r}'.format(_code, _e))\n"
+            "\n"
+            "run_daily(_account_stop_tick, time='every_bar')\n"
+        )
+
     config = {
         "base": {
             "start_date": start,

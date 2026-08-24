@@ -68,6 +68,16 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
         sub = merged[merged.index <= now]
         if sub.empty:
             continue
+        # 盘中陈旧价防护：实时回源可能拿到截至上一交易日的 bar（如行情源延迟/
+        # 服务端缓存），其末根收盘会被误当现价下单（08-17 德国ETF以周五收盘
+        # 1.940 成交的根因）。交易时段内禁止发布非当日 bar 价格。
+        bar_dt_last = pd.Timestamp(sub.index[-1])
+        _in_session = (now.weekday() < 5
+                       and datetime.time(9, 30) <= now.time() <= datetime.time(15, 0))
+        if _in_session and bar_dt_last.date() != now.date():
+            log.warning("[live_feed] %s 最新bar日期=%s 非今日，盘中拒绝发布陈旧价",
+                        code, bar_dt_last.date())
+            continue
         prices[code] = float(sub["close"].iloc[-1])
         bar = sub.index[-1]
         ts_str = str(bar)
