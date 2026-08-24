@@ -464,10 +464,10 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                   </div>
                   <div className="flex items-baseline gap-1.5">
                     <span className="text-[10px] text-muted shrink-0">当日</span>
-                    <span className={`text-xs num font-medium ${a.day_pnl == null ? 'text-muted' : a.day_pnl >= 0 ? 'text-bull' : 'text-bear'}`}>{a.day_pnl != null ? fmtNum(a.day_pnl) : '—'}</span>
+                    <span className={`text-xs num font-medium ${a.day_pnl_pct == null ? 'text-muted' : a.day_pnl_pct >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(a.day_pnl_pct)}</span>
                   </div>
                   <div className="flex items-baseline gap-1.5">
-                    <span className="text-[10px] text-muted shrink-0">收益率</span>
+                    <span className="text-[10px] text-muted shrink-0">总收益率</span>
                     <span className={`text-xs num font-medium ${ret == null ? '' : ret >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(ret)}</span>
                   </div>
                 </div>
