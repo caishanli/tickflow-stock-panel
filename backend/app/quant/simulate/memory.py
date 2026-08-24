@@ -46,11 +46,13 @@ def memory_check(extra: int = 1) -> dict:
     """内存门禁：ok=False 表示不应再 spawn。
 
     extra = 本次拟新增的账户数（默认 1）。available 用 MemAvailable 口径。
+    宽限：系统还有虚拟内存（swap）可兜底，容量按原口径放宽 1 个账户——
+    needed = estimate × max(extra, 活进程数 + extra - 1)。
     """
     procs = list_alive_sim_procs()
     available_mb = psutil.virtual_memory().available / 1024**2
     estimate_mb = _estimate_mb(procs)
-    needed_mb = estimate_mb * (len(procs) + extra)
+    needed_mb = estimate_mb * max(extra, len(procs) + extra - 1)
     return {
         "ok": available_mb >= needed_mb,
         "available_mb": available_mb,

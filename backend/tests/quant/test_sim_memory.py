@@ -82,7 +82,8 @@ def test_memory_check_blocks_when_insufficient(monkeypatch):
     assert m["ok"] is False
     assert m["alive"] == 1
     assert m["estimate_mb"] == 300.0
-    assert m["needed_mb"] == 600.0  # 300 × (1 活 + 1 新增)
+    # 放宽一档：needed = 300 × max(1 新增, 1 活 + 1 新增 - 1) = 300
+    assert m["needed_mb"] == 300.0
 
 
 def test_memory_check_passes_when_sufficient(monkeypatch):
