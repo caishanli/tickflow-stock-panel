@@ -345,7 +345,7 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                 <th className="px-3 py-2.5 font-normal">状态</th>
                 <th className="px-3 py-2.5 font-normal text-right">净值</th>
                 <th className="px-3 py-2.5 font-normal text-right">当日收益</th>
-                <th className="px-3 py-2.5 font-normal text-right">收益率</th>
+                <th className="px-3 py-2.5 font-normal text-right">收益</th>
                 <th className="px-3 py-2.5 font-normal text-right w-16"></th>
               </tr>
             </thead>
@@ -394,11 +394,11 @@ function SimList({ accounts, strategyName, onNew, onOpen, onDelete, onDeleteMany
                     <td className="px-3 py-2.5 text-right num cursor-pointer" onClick={() => onOpen(a.id)}>{fmtNum(a.net_value)}</td>
                     <td className={`px-3 py-2.5 text-right num cursor-pointer ${a.day_pnl == null ? 'text-muted' : a.day_pnl >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
                       {a.day_pnl != null ? fmtNum(a.day_pnl) : '—'}
-                      {a.day_pnl_pct != null && <div className="text-[10px] opacity-80">{fmtPct(a.day_pnl_pct)}</div>}
+                      {a.day_pnl_pct != null && <div className="opacity-80">{fmtPct(a.day_pnl_pct)}</div>}
                     </td>
                     <td className={`px-3 py-2.5 text-right num cursor-pointer ${a.pnl == null ? 'text-muted' : a.pnl >= 0 ? 'text-bull' : 'text-bear'}`} onClick={() => onOpen(a.id)}>
                       {a.pnl != null ? fmtNum(a.pnl) : '—'}
-                      {ret != null && <div className="text-[10px] opacity-80">{fmtPct(ret)}</div>}
+                      {ret != null && <div className="opacity-80">{fmtPct(ret)}</div>}
                     </td>
                     <td className="px-3 py-2.5 text-right">
                       <button onClick={(e) => { e.stopPropagation(); if (window.confirm(`确定删除「${a.name}」？`)) onDelete(a.id) }}
