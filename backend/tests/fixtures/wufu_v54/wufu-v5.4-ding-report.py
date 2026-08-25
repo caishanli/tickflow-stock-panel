@@ -378,6 +378,10 @@ def pre_trade_report(context):
         except Exception as e:
             log.warning(f"【预买卖报告】池重建失败: {e}，跳过本次预报告")
             return
+        if not getattr(g, 'merged_etf_pool', None) and getattr(g, 'is_a_share_weak', False):
+            # 走弱期 midday_routine 只建 filtered_global_pool，merged_etf_pool
+            # 由 13:10 afternoon_routine 合并（镜像其口径）。
+            g.merged_etf_pool = sorted(set(getattr(g, 'filtered_global_pool', None) or g.global_etf_pool))
         if not getattr(g, 'merged_etf_pool', None):
             log.info("【预买卖报告】合并池重建后仍为空，跳过本次预报告")
             return
