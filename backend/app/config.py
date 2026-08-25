@@ -102,6 +102,7 @@ class Settings(BaseSettings):
 
     # 模拟盘 -- 交易时段每分钟第 N 秒触发策略 tick(等快照时间戳跨过分钟边界,
     # HH:MM run_daily 才能在当轮命中)。需 > 行情源时间戳滞后(腾讯/新浪约1-3s)。
+    # runner 导入时读取一次, 改值需重启模拟盘进程; 优先级 环境变量 > 根.env > 默认。
     sim_tick_offset: int = 8
 
     # Auth — 首次启动时预置访问密码(明文, 仅用于初始化, 详见 services/auth.bootstrap_from_env)

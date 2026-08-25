@@ -261,7 +261,7 @@ class _FakeProc:
     pid = 43210
 
 
-def test_m4_account_start_idempotent(tmp_quant, monkeypatch):
+def test_m4_account_start_idempotent(tmp_quant, monkeypatch, mem_ok):
     aid = service.account_create("acct_m4", 100000.0, 0.03)
     calls = []
     monkeypatch.setattr(service.subprocess, "Popen",
