@@ -208,6 +208,9 @@ def test_realtime_snapshot_empty_in_trading_no_crash(tmp_path, monkeypatch):
 
     s = DataSources(data_root=str(tmp_path), mootdx_factory=lambda: StubSrc(), fetch_workers=1)
     try:
+        # 强制纯 mootdx 离线路径：HTTP 源未 mock，防交易时段真实触网
+        monkeypatch.setattr(s.puller, "tencent", None)
+        monkeypatch.setattr(s.puller, "sina", None)
         monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: True)
         df = s.get_realtime_snapshot(["600000.XSHG"])
         assert df.is_empty()
@@ -254,10 +257,10 @@ def test_fetch_one_rebuilds_source_on_timeout(monkeypatch):
     monkeypatch.setattr("app.services.stockdata.sources._pull_recent_guarded", fake_pull)
     p = NetworkPuller(factory=fake_factory, workers=1)
     try:
-        assert p._fetch_one("600000.XSHG").is_empty()
+        assert p._pull_mootdx_one("600000.XSHG") is None
         assert len(calls) == 1
         assert getattr(p._local, "src", None) is None  # 已重置，不复用坏 socket
-        assert p._fetch_one("600000.XSHG").is_empty()
+        assert p._pull_mootdx_one("600000.XSHG") is None
         assert len(calls) == 2  # 第二次 fetch 重建数据源
     finally:
         p.shutdown()
@@ -290,6 +293,7 @@ def test_metadata_methods_with_ohlcv_only_partitions(src, monkeypatch):
 def _write_instruments(root, rows):
     """写 instruments parquet（股票名称本地来源）。"""
     import os
+
     import polars as pl
     d = os.path.join(root, "instruments")
     os.makedirs(d, exist_ok=True)
@@ -346,6 +350,7 @@ def test_get_stock_names_etf_falls_back_to_api(tmp_path, monkeypatch):
 def test_get_stock_names_etf_from_api(tmp_path, monkeypatch):
     """ETF 名称本地缺失时走免费 API 成功路径。"""
     import os
+
     import polars as pl
     os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
     _write_instruments(str(tmp_path), [
@@ -373,6 +378,7 @@ def test_get_stock_names_etf_from_api(tmp_path, monkeypatch):
 def test_get_stock_names_etf_from_local_parquet(tmp_path, monkeypatch):
     """ETF 名称若本地 instruments_etf parquet 已有则直接读，不触网。"""
     import os
+
     import polars as pl
     os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
     _write_instruments(str(tmp_path), [

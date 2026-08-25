@@ -1,6 +1,7 @@
 # backend/tests/quant/test_stockdata_rt_sources.py
 """rt_sources 单测：解析层纯文本 fixture（2026-08-25 收盘后实测录制）。"""
 import datetime as _dt
+from contextlib import contextmanager
 
 import polars as pl
 import pytest
@@ -9,9 +10,9 @@ from app.services.stockdata.rt_sources import (
     RTQuote,
     SinaRTSource,
     TencentRTSource,
+    _tf_to_vendor,
     parse_sina_payload,
     parse_tencent_payload,
-    _tf_to_vendor,
 )
 
 # 2026-08-25 收盘后实测原行(qt.gtimg.cn): v[35]=价/量/额复合串, v[37]=累计额(万元)
@@ -98,15 +99,13 @@ def test_sources_http_roundtrip(monkeypatch):
             return None
 
     class FakeSession:
-        headers = {}
+        def __init__(self):
+            self.headers = {}
 
         def get(self, url, timeout=None):
             captured["url"] = url
             captured["timeout"] = timeout
-            if "gtimg" in url:
-                body = _TENCENT_LINE
-            else:
-                body = _SINA_LINE
+            body = _TENCENT_LINE if "gtimg" in url else _SINA_LINE
             return FakeResp(body)
 
     t = TencentRTSource()
@@ -124,7 +123,8 @@ def test_sources_http_roundtrip(monkeypatch):
 
 def test_source_fetch_network_error_returns_empty(monkeypatch):
     class BoomSession:
-        headers = {}
+        def __init__(self):
+            self.headers = {}
 
         def get(self, url, timeout=None):
             raise OSError("network down")
@@ -247,3 +247,110 @@ def test_synthesizer_last_quote_time():
     syn.update({"600000.SH": _q("600000.SH", 9.0, 100, 900,
                                 _dt.datetime(2026, 8, 25, 10, 0, 17))})
     assert syn.last_quote_time("600000.SH") == _dt.datetime(2026, 8, 25, 10, 0, 17)
+
+
+# ---- NetworkPuller 编排链：TTL 缓存 / mootdx 自举 / 腾讯→新浪降级 ----
+
+
+@contextmanager
+def _mk_puller(monkeypatch, tencent_quotes=None, sina_quotes=None,
+               forced=None, mootdx_empty=False):
+    """构造注入假源的 NetworkPuller（不触真实网络）。
+
+    FakeSrc.get_minute_recent 返回一根今日 09:31 bar（模拟自举/mootdx 路径出数）；
+    mootdx_empty=True 时返回空帧（隔离测试 HTTP 链路，mootdx 视为无数据）。
+    """
+    import os
+
+    from app.services.stockdata.sources import NetworkPuller
+
+    os.environ.pop("STOCKDATA_RT_SOURCE", None)
+    if forced:
+        os.environ["STOCKDATA_RT_SOURCE"] = forced
+
+    class FakeSrc:
+        def __init__(self):
+            self.calls = []
+
+        def get_minute_recent(self, code, pages=1):
+            import pandas as pd
+            self.calls.append(code)
+            if mootdx_empty:
+                return pd.DataFrame()
+            day = _dt.date.today().isoformat()
+            return pd.DataFrame({
+                "datetime": [pd.Timestamp(f"{day} 09:31:00")],
+                "open": [1.0], "close": [1.0], "high": [1.0], "low": [1.0],
+                "vol": [100.0], "amount": [100.0],
+            }).set_index("datetime")
+
+    p = NetworkPuller(factory=lambda: FakeSrc(), workers=1)
+    p.tencent = type("T", (), {
+        "fetch": staticmethod(lambda syms: tencent_quotes or {}),
+        "close": staticmethod(lambda: None)})()
+    p.sina = type("S", (), {
+        "fetch": staticmethod(lambda syms: sina_quotes or {}),
+        "close": staticmethod(lambda: None)})()
+    yield p
+    p.shutdown()
+
+
+def test_fetch_many_tencent_primary_sina_fallback(monkeypatch):
+    """腾讯只回一只、新浪/mootdx 都拿不到另一只时：只出腾讯那只。"""
+    # 固定非交易时段：排除自举路径干扰（自举走 FakeSrc）
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: False)
+    ts = _dt.datetime.now().replace(second=0, microsecond=0)
+    ok = _q("600000.SH", 9.0, 100_000, 900_000, ts)
+    with _mk_puller(monkeypatch, tencent_quotes={"600000.SH": ok},
+                    mootdx_empty=True) as p:
+        frames = p.fetch_many(["600000.XSHG", "000001.XSHE"])
+        syms = {r["symbol"][0] for r in frames}
+        assert syms == {"600000.SH"}            # 仅腾讯命中那只
+
+
+def test_fetch_many_forced_mootdx_skips_http(monkeypatch):
+    """STOCKDATA_RT_SOURCE=mootdx：完全不走 HTTP，经 FakeSrc（mootdx 路径）出数。"""
+    def boom(syms):
+        raise AssertionError("forced=mootdx 不应触 HTTP")
+
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)   # 交易时段才触发自举
+    with _mk_puller(monkeypatch, forced="mootdx") as p:
+        p.tencent = type("T", (), {"fetch": staticmethod(boom),
+                                   "close": staticmethod(lambda: None)})()
+        frames = p.fetch_many(["600000.XSHG"])
+        assert frames and frames[0]["symbol"][0] == "600000.SH"
+
+
+def test_fetch_many_result_ttl_reuses(monkeypatch):
+    ts = _dt.datetime.now().replace(second=0, microsecond=0)
+    ok = _q("600000.SH", 9.0, 100_000, 900_000, ts)
+    calls = []
+
+    def fake_fetch(syms):
+        calls.append(list(syms))
+        return {"600000.SH": ok}
+
+    # 固定非交易时段 + 禁自举：确保计数只反映 HTTP 批量调用
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: False)
+    with _mk_puller(monkeypatch, mootdx_empty=True) as p:
+        p.tencent = type("T", (), {"fetch": staticmethod(fake_fetch),
+                                   "close": staticmethod(lambda: None)})()
+        p.fetch_many(["600000.XSHG"])
+        p.fetch_many(["600000.XSHG"])       # TTL 内第二次
+        assert len(calls) == 1               # 未再触网
+
+
+def test_bootstrap_once_per_day(monkeypatch):
+    """交易时段冷启动：先 mootdx 自举一次；TTL 内第二轮不再自举。"""
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    with _mk_puller(monkeypatch, forced="mootdx") as p:
+        src_obj = p._source()
+        p.fetch_many(["600000.XSHG"])
+        n_after_first = len(src_obj.calls)
+        assert n_after_first >= 1           # 第一轮自举发生
+        p.fetch_many(["600000.XSHG"])       # 结果缓存命中 → 不再自举
+        assert len(src_obj.calls) == n_after_first
