@@ -225,8 +225,9 @@ class BarSynthesizer:
                     st.o = st.h = st.l = st.c = q.price
                     st.v = st.amt = 0.0
                     st.bar_dt = bar_dt
-                elif bar_dt != st.bar_dt:
+                elif st.bar_dt is not None and bar_dt > st.bar_dt:
                     # 封口旧 bar → done；开新 bar：上一拍价格开盘
+                    # （仅向前滚动：迟到旧分钟 tick 走 else 并入当前 bar，不重开封口 bar）
                     done_rows.append((sym, st.bar_dt, st.o, st.h, st.l,
                                       st.c, st.v, st.amt))
                     st.o = st.c
@@ -237,6 +238,7 @@ class BarSynthesizer:
                     st.amt = da
                     st.bar_dt = bar_dt
                 else:
+                    # 同分钟（含迟到旧分钟 tick 折入当前 bar）：更新 HLC、量额差分累加
                     st.h = max(st.h, q.price)
                     st.l = min(st.l, q.price)
                     st.c = q.price

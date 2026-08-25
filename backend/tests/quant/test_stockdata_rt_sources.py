@@ -179,6 +179,23 @@ def test_synthesizer_minute_rollover_opens_new_bar():
     assert new_row["volume"] == pytest.approx(60_000)
 
 
+def test_synthesizer_out_of_order_tick_folds_into_current_bar():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    syn.update({"600000.SH": _q("600000.SH", 9.0, 100_000, 900_000,
+                                _dt.datetime(2026, 8, 25, 10, 0, 30))})
+    syn.update({"600000.SH": _q("600000.SH", 9.1, 160_000, 1_450_000,
+                                _dt.datetime(2026, 8, 25, 10, 1, 5))})
+    # 迟到 tick(旧分钟时间戳): 不得重新开封已封口的 10:00 bar
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.15, 170_000, 1_550_000,
+                                         _dt.datetime(2026, 8, 25, 10, 0, 55))})
+    df = frames[0]
+    assert df["datetime"].to_list() == [_dt.datetime(2026, 8, 25, 10, 1)]
+    row = df.to_dicts()[0]
+    assert row["close"] == 9.15                      # 价格并入当前 bar
+    assert row["volume"] == pytest.approx(70_000)    # 差分并入当前 bar (10k+60k)
+
+
 def test_synthesizer_negative_delta_clamps_zero():
     from app.services.stockdata.rt_sources import BarSynthesizer
 
