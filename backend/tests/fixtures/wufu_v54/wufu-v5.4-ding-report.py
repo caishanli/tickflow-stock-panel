@@ -370,8 +370,17 @@ def pre_trade_report(context):
     if _is_replay_past(context):
         return  # 历史日补跑：不浪费全池计算、不产生无用日志
     if not getattr(g, 'merged_etf_pool', None):
-        log.info("【预买卖报告】合并池未就绪，跳过本次预报告")
-        return
+        # 盘中重启场景：09:00/09:40 晨间任务被种子标记为已触发，池子为空。
+        # 复用晨间管线重建合并池（走弱判定 + 池更新），保证预测与 13:10 同口径。
+        try:
+            check_a_share_weak_period(context)
+            midday_routine(context)
+        except Exception as e:
+            log.warning(f"【预买卖报告】池重建失败: {e}，跳过本次预报告")
+            return
+        if not getattr(g, 'merged_etf_pool', None):
+            log.info("【预买卖报告】合并池重建后仍为空，跳过本次预报告")
+            return
     tag = context.current_dt.strftime('%H:%M')
     log.info(f"▶️ 【预买卖报告 @{tag}】启动...")
     try:

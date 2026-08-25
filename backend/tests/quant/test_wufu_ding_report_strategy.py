@@ -150,10 +150,11 @@ def test_pre_trade_report_replay_guard_skips_past_days():
     assert ns["_is_replay_past"](ctx_today) is False           # 今天的盘中补跑允许触发
 
 
-def test_pre_trade_report_pool_not_ready_skips():
+def test_pre_trade_report_pool_rebuild_fail_skips():
     ns = _load_strategy()
     ns["g"].__dict__.pop("merged_etf_pool", None)
+    ns["check_a_share_weak_period"] = lambda ctx: (_ for _ in ()).throw(RuntimeError("boom"))
     ctx = _make_ctx({})
     ns["pre_trade_report"](ctx)
     assert not ns["log"].notifies
-    assert any("合并池未就绪" in m for m in ns["log"].infos)
+    assert any("池重建失败" in m for m in ns["log"].warnings)
