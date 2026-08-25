@@ -910,8 +910,6 @@ class NetworkPuller:
             if todo:
                 futures = {self._pool.submit(self._pull_mootdx_one, c): c
                            for c in todo}
-                for f in futures.values():
-                    pass
                 for f, tf in futures.items():
                     try:
                         frame = f.result()
@@ -930,8 +928,6 @@ class NetworkPuller:
         if getattr(self, "sina", None) is not None:
             self.sina.close()
 ```
-
-注意：上面 futures 循环里第一段 `for f in futures.values(): pass` 是笔误示例——落地时**删掉**，只保留第二个循环。（实现者若照抄会多一个空循环，ruff 不会报但请勿保留。）
 
 (d) **保留** `_pull_recent_guarded` 模块级函数原样（mootdx 路径仍用它）。
 
