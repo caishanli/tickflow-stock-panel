@@ -252,7 +252,7 @@ class NetworkPuller:
         self._bootstrap_day: _dt.date | None = None
         self.synth = _rt.BarSynthesizer()
         forced = os.getenv("STOCKDATA_RT_SOURCE", "auto") or "auto"
-        self.tencent = None if forced == "mootdx" else _rt.TencentRTSource()
+        self.tencent = None if forced in ("mootdx", "sina") else _rt.TencentRTSource()
         self.sina = None if forced in ("mootdx", "tencent") else _rt.SinaRTSource()
 
     def _source(self):

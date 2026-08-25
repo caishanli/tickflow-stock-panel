@@ -14,6 +14,7 @@ from app.services.stockdata.rt_sources import (
     parse_sina_payload,
     parse_tencent_payload,
 )
+from app.services.stockdata.sources import NetworkPuller
 
 # 2026-08-25 收盘后实测原行(qt.gtimg.cn): v[35]=价/量/额复合串, v[37]=累计额(万元)
 _TENCENT_LINE = 'v_sh600000="1~浦发银行~600000~9.08~9.22~9.24~881756~343481~536689~9.07~3089~9.06~15385~9.05~8179~9.04~2976~9.03~3783~9.08~984~9.09~1749~9.10~6749~9.11~634~9.12~1024~~20260825161459~-0.14~-1.52~9.28~9.06~9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06~2.39~3024.17~3024.17~0.40~10.14~8.30~1.32~22272~9.12~4.89~6.05~~~0.01~80447.8557~12.0764~133~   A~GP-A~-24.46~1.23~4.63~6.03~0.49~13.83~8.07~-1.41~-1.20~2.02~33305838300~33305838300~49.99~-18.93~33305838300~~~-33.28~0.00~~CNY~0~___D__F__N~9.00~7435~";'
@@ -260,13 +261,11 @@ def _mk_puller(monkeypatch, tencent_quotes=None, sina_quotes=None,
     FakeSrc.get_minute_recent 返回一根今日 09:31 bar（模拟自举/mootdx 路径出数）；
     mootdx_empty=True 时返回空帧（隔离测试 HTTP 链路，mootdx 视为无数据）。
     """
-    import os
-
     from app.services.stockdata.sources import NetworkPuller
 
-    os.environ.pop("STOCKDATA_RT_SOURCE", None)
     if forced:
-        os.environ["STOCKDATA_RT_SOURCE"] = forced
+        # monkeypatch 自动还原，测试间不泄漏 STOCKDATA_RT_SOURCE
+        monkeypatch.setenv("STOCKDATA_RT_SOURCE", forced)
 
     class FakeSrc:
         def __init__(self):
@@ -321,6 +320,30 @@ def test_fetch_many_forced_mootdx_skips_http(monkeypatch):
                                    "close": staticmethod(lambda: None)})()
         frames = p.fetch_many(["600000.XSHG"])
         assert frames and frames[0]["symbol"][0] == "600000.SH"
+
+
+def test_fetch_many_forced_sina_no_tencent(monkeypatch):
+    """STOCKDATA_RT_SOURCE=sina：不构造腾讯源，走新浪+自举路径。"""
+    def boom(syms):
+        raise AssertionError("forced=sina 不应触腾讯")
+
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    monkeypatch.setenv("STOCKDATA_RT_SOURCE", "sina")
+    # 类级雷区：即便未来误构造腾讯源，一旦触网立即爆
+    monkeypatch.setattr(TencentRTSource, "fetch", staticmethod(boom))
+    p = NetworkPuller(factory=lambda: type("S", (), {
+        "get_minute_recent": staticmethod(lambda c, pages=1: __import__("pandas").DataFrame()),
+    })(), workers=1)
+    try:
+        assert p.tencent is None           # 核心回归：sina 模式不构造腾讯源
+        assert p.sina is not None          # 新浪仍在
+        p.sina = type("Sn", (), {"fetch": staticmethod(lambda syms: {}),
+                                 "close": staticmethod(lambda: None)})()
+        frames = p.fetch_many(["600000.XSHG"])   # 自举/mootdx 兜底均空帧 → 无数据，全程未触腾讯
+        assert frames == []
+    finally:
+        p.shutdown()
 
 
 def test_fetch_many_result_ttl_reuses(monkeypatch):
