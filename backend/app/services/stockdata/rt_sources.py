@@ -2,7 +2,7 @@
 
 设计 spec：docs/superpowers/specs/2026-08-25-stockdata-rt-tencent-sina-design.md。
 单位口径（实测校准 2026-08-25）：RTQuote.cum_volume 一律「股」、cum_amount 一律「元」；
-腾讯原始量=手(×100)、额=元直用（实测 field37 与新浪同源同量级，非万元）；新浪量=股、额=元直用。
+腾讯原始量=手(×100)、额=万元(×1e4)；新浪量=股、额=元直用。
 """
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def parse_tencent_payload(text: str) -> dict[str, RTQuote]:
             high=_f(v[33]),
             low=_f(v[34]),
             cum_volume=_f(v[6]) * 100.0,
-            cum_amount=_f(v[37]),
+            cum_amount=_f(v[37]) * 1e4,
             quote_time=_parse_ts(v[30]),
         )
     return out
