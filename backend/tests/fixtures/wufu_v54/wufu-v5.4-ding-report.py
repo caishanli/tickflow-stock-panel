@@ -352,18 +352,23 @@ def buy_routine(context):
 PRE_REPORT_TOP_SELLS = 3       # 卖出候选最多展示前 3
 
 
+def _is_replay_past(context):
+    """是否处于"过去日期"的历史补跑（跳过）；今天的盘中补跑返回 False（允许触发）。"""
+    try:
+        lag_seconds = (datetime.now() - context.current_dt).total_seconds()
+    except Exception:
+        return False
+    return lag_seconds > 300 and context.current_dt.date() < datetime.now().date()
+
+
 def pre_trade_report(context):
     """11:30 / 13:01 预买卖报告：预测 13:10 调仓（预计买入 + 最可能卖出前3）。
 
     直接复用 get_final_ranked_etfs(quiet=True)，与 13:10 正式管线完全同口径
     （含持仓宽容/数据缺失保护）。结果走 log.notify：落 sim_logs 并推钉钉。
     """
-    try:
-        lag_seconds = (datetime.now() - context.current_dt).total_seconds()
-    except Exception:
-        lag_seconds = 0.0
-    if lag_seconds > 300:
-        return  # 历史补跑：不浪费全池计算、不产生无用日志
+    if _is_replay_past(context):
+        return  # 历史日补跑：不浪费全池计算、不产生无用日志
     if not getattr(g, 'merged_etf_pool', None):
         log.info("【预买卖报告】合并池未就绪，跳过本次预报告")
         return

@@ -139,12 +139,15 @@ def test_report_unevaluated_holding_listed_separately():
     assert "📤" not in msg                                    # F 不进卖出候选
 
 
-def test_pre_trade_report_replay_guard_skips():
+def test_pre_trade_report_replay_guard_skips_past_days():
     ns = _load_strategy()
     _prep(ns)
-    ctx = _make_ctx({"A.XSHG": 100}, dt=datetime(2026, 7, 10, 13, 1))  # 历史 dt
-    ns["pre_trade_report"](ctx)
-    assert not ns["log"].notifies                             # 补跑直接跳过
+    from datetime import timedelta
+    ctx_past = _make_ctx({"A.XSHG": 100}, dt=datetime.now() - timedelta(days=5))  # 历史日
+    ns["pre_trade_report"](ctx_past)
+    assert not ns["log"].notifies                             # 过去日期补跑直接跳过
+    ctx_today = _make_ctx({"A.XSHG": 100}, dt=datetime.now() - timedelta(minutes=30))
+    assert ns["_is_replay_past"](ctx_today) is False           # 今天的盘中补跑允许触发
 
 
 def test_pre_trade_report_pool_not_ready_skips():
