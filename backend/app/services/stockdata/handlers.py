@@ -85,6 +85,10 @@ def h_get_security_info(p, s: DataSources):
     return "json", s.get_security_info(_norm_code(p["code"]))
 
 
+def h_get_security_infos(p, s: DataSources):
+    return "json", s.get_security_infos(p.get("codes"))
+
+
 def h_get_index_stocks(p, s: DataSources):
     return "json", s.get_index_stocks(_norm_code(p["index_code"]), p.get("date"))
 
@@ -96,6 +100,10 @@ def h_get_stock_names(p, s: DataSources):
 
 def h_get_adj_factors(p, s: DataSources):
     return "parquet", s.get_adj_factors()
+
+
+def h_get_financials(p, s: DataSources):
+    return "parquet", s.get_financials()
 
 
 def h_get_etf_nav(p, s: DataSources):
@@ -121,9 +129,11 @@ HANDLERS = {
     "get_trade_days": h_get_trade_days,
     "get_all_securities": h_get_all_securities,
     "get_security_info": h_get_security_info,
+    "get_security_infos": h_get_security_infos,
     "get_index_stocks": h_get_index_stocks,
     "get_stock_names": h_get_stock_names,
     "get_adj_factors": h_get_adj_factors,
+    "get_financials": h_get_financials,
     "get_etf_nav": h_get_etf_nav,
     "trigger_sync": h_trigger_sync,
 }

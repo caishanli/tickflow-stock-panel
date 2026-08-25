@@ -34,6 +34,33 @@ from rqalpha.model.instrument import Instrument
 
 logger = logging.getLogger("jqcompat")
 
+
+def _install_stub_modules():
+    """死代码依赖的聚宽生态模块空壳：保证 import 不崩即可。
+
+    jqfactor（get_factor_values）/ talib / jqlib.technical_analysis
+    （Bollinger_Bands）在既有策略中仅被未调用的函数引用（如 filter_roic /
+    boll_filter），函数体一旦真被调用则显式抛 NotImplementedError。
+    """
+    for _name in ("jqfactor", "talib"):
+        if _name not in sys.modules:
+            _m = types.ModuleType(_name)
+            _m.__all__ = []
+            sys.modules.setdefault(_name, _m)
+    if "jqlib" not in sys.modules:
+        sys.modules.setdefault("jqlib", types.ModuleType("jqlib"))
+    if "jqlib.technical_analysis" not in sys.modules:
+        _ta = types.ModuleType("jqlib.technical_analysis")
+
+        def _not_impl(*a, **k):
+            raise NotImplementedError(
+                "jqlib.technical_analysis 未实现（该 API 仅存在于策略死代码路径）")
+        _ta.Bollinger_Bands = _not_impl
+        sys.modules.setdefault("jqlib.technical_analysis", _ta)
+
+
+_install_stub_modules()
+
 # ---------------------------------------------------------------------------
 # 全局状态（由安装函数填充）
 # ---------------------------------------------------------------------------
@@ -117,12 +144,17 @@ def _instrument(code):
         return None
 
 
+_JQ_TO_BAR_FIELD = {"money": "total_turnover", "high_limit": "limit_up",
+                    "low_limit": "limit_down"}
+
+
+def _jq_to_bar_field(f):
+    return _JQ_TO_BAR_FIELD.get(f, f)
+
+
 def _actual_fields(fields):
     """聚宽字段名 -> rqalpha recarray 字段名。"""
-    out = []
-    for f in fields:
-        out.append("total_turnover" if f == "money" else f)
-    return out
+    return [_jq_to_bar_field(f) for f in fields]
 
 
 def _bars_to_long_df(bars, code, requested_fields, freq):
@@ -130,7 +162,7 @@ def _bars_to_long_df(bars, code, requested_fields, freq):
     times = pd.to_datetime(dt.astype("int64").astype(str), format="%Y%m%d%H%M%S")
     rows = {"time": times, "code": code}
     for f in requested_fields:
-        actual = "total_turnover" if f == "money" else f
+        actual = _jq_to_bar_field(f)
         rows[f] = np.asarray(bars[actual]) if actual in bars.dtype.names else np.nan
     return pd.DataFrame(rows)
 
@@ -194,6 +226,9 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
     _check_fq(fq, codes)
     if fields is None:
         fields = ["open", "close", "high", "low", "volume", "money"]
+    elif isinstance(fields, str):
+        # 聚宽允许 fields='close'（策略常写 ('close') 实为字符串），不能 list() 拆字符
+        fields = [fields]
     else:
         fields = list(fields)
     end_dt = pd.Timestamp(end_date) if end_date is not None else env.trading_dt
@@ -233,7 +268,7 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
                 _tlist.append(np.asarray(bars["datetime"], dtype="int64"))
                 _clist.append(code)
                 for f in fields:
-                    actual = "total_turnover" if f == "money" else f
+                    actual = _jq_to_bar_field(f)
                     _flist[f].append(
                         np.asarray(bars[actual]) if actual in bars.dtype.names
                         else np.full(n, np.nan))
@@ -286,6 +321,9 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
             pd.DataFrame(columns=["time", "code"] + fields), codes, freq, fields, end_dt)
     out = pd.concat(frames, ignore_index=True)
     out = _fallback_volume_daily(out, codes, freq, fields, end_dt)
+    if isinstance(security, str) and not panel:
+        # 聚宽语义：单标的 panel=False 返回「索引=time，列=fields」（无 code 列）
+        out = out.drop(columns=["code"], errors="ignore").set_index("time")
     return out
 
 
@@ -413,8 +451,51 @@ def get_security_name(code):
     return "未知名称"
 
 
+_SECURITY_INFO_CACHE: dict = {}
+_EPOCH_START = _dt.date(2000, 1, 1)
+
+
+class _JqSecurityInfo:
+    """聚宽 get_security_info 返回口径：start_date(date)/display_name/委托 Instrument。"""
+
+    def __init__(self, ins, start_date):
+        self._ins = ins
+        self.start_date = start_date
+
+    @property
+    def display_name(self):
+        return getattr(self._ins, "symbol", "") or ""
+
+    @property
+    def name(self):
+        return getattr(self._ins, "symbol", "") or ""
+
+    def __getattr__(self, n):
+        return getattr(self._ins, n)
+
+
 def get_security_info(code):
-    return _instrument(code)
+    ins = _instrument(code)
+    bare = str(code).split(".")[0]
+    if bare not in _SECURITY_INFO_CACHE:
+        # 首次访问批量拉全量元数据（instruments 快照，一次请求），避免逐只 RTT
+        try:
+            dm = _active_dm()
+            client = getattr(dm, "client", None)
+            infos = client.get_security_infos() if client is not None else {}
+        except Exception:
+            infos = {}
+        for sym, info in (infos or {}).items():
+            b = str(sym).split(".")[0]
+            raw = (info or {}).get("start_date")
+            try:
+                _SECURITY_INFO_CACHE[b] = (pd.Timestamp(raw).date()
+                                           if raw else _EPOCH_START)
+            except Exception:
+                _SECURITY_INFO_CACHE[b] = _EPOCH_START
+        _SECURITY_INFO_CACHE.setdefault(bare, _EPOCH_START)
+    sd = _SECURITY_INFO_CACHE.get(bare) or _EPOCH_START
+    return _JqSecurityInfo(ins, sd)
 
 
 def attribute_history(security, count, unit="1d", fields=None, skip_paused=True,
@@ -434,7 +515,11 @@ def attribute_history(security, count, unit="1d", fields=None, skip_paused=True,
     df = get_price(security, count=count, frequency=unit, fields=fields, panel=False, fq=fq)
     if df is None or df.empty:
         return pd.DataFrame()
-    return df.set_index("time")[list(fields)]
+    if isinstance(fields, str):
+        fields = [fields]
+    if "time" in df.columns:
+        df = df.set_index("time")
+    return df[list(fields)]
 
 
 def is_temporarily_suspended(security, context=None, minute_count=10):
@@ -470,15 +555,58 @@ def get_trade_days(start_date=None, end_date=None, count=None):
     return list(cal)
 
 
-def history(security, bar_count, unit="1d", field=None, skip_paused=True, df=True,
-            fq="pre", **kwargs):
-    """聚宽 history。fq 现状同 get_price：本地日线统一前复权，pre/qfq/None
-    直接满足，其余口径仅 warning 一次、实际返回前复权价。"""
-    fields = [field] if isinstance(field, str) else (field or ["close"])
-    df_out = get_price(security, count=bar_count, frequency=unit, fields=fields, panel=False, fq=fq)
-    if df_out is None or df_out.empty:
+def history(count=None, unit="1d", field="avg", security_list=None, df=True,
+            skip_paused=True, fq="pre", **kwargs):
+    """聚宽 history：``history(count, unit, field, security_list=None, ...)``。
+
+    security_list 为 None/单标的 → DataFrame（index=time，列=field 名）；
+    多标的 → 宽表（index=time，列=各代码），与聚宽一致。
+    兼容旧约定（首参传标的列表）：此时按 get_price(count=...) 语义处理。
+    """
+    if count is not None and not isinstance(count, int):
+        # 旧约定 history(security, bar_count, unit, field)：既有 ETF 策略路径
+        security = count
+        bar_count = unit if isinstance(unit, int) else kwargs.pop("bar_count", 1)
+        _unit = field if isinstance(field, str) and field in ("1d", "1m") else "1d"
+        _field = security_list if isinstance(security_list, str) else "close"
+        fields = [_field]
+        df_out = get_price(security, count=bar_count, frequency=_unit,
+                           fields=fields, panel=False, fq=fq)
+        if df_out is None or df_out.empty:
+            return pd.DataFrame()
+        return df_out.set_index("time")[fields]
+
+    fields = [field] if isinstance(field, str) else list(field or ["close"])
+    if security_list is None:
+        # 聚宽无 security_list 时默认 universe；本地要求显式传入，空返回兜底
+        logger.warning("history() 未传 security_list，返回空 DataFrame")
         return pd.DataFrame()
-    return df_out.set_index("time")[list(fields)]
+    env = Environment.get_instance()
+    end_dt = getattr(env, "trading_dt", None)
+    single_str = isinstance(security_list, str)
+    codes = [security_list] if single_str else list(security_list)
+    frames = {}
+    for code in codes:
+        out = get_price(code, end_date=end_dt, count=int(count), frequency=unit,
+                        fields=fields, panel=False, skip_paused=skip_paused, fq=fq)
+        if out is None or out.empty:
+            continue
+        if "time" in out.columns:
+            out = out.set_index("time")
+        frames[code] = out[fields]
+    if not frames:
+        return pd.DataFrame(columns=codes if len(fields) == 1 else None)
+    if len(fields) == 1:
+        # 单字段：列=代码（聚宽口径）；无数据标的补 NaN 列
+        wide = pd.DataFrame({c: g[fields[0]] for c, g in frames.items()})
+        for code in codes:
+            if code not in wide.columns:
+                wide[code] = np.nan
+        wide = wide.reindex(columns=codes)
+        if single_str:
+            wide = wide.rename(columns={codes[0]: field})
+        return wide
+    return pd.concat(frames, axis=1)  # 多字段：MultiIndex (code, field)
 
 
 def get_extras(field, securities, start_date=None, end_date=None, count=None,
@@ -560,8 +688,201 @@ def set_benchmark(code):
     _BENCHMARK = code
 
 
+_SLIPPAGE_OVERRIDE = None  # set_slippage(FixedSlippage(x)) 记录的值（None=未设置）
+
+
+class FixedSlippage:
+    """聚宽固定滑点：仅记录值（撮合滑点由 rqalpha config 下发；策略显式
+    set_slippage 时通过 _SLIPPAGE_OVERRIDE 尽力同步到运行中的 matcher）。"""
+
+    def __init__(self, value=0.0):
+        self.value = float(value)
+
+
 def set_slippage(*args, **kwargs):
-    pass
+    global _SLIPPAGE_OVERRIDE
+    for a in args:
+        if isinstance(a, FixedSlippage):
+            _SLIPPAGE_OVERRIDE = a.value
+            break
+        if isinstance(a, (int, float)):
+            _SLIPPAGE_OVERRIDE = float(a)
+            break
+    # 运行中 matcher 的滑点尽力覆盖（sys_simulation start_up 已建好 decider）
+    try:
+        env = Environment.get_instance()
+        matcher = getattr(env, "matcher", None) or getattr(
+            getattr(env, "broker", None), "matcher", None)
+        decider = getattr(matcher, "_slippage_decider", None)
+        if decider is not None and _SLIPPAGE_OVERRIDE is not None:
+            decider._slippage = _SLIPPAGE_OVERRIDE
+    except Exception:
+        pass
+
+
+class OrderStatus:
+    """聚宽 OrderStatus 子集：held=已成交（对应 rqalpha FILLED）。"""
+    held = "held"
+    open = "open"
+    canceled = "canceled"
+    rejected = "rejected"
+
+
+class _JqOrderProxy:
+    """rqalpha Order → 聚宽口径代理（order.filled / order.amount / order.status）。"""
+
+    def __init__(self, order):
+        self._order = order
+
+    @property
+    def filled(self):
+        return float(getattr(self._order, "filled_quantity", 0) or 0)
+
+    @property
+    def amount(self):
+        return float(getattr(self._order, "quantity", 0) or 0)
+
+    @property
+    def status(self):
+        from rqalpha.const import ORDER_STATUS
+        s = getattr(self._order, "status", None)
+        if s == ORDER_STATUS.FILLED:
+            return OrderStatus.held
+        if s == ORDER_STATUS.ACTIVE or s == ORDER_STATUS.PENDING_NEW:
+            return OrderStatus.open
+        if s in (ORDER_STATUS.CANCELLED, ORDER_STATUS.PENDING_CANCEL):
+            return OrderStatus.canceled
+        return OrderStatus.rejected
+
+    def __getattr__(self, name):
+        return getattr(self._order, name)
+
+
+# 原生下单函数必须在 register_api 覆盖前捕获（否则 from rqalpha.api import *
+# 拿到的是我们自己的 shim，无限递归）
+from rqalpha.api import order_target_value as _RQ_OTV  # noqa: E402
+from rqalpha.api import order_value as _RQ_OV  # noqa: E402
+from rqalpha.api import order_shares as _RQ_OS  # noqa: E402
+
+
+def order_target_value(security, value, limit_price=None):
+    """聚宽 order_target_value：调仓到目标市值（元）。基于 rqalpha 原生实现。"""
+    order = _RQ_OTV(security, float(value))
+    return _JqOrderProxy(order) if order is not None else None
+
+
+def order_value(security, value, limit_price=None):
+    """聚宽 order_value：按金额下单（负数卖出）。基于 rqalpha 原生实现。"""
+    order = _RQ_OV(security, float(value))
+    return _JqOrderProxy(order) if order is not None else None
+
+
+def order_shares(security, amount, limit_price=None):
+    order = _RQ_OS(security, float(amount))
+    return _JqOrderProxy(order) if order is not None else None
+
+
+# ---------------------------------------------------------------------------
+# run_monthly / run_weekly：复用分钟事件调度，回调内做「月/周内第 N 个交易日」守卫
+# ---------------------------------------------------------------------------
+def _norm_daily_hm(time_rule):
+    """与 run_daily 相同的时刻归一（返回 (hour, minute)，对齐本地分钟 bar）。"""
+    if time_rule is None:
+        return (9, 31)
+    if time_rule == "before_trading":
+        return (9, 31)
+    if time_rule == "open":
+        return (9, 32)
+    if time_rule == "close":
+        return (15, 0)
+    try:
+        hh, mm = str(time_rule).split(":")
+        hm = (int(hh), int(mm))
+    except Exception:
+        return (9, 31)
+    if hm <= (9, 30):
+        return (9, 31)
+    if hm >= (15, 0):
+        return (15, 0)
+    return hm
+
+
+def _nth_trading_day_rank(d, period="month"):
+    """d 在当月/当周交易日内排第几（1-based）；负数表示倒数第 N。非交易日返回 None。"""
+    env = Environment.get_instance()
+    try:
+        cal = pd.DatetimeIndex(env.data_proxy.get_trading_calendar())
+    except Exception:
+        return None
+    ts = pd.Timestamp(d).normalize()
+    if period == "month":
+        lo = ts.replace(day=1)
+        # 下月 1 日（ts 恰为当月 1 日时也必须滚到下月，否则区间塌陷为空）
+        y, m = ts.year, ts.month
+        hi_excl = pd.Timestamp(y + 1 if m == 12 else y, 1 if m == 12 else m + 1, 1)
+        seg = cal[(cal >= lo) & (cal < hi_excl)]
+    else:
+        lo = ts - pd.Timedelta(days=ts.weekday())
+        hi_excl = lo + pd.Timedelta(days=7)
+        seg = cal[(cal >= lo) & (cal < hi_excl)]
+    hits = np.where(seg == ts)[0]
+    if len(hits) == 0:
+        return None
+    idx = int(hits[0])
+    total = len(seg)
+    return idx + 1, -(total - idx)  # (正数第几个, 倒数第几个)
+
+
+def run_monthly(func, when=1, time=None, *args, **kwargs):
+    """聚宽 run_monthly：每月第 when 个交易日（负数=倒数）的 time 时刻执行。"""
+    hm = _norm_daily_hm(time)
+
+    def _guard(context):
+        import os as _os
+        if _os.getenv("JQ_SCHED_DEBUG"):
+            print("[sched-debug] monthly guard enter", hm,
+                  getattr(func, "__name__", func), flush=True)
+        env = Environment.get_instance()
+        d = getattr(env, "trading_dt", None)
+        if d is None:
+            return
+        rank = _nth_trading_day_rank(pd.Timestamp(d).date(), period="month")
+        if _os.getenv("JQ_SCHED_DEBUG"):
+            print("[sched-debug] monthly rank=", rank, flush=True)
+        if rank is None:
+            return
+        pos, neg = rank
+        if pos == when or (when < 0 and neg == when):
+            func(context)
+
+    _DAILY_AT.setdefault(hm, []).append(_guard)
+    return None
+
+
+def run_weekly(func, weekday=1, time=None, *args, **kwargs):
+    """聚宽 run_weekly：每周第 weekday 个交易日（负数=倒数）的 time 时刻执行。"""
+    hm = _norm_daily_hm(time)
+
+    def _guard(context):
+        import os as _os
+        if _os.getenv("JQ_SCHED_DEBUG"):
+            print("[sched-debug] weekly guard enter", hm,
+                  getattr(func, "__name__", func), flush=True)
+        env = Environment.get_instance()
+        d = getattr(env, "trading_dt", None)
+        if d is None:
+            return
+        rank = _nth_trading_day_rank(pd.Timestamp(d).date(), period="week")
+        if _os.getenv("JQ_SCHED_DEBUG"):
+            print("[sched-debug] weekly rank=", rank, flush=True)
+        if rank is None:
+            return
+        pos, neg = rank
+        if pos == weekday or (weekday < 0 and neg == weekday):
+            func(context)
+
+    _DAILY_AT.setdefault(hm, []).append(_guard)
+    return None
 
 
 def set_order_cost(*args, **kwargs):
@@ -640,6 +961,428 @@ def record(*args, **kwargs):
 def run_minute(func, second=0, **kwargs):
     logger.warning("run_minute 未完整实现（本策略未使用），已忽略: %s", getattr(func, "__name__", func))
     return None
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# get_index_stocks：经 StockDataClient 取成分（进程内缓存，install 时重置）
+# ---------------------------------------------------------------------------
+_INDEX_STOCKS_CACHE: dict = {}
+
+
+def _norm_jq_code(c):
+    """成分代码归一为 jq 风格（600xxx → 600xxx.XSHG）。"""
+    c = str(c).strip()
+    if "." in c:
+        return c
+    return c + (".XSHG" if c[:1] in ("5", "6", "9") else ".XSHE")
+
+
+def get_index_stocks(index_code, date=None):
+    env = Environment.get_instance()
+    ds = getattr(env, "data_source", None)
+    dm = getattr(ds, "_dm", None)
+    client = getattr(dm, "client", None)
+    if client is None:
+        from app.quant.datasource.network_client import StockDataClient
+        client = StockDataClient()
+    code = str(index_code)
+    dstr = str(date) if date is not None else None
+    key = (code, dstr)
+    if key not in _INDEX_STOCKS_CACHE:
+        raw = client.get_index_stocks(code, dstr)
+        _INDEX_STOCKS_CACHE[key] = [_norm_jq_code(c) for c in raw]
+        logger.info("get_index_stocks(%s, %s): %d 只", code, dstr,
+                    len(_INDEX_STOCKS_CACHE[key]))
+        # 成分股名称并入 _NAMES：支撑 filter_st_stock（ST/*ST/退市过滤）与展示。
+        # 名称缺失时 is_st 恒 False，会让 ST 股混入小市值选股（对齐聚宽偏差源）。
+        try:
+            bare = [c.split(".")[0] for c in _INDEX_STOCKS_CACHE[key]]
+            names = client.get_stock_names(bare) or {}
+            for b, n in names.items():
+                jq = _norm_jq_code(b)
+                if n and jq not in _NAMES:
+                    _NAMES[jq] = str(n)
+        except Exception:
+            logger.debug("get_index_stocks 成分名称获取失败（ST 过滤降级）", exc_info=True)
+    return list(_INDEX_STOCKS_CACHE[key])
+
+
+def _active_dm():
+    env = Environment.get_instance()
+    ds = getattr(env, "data_source", None)
+    return getattr(ds, "_dm", None)
+
+
+def _close_at_anchor(code: str, anchor):
+    """anchor 日（含）往前最近一根日线收盘价；无数据返回 nan。"""
+    dm = _active_dm()
+    if dm is None:
+        return float("nan")
+    try:
+        df = dm._daily_mem.get(f"get_daily_{code}")
+        if df is None or getattr(df, "empty", True):
+            df = dm.fetch("get_daily", code, "20240101",
+                          pd.Timestamp(anchor).strftime("%Y%m%d"))
+        if df is None or getattr(df, "empty", True):
+            return float("nan")
+        col = ("trade_date" if "trade_date" in df.columns
+               else "date" if "date" in df.columns else None)
+        if col is not None:
+            dts = pd.to_datetime(df[col])
+            sub = df[dts <= pd.Timestamp(anchor)]
+        else:
+            idx = pd.to_datetime(df.index)
+            sub = df[idx <= pd.Timestamp(anchor)]
+        if getattr(sub, "empty", True):
+            return float("nan")
+        crow = sub.iloc[-1]
+        for pc in ("close", "raw_close"):
+            if pc in sub.columns:
+                v = crow[pc]
+                if v == v and v is not None:
+                    return float(v)
+        return float("nan")
+    except Exception:
+        return float("nan")
+
+
+# ---------------------------------------------------------------------------
+# get_fundamentals + query ORM（valuation/income/cash_flow/indicator）
+# ---------------------------------------------------------------------------
+class _FinPred:
+    """行级谓词。soft=True：操作数缺失(NaN)时放行（缺数据不因该条件过滤）。"""
+
+    def __init__(self, fn, soft=False):
+        self.fn = fn
+        self.soft = soft
+
+    def __call__(self, row):
+        try:
+            return bool(self.fn(row))
+        except Exception:
+            return True if self.soft else False
+
+
+class _FinOrderSpec:
+    def __init__(self, expr, ascending=True):
+        self.expr = expr
+        self.ascending = ascending
+
+
+class _FinExpr:
+    """列表达式：支持列/列、列/常量四则运算后再比较。
+
+    含除法的表达式标记 soft：操作数缺失/除零 → 比较条件视为通过
+    （设计文档披露的偏差，避免 White_Horse 全选股清空）。
+    """
+
+    def __init__(self, getter, soft=False):
+        self._getter = getter
+        self._soft = soft
+
+    def __call__(self, row):
+        return self._getter(row)
+
+    @staticmethod
+    def _coerce(v):
+        if isinstance(v, (_FinExpr, _FinCol)):
+            return lambda row: float(v(row))
+        const = float(v)
+        return lambda row: const
+
+    def _bin(self, other, op, soft=None):
+        a, b = self._coerce(self), self._coerce(other)
+        s = self._soft if soft is None else soft
+        return _FinExpr(lambda row: op(a(row), b(row)), soft=s)
+
+    def __truediv__(self, other):
+        def _div(x, y):
+            if y == 0 or y != y or x != x:
+                return float("nan")
+            return x / y
+        return self._bin(other, _div, soft=True)
+
+    def __mul__(self, other):
+        return self._bin(other, lambda x, y: x * y)
+
+    def __add__(self, other):
+        return self._bin(other, lambda x, y: x + y)
+
+    def __sub__(self, other):
+        return self._bin(other, lambda x, y: x - y)
+
+    def _cmp(self, v, op):
+        soft = self._soft
+        cv = float(v)
+
+        def fn(row):
+            val = self(row)
+            if val != val:  # NaN
+                return soft
+            return op(val, cv)
+        return _FinPred(fn, soft=soft)
+
+    def __gt__(self, v):
+        return self._cmp(v, lambda a, b: a > b)
+
+    def __lt__(self, v):
+        return self._cmp(v, lambda a, b: a < b)
+
+    def __ge__(self, v):
+        return self._cmp(v, lambda a, b: a >= b)
+
+    def __le__(self, v):
+        return self._cmp(v, lambda a, b: a <= b)
+
+    def asc(self):
+        return _FinOrderSpec(self, ascending=True)
+
+    def desc(self):
+        return _FinOrderSpec(self, ascending=False)
+
+
+class _FinCol(_FinExpr):
+    """财务表列引用。row 以 (table, col) 为键取值；硬条件 NaN 一律 False。"""
+
+    def __init__(self, table, name):
+        super().__init__(None, soft=False)
+        self.table = table
+        self.name = name
+
+    def _getter_default(self, row):
+        return row.get((self.table, self.name), float("nan"))
+
+    def __call__(self, row):
+        try:
+            return row.get((self.table, self.name), float("nan"))
+        except Exception:
+            return float("nan")
+
+    def between(self, lo, hi):
+        flo, fhi = float(lo), float(hi)
+
+        def fn(row):
+            val = self(row)
+            if val != val:
+                return False
+            return flo <= val <= fhi
+        return _FinPred(fn, soft=False)
+
+    def in_(self, codes):
+        cs = {str(c) for c in codes}
+
+        def fn(row):
+            return str(row.get(("sys", "code"))) in cs
+
+        pred = _FinPred(fn, soft=False)
+        pred._codes = {str(c) for c in codes}
+        return pred
+
+
+def _make_fin_table(table_name, cols):
+    class _Table:
+        pass
+    t = _Table()
+    for c in cols:
+        setattr(t, c, _FinCol(table_name, c))
+    t.code = _FinCol(table_name, "code")
+    return t
+
+
+VALUATION = _make_fin_table("valuation", [
+    "market_cap", "circulating_market_cap", "pb_ratio", "pe_ratio"])
+INCOME = _make_fin_table("income", [
+    "net_profit", "np_parent_company_owners", "operating_revenue"])
+CASH_FLOW = _make_fin_table("cash_flow", ["subtotal_operate_cash_inflow"])
+INDICATOR = _make_fin_table("indicator", [
+    "adjusted_profit", "roe", "roa", "inc_return",
+    "inc_net_profit_year_on_year"])
+
+
+class _FinQuery:
+    def __init__(self, selects):
+        self.selects = selects          # [(table, col)]；(sys,code) 固定首列
+        self.preds = []
+        self._order = None              # _FinOrderSpec | None
+        self._limit_n = None
+
+    def filter(self, *preds):
+        self.preds.extend([p for p in preds if p is not None])
+        return self
+
+    def order_by(self, spec):
+        if isinstance(spec, _FinOrderSpec):
+            self._order = spec
+        else:
+            self._order = _FinOrderSpec(spec, ascending=True)
+        return self
+
+    def limit(self, n):
+        self._limit_n = int(n)
+        return self
+
+
+def query(*items):
+    """聚宽 query(...)：收集 select 列（code 列恒在首列）。"""
+    selects = [("sys", "code")]
+    for it in items:
+        if isinstance(it, _FinCol):
+            key = (it.table, it.name)
+            if key not in selects:
+                selects.append(key)
+    return _FinQuery(selects)
+
+
+_FINANCIALS_CACHE = None
+
+
+def _load_financials_cached():
+    """加载全量财务长表，补充同比所需的上年同季净利润列 net_profit_ly。"""
+    global _FINANCIALS_CACHE
+    if _FINANCIALS_CACHE is not None:
+        return _FINANCIALS_CACHE
+    try:
+        from app.services.tdx_financials import load_financials as _lf
+        df = _lf().to_pandas()
+    except Exception:
+        df = pd.DataFrame()
+    if df is None or df.empty:
+        _FINANCIALS_CACHE = pd.DataFrame()
+        return _FINANCIALS_CACHE
+    statq = df["stat_date"].astype(str)
+    # 报告期键 = 年+月日（如 20260331）；同比 = 上年同报告期净利润
+    df["stat_q"] = statq
+    base_np = dict(zip(df["symbol"] + df["stat_q"], df["net_profit"]))
+    ly_q = (df["stat_q"].str[:4].astype(int) - 1).astype(str) + df["stat_q"].str[4:]
+    df["net_profit_ly"] = (df["symbol"] + ly_q).map(base_np)
+    _FINANCIALS_CACHE = df
+    return df
+
+
+def reset_fundamentals_cache():
+    global _FINANCIALS_CACHE
+    _FINANCIALS_CACHE = None
+    _INDEX_STOCKS_CACHE.clear()
+
+
+def get_fundamentals(q: _FinQuery, date=None):
+    """执行财务查询。锚点日 = date（默认 context.previous_date 对应的交易日）。
+
+    行构造：每标的最新的 visible_from<=锚点 的季报 + 锚点收盘价 → 派生估值列。
+    过滤：硬条件 NaN=False；除法类 soft 条件 NaN=True。
+    """
+    import polars as _pl_unused  # noqa: F401  (保持依赖显式)
+
+    env = Environment.get_instance()
+    if date is not None:
+        anchor = pd.Timestamp(date).normalize()
+    else:
+        base = pd.Timestamp(getattr(env, "trading_dt", pd.Timestamp.today()))
+        try:
+            anchor = pd.Timestamp(
+                env.data_proxy.get_previous_trading_date(base.date())).normalize()
+        except Exception:
+            anchor = base.normalize() - pd.Timedelta(days=1)
+
+    candidates = None
+    hard_preds, soft_preds = [], []
+    for p in q.preds:
+        codes = getattr(p, "_codes", None)
+        if codes is not None:
+            candidates = sorted(codes) if candidates is None else sorted(set(candidates) & set(codes))
+        (soft_preds if p.soft else hard_preds).append(p)
+
+    fin = _load_financials_cached()
+    if candidates is None:
+        # 财务表为裸码；行内 code 输出与 _close_at_anchor 均需 jq 风格
+        candidates = [_norm_jq_code(c) for c in sorted(fin["symbol"].unique())] if len(fin) else []
+
+    rows = []
+    for sym in candidates:
+        close = _close_at_anchor(sym, anchor)
+        row = {}
+        row[("sys", "code")] = sym
+        frow = None
+        if len(fin):
+            # 财务表 symbol 为裸 6 位码，候选为 jq 风格（000001.XSHE）
+            bare_sym = sym.split(".")[0]
+            sub = fin[(fin["symbol"] == bare_sym)
+                      & (pd.to_datetime(fin["visible_from"]) <= anchor)]
+            if len(sub):
+                frow = sub.sort_values("stat_date").iloc[-1]
+
+        def g(col):
+            if frow is None or col not in frow.index:
+                return float("nan")
+            v = frow[col]
+            try:
+                v = float(v)
+            except Exception:
+                return float("nan")
+            return v if v == v else float("nan")
+
+        net_profit = g("net_profit")
+        total_assets = g("total_assets")
+        np_ly = g("net_profit_ly")
+        t_shares, f_shares, bps = g("total_shares"), g("float_a_shares"), g("bps")
+        row[("income", "net_profit")] = net_profit
+        row[("income", "np_parent_company_owners")] = g("np_parent_company_owners")
+        row[("income", "operating_revenue")] = g("operating_revenue")
+        row[("cash_flow", "subtotal_operate_cash_inflow")] = g("subtotal_operate_cash_inflow")
+        row[("indicator", "adjusted_profit")] = g("adjusted_profit")
+        roe = g("roe")
+        row[("indicator", "roe")] = roe
+        row[("indicator", "inc_return")] = roe
+        row[("indicator", "roa")] = (
+            net_profit / total_assets * 100.0
+            if total_assets == total_assets and total_assets
+            and net_profit == net_profit else float("nan"))
+        row[("indicator", "inc_net_profit_year_on_year")] = (
+            (net_profit / np_ly - 1.0) * 100.0
+            if np_ly == np_ly and np_ly and net_profit == net_profit else float("nan"))
+        mcap = t_shares * close / 1e8 if t_shares == t_shares and close == close else float("nan")
+        cmcap = f_shares * close / 1e8 if f_shares == f_shares and close == close else float("nan")
+        pb = close / bps if bps == bps and bps and close == close else float("nan")
+        row[("valuation", "market_cap")] = mcap
+        row[("valuation", "circulating_market_cap")] = cmcap
+        row[("valuation", "pb_ratio")] = pb
+        rows.append(row)
+
+    def keep(r):
+        for p in hard_preds:
+            if not p(r):
+                return False
+        for p in soft_preds:
+            if not p(r):
+                return False
+        return True
+
+    out_rows = [r for r in rows if keep(r)]
+
+    if q._order is not None:
+        e = q._order.expr
+
+        def key(r):
+            try:
+                v = float(e(r))
+            except Exception:
+                return (1, 0.0) if q._order.ascending else (-1, 0.0)
+            return ((0, v) if q._order.ascending else (0, -v)) if v == v else                    ((1, 0.0) if q._order.ascending else (-1, 0.0))
+        out_rows.sort(key=key)
+
+    if q._limit_n is not None:
+        out_rows = out_rows[:q._limit_n]
+
+    names, data = [], {}
+    for tab, col in q.selects:
+        name = col if tab != "sys" else "code"
+        if name in names:
+            continue
+        names.append(name)
+        data[name] = [r.get((tab, col), float("nan")) for r in out_rows]
+    return pd.DataFrame(data, columns=names)
+
 
 def run_daily(func, time=None, *args, **kwargs):
     """兼容聚宽 run_daily：支持 time='HH:MM' / 'before_trading' / 'every_bar'。
@@ -788,6 +1531,37 @@ class _SecurityData:
     @property
     def paused(self):
         return False
+
+    @property
+    def is_st(self):
+        """ST 判定：名称含 ST/*/退（_NAMES 缺名称时按非 ST，与 is_st_stock 同口径）。"""
+        return _is_st_name(self.code)
+
+    @property
+    def name(self):
+        return _NAMES.get(self.code, self.code)
+
+    @property
+    def display_name(self):
+        return self.name
+
+    @property
+    def day_open(self):
+        bar = self._bar
+        if bar is not None and getattr(bar, "open", None) == getattr(bar, "open", None):
+            try:
+                return float(bar.open)
+            except Exception:
+                pass
+        # 当日首根分钟 bar 的 open 兜底（日线 open 对盘中时刻即当日开盘价）
+        try:
+            env = Environment.get_instance()
+            b = env.data_proxy.get_bar(self.code, env.trading_dt, "1d")
+            if b is not None and b.open == b.open:
+                return float(b.open)
+        except Exception:
+            pass
+        return float("nan")
 
     @property
     def is_trading(self):
@@ -1759,6 +2533,13 @@ def _install_barcache_mod():
     def load_mod():
         class _JqBarCacheMod(AbstractMod):
             def start_up(self, env, mod_config):
+                import os as _os
+                if _os.getenv("JQ_SCHED_DEBUG"):
+                    logger.warning(
+                        "[sched-debug] barcache start_up: _DAILY_AT keys=%s counts=%s id(jqcompat)=%s",
+                        sorted(_DAILY_AT.keys()),
+                        {k: len(v) for k, v in _DAILY_AT.items()},
+                        id(sys.modules.get(__name__)))
                 # 日线频率（1d）下每天只有一根 BAR（15:00），按 (hour,minute)
                 # 匹配 bar 的分钟级调度无法覆盖盘前/盘中时刻。改为：
                 #   * 盘前桶 (9,31)（before_trading 及盘前时刻归并桶）在
@@ -1785,9 +2566,26 @@ def _install_barcache_mod():
                             try:
                                 cb(uctx)
                             except Exception as e:
+                                # 策略调度回调异常必须可见（rqalpha 会把 root
+                                # logging 压到 ERROR，warning 静默丢失）
+                                import os as _os, traceback as _tb
+                                if _os.getenv("JQ_QUIET_ERRORS") != "1":
+                                    print("daily_at(%s) 回调异常: %s" % (hm, e),
+                                          flush=True)
+                                    _tb.print_exc()
                                 logger.warning("daily_at(%s) 回调异常: %s", hm, e)
 
                 def _on_bar(event):
+                    import os as _os
+                    if _os.getenv("JQ_SCHED_DEBUG") and not getattr(
+                            self, "_sched_dumped", False):
+                        self._sched_dumped = True
+                        dt0 = getattr(env, "trading_dt", None)
+                        print("[sched-debug] first bar hm=",
+                              (getattr(dt0, "hour", None), getattr(dt0, "minute", None)),
+                              "keys=", sorted(_DAILY_AT.keys()),
+                              {k: [getattr(c, "__qualname__", "?") for c in v]
+                               for k, v in _DAILY_AT.items()}, flush=True)
                     _set_current_bar_dict(getattr(event, "bar_dict", None))
                     uctx = _make_uctx()
                     dt = getattr(env, "trading_dt", None)
@@ -1805,6 +2603,13 @@ def _install_barcache_mod():
                             try:
                                 cb(uctx)
                             except Exception as e:
+                                # 策略调度回调异常必须可见（rqalpha 会把 root
+                                # logging 压到 ERROR，warning 静默丢失）
+                                import os as _os, traceback as _tb
+                                if _os.getenv("JQ_QUIET_ERRORS") != "1":
+                                    print("daily_at(%s) 回调异常: %s" % (hm, e),
+                                          flush=True)
+                                    _tb.print_exc()
                                 logger.warning("daily_at(%s) 回调异常: %s", hm, e)
 
                 env.event_bus.add_listener(EVENT.BAR, _on_bar)
@@ -1839,6 +2644,9 @@ def _patch_rqalpha_objects():
     def _tpatch(cls):
         if cls is None:
             return
+        if not hasattr(cls, "security"):
+            # 聚宽 position.security = 标的代码（rqalpha 是 order_book_id）
+            cls.security = property(lambda self: self.order_book_id)
         if not hasattr(cls, "total_amount"):
             cls.total_amount = property(lambda self: self.long.quantity)
         if not hasattr(cls, "closeable_amount"):
@@ -1868,11 +2676,18 @@ def _patch_rqalpha_objects():
                 d = env.trading_dt.date()
                 idx = int(cal.searchsorted(pd.Timestamp(d)))
                 if idx > 0:
-                    return cal[idx - 1]
+                    prev = cal[idx - 1]
+                    # 聚宽语义：previous_date 是 datetime.date（策略做日期减法）
+                    return prev.date() if hasattr(prev, "date") else prev
             except Exception:
                 pass
             return env.trading_dt.date()
         StrategyContext.previous_date = property(_prev)
+
+    if not hasattr(StrategyContext, "run_params"):
+        class _RunParams:
+            type = "backtest"
+        StrategyContext.run_params = property(lambda self: _RunParams())
 
     # 让 context.universe 可读写（聚宽允许策略设置自己的 universe，rqalpha 只读）
     _orig_universe = getattr(StrategyContext, "universe", None)
@@ -1920,6 +2735,8 @@ def _register_jq_apis():
 
     _shims = [
         ("g", _GLOBAL_G),
+        ("datetime", _dt),  # 聚宽经 jqdata * 注入 datetime（策略常裸用 datetime.timedelta）
+        ("mean", np.mean),  # 聚宽全局 mean
         ("get_price", get_price),
         ("get_all_securities", get_all_securities),
         ("get_current_data", get_current_data),
@@ -1937,9 +2754,23 @@ def _register_jq_apis():
         ("record", record),
         ("run_daily", run_daily),
         ("run_minute", run_minute),
+        ("run_weekly", run_weekly),
+        ("run_monthly", run_monthly),
         ("log", _Log()),
         ("PriceRelatedSlippage", PriceRelatedSlippage),
         ("OrderCost", OrderCost),
+        ("FixedSlippage", FixedSlippage),
+        ("OrderStatus", OrderStatus),
+        ("order_target_value", order_target_value),
+        ("order_value", order_value),
+        ("order_shares", order_shares),
+        ("get_index_stocks", get_index_stocks),
+        ("get_fundamentals", get_fundamentals),
+        ("query", query),
+        ("valuation", VALUATION),
+        ("income", INCOME),
+        ("cash_flow", CASH_FLOW),
+        ("indicator", INDICATOR),
     ]
     _all_names = []
     for name, fn in _shims:
@@ -2021,6 +2852,10 @@ def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=N
     _DAILY_AT.clear()
     _FQ_WARNED.clear()  # fq 复权提示按回测重置（每次回测每标的重新提示一次）
     _CURRENT_BAR_DICT = None
+    reset_fundamentals_cache()
+    _SECURITY_INFO_CACHE.clear()
+    global _SLIPPAGE_OVERRIDE
+    _SLIPPAGE_OVERRIDE = None
 
     _register_jq_apis()
     _patch_rqalpha_objects()

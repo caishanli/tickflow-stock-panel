@@ -162,6 +162,13 @@ class StockDataClient:
             return pd.DataFrame()
         return pl.read_parquet(io.BytesIO(resp["d"])).to_pandas()
 
+    def get_financials(self) -> pd.DataFrame:
+        """全量季频财务长表（symbol/stat_date/visible_from + 财务列）。"""
+        resp = self._request("get_financials", {})
+        if resp["t"] != "parquet" or not resp["d"]:
+            return pd.DataFrame()
+        return pl.read_parquet(io.BytesIO(resp["d"])).to_pandas()
+
     def get_etf_nav(self, codes, date=None) -> dict[str, pd.DataFrame]:
         resp = self._request("get_etf_nav", {
             "security": codes, "date": date,
@@ -181,6 +188,12 @@ class StockDataClient:
 
     def get_security_info(self, code) -> dict:
         return self._request("get_security_info", {"code": code})["d"]
+
+    def get_security_infos(self, codes=None) -> dict:
+        """批量元数据 {symbol: {name, start_date, type}}（codes=None 返回全部）。"""
+        return self._request(
+            "get_security_infos",
+            {"codes": [str(c) for c in codes] if codes else None})["d"] or {}
 
     def get_index_stocks(self, index_code, date=None) -> list[str]:
         return self._request("get_index_stocks", {"index_code": index_code, "date": date})["d"]
