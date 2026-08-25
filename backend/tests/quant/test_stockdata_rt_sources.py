@@ -2,6 +2,7 @@
 """rt_sources 单测：解析层纯文本 fixture（2026-08-25 收盘后实测录制）。"""
 import datetime as _dt
 
+import polars as pl
 import pytest
 
 from app.services.stockdata.rt_sources import (
@@ -131,3 +132,101 @@ def test_source_fetch_network_error_returns_empty(monkeypatch):
     t = TencentRTSource()
     t._session = BoomSession()
     assert t.fetch(["600000.SH"]) == {}
+
+
+def _q(sym, price, cum_vol, cum_amt, ts):
+    return RTQuote(symbol=sym, price=price, prev_close=price, open_=price,
+                   high=price, low=price, cum_volume=cum_vol,
+                   cum_amount=cum_amt, quote_time=ts)
+
+
+def test_synthesizer_same_minute_updates_hlc():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    t0 = _dt.datetime(2026, 8, 25, 10, 0, 30)
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.0, 100_000, 900_000, t0)})
+    assert len(frames) == 1
+    df = frames[0]
+    assert df["close"].to_list() == [9.0]
+    assert df["datetime"].to_list() == [_dt.datetime(2026, 8, 25, 10, 0)]
+    # 首拍无基线：量额记 0
+    assert df["volume"].to_list() == [0]
+    # 同分钟第二拍：high/low/close 更新、量额差分
+    t1 = _dt.datetime(2026, 8, 25, 10, 0, 50)
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.2, 150_000, 1_380_000, t1)})
+    df = frames[0]
+    row = df.to_dicts()[0]
+    assert row["open"] == 9.0 and row["high"] == 9.2 and row["low"] == 9.0
+    assert row["close"] == 9.2
+    assert row["volume"] == pytest.approx(50_000)       # 差分
+    assert row["amount"] == pytest.approx(480_000)
+
+
+def test_synthesizer_minute_rollover_opens_new_bar():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    syn.update({"600000.SH": _q("600000.SH", 9.0, 100_000, 900_000,
+                                _dt.datetime(2026, 8, 25, 10, 0, 30))})
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.1, 160_000, 1_450_000,
+                                         _dt.datetime(2026, 8, 25, 10, 1, 5))})
+    df = frames[0]
+    # 返回帧 = 封口旧 bar(10:00) + 新 bar(10:01)，调用方按 (symbol,datetime) upsert
+    assert sorted(df["datetime"].to_list()) == [
+        _dt.datetime(2026, 8, 25, 10, 0), _dt.datetime(2026, 8, 25, 10, 1)]
+    new_row = df.filter(pl.col("datetime") == _dt.datetime(2026, 8, 25, 10, 1)
+                        ).to_dicts()[0]
+    assert new_row["open"] == 9.0                        # 上一拍价格开 bar
+    assert new_row["volume"] == pytest.approx(60_000)
+
+
+def test_synthesizer_negative_delta_clamps_zero():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+
+    def latest_volume(df):
+        return df.sort("datetime")["volume"].to_list()[-1]
+
+    syn = BarSynthesizer()
+    syn.update({"600000.SH": _q("600000.SH", 9.0, 500_000, 4_500_000,
+                                _dt.datetime(2026, 8, 25, 10, 0))})
+    # 累计量回落（源重置）：clamp 0 并以本次值重建基线
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.1, 100_000, 900_000,
+                                         _dt.datetime(2026, 8, 25, 10, 1))})
+    assert latest_volume(frames[0]) == 0
+    # 下一拍基于新基线正常差分
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.2, 130_000, 1_170_000,
+                                         _dt.datetime(2026, 8, 25, 10, 2))})
+    assert latest_volume(frames[0]) == pytest.approx(30_000)
+
+
+def test_synthesizer_multi_symbol_frames():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    ts = _dt.datetime(2026, 8, 25, 10, 0)
+    frames = syn.update({
+        "600000.SH": _q("600000.SH", 9.0, 100_000, 900_000, ts),
+        "000001.SZ": _q("000001.SZ", 11.5, 200_000, 2_300_000, ts),
+    })
+    df = pl.concat(frames)
+    assert sorted(df["symbol"].to_list()) == ["000001.SZ", "600000.SH"]
+
+
+def test_synthesizer_reset_if_new_day():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    syn.update({"600000.SH": _q("600000.SH", 9.0, 500_000, 4_500_000,
+                                _dt.datetime(2026, 8, 25, 15, 0))})
+    syn.reset_if_new_day(_dt.date(2026, 8, 26))
+    # 新交易日：首拍重新零基线（旧累计量不会产生巨额差分）
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.0, 80_000, 720_000,
+                                         _dt.datetime(2026, 8, 26, 9, 31))})
+    assert frames[0]["volume"].to_list() == [0]
+    assert frames[0]["datetime"].to_list() == [_dt.datetime(2026, 8, 26, 9, 31)]
+
+
+def test_synthesizer_last_quote_time():
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    assert syn.last_quote_time("600000.SH") is None
+    syn.update({"600000.SH": _q("600000.SH", 9.0, 100, 900,
+                                _dt.datetime(2026, 8, 25, 10, 0, 17))})
+    assert syn.last_quote_time("600000.SH") == _dt.datetime(2026, 8, 25, 10, 0, 17)

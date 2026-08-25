@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import ClassVar
 
+import polars as pl
 import requests
 
 logger = logging.getLogger("app.services.stockdata.rt_sources")
@@ -154,3 +155,107 @@ class SinaRTSource(_HttpSource):
     _url = _SINA_URL
     _parser = staticmethod(parse_sina_payload)
     _headers: ClassVar[dict[str, str]] = {**_UA, "Referer": "https://finance.sina.com.cn"}
+
+
+_MINUTE_COLS = ["symbol", "datetime", "open", "high", "low", "close",
+                "volume", "amount"]
+
+
+class _SymState:
+    __slots__ = ("amt", "bar_dt", "c", "h", "l",
+                 "last_amt", "last_price", "last_vol", "o", "v")
+
+    def __init__(self) -> None:
+        self.last_price = 0.0
+        self.last_vol = 0.0
+        self.last_amt = 0.0
+        self.bar_dt: _dt.datetime | None = None
+        self.o = self.h = self.l = self.c = 0.0
+        self.v = self.amt = 0.0
+
+
+def _floor_minute(ts: _dt.datetime) -> _dt.datetime:
+    return ts.replace(second=0, microsecond=0)
+
+
+class BarSynthesizer:
+    """连续快照 → 分钟 bar（线程安全；per-symbol 状态仅 watchlist 规模内存）。
+
+    update 返回：本次封口的历史 bar 行 + 各标的当前分钟 bar 最新整行。
+    调用方按 (symbol, datetime) upsert 幂等合并。
+    """
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self._state: dict[str, _SymState] = {}
+        self._quote_ts: dict[str, _dt.datetime] = {}
+        self._day: _dt.date = _dt.date.today()
+
+    def reset_if_new_day(self, day: _dt.date) -> None:
+        with self._lock:
+            if day != self._day:
+                self._state.clear()
+                self._quote_ts.clear()
+                self._day = day
+
+    def last_quote_time(self, symbol: str) -> _dt.datetime | None:
+        with self._lock:
+            return self._quote_ts.get(symbol)
+
+    def update(self, quotes: dict[str, RTQuote],
+               now: _dt.datetime | None = None) -> list[pl.DataFrame]:
+        now = now or _dt.datetime.now()
+        done_rows: list[tuple] = []      # 跨分钟封口的旧 bar
+        cur_rows: list[tuple] = []       # 每标的当前 bar 最新整行
+        with self._lock:
+            for sym, q in quotes.items():
+                if q.price <= 0:
+                    continue
+                st = self._state.get(sym)
+                if st is None:
+                    st = _SymState()
+                    self._state[sym] = st
+                has_bar = st.bar_dt is not None
+                dv = max(q.cum_volume - st.last_vol, 0.0) if has_bar else 0.0
+                da = max(q.cum_amount - st.last_amt, 0.0) if has_bar else 0.0
+                bar_dt = _floor_minute(q.quote_time or now)
+                if not has_bar:
+                    # 首拍：只建价格 bar，量额记 0（保守不虚增）
+                    st.o = st.h = st.l = st.c = q.price
+                    st.v = st.amt = 0.0
+                    st.bar_dt = bar_dt
+                elif bar_dt != st.bar_dt:
+                    # 封口旧 bar → done；开新 bar：上一拍价格开盘
+                    done_rows.append((sym, st.bar_dt, st.o, st.h, st.l,
+                                      st.c, st.v, st.amt))
+                    st.o = st.c
+                    st.h = max(st.c, q.price)
+                    st.l = min(st.c, q.price)
+                    st.c = q.price
+                    st.v = dv
+                    st.amt = da
+                    st.bar_dt = bar_dt
+                else:
+                    st.h = max(st.h, q.price)
+                    st.l = min(st.l, q.price)
+                    st.c = q.price
+                    st.v += dv
+                    st.amt += da
+                st.last_price = q.price
+                st.last_vol = q.cum_volume
+                st.last_amt = q.cum_amount
+                self._quote_ts[sym] = q.quote_time or now
+                cur_rows.append((sym, st.bar_dt, st.o, st.h, st.l,
+                                 st.c, st.v, st.amt))
+        if not cur_rows and not done_rows:
+            return []
+        all_rows = done_rows + cur_rows
+        cols = list(zip(*all_rows, strict=True))
+        df = pl.DataFrame({
+            "symbol": list(cols[0]), "datetime": list(cols[1]),
+            "open": list(cols[2]), "high": list(cols[3]), "low": list(cols[4]),
+            "close": list(cols[5]), "volume": list(cols[6]),
+            "amount": list(cols[7]),
+        }, schema_overrides={"datetime": pl.Datetime("us")})
+        return [df]
