@@ -790,6 +790,7 @@ def test_bootstrap_once_per_day(monkeypatch):
         assert n_after_first >= 1           # 第一轮自举发生
         p.fetch_many(["600000.XSHG"])       # 结果缓存命中 → 不再自举
         assert len(src_obj.calls) == n_after_first
+```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
