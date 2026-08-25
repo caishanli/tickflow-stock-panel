@@ -193,3 +193,19 @@ def test_base_position_has_ptrade_aliases():
     assert p.enable_amount == 100
     assert p.cost_basis == 3.0
     assert p.last_sale_price == 3.1
+
+
+def test_get_stock_status_never_halted_on_snapshot_absence():
+    """快照缺价不得推断为停牌（2026-08-25 960366ab 159502 全天停牌误判回归）。
+
+    实时回源瞬态失败/服务重启清内存 → minute_prices 缺该码，旧实现据此返回
+    True，叠加策略 _HALT_CACHE 按日黏住导致当天全部交易被跳过；且 jq 引擎
+    paused 恒 False，两侧行为不对称。现本地恒 False（真机仍由交易所应答）。
+    """
+    api = _fresh_api()
+    api._state["minute_prices"] = {}  # 快照全空：旧实现会把所有码判成停牌
+    out = api.get_stock_status(["159502.SZ", "511880.SS"], query_type="HALT")
+    assert out == {"159502.SZ": False, "511880.SS": False}
+    assert api.get_stock_status("510300.SS") == {"510300.SS": False}
+    # 其余 query_type 同样恒 False（本地无权威停牌源）
+    assert api.get_stock_status(["510300.SS"], query_type="ST") == {"510300.SS": False}
