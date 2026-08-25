@@ -1451,6 +1451,126 @@ def run_jq_backtest(strategy_path: str, params: dict,
             pass
 
 
+def _jq_account_stop_source(stop_loss: float) -> str:
+    """jq 桥账户级止损层注入源码（口径对齐模拟盘 Matcher：成本×(1-stop_loss)）。
+
+    任一持仓现价 ≤ 成本×(1-stop_loss) 即卖出全部可卖股数；stop_loss≤0 返回空
+    （关闭）。经 run_daily(every_bar) 触发——barcache mod 的 EVENT.BAR 监听注册
+    早于策略 handle_bar，故每根 bar 先于策略回调执行。与 _pt_account_stop_source
+    必须保持同层同口径，否则两语言层回测对齐门禁失配。
+    """
+    if stop_loss <= 0:
+        return ""
+    return (
+        "\n\n# ==== [bridge] 账户级止损注入（对齐模拟盘 Matcher 口径）====\n"
+        f"_ACCOUNT_STOP_LOSS = {stop_loss!r}\n"
+        "_ACCOUNT_STOP_ERR = set()\n"
+        "\n"
+        "def _account_stop_tick(context):\n"
+        "    # 动态解析下单函数：every_bar 可能被两条调度路径执行，其中一条的\n"
+        "    # 命名空间不含 rqalpha 注入的 API（NameError 曾被静默吞掉）。\n"
+        "    try:\n"
+        "        from rqalpha.api import order as _order\n"
+        "    except Exception as _ie:\n"
+        "        log.warning('账户止损不可用: {}'.format(_ie))\n"
+        "        return\n"
+        "    _cd = get_current_data()\n"
+        "    for _code in list(context.portfolio.positions.keys()):\n"
+        "        _pos = context.portfolio.positions[_code]\n"
+        "        try:\n"
+        "            if _pos.total_amount <= 0 or getattr(_pos, 'closeable_amount', 0) <= 0:\n"
+        "                continue\n"
+        "            _px = _cd[_code].last_price\n"
+        "            if not _px or not _pos.avg_cost:\n"
+        "                continue\n"
+        "            if _px <= _pos.avg_cost * (1 - _ACCOUNT_STOP_LOSS):\n"
+        "                log.info('🚨 【账户止损】{0} 触发-{1:.0%}止损，卖出 {2} 股 @{3}'.format(\n"
+        "                    _code, _ACCOUNT_STOP_LOSS, int(_pos.closeable_amount), _px))\n"
+        "                _order(_code, -int(_pos.closeable_amount))\n"
+        "        except Exception as _e:\n"
+        "            if ('stoperr', _code) not in _ACCOUNT_STOP_ERR:\n"
+        "                _ACCOUNT_STOP_ERR.add(('stoperr', _code))\n"
+        "                log.warning('账户止损下单异常 {0}: {1!r}'.format(_code, _e))\n"
+        "\n"
+        "run_daily(_account_stop_tick, time='every_bar')\n"
+    )
+
+
+def _pt_account_stop_source(stop_loss: float) -> str:
+    """ptrade 桥账户级止损层注入源码（与 _jq_account_stop_source 同层同口径）。
+
+    与 jq 变体差异仅在价格源与触发时机：
+    - 价格：ptradecompat 无 get_current_data，改读 event.bar_dict[code].close
+      （rqalpha 原生 BarObject，与持仓同为 JQ 码域）；
+    - 触发：在策略模块顶层自注册 EVENT.BAR user=False 监听——rqalpha 先执行
+      策略模块、后创建 Strategy 注册 handle_bar（main.py load→Strategy），
+      故该监听同样先于策略每根 bar 执行，与 jq 桥 every_bar 同序。
+    """
+    if stop_loss <= 0:
+        return ""
+    return (
+        "\n\n# ==== [bridge] 账户级止损注入（对齐模拟盘 Matcher 口径，ptrade 变体）====\n"
+        f"_ACCOUNT_STOP_LOSS = {stop_loss!r}\n"
+        "_ACCOUNT_STOP_ERR = set()\n"
+        "\n"
+        "def _account_stop_sell(context, _order, _code, _px):\n"
+        "    _pos = context.portfolio.positions[_code]\n"
+        "    log.info('🚨 【账户止损】{0} 触发-{1:.0%}止损，卖出 {2} 股 @{3}'.format(\n"
+        "        _code, _ACCOUNT_STOP_LOSS, int(_pos.closeable_amount), _px))\n"
+        "    _order(_code, -int(_pos.closeable_amount))\n"
+        "\n"
+        "def _account_stop_tick(context, bar_dict):\n"
+        "    # 动态解析下单函数：命名空间可能不含 rqalpha 注入的 API（NameError\n"
+        "    # 曾被静默吞掉）。\n"
+        "    try:\n"
+        "        from rqalpha.api import order as _order\n"
+        "    except Exception as _ie:\n"
+        "        log.warning('账户止损不可用: {}'.format(_ie))\n"
+        "        return\n"
+        "    for _code in list(context.portfolio.positions.keys()):\n"
+        "        _pos = context.portfolio.positions[_code]\n"
+        "        try:\n"
+        "            if _pos.total_amount <= 0 or getattr(_pos, 'closeable_amount', 0) <= 0:\n"
+        "                continue\n"
+        "            _bar = None\n"
+        "            if bar_dict is not None:\n"
+        "                try:\n"
+        "                    _bar = bar_dict[_code]\n"
+        "                except Exception:\n"
+        "                    _bar = getattr(bar_dict, _code, None)\n"
+        "            _px = getattr(_bar, 'close', None)\n"
+        "            if not _px or not _pos.avg_cost:\n"
+        "                continue\n"
+        "            if _px <= _pos.avg_cost * (1 - _ACCOUNT_STOP_LOSS):\n"
+        "                _account_stop_sell(context, _order, _code, _px)\n"
+        "        except Exception as _e:\n"
+        "            if ('stoperr', _code) not in _ACCOUNT_STOP_ERR:\n"
+        "                _ACCOUNT_STOP_ERR.add(('stoperr', _code))\n"
+        "                log.warning('账户止损下单异常 {0}: {1!r}'.format(_code, _e))\n"
+        "\n"
+        "def _account_stop_install():\n"
+        "    try:\n"
+        "        from rqalpha.core.events import EVENT\n"
+        "        from rqalpha.environment import Environment\n"
+        "\n"
+        "        def _on_bar(event):\n"
+        "            _ctx = getattr(getattr(Environment.get_instance(), 'user_strategy',\n"
+        "                                   None), 'user_context', None)\n"
+        "            if _ctx is not None:\n"
+        "                _account_stop_tick(_ctx, getattr(event, 'bar_dict', None))\n"
+        "\n"
+        "        Environment.get_instance().event_bus.add_listener(EVENT.BAR, _on_bar)\n"
+        "    except Exception as _ie:\n"
+        "        log.warning('账户止损注册失败: {}'.format(_ie))\n"
+        "\n"
+        "try:\n"
+        "    _account_stop_install()\n"
+        "except Exception as _ie:\n"
+        "    # 注入层自身故障不允许阻断策略加载（log 由兼容层提供，裸命名空间无）\n"
+        "    pass\n"
+    )
+
+
 def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
                            max_universe=None, strategy_path=""):
     """run_jq_backtest 主体（独立成函数，便于上层用 try/finally 恢复 dm._offline）。"""
@@ -1542,42 +1662,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     # 此前回测引擎缺这层，亏损单拖到策略内 -5% 止损才离场，系统性低估实盘
     # 表现（2026-08-22 排查：短窗基线回测 +4.37% vs 实盘 +17.5% 的最大分歧源）。
     # params["stop_loss"] 缺省 0.03 与 sim_accounts.stop_loss 默认一致；显式传 0 可关闭。
-    _acct_stop = float(params.get("stop_loss", 0.03) or 0)
-    if _acct_stop > 0:
-        # 卖出用 rqalpha 原生 order_shares（负数=卖出）；引擎无裸 order_target
-        strategy_code += (
-            "\n\n# ==== [bridge] 账户级止损注入（对齐模拟盘 Matcher 口径）====\n"
-            f"_ACCOUNT_STOP_LOSS = {_acct_stop!r}\n"
-            "_ACCOUNT_STOP_ERR = set()\n"
-            "\n"
-            "def _account_stop_tick(context):\n"
-            "    # 动态解析下单函数：every_bar 可能被两条调度路径执行，其中一条的\n"
-            "    # 命名空间不含 rqalpha 注入的 API（NameError 曾被静默吞掉）。\n"
-            "    try:\n"
-            "        from rqalpha.api import order as _order\n"
-            "    except Exception as _ie:\n"
-            "        log.warning('账户止损不可用: {}'.format(_ie))\n"
-            "        return\n"
-            "    _cd = get_current_data()\n"
-            "    for _code in list(context.portfolio.positions.keys()):\n"
-            "        _pos = context.portfolio.positions[_code]\n"
-            "        try:\n"
-            "            if _pos.total_amount <= 0 or getattr(_pos, 'closeable_amount', 0) <= 0:\n"
-            "                continue\n"
-            "            _px = _cd[_code].last_price\n"
-            "            if not _px or not _pos.avg_cost:\n"
-            "                continue\n"
-            "            if _px <= _pos.avg_cost * (1 - _ACCOUNT_STOP_LOSS):\n"
-            "                log.info('🚨 【账户止损】{0} 触发-{1:.0%}止损，卖出 {2} 股 @{3}'.format(\n"
-            "                    _code, _ACCOUNT_STOP_LOSS, int(_pos.closeable_amount), _px))\n"
-            "                _order(_code, -int(_pos.closeable_amount))\n"
-            "        except Exception as _e:\n"
-            "            if ('stoperr', _code) not in _ACCOUNT_STOP_ERR:\n"
-            "                _ACCOUNT_STOP_ERR.add(('stoperr', _code))\n"
-            "                log.warning('账户止损下单异常 {0}: {1!r}'.format(_code, _e))\n"
-            "\n"
-            "run_daily(_account_stop_tick, time='every_bar')\n"
-        )
+    strategy_code += _jq_account_stop_source(float(params.get("stop_loss", 0.03) or 0))
 
     config = {
         "base": {
@@ -1955,6 +2040,13 @@ def _run_ptrade_backtest_inner(dm, strategy_text, params, benchmark, start, end,
                          list_dates=etf_list_dates, market_codes=etf_universe)
 
     strategy_code = _ptrade_rewrite_source(strategy_text)
+
+    # ---- 账户级止损层注入（与 jq 桥同口径同层；缺省 0.03，传 0 关闭）----
+    # 08-25 补齐：此前仅 jq 桥有这层，两语言层回测对齐门禁
+    # （test_ptrade_vs_jq_alignment / test_70978ed5_ptrade_alignment）必失配。
+    _acct_stop = float(params.get("stop_loss", 0.03) or 0)
+    if _acct_stop > 0:
+        strategy_code += _pt_account_stop_source(_acct_stop)
 
     config = {
         "base": {

@@ -432,3 +432,48 @@ def test_ptrade_rewrite_source_after_trading_signature_adaptive():
     ns["after_trading_end"] = lambda context, data: calls.append(("ate2", context, data))
     ns["after_trading"](ctx)
     assert calls == [("ate2", ctx, None)]
+
+
+# ---------------------------------------------------------------------------
+# 账户级止损层注入（jq/ptrade 桥同层同口径；08-25 补齐 ptrade 变体）
+# ---------------------------------------------------------------------------
+
+def test_jq_account_stop_source():
+    src = bridge._jq_account_stop_source(0.03)
+    assert src.startswith("\n\n# ====[bridge]") or "账户级止损注入" in src
+    assert "_ACCOUNT_STOP_LOSS = 0.03" in src
+    assert "run_daily(_account_stop_tick, time='every_bar')" in src
+    assert "get_current_data()" in src
+    compile(src, "<jq_stop>", "exec")          # 注入片段必须可编译
+
+
+def test_pt_account_stop_source():
+    src = bridge._pt_account_stop_source(0.05)
+    assert "_ACCOUNT_STOP_LOSS = 0.05" in src
+    # 自注册 EVENT.BAR 监听（先于策略 handle_bar，与 jq 桥 every_bar 同序）
+    assert "event_bus.add_listener(EVENT.BAR, _on_bar)" in src
+    assert "_account_stop_install()" in src
+    assert "get_current_data" not in src        # compat 无该 API，价格走 bar_dict
+    compile(src, "<pt_stop>", "exec")
+
+
+def test_account_stop_source_disabled():
+    assert bridge._jq_account_stop_source(0) == ""
+    assert bridge._jq_account_stop_source(0.0) == ""
+    assert bridge._pt_account_stop_source(0) == ""
+
+
+def test_pt_rewrite_plus_account_stop_compiles():
+    """ptrade 改写 + 止损注入组合后整体可编译、钩子与止损层共存。"""
+    code = (
+        "def initialize(context):\n"
+        "    pass\n"
+        "\n"
+        "def handle_data(context, data):\n"
+        "    pass\n"
+    )
+    out = bridge._ptrade_rewrite_source(code)
+    out += bridge._pt_account_stop_source(0.03)
+    ns: dict = {}
+    exec(compile(out, "<strategy+stop>", "exec"), ns)
+    assert callable(ns["_account_stop_tick"])
