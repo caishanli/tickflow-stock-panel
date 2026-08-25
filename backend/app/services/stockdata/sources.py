@@ -316,7 +316,11 @@ class NetworkPuller:
             # ② 冷启动自举：交易时段、无任何当日记录的标的，mootdx 拉「今日迄今」一次
             for tf in list(todo):
                 if self._bootstrap_needed(tf):
-                    frame = self._pull_mootdx_one(tf)
+                    try:
+                        frame = self._pull_mootdx_one(tf)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[sources] %s 自举失败(非超时): %s", tf, e)
+                        frame = None
                     self._bootstrapped.add(tf)
                     if frame is not None and not frame.is_empty():
                         out[tf] = frame

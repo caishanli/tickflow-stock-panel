@@ -380,3 +380,43 @@ def test_bootstrap_once_per_day(monkeypatch):
         assert n_after_first >= 1           # 第一轮自举发生
         p.fetch_many(["600000.XSHG"])       # 结果缓存命中 → 不再自举
         assert len(src_obj.calls) == n_after_first
+
+
+def test_bootstrap_non_timeout_error_contained(monkeypatch):
+    """自举期非超时异常不得炸掉整个 fetch_many（对齐旧池路径的逐只容错）。"""
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    monkeypatch.delenv("STOCKDATA_RT_SOURCE", raising=False)
+    ts = _dt.datetime.now().replace(second=0, microsecond=0)
+    ok = _q("600000.SH", 9.0, 100_000, 900_000, ts)
+
+    class MalformedFrameSrc:
+        """get_minute_recent 返回畸形帧（index 名与数据列 'open' 同名）：
+        _pull_recent_guarded 不拦（返回的是帧），转换层 reset_index 抛
+        ValueError——这正是会逃出 _pull_mootdx_one 的非超时异常路径。"""
+
+        def __init__(self):
+            self.calls = []
+
+        def get_minute_recent(self, code, pages=1):
+            import pandas as pd
+            self.calls.append(code)
+            df = pd.DataFrame(
+                {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+                 "vol": [100.0], "amount": [100.0]},
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp(f"{_dt.date.today().isoformat()} 09:31:00")]),
+            )
+            df.index.name = "open"         # 构造合法；reset_index() → ValueError
+            return df
+
+    p = NetworkPuller(factory=lambda: MalformedFrameSrc(), workers=1)
+    try:
+        monkeypatch.setattr(p, "tencent", type("T", (), {
+            "fetch": staticmethod(lambda syms: {"600000.SH": ok}),
+            "close": staticmethod(lambda: None)})())
+        frames = p.fetch_many(["600000.XSHG"])   # 自举炸(非超时) → 腾讯接住
+        assert frames and frames[0]["symbol"][0] == "600000.SH"
+        assert p._source().calls == ["600000.SH"]     # 自举确实尝试过且只一次
+    finally:
+        p.shutdown()
