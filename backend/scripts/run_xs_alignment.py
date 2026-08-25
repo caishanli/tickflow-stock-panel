@@ -9,8 +9,8 @@ from app.quant import db
 PARAMS = {
     "name": "大小外择时小市值3.0-本地对齐",
     "strategy_id": "f51e08f9",
-    "start": "2026-04-01",
-    "end": "2026-08-21",
+    "start": sys.argv[1] if len(sys.argv) > 1 else "2026-04-01",
+    "end": sys.argv[2] if len(sys.argv) > 2 else "2026-08-21",
     "frequency": "1m",
     "capital": 1000000.0,
     "fee": 0.0003,

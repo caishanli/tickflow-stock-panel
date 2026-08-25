@@ -22,6 +22,13 @@ WIN = (dt.date(2026, 4, 1), dt.date(2026, 8, 21))
 def load_local_trades(run_id):
     con = sqlite3.connect("/home/caisl/tickflow-stock-panel/data/quant.db")
     con.row_factory = sqlite3.Row
+    pj = con.execute("SELECT params_json FROM backtest_runs WHERE id=?",
+                     (run_id,)).fetchone()
+    if pj:
+        p = json.loads(pj["params_json"])
+        global WIN
+        WIN = (dt.date.fromisoformat(p["start"]), dt.date.fromisoformat(p["end"]))
+        print(f"窗口(run 参数): {WIN[0]} ~ {WIN[1]}")
     rows = con.execute(
         "SELECT * FROM backtest_trades WHERE run_id=?", (run_id,)).fetchall()
     out = []

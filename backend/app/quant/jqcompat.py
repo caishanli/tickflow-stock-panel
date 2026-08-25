@@ -594,8 +594,14 @@ def history(count=None, unit="1d", field="avg", security_list=None, df=True,
         if "time" in out.columns:
             out = out.set_index("time")
         frames[code] = out[fields]
-    if not frames:
-        return pd.DataFrame(columns=codes if len(fields) == 1 else None)
+    # 无数据的标的补一行 NaN：调用方 last_prices[code][-1] 取到 NaN 而
+    # 非空序列越界崩溃（等价聚宽 fill_paused 的容错语义）
+    ref_ts = pd.Index([pd.Timestamp(getattr(env, "trading_dt", _dt.datetime.now()))])
+    for code in codes:
+        g = frames.get(code)
+        if g is None or getattr(g, "empty", True):
+            frames[code] = pd.DataFrame({f: [np.nan] for f in fields},
+                                        index=ref_ts)
     if len(fields) == 1:
         # 单字段：列=代码（聚宽口径）；无数据标的补 NaN 列
         wide = pd.DataFrame({c: g[fields[0]] for c, g in frames.items()})
@@ -1260,9 +1266,44 @@ def _load_financials_cached():
     return df
 
 
+_SHARE_EVENTS_CACHE = None  # {bare_sym: [(exdate_int, hou_zgb_wan, pan_hou_lt_wan), ...]}
+
+
+def _load_share_events_cached():
+    """mootdx xdxr category-5 股本变化时间线（data/pools/stock_xdxr_events.parquet）。
+
+    返回 {裸6位码: [(exdate, houzongguben万股, panhouliutong万股), ...]} 按 exdate 升序；
+    文件缺失返回空 dict。
+    """
+    global _SHARE_EVENTS_CACHE
+    if _SHARE_EVENTS_CACHE is not None:
+        return _SHARE_EVENTS_CACHE
+    out: dict = {}
+    try:
+        import polars as pl
+        from app.services.tdx_financials import DATA_ROOT as _DATA_ROOT
+        f = _DATA_ROOT / "pools" / "stock_xdxr_events.parquet"
+        df = pl.read_parquet(f).filter(pl.col("category") == 5)
+        for sym, exdate, hz, plt_ in zip(
+                df["symbol"], df["exdate"], df["houzongguben"],
+                df["panhouliutong"]):
+            if plt_ is None or plt_ != plt_ or plt_ <= 0:
+                continue
+            out.setdefault(str(sym), []).append(
+                (int(exdate), float(hz) if hz == hz else None, float(plt_)))
+        for v in out.values():
+            v.sort(key=lambda t: t[0])
+    except Exception:
+        out = {}
+    _SHARE_EVENTS_CACHE = out
+    return out
+
+
 def reset_fundamentals_cache():
     global _FINANCIALS_CACHE
     _FINANCIALS_CACHE = None
+    global _SHARE_EVENTS_CACHE
+    _SHARE_EVENTS_CACHE = None
     _INDEX_STOCKS_CACHE.clear()
 
 
@@ -1326,6 +1367,21 @@ def get_fundamentals(q: _FinQuery, date=None):
         total_assets = g("total_assets")
         np_ly = g("net_profit_ly")
         t_shares, f_shares, bps = g("total_shares"), g("float_a_shares"), g("bps")
+        # 流通股本用 mootdx xdxr 股本变化事件(panhouliutong, 锚点日前最后一笔)：
+        # 解禁/送转使真实流通盘频繁变动，TDX 季报流通数滞后。总股本仍用季报
+        # （xdxr 同时覆盖总+流通的实验已证伪：总股本事件日期语义混杂，
+        # 收益保真度 -0.03pp→-0.67pp，见 git 历史 ae08a15 前后）。
+        try:
+            ev = _load_share_events_cached().get(sym.split(".")[0])
+            if ev:
+                anchor_int = int(anchor.strftime("%Y%m%d"))
+                prev = [e for e in ev if e[0] <= anchor_int]
+                if prev:
+                    phl = prev[-1][2]
+                    if phl:
+                        f_shares = phl * 1e4  # 万股 → 股
+        except Exception:
+            pass
         row[("income", "net_profit")] = net_profit
         row[("income", "np_parent_company_owners")] = g("np_parent_company_owners")
         row[("income", "operating_revenue")] = g("operating_revenue")
