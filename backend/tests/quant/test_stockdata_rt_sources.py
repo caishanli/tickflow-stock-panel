@@ -266,6 +266,9 @@ def _mk_puller(monkeypatch, tencent_quotes=None, sina_quotes=None,
     if forced:
         # monkeypatch 自动还原，测试间不泄漏 STOCKDATA_RT_SOURCE
         monkeypatch.setenv("STOCKDATA_RT_SOURCE", forced)
+    else:
+        # 隔离环境变量：ambient shell 的 STOCKDATA_RT_SOURCE 不得翻转测试行为
+        monkeypatch.delenv("STOCKDATA_RT_SOURCE", raising=False)
 
     class FakeSrc:
         def __init__(self):

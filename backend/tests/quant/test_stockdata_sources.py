@@ -471,3 +471,46 @@ def test_get_adj_factors_cached(tmp_path):
         assert got2["symbol"].to_list() == ["512670.SH"]
     finally:
         os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_realtime_stale_gate_configurable(tmp_path, monkeypatch):
+    """陈旧门槛 STOCKDATA_RT_STALE_SEC：默认 10s；合成器快照时间可豁免陈旧。"""
+    import datetime as dt
+    import os
+
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=lambda: type(
+        "S", (), {"get_minute_recent": staticmethod(
+            lambda c, pages=1: __import__("pandas").DataFrame())}),
+        fetch_workers=1)
+    try:
+        monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                            lambda *a, **k: True)
+        # 内存库放一根 20s 前的 bar：默认 10s 门槛 → 判陈旧 → todo 含该标的
+        now = dt.datetime.now()
+        old_bar = pl.DataFrame({
+            "symbol": ["600000.SH"],
+            "datetime": [now - dt.timedelta(seconds=20)],
+            "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+            "volume": [0.0], "amount": [0.0]})
+        s.minute_store.update(dt.date.today().isoformat(), old_bar)
+        pulled = []
+
+        def fake_fetch_many(codes):
+            pulled.extend(codes)
+            return []
+
+        monkeypatch.setattr(s.puller, "fetch_many", fake_fetch_many)
+        s.get_realtime_snapshot(["600000.XSHG"])
+        assert pulled == ["600000.XSHG"]        # 20s > 10s → 判陈旧触发回源
+        # 但合成器刚见过快照（1s 前）→ 即使 bar 是旧的也不算陈旧
+        pulled.clear()
+        fake_qt = now - dt.timedelta(seconds=1)
+        monkeypatch.setattr(
+            s.puller.synth, "last_quote_time",
+            lambda sym, _t=fake_qt: _t)
+        s.get_realtime_snapshot(["600000.XSHG"])
+        assert pulled == []                     # 快照新鲜豁免
+    finally:
+        s.puller.shutdown()
+        os.environ.pop("PARTITION_DATA_ROOT", None)

@@ -608,13 +608,25 @@ class DataSources:
             if base_parts else pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
 
         # 未覆盖：内存缺失，或内存最新 bar < asof（过期）。指数跳过。非交易时段不拉。
+        # 陈旧阈值可调（STOCKDATA_RT_STALE_SEC，默认 10s）；合成器快照新鲜可豁免
+        # （bar 时间旧但刚收到实时快照 → 合成 bar 已足够新，不重复回源）。
+        try:
+            stale_sec = float(os.getenv("STOCKDATA_RT_STALE_SEC", "") or 10.0)
+        except ValueError:
+            stale_sec = 10.0
+
+        def _is_stale(sym: str, last_dt) -> bool:
+            qt = self.puller.synth.last_quote_time(sym)
+            eff = max(last_dt, qt) if qt is not None else last_dt
+            return eff < asof_ts - _dt.timedelta(seconds=stale_sec)
+
         latest_by_sym = {}
         for sym, mx in base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows():
             latest_by_sym[sym] = mx
         todo = [c for c in codes
                 if _in_trading(asof_ts) and not _is_index(c)
                 and (_tf_symbol(c) not in latest_by_sym
-                     or latest_by_sym[_tf_symbol(c)] < asof_ts - _dt.timedelta(minutes=3))]
+                     or _is_stale(_tf_symbol(c), latest_by_sym[_tf_symbol(c)]))]
         fills: list[pl.DataFrame] = []
         if todo:
             pulls = self.puller.fetch_many(todo)
