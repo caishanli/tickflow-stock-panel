@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     backtest_matrix_cache_prewarm: bool = True
     backtest_matrix_cache_prewarm_years: int = 5
 
+    # 模拟盘 -- 交易时段每分钟第 N 秒触发策略 tick(等快照时间戳跨过分钟边界,
+    # HH:MM run_daily 才能在当轮命中)。需 > 行情源时间戳滞后(腾讯/新浪约1-3s)。
+    sim_tick_offset: int = 8
+
     # Auth — 首次启动时预置访问密码(明文, 仅用于初始化, 详见 services/auth.bootstrap_from_env)
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。
     auth_password: str = ""
