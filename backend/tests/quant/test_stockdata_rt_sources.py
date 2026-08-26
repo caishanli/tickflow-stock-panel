@@ -122,6 +122,54 @@ def test_sources_http_roundtrip(monkeypatch):
     assert "600000.SH" in out2
 
 
+def test_source_fetch_chunks_large_batches(monkeypatch):
+    """超批分块：>200 只拆多次请求，URL 不超限；单块失败不影响其余块。"""
+    from app.services.stockdata.rt_sources import RT_BATCH_SIZE
+
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        @property
+        def text(self):
+            return self._body
+
+        def raise_for_status(self):
+            return None
+
+    def make_line(sym):
+        pure, suf = sym.split(".")
+        return (f'v_{"sh" if suf == "SH" else "sz"}{pure}="1~X~{pure}~9.08~9.22~9.24~'
+                f'881756~1~1~9.08~1~9.08~1~9.07~1~9.06~1~9.05~1~9.04~1~9.08~1~9.09~'
+                f'1~9.10~1~9.11~1~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
+                f'9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06";')
+
+    class ChunkSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, timeout=None):
+            calls.append(url)
+            codes = url.rsplit("q=", 1)[1].split(",")
+            if len(calls) == 2:  # 第二块模拟失败（如 414/网络错误）
+                raise OSError("boom")
+            return FakeResp("\n".join([make_line(f"{c[2:]}.{'SH' if c.startswith('sh') else 'SZ'}")
+                                       for c in codes]))
+
+    t = TencentRTSource()
+    t._session = ChunkSession()
+    syms = [f"{600000 + i}.SH" for i in range(RT_BATCH_SIZE + 50)]
+    quotes = t.fetch(syms)
+    assert len(calls) == 2                          # 分成两块
+    assert all(len(u.rsplit("q=", 1)[1].split(",")) <= RT_BATCH_SIZE for u in calls)
+    assert len(quotes) == RT_BATCH_SIZE             # 失败块丢弃，成功块照常返回
+    assert "600000.SH" in quotes and f"{600000 + RT_BATCH_SIZE - 1}.SH" in quotes
+
+
 def test_source_fetch_network_error_returns_empty(monkeypatch):
     class BoomSession:
         def __init__(self):
@@ -231,6 +279,8 @@ def test_synthesizer_multi_symbol_frames():
 def test_synthesizer_reset_if_new_day():
     from app.services.stockdata.rt_sources import BarSynthesizer
     syn = BarSynthesizer()
+    # 显式钉住交易日：__init__ 的 _day=today 跨午夜后与固定测试日期不一致会翻转
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
     syn.update({"600000.SH": _q("600000.SH", 9.0, 500_000, 4_500_000,
                                 _dt.datetime(2026, 8, 25, 15, 0))})
     syn.reset_if_new_day(_dt.date(2026, 8, 26))
