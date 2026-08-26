@@ -944,3 +944,58 @@ def test_daily_mem_offline_mode_exempt_from_refetch(tmp_path):
     dm._daily_mem[f"get_daily_{CODE}"] = frame
     out = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
     assert float(out["close"].iloc[-1]) == 1.5
+
+
+# ---- 复权缓存每日重建（live）/ 冻结（离线）----
+
+def test_adj_cache_rebuilds_on_new_day(tmp_path, monkeypatch):
+    """live 模式：跨日后复权因子/事件缓存必须重建（15:35 同步写入新事件）。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._adj_factor = {"510300.XSHG": {pd.Timestamp("2026-08-01"): 1.0}}
+    dm._adj_events_cache = {"510300.XSHG": []}
+    dm._adj_built_day = "2026-08-25"   # 昨天构建
+    dm._offline = False
+
+    import polars as pl
+    import os
+    root = tmp_path / "part"
+    (root / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"],
+        "trade_date": [pd.Timestamp("2026-08-01")],
+        "ex_factor": [1.0],
+    }).write_parquet(root / "adj_factor_etf" / "all.parquet")
+
+    class _Client:
+        def get_adj_factors(self):
+            return pd.DataFrame()   # 空，走本地
+
+    dm._partition_root = lambda: str(root)
+    dm._to_jq_code = lambda s: s
+    dm.client = _Client()
+    dm._offline = False
+
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-26 10:00:00")))
+    fmap = dm._adj_factor_map()
+    assert dm._adj_built_day == "2026-08-26", "跨日必须重建因子表"
+    assert fmap["510300.XSHG"][pd.Timestamp("2026-08-01")] == 1.0
+    # 同日再取：命中缓存不重建（用失败注入验证不触发读取）
+    monkeypatch.setattr(pl, "scan_parquet", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    fmap2 = dm._adj_factor_map()
+    assert fmap2["510300.XSHG"][pd.Timestamp("2026-08-01")] == 1.0
+
+
+def test_adj_cache_frozen_offline():
+    """离线/回测：复权缓存构建一次即固定，不随日期变化重建。"""
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._adj_factor = {"X": {pd.Timestamp("2026-08-01"): 1.0}}
+    dm._adj_events_cache = {"X": []}
+    dm._adj_built_day = "2026-08-01"   # 很久以前构建
+    dm._offline = True
+    assert dm._adj_fresh() is True

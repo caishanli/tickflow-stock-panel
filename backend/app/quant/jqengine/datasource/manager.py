@@ -247,6 +247,16 @@ class DataManager:
         # 真实价，与聚宽 use_real_price 行为一致）。
         self._adj_factor = None  # 惰性：None=未加载，{} = 已加载但空
         self._adj_events_cache = None  # 惰性：从因子表重建的除权事件
+        # 复权缓存构建日期：live 模式每天重建一次（因子表 15:35 同步会写入
+        # 新事件），离线/回测数据冻结不重建。与日线近端回源同一哲学：
+        # "进程内存里的数据不能假设永远等于磁盘/服务端最新"。
+        self._adj_built_day = None
+
+    def _adj_fresh(self) -> bool:
+        """复权缓存是否可复用：离线冻结 或 当日已构建。"""
+        if getattr(self, "_offline", False):
+            return self._adj_built_day is not None
+        return self._adj_built_day == pd.Timestamp.now().normalize().date().isoformat()
 
     def _adj_factor_map(self) -> dict[str, dict]:
         """加载前复权因子表: {jq_code: {trade_date(date): ex_factor}}。
@@ -256,9 +266,10 @@ class DataManager:
         stockdata 网络服务因子表 (服务端读同一 adj_factor_etf 目录);
         任一来源不可用/离线时另一来源兜底。
         """
-        if self._adj_factor is not None:
+        if self._adj_factor is not None and self._adj_fresh():
             return self._adj_factor
         self._adj_factor = {}
+        self._adj_events_cache = None  # 因子表重建 → 事件表一并失效
         import glob as _glob
         roots = [
             os.path.join(self._partition_root(), "adj_factor_etf"),
@@ -290,6 +301,7 @@ class DataManager:
                     self._adj_factor.setdefault(jq, {})[pd.Timestamp(row["trade_date"])] = float(row["ex_factor"])
         except Exception as e:
             logger.warning("[DataManager] adj_factor 网络加载失败: %s", e)
+        self._adj_built_day = pd.Timestamp.now().normalize().date().isoformat()
         return self._adj_factor
 
     def _apply_qfq(self, pdf: pd.DataFrame, jq: str, cutoff=None) -> pd.DataFrame:
@@ -331,10 +343,11 @@ class DataManager:
         聚宽 pre/none 比值含 4 位价格精度噪声（±0.1% 级微小波动），需过滤：
         仅保留因子明显偏离 1 的真实除权事件（阈值 10%），忽略噪声。
         """
-        if self._adj_events_cache is not None:
+        if self._adj_events_cache is not None and self._adj_fresh():
             return self._adj_events_cache
         self._adj_events_cache = {}
         fmap = self._adj_factor_map()
+        self._adj_built_day = pd.Timestamp.now().normalize().date().isoformat()
         for jq, m in fmap.items():
             items = sorted(m.items())
             if len(items) < 2:
