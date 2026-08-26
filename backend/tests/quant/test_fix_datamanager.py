@@ -828,3 +828,82 @@ def test_minute_diag_logs_on_today_missing(tmp_path, monkeypatch, caplog):
     msgs = [r.getMessage() for r in caplog.records]
     assert any("盘中取数空" in m and CODE in m for m in msgs), msgs
     assert CODE not in dm._minute_empty
+
+
+# ---- 近端历史陈旧窗口：previous_date 锚定查询不再绕过 _is_stale ----
+
+def test_recent_history_end_window():
+    """end 在近 7 天内 → 需要新鲜度检查；更老/None → 不检查；坏值 → 保守检查。"""
+    from datetime import timedelta
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    now = pd.Timestamp.now()
+    assert mgr_mod._is_recent_history_end(now) is True                    # 今天
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=6)) is True
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=8)) is False  # 远端历史
+    assert mgr_mod._is_recent_history_end(None) is False
+    assert mgr_mod._is_recent_history_end("not-a-date") is True           # 坏值保守放行检查
+
+
+def test_daily_mem_stale_near_history_refetch(tmp_path, monkeypatch):
+    """长命进程的日线缓存帧若非当日回源，近端历史请求（end=昨天）必须重取，
+    且当日只回源一次（戳记生效）。离线模式豁免（回测数据冻结无修订）。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    today = pd.Timestamp("2026-08-26")
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: today))
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_fetch_day = {}
+    dm._daily_ver = 0
+    dm._offline = False
+    dm.cache = DataCache(str(tmp_path / "cache"))
+    fetched = {'n': 0}
+
+    class _Net:
+        def get_daily(self, code, start, end):
+            fetched['n'] += 1
+            idx = pd.DatetimeIndex([pd.Timestamp(end)])
+            return pd.DataFrame({"close": [1.9 + fetched['n']]}, index=idx)
+
+    dm.sources = {"network": _Net()}
+    dm._priority = lambda: ["network"]
+    dm._src_fail = {}
+    dm._maybe_demote = lambda name: None
+
+    # 昨日盘中/收盘重估写入的未修订帧：覆盖 end=08-25、末日期=昨天，
+    # _is_stale(stale_days=1) 永远判新鲜——但非当日回源 → 必须重取。
+    stale_frame = pd.DataFrame(
+        {"close": [1.5, 1.5]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-08-20"), pd.Timestamp("2026-08-25")]),
+    )
+    key = f"get_daily_{CODE}"
+    dm._daily_mem[key] = stale_frame
+    out = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
+    assert fetched['n'] == 1, "非当日回源的近端历史陈帧必须重取"
+    assert float(out["close"].iloc[-1]) == 2.9  # 拼接后尾部为新帧值
+    # 同日再次请求：戳记命中，不重复回源
+    out2 = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
+    assert fetched['n'] == 1 and float(out2["close"].iloc[-1]) == 2.9
+
+
+def test_daily_mem_offline_mode_exempt_from_freshness_gate(tmp_path):
+    """离线/回测模式豁免新鲜度门禁：无戳记的预加载帧直接服务，不回源。"""
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_fetch_day = {}
+    dm._daily_ver = 0
+    dm._offline = True
+    dm.cache = DataCache(str(tmp_path / "cache-off"))
+    frame = pd.DataFrame(
+        {"close": [1.5]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-08-25")]),
+    )
+    dm._daily_mem[f"get_daily_{CODE}"] = frame
+    out = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
+    assert float(out["close"].iloc[-1]) == 1.5
