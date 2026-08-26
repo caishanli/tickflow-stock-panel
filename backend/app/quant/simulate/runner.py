@@ -47,6 +47,22 @@ def in_trading(now=None):
         and now.weekday() < 5  # M2：weekday 用传入的 now，而非真实当前时间
 
 
+MORNING_END_GRACE = datetime.time(11, 31)  # 上午收盘宽限：11:30 bar 的实盘处理窗口
+
+
+def _tick_window(now) -> bool:
+    """主循环是否进入"处理 bar"分支（与下午 15:00~15:02 宽限对称）。
+
+    实盘每根 bar 在 :08 才被取到（TICK_OFFSET=8），而 in_trading 在 11:30:00
+    整点即截止——若无宽限，11:30 的 bar 会掉进午休分支永远不被处理，
+    注册在 11:30 的 run_daily 任务（如预买卖报告）实盘永不触发。
+    """
+    t = now.time()
+    return (in_trading(now)
+            or (datetime.time(11, 30) < t <= MORNING_END_GRACE)
+            or (datetime.time(15, 0) < t <= SESSION_END_GRACE))
+
+
 # ---------------------------------------------------------------------------
 # 看护模式（无策略账户，旧行为保留）
 # ---------------------------------------------------------------------------
@@ -1198,7 +1214,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
             if hooks_done["pre"] != today and t >= datetime.time(9, 25):
                 _pre_market(account_id, bundle, ctx, aux["fired"], jq_api, now, aux)
                 hooks_done["pre"] = today
-            if in_trading(now) or (datetime.time(15, 0) < t <= SESSION_END_GRACE):
+            if _tick_window(now):
                 if aux["frequency"] == "daily" and aux["daily_done"] == today:
                     # 日频账户：当日唯一 tick 已完成，仍做实时打标
                     dirty = _mark_to_market(feed, dm, ctx, state,
