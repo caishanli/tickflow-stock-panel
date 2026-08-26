@@ -350,6 +350,7 @@ def buy_routine(context):
 
 # ==================== 预买卖报告（v5.4-report）====================
 PRE_REPORT_TOP_SELLS = 3       # 卖出候选最多展示前 3
+PRE_REPORT_TOP_CANDS = 2       # 买入候选展示条数（33天回放 coverage@2=100%）
 
 
 def _is_replay_past(context):
@@ -440,6 +441,10 @@ def _build_pre_trade_message(context, tag, ranked):
         lines.append("📥 预计买入：" + " → ".join(buy_strs))
     else:
         lines.append("📥 预计买入：无")
+    cands = [m['etf'] for m in (getattr(g, 'ranked_candidates_full', []) or [])[:PRE_REPORT_TOP_CANDS]]
+    if cands:
+        cand_strs = [f"{_short_code(c)} {get_security_name(c)}" for c in cands]
+        lines.append("🎯 过滤后候选前2：" + " → ".join(cand_strs))
 
     full_rank = getattr(g, 'ranked_candidates_full', []) or []
     rank_pos = {m['etf']: i for i, m in enumerate(full_rank)}

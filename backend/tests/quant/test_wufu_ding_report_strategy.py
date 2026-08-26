@@ -97,6 +97,25 @@ def test_report_predicts_buy_and_sell_order():
     assert "1️⃣ E 戊ETF（排名5/6，动量1.2000）" in msg       # E 持仓不在目标
 
 
+def test_report_lists_top2_candidates():
+    """🎯 过滤后候选前2：不管是否持仓/是否目标都按过滤排名列出（coverage@2=100%）。"""
+    ns = _load_strategy()
+    _prep(ns)
+    ctx = _make_ctx({"C.XSHE": 1000, "E.XSHE": 2000})
+    msg = ns["_build_pre_trade_message"](ctx, "13:01", FULL)
+    assert "🎯 过滤后候选前2：A 甲ETF → B 乙ETF" in msg
+    # 持仓 E 也应出现在候选里（候选与买卖预测独立）
+    ctx2 = _make_ctx({"E.XSHE": 2000})
+    msg2 = ns["_build_pre_trade_message"](ctx2, "11:30", [FULL[0]])
+    assert "🎯 过滤后候选前2：A 甲ETF → B 乙ETF" in msg2
+    assert "📥 预计买入：A 甲ETF" in msg2                     # 目标 A 减持仓 E → 买 A
+    # 排名为空（防御模式）时不列候选
+    ns2 = _load_strategy()
+    _prep(ns2, ranked_full=[], assessed=set())
+    msg3 = ns2["_build_pre_trade_message"](_make_ctx({}), "13:01", [])
+    assert "🎯" not in msg3
+
+
 def test_report_sell_worst_rank_first_truncates_three():
     ns = _load_strategy()
     _prep(ns, holdings_num=1)                                # 目标仅 A
@@ -107,7 +126,7 @@ def test_report_sell_worst_rank_first_truncates_three():
     assert len(lines) == 3
     assert "F 己ETF" in lines[0] and "排名6/6" in lines[0]    # 排名最差者第1：F,E,D
     assert "D 丁ETF" in lines[2] and "排名4/6" in lines[2]
-    assert "乙ETF" not in msg                                 # B 未持有，不出现
+    assert "乙ETF" not in "".join(lines)                      # B 未持有，不在卖出候选（可在🎯候选行出现）
 
 
 def test_report_no_sell_when_all_in_targets():
@@ -154,7 +173,8 @@ def test_pre_trade_report_pool_rebuild_fail_skips():
     ns = _load_strategy()
     ns["g"].__dict__.pop("merged_etf_pool", None)
     ns["check_a_share_weak_period"] = lambda ctx: (_ for _ in ()).throw(RuntimeError("boom"))
-    ctx = _make_ctx({})
+    from datetime import timedelta
+    ctx = _make_ctx({}, dt=datetime.now() - timedelta(minutes=1))  # 今天盘中，非历史补跑
     ns["pre_trade_report"](ctx)
     assert not ns["log"].notifies
     assert any("池重建失败" in m for m in ns["log"].warnings)
