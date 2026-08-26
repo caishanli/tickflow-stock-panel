@@ -845,9 +845,9 @@ def test_recent_history_end_window():
     assert mgr_mod._is_recent_history_end("not-a-date") is True           # 坏值保守放行检查
 
 
-def test_daily_mem_stale_near_history_refetch(tmp_path, monkeypatch):
-    """长命进程的日线缓存帧若非当日回源，近端历史请求（end=昨天）必须重取，
-    且当日只回源一次（戳记生效）。离线模式豁免（回测数据冻结无修订）。"""
+def test_daily_mem_near_history_always_refetch(tmp_path, monkeypatch):
+    """近端历史（end 近 7 天内）每次查询都回源取最新，不信任进程缓存；
+    且回源后缓存尾部被拼接刷新（保远古广度）。"""
     from app.quant.jqengine.datasource import manager as mgr_mod
     from app.quant.jqengine.datasource.manager import DataManager
 
@@ -857,7 +857,6 @@ def test_daily_mem_stale_near_history_refetch(tmp_path, monkeypatch):
 
     dm = DataManager.__new__(DataManager)
     dm._daily_mem = {}
-    dm._daily_fetch_day = {}
     dm._daily_ver = 0
     dm._offline = False
     dm.cache = DataCache(str(tmp_path / "cache"))
@@ -867,15 +866,14 @@ def test_daily_mem_stale_near_history_refetch(tmp_path, monkeypatch):
         def get_daily(self, code, start, end):
             fetched['n'] += 1
             idx = pd.DatetimeIndex([pd.Timestamp(end)])
-            return pd.DataFrame({"close": [1.9 + fetched['n']]}, index=idx)
+            return pd.DataFrame({"close": [1.5 + fetched['n']]}, index=idx)
 
     dm.sources = {"network": _Net()}
     dm._priority = lambda: ["network"]
     dm._src_fail = {}
     dm._maybe_demote = lambda name: None
 
-    # 昨日盘中/收盘重估写入的未修订帧：覆盖 end=08-25、末日期=昨天，
-    # _is_stale(stale_days=1) 永远判新鲜——但非当日回源 → 必须重取。
+    # 昨日收盘重估写入的旧帧（覆盖 end=08-25）：近端查询必须无视它直接回源
     stale_frame = pd.DataFrame(
         {"close": [1.5, 1.5]},
         index=pd.DatetimeIndex([pd.Timestamp("2026-08-20"), pd.Timestamp("2026-08-25")]),
@@ -883,20 +881,59 @@ def test_daily_mem_stale_near_history_refetch(tmp_path, monkeypatch):
     key = f"get_daily_{CODE}"
     dm._daily_mem[key] = stale_frame
     out = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
-    assert fetched['n'] == 1, "非当日回源的近端历史陈帧必须重取"
-    assert float(out["close"].iloc[-1]) == 2.9  # 拼接后尾部为新帧值
-    # 同日再次请求：戳记命中，不重复回源
+    assert fetched['n'] == 1, "近端历史必须每次都回源"
+    assert float(out["close"].iloc[-1]) == 2.5
+    # 第二次查询同样回源（不信任同日缓存）
     out2 = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
-    assert fetched['n'] == 1 and float(out2["close"].iloc[-1]) == 2.9
+    assert fetched['n'] == 2 and float(out2["close"].iloc[-1]) == 3.5
+    # 回源结果拼接进缓存：头部保留远古行 + 尾部为最新值
+    mem = dm._daily_mem[key]
+    assert mem.index.min() == pd.Timestamp("2026-08-20")
+    assert float(mem["close"].iloc[-1]) == 3.5
 
 
-def test_daily_mem_offline_mode_exempt_from_freshness_gate(tmp_path):
-    """离线/回测模式豁免新鲜度门禁：无戳记的预加载帧直接服务，不回源。"""
+def test_daily_mem_far_history_served_from_cache(tmp_path, monkeypatch):
+    """远端历史（end 早于近端窗口）照旧走缓存，不回源。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    today = pd.Timestamp("2026-08-26")
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: today))
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+    dm._offline = False
+    dm.cache = DataCache(str(tmp_path / "cache"))
+    fetched = {'n': 0}
+
+    class _Net:
+        def get_daily(self, code, start, end):
+            fetched['n'] += 1
+            return pd.DataFrame({"close": [9.9]},
+                                index=pd.DatetimeIndex([pd.Timestamp(end)]))
+
+    dm.sources = {"network": _Net()}
+    dm._priority = lambda: ["network"]
+    dm._src_fail = {}
+    dm._maybe_demote = lambda name: None
+
+    frame = pd.DataFrame(
+        {"close": [1.5]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-06-01")]),
+    )
+    dm._daily_mem[f"get_daily_{CODE}"] = frame
+    out = dm.fetch("get_daily", CODE, "2026-05-01", "2026-06-01")
+    assert fetched['n'] == 0 and float(out["close"].iloc[-1]) == 1.5
+
+
+def test_daily_mem_offline_mode_exempt_from_refetch(tmp_path):
+    """离线/回测模式数据冻结，近端历史也直接服务缓存，不回源。"""
     from app.quant.jqengine.datasource.manager import DataManager
 
     dm = DataManager.__new__(DataManager)
     dm._daily_mem = {}
-    dm._daily_fetch_day = {}
     dm._daily_ver = 0
     dm._offline = True
     dm.cache = DataCache(str(tmp_path / "cache-off"))

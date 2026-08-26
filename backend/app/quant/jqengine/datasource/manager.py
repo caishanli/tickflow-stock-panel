@@ -223,9 +223,6 @@ class DataManager:
             on_evict=lambda k, _v: self._minute_cov.pop(k, None))
         self._minute_empty = set()  # 已知无分钟数据的标的，避免重复网络请求
         self._daily_mem = {}
-        # 近端历史新鲜度：cache_key -> 最近一次回源落缓的日期（ISO）。
-        # previous_date 锚定的查询靠它保证"每天至少回源一次"，见 fetch 命中路径。
-        self._daily_fetch_day = {}
         self._daily_preloaded = False  # preload_daily 幂等标志（分区数据已载入）
         self._daily_preloaded_asof = None  # 上次 preload 的 asof（新交易日据此重载）
         # _daily_mem 数据版本号：每次写入/删除递增，money memo 键含版本据此失效
@@ -616,24 +613,16 @@ class DataManager:
                 # 下方 cache.get 回源补齐。
                 req_start = args[1] if len(args) > 1 else None
                 req_end = args[2] if len(args) > 2 else None
-                # 近端历史请求（end 落在近 N 天）要求缓存"当日已回源过一次"，
-                # 否则视为陈帧回源重取：帧末日期=昨天的缓存按 _is_stale(stale_days=1)
-                # 永远判新鲜，但可能是昨日盘中/收盘重估写入的未修订值（15:35
-                # 同步才修正）——长命进程据此对同一 previous_date 查询返回不同
-                # 历史（08-26 d092ad90 与克隆盘同刻动量排名整表分歧、同策略
-                # 同持仓做出相反调仓的根因）。更老的历史照旧信任缓存。
-                _is_live_req = _is_recent_history_end(req_end)
-                # 离线/回测模式数据冻结、无修订可言，且 preload_daily 直写
-                # 缓存不带戳记——新鲜度门禁只在实时模式生效。
-                if DataCache._covers(mem, req_start, req_end):
-                    _near = (_is_recent_history_end(req_end)
-                             and not getattr(self, "_offline", False))
-                    _stamps = getattr(self, "_daily_fetch_day", None) or {}
-                    _today_iso = pd.Timestamp.now().normalize().date().isoformat()
-                    _fresh_today = (not _near
-                                    or _stamps.get(cache_key) == _today_iso)
-                    if _fresh_today and not (self.cache._is_stale(mem) and _is_live_req):
-                        return mem
+                # 近端历史（end 落在近 N 天）**永远回源，不信任进程缓存**：
+                # 帧末日期=昨天的缓存可能早于最近一次 mootdx/服务端回源落盘修订
+                # （15:35 同步才修正当日 bar），长命进程据此对同一 previous_date
+                # 查询返回不同历史（08-26 d092ad90 与克隆盘同刻动量排名整表
+                # 分歧、同策略同持仓做出相反调仓的根因）。只有不修订的远古
+                # 历史（end 早于窗口）才走缓存；离线/回测模式数据冻结一律走缓存。
+                if (DataCache._covers(mem, req_start, req_end)
+                        and (getattr(self, "_offline", False)
+                             or not _is_recent_history_end(req_end))):
+                    return mem
             # 覆盖不足不预先删除旧帧：先回源，成功才经 _put_daily_mem_protected
             # 覆盖写入；失败则保留旧帧并抛错。原实现"先删后取"，回源瞬时失败会让
             # 该标的从缓存彻底消失，批量日线读取静默跳过（08-21 黄金ETF被误换仓的
@@ -731,9 +720,6 @@ class DataManager:
         if cache_key.startswith("get_daily") and hasattr(new_df, "columns"):
             new_df = _ensure_money_yuan(new_df, "mem")
             new_df = _ensure_volume_shares(new_df, "mem")
-        if not hasattr(self, "_daily_fetch_day"):
-            self._daily_fetch_day = {}
-        _today_iso = pd.Timestamp.now().normalize().date().isoformat()
         if cache_key in self._daily_mem:
             old = self._daily_mem.get(cache_key)
             old_cov = self._frame_coverage(old)
@@ -743,29 +729,27 @@ class DataManager:
                 new_lo, new_hi = new_cov
                 old_covers_new = old_lo <= new_lo and old_hi >= new_hi
                 if old_covers_new:
-                    # 已有更全缓存。但若它并非今日回源（近端修订进不来），
-                    # 用新帧行就地刷新尾部（保广度拼接），并标记今日已回源；
-                    # 当日已回源过则维持原保护语义，不重复覆盖。
-                    if self._daily_fetch_day.get(cache_key) == _today_iso:
-                        return
-                    try:
-                        base = old.copy()
-                        if (isinstance(base.index, pd.DatetimeIndex)
-                                and isinstance(new_df.index, pd.DatetimeIndex)
-                                and len(new_df.index)):
-                            cut = new_df.index.min()
-                            merged = pd.concat(
-                                [base[base.index < cut], new_df])
-                            merged = (merged[~merged.index.duplicated(keep="last")]
-                                      .sort_index())
-                            self._daily_mem[cache_key] = merged
-                            self._daily_ver += 1
-                    except Exception:
-                        pass
-                    self._daily_fetch_day[cache_key] = _today_iso
+                    # 已有更全缓存。仅当新帧刷新了尾部（end >= 旧帧 end，
+                    # 即近端回源/补日场景）才拼接合并，让 15:35 同步的修订
+                    # 进得来又不丢远古广度；子区间查询（end 更早，如
+                    # _trade_days_between）不改变缓存。
+                    if new_hi >= old_hi:
+                        try:
+                            base = old.copy()
+                            if (isinstance(base.index, pd.DatetimeIndex)
+                                    and isinstance(new_df.index, pd.DatetimeIndex)
+                                    and len(new_df.index)):
+                                cut = new_df.index.min()
+                                merged = pd.concat(
+                                    [base[base.index < cut], new_df])
+                                merged = (merged[~merged.index.duplicated(keep="last")]
+                                          .sort_index())
+                                self._daily_mem[cache_key] = merged
+                                self._daily_ver += 1
+                        except Exception:
+                            pass
                     return
         self._daily_mem[cache_key] = new_df
-        self._daily_fetch_day[cache_key] = _today_iso
         self._daily_ver += 1
 
     def _maybe_demote(self, name):
