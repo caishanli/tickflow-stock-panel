@@ -833,14 +833,14 @@ def test_minute_diag_logs_on_today_missing(tmp_path, monkeypatch, caplog):
 # ---- 近端历史陈旧窗口：previous_date 锚定查询不再绕过 _is_stale ----
 
 def test_recent_history_end_window():
-    """end 在近 7 天内 → 需要新鲜度检查；更老/None → 不检查；坏值 → 保守检查。"""
-    from datetime import timedelta
+    """end 在近 14 天内 → 需要回源；更老/None → 不检查；坏值 → 保守检查。"""
     from app.quant.jqengine.datasource import manager as mgr_mod
 
     now = pd.Timestamp.now()
     assert mgr_mod._is_recent_history_end(now) is True                    # 今天
     assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=6)) is True
-    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=8)) is False  # 远端历史
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=10)) is True  # 长假场景
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=15)) is False  # 远端历史
     assert mgr_mod._is_recent_history_end(None) is False
     assert mgr_mod._is_recent_history_end("not-a-date") is True           # 坏值保守放行检查
 
