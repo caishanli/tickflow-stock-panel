@@ -414,7 +414,20 @@ def get_security_name(code):
 
 
 def get_security_info(code):
-    return _instrument(code)
+    inst = _instrument(code)
+    if inst is not None:
+        # Add聚宽-compatible start_date attribute if missing
+        if not hasattr(inst, 'start_date'):
+            listed = getattr(inst, 'listed_date', None)
+            if listed is not None:
+                # Convert to datetime.date for strategy compatibility
+                inst.start_date = listed.date() if hasattr(listed, 'date') else listed
+            else:
+                inst.start_date = None
+        # Add display_name if missing
+        if not hasattr(inst, 'display_name'):
+            inst.display_name = getattr(inst, 'symbol', code)
+    return inst
 
 
 def attribute_history(security, count, unit="1d", fields=None, skip_paused=True,
@@ -461,13 +474,71 @@ def get_trade_days(start_date=None, end_date=None, count=None):
         if end_date is not None:
             end = pd.Timestamp(end_date)
             idx = int(cal.searchsorted(pd.Timestamp(end)))
-            return list(cal[max(0, idx - int(count) + 1): idx + 1])
-        return list(cal[: int(count)])
+            return [d.date() if hasattr(d, 'date') else d for d in cal[max(0, idx - int(count) + 1): idx + 1]]
+        return [d.date() if hasattr(d, 'date') else d for d in cal[: int(count)]]
     if start_date is not None and end_date is not None:
         s = pd.Timestamp(start_date).normalize()
         e = pd.Timestamp(end_date).normalize()
-        return [d for d in cal if s <= d.normalize() <= e]
-    return list(cal)
+        return [d.date() if hasattr(d, 'date') else d for d in cal if s <= d.normalize() <= e]
+    return [d.date() if hasattr(d, 'date') else d for d in cal]
+
+
+def get_all_trade_days(start_date=None, end_date=None):
+    """聚宽 get_all_trade_days: 返回所有交易日列表。"""
+    return get_trade_days(start_date=start_date, end_date=end_date)
+
+
+def get_concepts():
+    """聚宽 get_concepts: 返回所有概念板块 DataFrame (index=code, columns=[name])。
+    
+    简化实现：返回空 DataFrame。策略中的概念筛选会退化为不过滤。
+    """
+    return pd.DataFrame(columns=['name'])
+
+
+def get_concept(stock_list, date=None):
+    """聚宽 get_concept: 返回指定股票的概念板块映射。
+    
+    使用 rqalpha Instrument 的 concept_names 和 industry_name 属性。
+    如果数据源没有概念数据，使用 industry_name 作为回退分组依据。
+    返回格式: {stock_code: {'jq_concept': [{'concept_name': name}]}}
+    """
+    result = {}
+    for stock in (stock_list or []):
+        inst = _instrument(stock)
+        if inst is None:
+            continue
+        concepts = []
+        # Try concept names first
+        try:
+            concept_names = inst.concept_names
+            if concept_names:
+                if isinstance(concept_names, str):
+                    concept_names = [c.strip() for c in concept_names.split(',') if c.strip()]
+                for name in concept_names:
+                    concepts.append({'concept_name': name})
+        except (AttributeError, KeyError):
+            pass
+        # Add industry name as a concept (fallback)
+        try:
+            industry = inst.industry_name
+            if industry:
+                concepts.append({'concept_name': industry})
+        except (AttributeError, KeyError):
+            pass
+        # If still no concepts, use a generic group
+        if not concepts:
+            concepts.append({'concept_name': '连板股'})
+        result[stock] = {'jq_concept': concepts}
+    return result
+
+
+def get_concept_stocks(code, date=None):
+    """聚宽 get_concept_stocks: 返回指定概念板块的股票列表。
+    
+    简化实现：返回空列表。概念筛选由 get_concept 处理。
+    """
+    return []
 
 
 def history(security, bar_count, unit="1d", field=None, skip_paused=True, df=True,
@@ -486,13 +557,32 @@ def get_extras(field, securities, start_date=None, end_date=None, count=None,
                **kwargs):
     """聚宽 get_extras 兼容 shim。
 
-    当前仅支持 field='unit_net_value'（ETF 真实净值），其余字段返回空 DataFrame 并 warn。
+    支持 field='unit_net_value'（ETF 真实净值）和 'is_st'（ST 状态检查），
+    其余字段返回空 DataFrame 并 warn。
     """
     import logging as _log
+    codes = [securities] if isinstance(securities, str) else list(securities)
+
+    if field == "is_st":
+        # ST 状态检查：基于 instrument.special_type 或 name 包含 ST/退
+        result = {}
+        for code in codes:
+            inst = _instrument(code)
+            if inst is None:
+                result[code] = True  # 未知标的视为 ST
+                continue
+            special = getattr(inst, 'special_type', '') or ''
+            name = getattr(inst, 'symbol', '') or ''
+            # Check for ST, *ST, 退 in special_type or symbol
+            is_st = ('ST' in special.upper() or '退' in special or
+                     'ST' in name.upper() or '退' in name)
+            result[code] = is_st
+        idx = pd.DatetimeIndex([start_date]) if start_date else pd.DatetimeIndex([pd.Timestamp.now().normalize()])
+        return pd.DataFrame(result, index=idx)
+
     if field != "unit_net_value":
         _log.warning("[jqcompat] get_extras field=%s not implemented, returning empty", field)
         return pd.DataFrame()
-    codes = [securities] if isinstance(securities, str) else list(securities)
     env = Environment.get_instance()
     end_dt = pd.Timestamp(end_date) if end_date is not None else env.trading_dt
     navs = _get_etf_nav_df(codes, end_dt.date())
@@ -1858,7 +1948,9 @@ def _patch_rqalpha_objects():
 
     if not hasattr(StrategyContext, "current_dt"):
         StrategyContext.current_dt = property(
-            lambda self: Environment.get_instance().calendar_dt)
+            lambda self: Environment.get_instance().calendar_dt.to_pydatetime()
+            if hasattr(Environment.get_instance().calendar_dt, 'to_pydatetime')
+            else Environment.get_instance().calendar_dt)
 
     if not hasattr(StrategyContext, "previous_date"):
         def _prev(self):
@@ -1868,7 +1960,11 @@ def _patch_rqalpha_objects():
                 d = env.trading_dt.date()
                 idx = int(cal.searchsorted(pd.Timestamp(d)))
                 if idx > 0:
-                    return cal[idx - 1]
+                    val = cal[idx - 1]
+                    # Convert pandas Timestamp to datetime.date for strategy compatibility
+                    if hasattr(val, 'date'):
+                        return val.date()
+                    return val
             except Exception:
                 pass
             return env.trading_dt.date()
@@ -1928,6 +2024,10 @@ def _register_jq_apis():
         ("attribute_history", attribute_history),
         ("is_temporarily_suspended", is_temporarily_suspended),
         ("get_trade_days", get_trade_days),
+        ("get_all_trade_days", get_all_trade_days),
+        ("get_concepts", get_concepts),
+        ("get_concept", get_concept),
+        ("get_concept_stocks", get_concept_stocks),
         ("set_benchmark", set_benchmark),
         ("set_slippage", set_slippage),
         ("set_order_cost", set_order_cost),
@@ -1947,6 +2047,19 @@ def _register_jq_apis():
         setattr(_JQDATA_MOD, name, fn)
         _all_names.append(name)
     _JQDATA_MOD.__all__ = _all_names
+
+    # Fake jqfactor module so "from jqfactor import *" in strategies doesn't crash
+    _jqfactor_mod = types.ModuleType("jqfactor")
+    _jqfactor_mod.__all__ = []
+    sys.modules.setdefault("jqfactor", _jqfactor_mod)
+
+    # Fake jqlib module so "from jqlib.technical_analysis import *" doesn't crash
+    _jqlib_mod = types.ModuleType("jqlib")
+    _jqlib_ta_mod = types.ModuleType("jqlib.technical_analysis")
+    _jqlib_ta_mod.__all__ = []
+    _jqlib_mod.technical_analysis = _jqlib_ta_mod
+    sys.modules.setdefault("jqlib", _jqlib_mod)
+    sys.modules.setdefault("jqlib.technical_analysis", _jqlib_ta_mod)
 
 
 def _patch_price_board():

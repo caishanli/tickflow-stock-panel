@@ -14,6 +14,18 @@ _jqdata = types.ModuleType("jqdata")
 _jqdata.__all__ = []
 sys.modules.setdefault("jqdata", _jqdata)
 
+# Fake jqfactor module so "from jqfactor import *" in strategies doesn't crash
+_jqfactor = types.ModuleType("jqfactor")
+_jqfactor.__all__ = []
+sys.modules.setdefault("jqfactor", _jqfactor)
+
+# Fake jqlib module so "from jqlib.technical_analysis import *" doesn't crash
+_jqlib = types.ModuleType("jqlib")
+_jqlib.technical_analysis = types.ModuleType("jqlib.technical_analysis")
+_jqlib.technical_analysis.__all__ = []
+sys.modules.setdefault("jqlib", _jqlib)
+sys.modules.setdefault("jqlib.technical_analysis", _jqlib.technical_analysis)
+
 
 class StrategyBundle:
     """一次策略编译的产物。"""
