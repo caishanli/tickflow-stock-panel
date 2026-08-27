@@ -26,8 +26,10 @@ SOURCES = {"network": NetworkSource}
 # 几乎全 miss), 是 stockdata CPU 风暴的根源. 下游 DataCache._covers 发现
 # 覆盖不足时会带显式日期重取, 不丢数据. 
 _DAILY_FETCH_LOOKBACK_DAYS = 400
-# 近端历史陈旧窗口：end 落在该窗口内的日线请求做 _is_stale 检查（天）。
-_RECENT_HISTORY_STALE_WINDOW_DAYS = 7
+# 近端历史陈旧窗口：end 落在该窗口内的日线请求每次回源取最新（天）。
+# 需覆盖最长节假日（春节/国庆 8 天）+ 缓冲：长假后首个交易日 previous_date
+# 若落在窗口外会退回缓存路径，旧帧可能早于节前最后一次同步修订。
+_RECENT_HISTORY_STALE_WINDOW_DAYS = 14
 
 
 def _is_recent_history_end(req_end) -> bool:
