@@ -347,7 +347,9 @@ class DataManager:
         """
         if self._adj_events_cache is not None and self._adj_fresh():
             return self._adj_events_cache
-        self._adj_events_cache = {}
+        # 先构建局部 dict 再赋值：下方 _adj_factor_map() 判定需要重建时会把
+        # self._adj_events_cache 置 None，直接写入实例属性会 AttributeError。
+        out = {}
         fmap = self._adj_factor_map()
         self._adj_built_day = pd.Timestamp.now().normalize().date().isoformat()
         for jq, m in fmap.items():
@@ -365,7 +367,8 @@ class DataManager:
                     if (f < 0.9 or f > 1.1) and 0.0 < f < 10.0:
                         events.append((cur_dt, f))
             if events:
-                self._adj_events_cache[jq] = events
+                out[jq] = events
+        self._adj_events_cache = out
         return self._adj_events_cache
 
     def set_minute_window(self, start, end):

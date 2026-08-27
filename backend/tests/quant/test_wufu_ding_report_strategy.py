@@ -147,6 +147,7 @@ def test_report_defensive_mode_when_ranked_empty():
     assert "📥 预计买入：511880 银华日利" in msg
     assert "1️⃣ C 丙ETF（未入过滤排名，动量N/A）" in msg       # 无排名者按序列出
     assert "2️⃣ E 戊ETF" in msg
+    assert "🎯" not in msg                                    # 防御模式不列候选（ranked_candidates_full 是昨日残留）
 
 
 def test_report_unevaluated_holding_listed_separately():

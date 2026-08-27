@@ -999,3 +999,45 @@ def test_adj_cache_frozen_offline():
     dm._adj_built_day = "2026-08-01"   # 很久以前构建
     dm._offline = True
     assert dm._adj_fresh() is True
+
+
+def test_adj_events_rebuild_across_days_no_none_crash(tmp_path, monkeypatch):
+    """跨日触发 _adj_factor_map 重建时 _adj_events 不得因 events_cache 被
+    置 None 而崩溃（08-27 review 发现的重建竞态）。"""
+    import polars as pl
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    root = tmp_path / "part"
+    (root / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG", "510300.XSHG"],
+        "trade_date": [pd.Timestamp("2026-08-01"), pd.Timestamp("2026-08-04")],
+        # 相邻因子 1.0 → 0.5（÷2 除权跳变，>10% 阈值 → 必须生成事件）
+        "ex_factor": [1.0, 0.5],
+    }).write_parquet(root / "adj_factor_etf" / "all.parquet")
+
+    dm = DataManager.__new__(DataManager)
+    dm._offline = False
+    dm._adj_factor = None
+    dm._adj_events_cache = None
+    dm._adj_built_day = None
+    dm._partition_root = lambda: str(root)
+    dm._to_jq_code = lambda s: s
+
+    class _Client:
+        def get_adj_factors(self):
+            return pd.DataFrame()
+
+    dm.client = _Client()
+    events_day1 = dm._adj_events()
+    assert ("2026-08-04 00:00:00", 2.0) == tuple(events_day1["510300.XSHG"][0]) or \
+           events_day1["510300.XSHG"][0][1] == 2.0
+
+    # 跨日：built_day 标记为昨天 → 触发 map+events 全量重建路径
+    dm._adj_built_day = "2026-08-25"
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-26 09:00:00")))
+    events_day2 = dm._adj_events()   # 不应 AttributeError
+    assert events_day2["510300.XSHG"][0][1] == 2.0
+    assert dm._adj_built_day == "2026-08-26"

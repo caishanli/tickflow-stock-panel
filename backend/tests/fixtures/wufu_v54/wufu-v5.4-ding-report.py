@@ -441,7 +441,10 @@ def _build_pre_trade_message(context, tag, ranked):
         lines.append("📥 预计买入：" + " → ".join(buy_strs))
     else:
         lines.append("📥 预计买入：无")
-    cands = [m['etf'] for m in (getattr(g, 'ranked_candidates_full', []) or [])[:PRE_REPORT_TOP_CANDS]]
+    # 防御模式（排名整体为空）下 ranked_candidates_full 可能是昨日残留值，
+    # 列出来会误导——仅常规模式展示候选。
+    cands = ([] if defensive_mode
+             else [m['etf'] for m in (getattr(g, 'ranked_candidates_full', []) or [])[:PRE_REPORT_TOP_CANDS]])
     if cands:
         cand_strs = [f"{_short_code(c)} {get_security_name(c)}" for c in cands]
         lines.append("🎯 过滤后候选前2：" + " → ".join(cand_strs))
