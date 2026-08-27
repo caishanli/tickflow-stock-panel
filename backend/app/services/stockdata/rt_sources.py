@@ -150,7 +150,7 @@ class _HttpSource:
                 # 单块失败仅丢弃该块, 其余块继续; 缺失标的由编排链降级下家
                 failed += 1
                 logger.warning("[rt_sources] %s 第%s/%s块拉取失败: %s",
-                               type(self).__name__, failed, chunks, e)
+                               type(self).__name__, i // RT_BATCH_SIZE + 1, chunks, e)
         if failed and out:
             logger.warning("[rt_sources] %s 部分失败 %s/%s 块, 已成功解析 %s 只",
                            type(self).__name__, failed, chunks, len(out))
