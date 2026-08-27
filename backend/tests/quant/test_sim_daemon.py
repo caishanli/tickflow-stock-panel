@@ -26,7 +26,7 @@ class _FakePopen:
         self.pid = 4242
 
 
-def test_account_ensure_running_spawns_when_running_no_pause(tmp_quant, monkeypatch):
+def test_account_ensure_running_spawns_when_running_no_pause(tmp_quant, monkeypatch, mem_ok):
     db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
     calls = []
     monkeypatch.setattr(service.subprocess, "Popen",
@@ -79,7 +79,7 @@ def test_account_ensure_running_skips_when_pid_alive(tmp_quant, monkeypatch):
     assert calls == []
 
 
-def test_account_ensure_running_spawns_when_pid_dead(tmp_quant, monkeypatch):
+def test_account_ensure_running_spawns_when_pid_dead(tmp_quant, monkeypatch, mem_ok):
     # 反面分支：pid 已落库但进程死掉（_alive False）→ 仍应拉起。
     db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
     db.update_sim_account("a1", pid=4242)
@@ -93,12 +93,35 @@ def test_account_ensure_running_spawns_when_pid_dead(tmp_quant, monkeypatch):
     assert len(calls) == 1
 
 
-def test_account_ensure_running_logs_error_on_popen_failure(tmp_quant, monkeypatch):
+def test_account_ensure_running_logs_error_on_popen_failure(tmp_quant, monkeypatch, mem_ok):
     db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
     monkeypatch.setattr(service.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     service.account_ensure_running("a1")  # 不应 raise
     logs = db.get_sim_logs("a1")
     assert any(m["level"] == "error" for m in logs)
+
+
+def test_account_ensure_running_skips_when_memory_insufficient(tmp_quant, monkeypatch):
+    """内存守卫拦截路径: 不足时不 spawn、不落 pid, 落 warn 日志(钉住守卫行为)。"""
+    from app.quant.simulate import memory as sim_memory
+    db.insert_sim_account("a1", "acc1", 100000.0, 0.03, "running")
+    db.update_sim_account("a1", pid=12345)  # 钉住: 拦截路径不得改写 pid
+    alive = types.SimpleNamespace(info={
+        "pid": 1,
+        "cmdline": ["python", "run_quant_sim.py", "other"],
+        "memory_info": types.SimpleNamespace(rss=300 * 1024 ** 2),
+    })
+    monkeypatch.setattr(sim_memory.psutil, "process_iter", lambda attrs=(): iter([alive]))
+    monkeypatch.setattr(sim_memory.psutil, "virtual_memory",
+                        lambda: types.SimpleNamespace(available=100 * 1024 ** 2))
+    calls = []
+    monkeypatch.setattr(service.subprocess, "Popen",
+                        lambda *a, **k: calls.append((a, k)) or _FakePopen(*a, **k))
+    service.account_ensure_running("a1")
+    assert calls == []
+    assert db.get_sim_account("a1")["pid"] == 12345
+    logs = db.get_sim_logs("a1")
+    assert any(m["level"] == "warn" and "内存不足" in m["message"] for m in logs)
 
 
 def test_account_reset_writes_pause_even_when_kill_succeeds(tmp_quant, monkeypatch):

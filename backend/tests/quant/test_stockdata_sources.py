@@ -208,6 +208,9 @@ def test_realtime_snapshot_empty_in_trading_no_crash(tmp_path, monkeypatch):
 
     s = DataSources(data_root=str(tmp_path), mootdx_factory=lambda: StubSrc(), fetch_workers=1)
     try:
+        # 强制纯 mootdx 离线路径：HTTP 源未 mock，防交易时段真实触网
+        monkeypatch.setattr(s.puller, "tencent", None)
+        monkeypatch.setattr(s.puller, "sina", None)
         monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: True)
         df = s.get_realtime_snapshot(["600000.XSHG"])
         assert df.is_empty()
@@ -254,10 +257,10 @@ def test_fetch_one_rebuilds_source_on_timeout(monkeypatch):
     monkeypatch.setattr("app.services.stockdata.sources._pull_recent_guarded", fake_pull)
     p = NetworkPuller(factory=fake_factory, workers=1)
     try:
-        assert p._fetch_one("600000.XSHG").is_empty()
+        assert p._pull_mootdx_one("600000.XSHG") is None
         assert len(calls) == 1
         assert getattr(p._local, "src", None) is None  # 已重置，不复用坏 socket
-        assert p._fetch_one("600000.XSHG").is_empty()
+        assert p._pull_mootdx_one("600000.XSHG") is None
         assert len(calls) == 2  # 第二次 fetch 重建数据源
     finally:
         p.shutdown()
@@ -290,6 +293,7 @@ def test_metadata_methods_with_ohlcv_only_partitions(src, monkeypatch):
 def _write_instruments(root, rows):
     """写 instruments parquet（股票名称本地来源）。"""
     import os
+
     import polars as pl
     d = os.path.join(root, "instruments")
     os.makedirs(d, exist_ok=True)
@@ -346,6 +350,7 @@ def test_get_stock_names_etf_falls_back_to_api(tmp_path, monkeypatch):
 def test_get_stock_names_etf_from_api(tmp_path, monkeypatch):
     """ETF 名称本地缺失时走免费 API 成功路径。"""
     import os
+
     import polars as pl
     os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
     _write_instruments(str(tmp_path), [
@@ -373,6 +378,7 @@ def test_get_stock_names_etf_from_api(tmp_path, monkeypatch):
 def test_get_stock_names_etf_from_local_parquet(tmp_path, monkeypatch):
     """ETF 名称若本地 instruments_etf parquet 已有则直接读，不触网。"""
     import os
+
     import polars as pl
     os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
     _write_instruments(str(tmp_path), [
@@ -464,4 +470,47 @@ def test_get_adj_factors_cached(tmp_path):
         got2 = s.get_adj_factors()
         assert got2["symbol"].to_list() == ["512670.SH"]
     finally:
+        os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_realtime_stale_gate_configurable(tmp_path, monkeypatch):
+    """陈旧门槛 STOCKDATA_RT_STALE_SEC：默认 10s；合成器快照时间可豁免陈旧。"""
+    import datetime as dt
+    import os
+
+    os.environ["PARTITION_DATA_ROOT"] = str(tmp_path)
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=lambda: type(
+        "S", (), {"get_minute_recent": staticmethod(
+            lambda c, pages=1: __import__("pandas").DataFrame())}),
+        fetch_workers=1)
+    try:
+        monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                            lambda *a, **k: True)
+        # 内存库放一根 20s 前的 bar：默认 10s 门槛 → 判陈旧 → todo 含该标的
+        now = dt.datetime.now()
+        old_bar = pl.DataFrame({
+            "symbol": ["600000.SH"],
+            "datetime": [now - dt.timedelta(seconds=20)],
+            "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+            "volume": [0.0], "amount": [0.0]})
+        s.minute_store.update(dt.date.today().isoformat(), old_bar)
+        pulled = []
+
+        def fake_fetch_many(codes):
+            pulled.extend(codes)
+            return []
+
+        monkeypatch.setattr(s.puller, "fetch_many", fake_fetch_many)
+        s.get_realtime_snapshot(["600000.XSHG"])
+        assert pulled == ["600000.XSHG"]        # 20s > 10s → 判陈旧触发回源
+        # 但合成器刚见过快照（1s 前）→ 即使 bar 是旧的也不算陈旧
+        pulled.clear()
+        fake_qt = now - dt.timedelta(seconds=1)
+        monkeypatch.setattr(
+            s.puller.synth, "last_quote_time",
+            lambda sym, _t=fake_qt: _t)
+        s.get_realtime_snapshot(["600000.XSHG"])
+        assert pulled == []                     # 快照新鲜豁免
+    finally:
+        s.puller.shutdown()
         os.environ.pop("PARTITION_DATA_ROOT", None)
