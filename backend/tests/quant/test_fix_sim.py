@@ -118,11 +118,13 @@ def test_m2_in_trading_uses_now_arg():
 
 # ---- M2：11:30 bar 实盘宽限（TICK_OFFSET=8 时 in_trading 已截止）----
 def test_m2_tick_window_covers_morning_end_grace():
-    # 2026-07-20 周一
+    # 2026-07-20 周一；宽限 11:30~11:35（数据源延迟时整分钟 :08 重试）
     assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 29, 30)) is True   # 盘中
-    assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 30, 8)) is True    # 11:30 bar 实盘处理窗口
+    assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 30, 8)) is True    # 11:30 bar 处理窗口
     assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 30, 58)) is True
-    assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 31, 8)) is False   # 午休
+    assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 31, 8)) is True    # 重试轮
+    assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 33, 8)) is True
+    assert runner._tick_window(datetime.datetime(2026, 7, 20, 11, 35, 8)) is False   # 午休
     assert runner._tick_window(datetime.datetime(2026, 7, 20, 12, 0, 0)) is False
     assert runner._tick_window(datetime.datetime(2026, 7, 20, 15, 1, 0)) is True     # 下午宽限
     assert runner._tick_window(datetime.datetime(2026, 7, 20, 15, 3, 0)) is False

@@ -47,7 +47,7 @@ def in_trading(now=None):
         and now.weekday() < 5  # M2：weekday 用传入的 now，而非真实当前时间
 
 
-MORNING_END_GRACE = datetime.time(11, 31)  # 上午收盘宽限：11:30 bar 的实盘处理窗口
+MORNING_END_GRACE = datetime.time(11, 35)  # 上午收盘宽限：11:30 bar 的实盘处理窗口
 
 
 def _tick_window(now) -> bool:
@@ -56,6 +56,9 @@ def _tick_window(now) -> bool:
     实盘每根 bar 在 :08 才被取到（TICK_OFFSET=8），而 in_trading 在 11:30:00
     整点即截止——若无宽限，11:30 的 bar 会掉进午休分支永远不被处理，
     注册在 11:30 的 run_daily 任务（如预买卖报告）实盘永不触发。
+    宽限需覆盖数据源延迟：11:30 bar 在 :08 常尚未就绪，tick 返回旧 bar
+    跳过，下一轮重试在整分钟 :08（11:31/11:32/...），5 分钟窗口保证
+    至少 4 次重试；数据源正常时在 11:30 当场处理。
     """
     t = now.time()
     return (in_trading(now)
