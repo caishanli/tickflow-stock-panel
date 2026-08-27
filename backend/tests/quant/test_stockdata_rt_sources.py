@@ -124,6 +124,8 @@ def test_sources_http_roundtrip(monkeypatch):
 
 def test_source_fetch_chunks_large_batches(monkeypatch):
     """超批分块：>200 只拆多次请求，URL 不超限；单块失败不影响其余块。"""
+    import math
+
     from app.services.stockdata.rt_sources import RT_BATCH_SIZE
 
     calls = []
@@ -163,11 +165,60 @@ def test_source_fetch_chunks_large_batches(monkeypatch):
     t = TencentRTSource()
     t._session = ChunkSession()
     syms = [f"{600000 + i}.SH" for i in range(RT_BATCH_SIZE + 50)]
+    n_chunks = math.ceil(len(syms) / RT_BATCH_SIZE)
     quotes = t.fetch(syms)
-    assert len(calls) == 2                          # 分成两块
+    assert len(calls) == n_chunks
     assert all(len(u.rsplit("q=", 1)[1].split(",")) <= RT_BATCH_SIZE for u in calls)
     assert len(quotes) == RT_BATCH_SIZE             # 失败块丢弃，成功块照常返回
     assert "600000.SH" in quotes and f"{600000 + RT_BATCH_SIZE - 1}.SH" in quotes
+
+
+def test_source_fetch_midloop_failure_keeps_surrounding_chunks(monkeypatch):
+    """中间块失败不得中断后续块：3 块中第 2 块挂, 第 1/3 块都要保住。"""
+    from app.services.stockdata.rt_sources import RT_BATCH_SIZE
+
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        @property
+        def text(self):
+            return self._body
+
+        def raise_for_status(self):
+            return None
+
+    def make_line(sym):
+        pure, suf = sym.split(".")
+        return (f'v_{"sh" if suf == "SH" else "sz"}{pure}="1~X~{pure}~9.08~9.22~9.24~'
+                f'881756~1~1~9.08~1~9.08~1~9.07~1~9.06~1~9.05~1~9.04~1~9.08~1~9.09~'
+                f'1~9.10~1~9.11~1~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
+                f'9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06";')
+
+    class ChunkSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, timeout=None):
+            calls.append(url)
+            if len(calls) == 2:  # 第 2 块失败
+                raise OSError("boom")
+            codes = url.rsplit("q=", 1)[1].split(",")
+            return FakeResp("\n".join([make_line(f"{c[2:]}.{'SH' if c.startswith('sh') else 'SZ'}")
+                                       for c in codes]))
+
+    t = TencentRTSource()
+    t._session = ChunkSession()
+    syms = [f"{600000 + i}.SH" for i in range(RT_BATCH_SIZE * 3)]
+    quotes = t.fetch(syms)
+    assert len(calls) == 3                          # 第 2 块失败不中断第 3 块
+    assert len(quotes) == RT_BATCH_SIZE * 2         # 第 1 + 第 3 块都保住
+    assert f"{600000 + RT_BATCH_SIZE * 2}.SH" in quotes   # 第 3 块的标的在
+    assert f"{600000 + RT_BATCH_SIZE}.SH" not in quotes   # 第 2 块确实丢了
 
 
 def test_source_fetch_network_error_returns_empty(monkeypatch):

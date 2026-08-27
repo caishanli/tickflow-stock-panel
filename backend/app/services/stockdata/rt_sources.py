@@ -23,9 +23,9 @@ _TENCENT_URL = "https://qt.gtimg.cn/q="
 _SINA_URL = "https://hq.sinajs.cn/list="
 _HTTP_TIMEOUT = 3.0
 # 单请求标的上限：实测腾讯 6870 只单 URL(61KB) 会吃 HTTP 414；200 只/块
-# 全市场 35 请求 0.5s 内拉完且无限流（2026-08-26 盘前实测）。env 可调。
+# 全市场 35 请求 0.5s 内拉完且无限流（2026-08-26 实测）。env 可调, 建议 50~500。
 try:
-    RT_BATCH_SIZE = max(1, int(os.getenv("STOCKDATA_RT_BATCH", "") or 200))
+    RT_BATCH_SIZE = min(500, max(1, int(os.getenv("STOCKDATA_RT_BATCH", "") or 200)))
 except ValueError:
     RT_BATCH_SIZE = 200
 
@@ -136,18 +136,24 @@ class _HttpSource:
         if not vendor:
             return {}
         out: dict[str, RTQuote] = {}
-        try:
-            timeout = float(os.getenv("STOCKDATA_RT_HTTP_TIMEOUT", "") or _HTTP_TIMEOUT)
-            for i in range(0, len(vendor), RT_BATCH_SIZE):
+        timeout = float(os.getenv("STOCKDATA_RT_HTTP_TIMEOUT", "") or _HTTP_TIMEOUT)
+        chunks = (len(vendor) + RT_BATCH_SIZE - 1) // RT_BATCH_SIZE
+        failed = 0
+        for i in range(0, len(vendor), RT_BATCH_SIZE):
+            try:
                 resp = self._session.get(
                     self._url + ",".join(vendor[i:i + RT_BATCH_SIZE]), timeout=timeout)
                 resp.raise_for_status()
                 resp.encoding = "gbk"
                 out.update(self._parser(resp.text))
-        except Exception as e:  # noqa: BLE001
-            # 已成功块的结果保留（部分数据优于全丢）；缺失标的由编排链降级下家
-            logger.warning("[rt_sources] %s 批量拉取失败(%s 只): %s",
-                           type(self).__name__, len(vendor), e)
+            except Exception as e:  # noqa: BLE001
+                # 单块失败仅丢弃该块, 其余块继续; 缺失标的由编排链降级下家
+                failed += 1
+                logger.warning("[rt_sources] %s 第%s/%s块拉取失败: %s",
+                               type(self).__name__, failed, chunks, e)
+        if failed and out:
+            logger.warning("[rt_sources] %s 部分失败 %s/%s 块, 已成功解析 %s 只",
+                           type(self).__name__, failed, chunks, len(out))
         return out
 
     def close(self) -> None:
