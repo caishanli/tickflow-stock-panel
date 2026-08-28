@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json as _json
 import logging
@@ -16,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import polars as pl
 
@@ -688,9 +689,9 @@ class DataSources:
             pass
         return stocks
 
-    _BAOSTOCK_INDEX = {"000300": "query_hs300_stocks",
-                       "000016": "query_sz50_stocks",
-                       "000905": "query_zz500_stocks"}
+    _BAOSTOCK_INDEX: ClassVar[dict] = {"000300": "query_hs300_stocks",
+                                       "000016": "query_sz50_stocks",
+                                       "000905": "query_zz500_stocks"}
 
     def _fetch_index_stocks_live(self, code6: str) -> list[str]:
         # 1) baostock 覆盖的中证指数（fields: updateDate, sh.600000, 名称）
@@ -713,10 +714,8 @@ class DataSources:
                     if out:
                         return sorted(set(out))
                 finally:
-                    try:
+                    with contextlib.suppress(Exception):
                         _bs.logout()
-                    except Exception:
-                        pass
             except Exception:
                 logger.warning("index_stocks %s baostock 拉取失败", code6,
                                exc_info=True)
