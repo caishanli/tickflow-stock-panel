@@ -21,6 +21,7 @@ from typing import ClassVar, TypeVar
 
 import polars as pl
 
+from . import rt_sources as _rt
 from .single_flight import DedupCache, SingleFlight
 
 logger = logging.getLogger("app.services.stockdata.sources")
@@ -232,19 +233,28 @@ class DayFileCache:
 
 
 class NetworkPuller:
-    """服务端共享网络拉取线程池：有界并发 + 每线程独立数据源 + 标的级 single-flight。
-
-    所有 handler 线程的实时回源都提交到此池：并发客户端请求的重叠标的内在
-    ``rt:{code}`` 键上只拉一次，对 mootdx 的并发 socket 数被池上限约束。
-    """
+    """共享实时拉取编排：结果TTL缓存 → mootdx冷启动自举 → 腾讯批量 → 新浪批量
+    → mootdx逐只兜底。batch 级加锁串行化，避免并发客户端重复批量请求；
+    forced=mootdx 时完全走旧逐只路径（一键回滚）。"""
 
     def __init__(self, factory: Callable | None = None, workers: int = 16):
         self._factory = factory
         self._workers = max(1, workers)
-        self._single = SingleFlight()
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(
             max_workers=self._workers, thread_name_prefix="stockdata-pull")
+        self._chain_lock = threading.Lock()
+        try:
+            self._result_ttl = float(os.getenv("STOCKDATA_RT_RESULT_TTL", "") or 3.0)
+        except (TypeError, ValueError):
+            self._result_ttl = 3.0
+        self._result_cache: dict[str, tuple[float, pl.DataFrame]] = {}
+        self._bootstrapped: set[str] = set()
+        self._bootstrap_day: _dt.date | None = None
+        self.synth = _rt.BarSynthesizer()
+        forced = os.getenv("STOCKDATA_RT_SOURCE", "auto") or "auto"
+        self.tencent = None if forced in ("mootdx", "sina") else _rt.TencentRTSource()
+        self.sina = None if forced in ("mootdx", "tencent") else _rt.SinaRTSource()
 
     def _source(self):
         src = getattr(self._local, "src", None)
@@ -257,41 +267,105 @@ class NetworkPuller:
             self._local.src = src
         return src
 
-    def _fetch_one(self, code: str) -> pl.DataFrame:
+    def _cache_put(self, tf: str, frame: pl.DataFrame) -> None:
+        self._result_cache[tf] = (time.monotonic(), frame)
+
+    def _bootstrap_needed(self, code_tf: str) -> bool:
+        """交易时段冷启动自举判定：当日既无合成记录也无结果缓存。"""
+        if not _in_trading():
+            return False
+        today = _dt.date.today()
+        if self._bootstrap_day != today:
+            self._bootstrap_day = today
+            self._bootstrapped.clear()
+        has_record = (code_tf in self._bootstrapped
+                      or code_tf in self._result_cache
+                      or self.synth.last_quote_time(code_tf) is not None)
+        return not has_record
+
+    def _pull_mootdx_one(self, code_tf: str) -> pl.DataFrame | None:
+        """mootdx 单只实时分钟拉取（超时重置线程源）。返回帧或 None。"""
         try:
-            df = _pull_recent_guarded(self._source(), code)
+            df = _pull_recent_guarded(self._source(), code_tf)
         except TimeoutError:
-            # 超时：复用 socket 可能已坏，重置本线程数据源，下次 fetch 重建
+            # 超时：复用 socket 可能已坏，重置本线程数据源，下次拉取重建
             self._local.src = None
-            return pl.DataFrame()
+            return None
         if df is None or df.empty:
-            return pl.DataFrame()
+            return None
         pdf = df.reset_index()
-        pdf["symbol"] = _tf_symbol(code)
+        pdf["symbol"] = code_tf
         for c in _MINUTE_COLS:
             if c not in pdf.columns:
                 pdf[c] = None
-        return _as_datetime(pl.from_pandas(pdf[_MINUTE_COLS]))
-
-    def fetch_minute(self, code: str) -> pl.DataFrame:
-        """单只标的实时分钟（per-symbol 去重：同一分钟多请求只回源一次）。"""
-        return self._single.run(f"rt:{code}", lambda: self._fetch_one(code))
+        frame = _as_datetime(pl.from_pandas(pdf[_MINUTE_COLS]))
+        return frame if not frame.is_empty() else None
 
     def fetch_many(self, codes: list[str]) -> list[pl.DataFrame]:
-        futures = {self._pool.submit(self.fetch_minute, c): c for c in codes}
-        out = []
-        for f in futures:
-            try:
-                df = f.result()
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[sources] 实时回源异常 %s: %s", f, e)
-                continue
-            if df is not None and not df.is_empty():
-                out.append(df)
-        return out
+        with self._chain_lock:
+            tf_codes = [_tf_symbol(c) for c in codes]
+            out: dict[str, pl.DataFrame] = {}
+            todo: list[str] = []
+            now_mono = time.monotonic()
+            # ① 结果 TTL 缓存：命中直接复用帧不再触网
+            for tf in dict.fromkeys(tf_codes):
+                hit = self._result_cache.get(tf)
+                if hit is not None and now_mono - hit[0] < self._result_ttl:
+                    out[tf] = hit[1]
+                else:
+                    todo.append(tf)
+            # ② 冷启动自举：交易时段、无任何当日记录的标的，mootdx 拉「今日迄今」一次
+            for tf in list(todo):
+                if self._bootstrap_needed(tf):
+                    try:
+                        frame = self._pull_mootdx_one(tf)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[sources] %s 自举失败(非超时): %s", tf, e)
+                        frame = None
+                    self._bootstrapped.add(tf)
+                    if frame is not None and not frame.is_empty():
+                        out[tf] = frame
+                        self._cache_put(tf, frame)
+                        todo.remove(tf)
+            # ③④ 腾讯批量 → 新浪批量 → 合成；forced=mootdx 跳过 HTTP 链
+            forced = os.getenv("STOCKDATA_RT_SOURCE", "auto") or "auto"
+            if forced != "mootdx" and todo:
+                quotes: dict[str, _rt.RTQuote] = {}
+                if self.tencent is not None:
+                    quotes.update(self.tencent.fetch(todo))
+                missing = [s for s in todo if s not in quotes]
+                if missing and self.sina is not None:
+                    quotes.update(self.sina.fetch(missing))
+                still_missing = [s for s in todo if s not in quotes]
+                if quotes:
+                    self.synth.reset_if_new_day(_dt.date.today())
+                    for df in self.synth.update(quotes):
+                        for sym in df["symbol"].unique().to_list():
+                            sub = df.filter(pl.col("symbol") == sym)
+                            out[sym] = sub
+                            self._cache_put(sym, sub)
+                todo = still_missing
+            # ⑤ mootdx 逐只兜底（池内并行）
+            if todo:
+                futures = {self._pool.submit(self._pull_mootdx_one, c): c
+                           for c in todo}
+                for f, tf in futures.items():
+                    try:
+                        frame = f.result()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[sources] mootdx 兜底失败 %s: %s", tf, e)
+                        continue
+                    if frame is not None and not frame.is_empty():
+                        out[frame["symbol"][0]] = frame
+                        self._cache_put(frame["symbol"][0], frame)
+            return list(out.values())
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False)
+        if self.tencent is not None:
+            self.tencent.close()
+        if self.sina is not None:
+            self.sina.close()
 
 
 def _pull_recent_guarded(src, code: str, timeout: float = 30.0):
@@ -540,13 +614,25 @@ class DataSources:
             if base_parts else pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
 
         # 未覆盖：内存缺失，或内存最新 bar < asof（过期）。指数跳过。非交易时段不拉。
+        # 陈旧阈值可调（STOCKDATA_RT_STALE_SEC，默认 10s）；合成器快照新鲜可豁免
+        # （bar 时间旧但刚收到实时快照 → 合成 bar 已足够新，不重复回源）。
+        try:
+            stale_sec = float(os.getenv("STOCKDATA_RT_STALE_SEC", "") or 10.0)
+        except ValueError:
+            stale_sec = 10.0
+
+        def _is_stale(sym: str, last_dt) -> bool:
+            qt = self.puller.synth.last_quote_time(sym)
+            eff = max(last_dt, qt) if qt is not None else last_dt
+            return eff < asof_ts - _dt.timedelta(seconds=stale_sec)
+
         latest_by_sym = {}
         for sym, mx in base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows():
             latest_by_sym[sym] = mx
         todo = [c for c in codes
                 if _in_trading(asof_ts) and not _is_index(c)
                 and (_tf_symbol(c) not in latest_by_sym
-                     or latest_by_sym[_tf_symbol(c)] < asof_ts - _dt.timedelta(minutes=3))]
+                     or _is_stale(_tf_symbol(c), latest_by_sym[_tf_symbol(c)]))]
         fills: list[pl.DataFrame] = []
         if todo:
             pulls = self.puller.fetch_many(todo)

@@ -26,6 +26,7 @@ from ..config import CONFIG
 from ..datasource.manager import QuantDataProvider
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
+from app.config import settings
 
 log = logging.getLogger("app.quant.simulate.runner")
 
@@ -33,7 +34,7 @@ POLL_INTERVAL = 60  # 看护模式巡检间隔（秒）：分钟级止损，同�
 IDLE_INTERVAL = 30  # 非交易时段空转间隔（秒）
 LIMIT_DOWN_PCT = -0.098  # 跌停判定阈值（主板 10% 留容差；科创/创业 20% 简化不细分）
 LIMIT_UP_PCT = 0.098     # 涨停判定阈值（禁买，与跌停同口径）
-TICK_OFFSET = 8          # 交易时段每分钟第 N 秒后触发，等刚收的 bar 可读
+TICK_OFFSET = settings.sim_tick_offset  # 交易时段每分钟第 N 秒后触发(SIM_TICK_OFFSET, 等快照跨分钟边界)
 SESSION_END_GRACE = datetime.time(15, 2)  # 15:00 收市 bar 的处理宽限（之后进收盘钩子）
 MARK_INTERVAL = 10          # 盘中实时打标间隔（秒）
 MARK_SNAPSHOT_TICK = 0.0005 # 打标价格相对上次跳变超过该比例才落快照

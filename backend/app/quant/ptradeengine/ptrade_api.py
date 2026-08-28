@@ -374,14 +374,18 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
 
 
 def get_stock_status(codes, query_type="HALT", query_date=None):
-    """停牌检测：HALT → {PTrade码: 是否停牌}。由 minute_prices 可得性推导。"""
+    """停牌检测：HALT → {PTrade码: 是否停牌}。本地恒 False（不阻止交易）。
+
+    真机 PTrade 由交易所权威停牌状态应答；本地引擎无权威停牌数据源。此前用
+    「实时快照缺席⇔停牌」推断：行情瞬态缺失（单标的回源超时/stockdata 服务
+    重启清分钟内存）即被误判成全天停牌，叠加策略 _HALT_CACHE 按日黏住，当天
+    该标的全部买卖被跳过（2026-08-25 960366ab 的 159502 实际正常成交却被
+    「全天停牌，跳过交易」，同刻 jq 账户正常轮仓）。jq 引擎 paused 恒 False，
+    为两侧行为对齐并消除误判，本地一律返回 False；盘中临时停牌仍由
+    is_temporarily_suspended（当根分钟量=0）兜底。"""
     if isinstance(codes, str):
         codes = [codes]
-    out = {}
-    snap = _state.get("minute_prices") or {}
-    for c in codes:
-        out[c] = c not in snap
-    return out
+    return {c: False for c in codes}
 
 
 # ---- 交易日历（DataManager 指数日线推导） ----
