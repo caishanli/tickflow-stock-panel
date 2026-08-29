@@ -309,6 +309,8 @@ async def _application_lifespan(app: FastAPI):
 
     # 通用监控规则引擎: 启动时 reload 规则到内存态 (修复重启后告警失效)
     from app.services import preferences
+    from app.strategy import monitor_rules as mr_store
+    from app.strategy.monitor import MonitorRuleEngine
     from app.services.sector_monitor import SectorMonitorService
     monitor_engine = MonitorRuleEngine()
     sector_monitor_service = SectorMonitorService(repo)
