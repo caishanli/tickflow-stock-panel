@@ -12,6 +12,7 @@ mock 范式沿用 test_stocksdk_provider.py (monkeypatch 模块属性)。
 from __future__ import annotations
 
 from datetime import date, datetime
+from threading import Lock
 from unittest.mock import MagicMock
 
 import httpx
@@ -411,6 +412,38 @@ def test_sync_and_persist_minute_custom_persists(monkeypatch, tmp_path):
     get_client_spy.assert_not_called()
 
 
+def test_sync_and_persist_minute_holds_repository_write_lock(monkeypatch, tmp_path):
+    expected_df = _mock_minute_df()
+    mock_provider = MagicMock()
+    mock_provider.get_minute.return_value = expected_df
+    _setup_custom_provider(monkeypatch, mock_provider, has_dataset=True)
+
+    monkeypatch.setattr(kline_sync, "_cleanup_null_datetime_minute", lambda repo: None)
+    monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda repo: None)
+    monkeypatch.setattr(kline_sync, "_latest_minute_datetime", lambda repo: None)
+    monkeypatch.setattr(kline_sync, "resolve_limit", lambda *a, **kw: MagicMock(batch=100, rpm=30))
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
+
+    write_lock = Lock()
+
+    def assert_locked(df, minute_dir):
+        assert not write_lock.acquire(blocking=False)
+        return df.height
+
+    monkeypatch.setattr(kline_sync, "_write_minute_partition", assert_locked)
+
+    mock_repo = MagicMock()
+    mock_repo.store.data_dir = tmp_path
+    mock_repo.db.execute = MagicMock()
+    mock_repo._write_lock = write_lock
+
+    written = kline_sync.sync_and_persist_minute(
+        ["600519.SH"], mock_repo, MagicMock(),
+    )
+
+    assert written == expected_df.height
+
+
 # ---------- 测试 13: get_provider 异常时 fall through TickFlow (Issue 2) ----------
 
 def test_get_provider_exception_falls_back_to_tickflow(monkeypatch):
@@ -680,3 +713,25 @@ def test_intraday_monitor_support_resolver_exception_falls_back(monkeypatch):
 
     assert support["available"] is True
     assert support["source"] == "minute_batch"
+
+
+# ---------- 测试 20: sync_minute_single 拒绝指数 symbol (防污染 kline_minute) ----------
+
+def test_sync_minute_single_rejects_index_symbol():
+    """指数分钟K无本地存储, 落库会污染股票分钟表; 端点应显式 400 而非 500。"""
+    import asyncio
+
+    import pytest
+    from fastapi import HTTPException
+
+    from app.api import kline as kline_api
+
+    mock_repo = MagicMock()
+    mock_repo.resolve_asset_type.return_value = "index"
+    mock_request = MagicMock()
+    mock_request.app.state.repo = mock_repo
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(kline_api.sync_minute_single(mock_request, {"symbol": "000001.SH"}))
+    assert exc_info.value.status_code == 400
+    assert "指数" in str(exc_info.value.detail)

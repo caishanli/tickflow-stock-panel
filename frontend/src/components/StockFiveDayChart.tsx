@@ -80,7 +80,7 @@ export function StockFiveDayChart({ symbol, dates, prevClose, height = 420, mark
 }
 
 function buildOption(daysRows: MinuteKlineRow[][], dates: string[], prevClose: number | undefined, markers: IntradayMarker[] | undefined, ct: ChartTheme): EChartsOption {
-  const timeIndexMap = new Map(FULL_DAY_TIMES.map((t, i) => [t, i]))
+  const timeIndexMap = new Map<string, number>(FULL_DAY_TIMES.map((t, i) => [t, i] as const))
   const n = daysRows.length
   const total = n * DAY_POINTS
 

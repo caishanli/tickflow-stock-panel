@@ -6,10 +6,12 @@ import math
 import time
 from datetime import date
 
+import anyio
 import polars as pl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
+from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import watchlist
 from app.services.watchlist_ocr import import_watchlist_image
 from app.services.watchlist_ocr.provider import get_ocr_provider
@@ -27,16 +29,33 @@ _IMPORT_IMAGE_TYPES = {
     "image/bmp",
     "image/gif",
 }
+# OCR 独立并发上限：避免多张大图同时解码 + 多 Tesseract 子进程
+_OCR_LIMITER = anyio.CapacityLimiter(2)
 
 
 class AddRequest(BaseModel):
     symbol: str
     note: str = ""
+    group_id: str | None = None
 
 
 class BatchAddRequest(BaseModel):
     symbols: list[str]
     note: str = ""
+    group_id: str | None = None
+
+
+class GroupNameRequest(BaseModel):
+    name: str
+    color: str | None = None
+
+
+class GroupReorderRequest(BaseModel):
+    ordered_ids: list[str]
+
+
+class GroupAssignRequest(BaseModel):
+    group_id: str | None = None
 
 
 def _with_names(rows: list[dict], request: Request) -> list[dict]:
@@ -60,15 +79,74 @@ def list_all(request: Request):
 
 @router.post("")
 def add_one(req: AddRequest, request: Request):
-    rows = watchlist.add(req.symbol, req.note)
+    try:
+        rows = watchlist.add(req.symbol, req.note, req.group_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     return {"symbols": _with_names(rows, request)}
 
 
 @router.post("/batch")
 def add_batch(req: BatchAddRequest, request: Request):
-    for sym in req.symbols:
-        watchlist.add(sym, req.note)
-    return {"symbols": _with_names(watchlist.list_symbols(), request), "added": len(req.symbols)}
+    try:
+        rows, added = watchlist.add_batch(req.symbols, req.note, req.group_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"symbols": _with_names(rows, request), "added": added}
+
+
+@router.get("/groups")
+def list_groups():
+    return {"groups": watchlist.list_groups()}
+
+
+@router.post("/groups")
+def create_group(req: GroupNameRequest):
+    try:
+        groups, group = watchlist.create_group(req.name, req.color)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"groups": groups, "group": group}
+
+
+@router.put("/groups/reorder")
+def reorder_groups(req: GroupReorderRequest):
+    """重排分组前后顺序 (json 数组顺序即定义顺序, 侧边栏/标签栏/分组视图共用)。"""
+    try:
+        groups = watchlist.reorder_groups(req.ordered_ids)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"groups": groups}
+
+
+@router.put("/groups/{group_id}")
+def rename_group(group_id: str, req: GroupNameRequest):
+    try:
+        groups = watchlist.rename_group(group_id, req.name, req.color)
+    except KeyError as e:
+        raise HTTPException(404, "自选分组不存在") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"groups": groups}
+
+
+@router.delete("/groups/{group_id}")
+def delete_group(group_id: str, request: Request):
+    try:
+        groups, rows = watchlist.delete_group(group_id)
+    except KeyError as e:
+        raise HTTPException(404, "自选分组不存在") from e
+    return {"groups": groups, "symbols": _with_names(rows, request)}
+
+
+@router.post("/groups/{group_id}/clear")
+def clear_group(group_id: str, request: Request):
+    """清空分组成员:把该分组内所有股票转为未分组,保留分组定义。"""
+    try:
+        rows = watchlist.clear_group(group_id)
+    except KeyError as e:
+        raise HTTPException(404, "自选分组不存在") from e
+    return {"symbols": _with_names(rows, request)}
 
 
 @router.get("/ocr-status")
@@ -81,8 +159,6 @@ def ocr_status():
 @router.post("/import-image")
 async def import_from_image(request: Request, file: UploadFile = File(...)):
     """从自选截图识别股票代码，返回候选列表（不自动写入自选）。"""
-    import anyio
-
     content_type = (file.content_type or "").split(";")[0].strip().lower()
     filename = (file.filename or "").lower()
     # 严格白名单：不接受任意 image/*（如 image/svg+xml）
@@ -100,9 +176,10 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
     existing = {r["symbol"] for r in watchlist.list_symbols()}
     data_dir = request.app.state.repo.store.data_dir
     try:
-        # OCR 为同步 CPU/子进程；丢进线程池，避免卡住事件循环（行情 SSE 等）
+        # OCR 为同步 CPU/子进程；独立 limiter 限制并发，避免卡住事件循环（行情 SSE 等）
         result = await anyio.to_thread.run_sync(
             lambda: import_watchlist_image(data, data_dir, existing_symbols=existing),
+            limiter=_OCR_LIMITER,
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
@@ -123,6 +200,42 @@ def move_one_to_top(symbol: str, request: Request):
     return {"symbols": _with_names(rows, request)}
 
 
+@router.put("/{symbol}/group")
+def assign_group(symbol: str, req: GroupAssignRequest, request: Request):
+    """互斥设定分组(仅保留此组; None=移出全部分组)。多组操作用 members 端点。"""
+    try:
+        rows = watchlist.set_group(symbol, req.group_id)
+    except KeyError as e:
+        raise HTTPException(404, "自选标的不存在") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"symbols": _with_names(rows, request)}
+
+
+@router.post("/groups/{group_id}/members/{symbol}")
+def add_member(group_id: str, symbol: str, request: Request):
+    """把标的加入分组(多组成员关系: 不影响其他分组)。"""
+    try:
+        rows = watchlist.add_to_group(symbol, group_id)
+    except KeyError as e:
+        raise HTTPException(404, "自选标的不存在") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"symbols": _with_names(rows, request)}
+
+
+@router.delete("/groups/{group_id}/members/{symbol}")
+def remove_member(group_id: str, symbol: str, request: Request):
+    """把标的移出分组(仅摘本组标签; 标的仍在自选, 可能落入未分组)。"""
+    try:
+        rows = watchlist.remove_from_group(symbol, group_id)
+    except KeyError as e:
+        raise HTTPException(404, "自选标的不存在") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"symbols": _with_names(rows, request)}
+
+
 @router.delete("/{symbol}")
 def remove_one(symbol: str, request: Request):
     rows = watchlist.remove(symbol)
@@ -138,7 +251,7 @@ def clear_all():
 
 # 自选页需要的列
 _WATCHLIST_COLS = [
-    "symbol", "close", "change_pct", "change_amount", "amount",
+    "symbol", "close", "open", "high", "low", "change_pct", "change_amount", "amount",
     "turnover_rate",
     "amplitude", "annual_vol_20d",
     "vol_ratio_5d",
@@ -151,6 +264,7 @@ _WATCHLIST_COLS = [
     "boll_upper", "boll_lower",
     "atr_14",
     "momentum_5d", "momentum_10d", "momentum_20d", "momentum_30d", "momentum_60d",
+    "deviate_3d", "deviate_10d", "deviate_30d",
     "consecutive_limit_ups", "consecutive_limit_downs",
     "signal_limit_up", "signal_limit_down", "signal_volume_surge",
     "signal_ma_golden_5_20", "signal_macd_golden", "signal_n_day_high",
@@ -180,8 +294,10 @@ def watchlist_enriched(
     # 按资产拆分自选 symbol; ETF enriched 是独立缓存, 仅自选真的含 ETF 才去加载
     # (避免无 ETF 用户在缓存冷启动时触发 ETF 全量懒加载)
     etf_set = repo.get_etf_symbol_set()
-    stock_symbols = [s for s in symbols if s not in etf_set]
+    index_set = repo.get_index_symbol_set()
     etf_symbols = [s for s in symbols if s in etf_set]
+    index_symbols = [s for s in symbols if s not in etf_set and s in index_set]
+    stock_symbols = [s for s in symbols if s not in etf_set and s not in index_set]
 
     df_e, cache_date = repo.get_enriched_latest()
 
@@ -210,8 +326,19 @@ def watchlist_enriched(
             df_etf = etf_watchlist_df
         df = df_etf if df.is_empty() else pl.concat([df, df_etf], how="diagonal_relaxed")
 
-    # as_of 取两类缓存中较旧者, 避免把旧的 ETF 行标成股票缓存日期
-    dates = [d for d in (cache_date if stock_symbols else None, etf_date) if d is not None]
+    # 指数行合并 (镜像 ETF 分支); 缺失列 (换手率/涨跌停信号等) 为 null
+    index_date = None
+    if index_symbols:
+        df_idx_all, index_date = repo.get_enriched_latest_asset("index")
+        idx_watchlist_df = pl.DataFrame({"symbol": index_symbols})
+        if not df_idx_all.is_empty():
+            df_idx = idx_watchlist_df.join(df_idx_all, on="symbol", how="left")
+        else:
+            df_idx = idx_watchlist_df
+        df = df_idx if df.is_empty() else pl.concat([df, df_idx], how="diagonal_relaxed")
+
+    # as_of 取三类缓存中较旧者
+    dates = [d for d in (cache_date if stock_symbols else None, etf_date, index_date) if d is not None]
     as_of = min(dates) if dates else None
     if df.is_empty():
         return {"rows": [], "as_of": str(as_of) if as_of else None, "elapsed_ms": 0}
@@ -225,8 +352,14 @@ def watchlist_enriched(
         pl.col("symbol").replace_strict(name_map, default=None, return_dtype=pl.Utf8).alias("name")
     )
 
+    # 标注资产类型: 前端据此渲染徽标/豁免板块筛选/分时列降级
+    asset_map = {**{s: "etf" for s in etf_symbols}, **{s: "index" for s in index_symbols}}
+    df = df.with_columns(
+        pl.col("symbol").replace_strict(asset_map, default="stock", return_dtype=pl.Utf8).alias("asset_type")
+    )
+
     # 选择内置需要的列
-    keep = [c for c in _WATCHLIST_COLS + ["name", "float_shares"] if c in df.columns]
+    keep = [c for c in _WATCHLIST_COLS + ["name", "float_shares", "asset_type"] if c in df.columns]
     df = df.select(keep)
 
     # 动态 JOIN 扩展数据表
@@ -250,7 +383,7 @@ def watchlist_enriched(
                     ext_df, _ = _read_ext_dataframe(cfg, data_dir)
                 else:
                     ext_df = pl.from_arrow(db.query(
-                        f"SELECT symbol, \"{field_name}\" FROM {view_name}"
+                        f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
                     ).arrow())
                 if not ext_df.is_empty() and "symbol" in ext_df.columns:
                     ext_df = (
@@ -308,6 +441,6 @@ def _parse_ext_columns(ext_columns: str) -> list[tuple[str, str]]:
         config_id, field_name = part.split(".", 1)
         config_id = config_id.strip()
         field_name = field_name.strip()
-        if config_id and field_name:
+        if config_id and field_name and is_valid_ext_ident(config_id):
             result.append((config_id, field_name))
     return result

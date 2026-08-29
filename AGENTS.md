@@ -90,3 +90,8 @@ uv run --extra dev mypy app               # 类型检查
 
 - 单容器 Docker：`Dockerfile` 两阶段，前端 `dist` 拷进后端镜像，`docker compose up --build` 后访问 `http://localhost:3018`。进阶见 `docs/deployment.md`。
 - CI：`.github/workflows/docker.yml` 推镜像到 ghcr（main/tag/手动）；`release.yml` 仅手动构建桌面客户端。
+
+> 上游贡献指南：修改/审查代码前先读根目录 [`CONTRIBUTING.md`](CONTRIBUTING.md)（架构、数据契约、
+> 插件化、测试矩阵与 PR 合并标准）；涉及二次开发/上游升级兼容时再读
+> [`docs/secondary-development.md`](docs/secondary-development.md)（区分已实现能力与目标扩展契约，
+> 不得根据设计示例虚构尚不存在的 API）。

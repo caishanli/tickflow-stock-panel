@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,31 @@ _REQUIRED = {
     "financial": {"symbol"},
 }
 
+# 小数制下 change_pct/amplitude/turnover_rate 的物理上限: A股最大涨跌停 30% (+容差)。
+# 中位数口径下小数制批次不可能超过该值, 百分制批次(典型中位数 0.5~3)必然超过。
+_PCT_FRACTION_MAX = 0.31
+
+
+def _normalize_pct_units(df: pl.DataFrame) -> pl.DataFrame:
+    """百分制源自适应归一为小数制 (契约: change_pct/amplitude/turnover_rate 为小数,
+    0.0366 = 3.66%)。不少第三方接口(如 a-stock-data)直接返回 3.66 表示 3.66%,
+    若不归一, 下游(行业/概念统计、前端 x100 展示)会整体放大 100 倍。
+
+    截面判定: 样本 >= 5 用 |值| 中位数(对个别无涨跌幅限制新股免疫),
+    小样本退用最大值。整批同除 100, 避免逐值阈值在 0.3~1 区间的歧义。
+    """
+    for col in ("change_pct", "amplitude", "turnover_rate"):
+        if col not in df.columns:
+            continue
+        df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False).alias(col))
+        vals = df[col].drop_nulls().abs()
+        if vals.is_empty():
+            continue
+        stat = vals.median() if vals.len() >= 5 else vals.max()
+        if stat > _PCT_FRACTION_MAX:
+            df = df.with_columns((pl.col(col) / 100).alias(col))
+    return df
+
 
 class GenericHTTPProvider:
     """HTTP-backed custom source. It only handles fetching and schema mapping."""
@@ -57,6 +82,20 @@ class GenericHTTPProvider:
                 missing = sorted(required - mapped)
                 if missing:
                     errors.append(f"{dataset}: missing mapped fields: {', '.join(missing)}")
+            if dataset != "realtime":
+                request_params = [cfg.symbols_param, cfg.start_param, cfg.end_param]
+                if dataset == "minute":
+                    request_params.extend(
+                        name for name in (cfg.asset_type_param, cfg.freq_param) if name
+                    )
+                duplicates = sorted({
+                    name for name in request_params if request_params.count(name) > 1
+                })
+                if duplicates:
+                    errors.append(
+                        f"{dataset}: duplicate request parameter names: "
+                        f"{', '.join(duplicates)}"
+                    )
         return errors
 
     def get_daily(
@@ -107,6 +146,8 @@ class GenericHTTPProvider:
         cfg = self._dataset("realtime")
         rows = self._request_rows(cfg)
         df = self._mapped_frame(cfg, rows)
+        # 百分制源(返回 3.66 表示 3.66%)截面归一为契约小数制
+        df = _normalize_pct_units(df)
         if df.is_empty():
             return []
         return df.to_dicts()
@@ -197,7 +238,34 @@ class GenericHTTPProvider:
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         cfg = self._dataset(dataset)
-        rows = self._request_rows(cfg, symbols=symbols or [])
+        test_symbols = symbols or ["000001.SZ"]
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=7)
+        if dataset == "realtime":
+            rows = self._request_rows(cfg)
+        elif dataset == "minute":
+            override: dict[str, Any] = {}
+            if cfg.asset_type_param:
+                override[cfg.asset_type_param] = "stock"
+            if cfg.freq_param:
+                override[cfg.freq_param] = "1m"
+            rows = self._request_rows(
+                cfg,
+                symbols=test_symbols,
+                start_time=start_time,
+                end_time=end_time,
+                override_params=override or None,
+                override_body=override or None,
+            )
+        elif dataset in {"daily", "adj_factor"}:
+            rows = self._request_rows(
+                cfg,
+                symbols=test_symbols,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        else:
+            rows = self._request_rows(cfg, symbols=test_symbols)
         df = self._mapped_frame(cfg, rows)
         return {
             "provider": self.name,

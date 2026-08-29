@@ -12,6 +12,9 @@ interface Props {
   prevClose?: number
   className?: string
   onPriceHover?: (price: number | null) => void
+  onPriceDoubleClick?: (price: number, currentPrice: number) => void
+  currentPrice?: number
+  priceLines?: { value: number; label?: string; color?: string }[]
   /** 自动刷新间隔(ms)。undefined/0 = 不轮询(默认)。个股对话框盘中实时刷新时传入。 */
   refetchIntervalMs?: number
   /** 分时图买卖标记 (date 感知) */
@@ -29,6 +32,9 @@ export function StockIntradayChart({
   prevClose,
   className,
   onPriceHover,
+  onPriceDoubleClick,
+  currentPrice,
+  priceLines,
   refetchIntervalMs,
   markers,
   dataSource,
@@ -57,6 +63,8 @@ export function StockIntradayChart({
   // source=none 表示本地无数据且 TickFlow 也拉不到 (停牌/复牌延迟/非交易日)
   // 此时不弹"是否获取"询问窗, 只做静态提示, 避免误导用户去拉明知拉不到的数据
   const sourceIsNone = minute.data?.source === 'none'
+  // 指数分钟K无本地存储且不支持落库获取 (后端 sync_minute_single 显式拒绝), 不显示获取按钮
+  const isIndex = minute.data?.asset_type === 'index'
 
   useEffect(() => {
     setMinuteDismissed(false)
@@ -75,6 +83,9 @@ export function StockIntradayChart({
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
               <span>正在获取分钟K数据…</span>
             </div>
+          ) : isIndex ? (
+            // 指数: 分钟K仅支持实时读取, 无落库获取入口
+            <div className="flex items-center justify-center h-full text-xs text-muted">指数暂无分钟数据</div>
           ) : sourceIsNone ? (
             // 数据源确认无此日分钟数据 (停牌/复牌延迟等): 静态提示 + 保留重试
             <div className="flex flex-col items-center justify-center h-full gap-3">
@@ -127,6 +138,9 @@ export function StockIntradayChart({
           onPriceHover={onPriceHover}
           markers={markers}
           allowLimitMode={allowLimitMode}
+          onPriceDoubleClick={onPriceDoubleClick}
+          currentPrice={currentPrice}
+          priceLines={priceLines}
         />
       )}
     </div>

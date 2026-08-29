@@ -101,6 +101,8 @@ data/quant.db-journal
 backend._recheck*.py
 backend/_verify*.py
 backend/_desktop_run.log
+reports/tickflow_pro_probe/
+.cursor/debug-*.log
 
 # ===== 打包产物 (本地构建的安装包,不入库) =====
 backend/TickFlowStockPanel-win-x64.zip
@@ -121,3 +123,4 @@ backend/jqdata/
 backend/runtime/
 backend/app/quant/jqengine/data/
 .superpowers/
+reports/cursor_tickflow_pro_rate_limit_p0.bundle

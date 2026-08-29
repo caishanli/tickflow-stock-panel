@@ -33,7 +33,12 @@ import polars as pl
 
 from app.market_time import cn_now, cn_today
 from app.tickflow.capabilities import Cap
-from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
+from app.tickflow.rate_limits import (
+    apply_safety_rpm,
+    chunked,
+    resolve_limit,
+    sleep_between_batches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,6 @@ TIER_INTERVAL_RANGE: dict[str, tuple[float, float]] = {
 DEFAULT_RANGE = (10.0, 120.0)
 
 # 限速余量: 只用 rpm 的 80%, 给系统其他 depth 调用留空间
-RPM_MARGIN = 0.8
 # 间隔硬下限/上限(任何套餐)
 INTERVAL_HARD_MIN = 10.0
 INTERVAL_HARD_MAX = 300.0
@@ -142,11 +146,18 @@ class DepthService:
             logger.warning("depth sealed 从 parquet 恢复失败: %s", e)
 
     def start_polling(self) -> None:
-        """启动盘中轮询线程(连板梯队监控开启 + 有能力 + 交易时段)。"""
+        """启动盘中轮询线程(连板梯队监控开启 + 实时行情开启 + 有能力)。
+
+        依赖实时行情开关: 实时行情关闭时 enriched 内存缓存停留在上一交易日,
+        轮询会反复拉取陈旧的涨跌停名单(浪费 API 额度且数据无意义)。
+        实时行情开关切换时由 settings API 调 stop_polling/start_polling 同步启停。
+        """
         if not self._has_capability():
             return
         from app.services import preferences
         if not preferences.get_limit_ladder_monitor_enabled():
+            return
+        if not preferences.get_realtime_quotes_enabled():
             return
         # check-then-act 加锁: 两个线程同时 start_polling 不会各起一个轮询线程
         with self._lock:
@@ -511,9 +522,9 @@ class DepthService:
         raw_user = preferences.get_depth_polling_interval()
         user_interval = max(lo, min(hi, raw_user))
 
-        # ② 限速安全 clamp
+        # ② 限速安全 clamp（与 resolve_limit 共用 SAFETY_RPM_FACTOR，不叠乘）
         batches = max(1, math.ceil(n_symbols / batch_size))
-        usable_rpm = rpm * RPM_MARGIN
+        usable_rpm = apply_safety_rpm(rpm) or 1
         calls_per_min = usable_rpm / batches if batches > 0 else usable_rpm
         safe_interval = 60.0 / calls_per_min if calls_per_min > 0 else INTERVAL_HARD_MAX
 

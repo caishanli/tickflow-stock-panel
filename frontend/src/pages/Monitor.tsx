@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
+import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AlertTriangle, RadioTower, Plus, Trash2, Settings2, Zap, Bell, ListChecks, BellRing, TrendingUp, TrendingDown, Flame, Tags } from 'lucide-react'
@@ -8,9 +9,12 @@ import { Skeleton } from '@/components/data/Skeleton'
 import { api, type MonitorRule, type AlertEvent, type MonitorCondition, type MonitorExtFieldItem } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { fmtPrice, fmtPct } from '@/lib/format'
+import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 import { cn } from '@/lib/cn'
 import { cnSignal } from '@/lib/signals'
+import { LEGACY_STRATEGY_NOTIFY_EVENTS, STRATEGY_NOTIFY_EVENT_OPTIONS, strategyEventMeta, strategyName } from '@/lib/strategyMonitorEvents'
 import { boardTag } from '@/components/stock-table/primitives'
+import { resolveWatchlistGroupColor } from '@/lib/watchlist-group-colors'
 import { markSeen, resetBadge, leaveMonitorPage } from '@/lib/monitorBadge'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
@@ -18,7 +22,8 @@ import { DimensionMembersDialog, type DimensionKind, type DimensionMembersTarget
 import { usePreferences } from '@/lib/useSharedQueries'
 
 const TYPE_LABEL: Record<string, string> = {
-  signal: '个股信号', price: '价格/涨跌', market: '市场异动', strategy: '策略监控',
+  signal: '信号', price: '价格/涨跌', market: '市场异动', strategy: '策略监控', sector: '板块监控',
+  abnormal: '异动监控',
 }
 
 /** 严重级别 → 左侧色条 + 图标 */
@@ -32,16 +37,18 @@ const SOURCE_BADGE_STYLE: Record<string, string> = {
   signal:   'bg-accent/10 text-accent border-accent/20',
   price:    'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
   market:   'bg-purple-500/10 text-purple-400 border-purple-500/20',
+  sector:   'bg-cyan-500/10 text-cyan-700 border-cyan-500/20 dark:text-cyan-300',
+  abnormal: 'bg-orange-500/10 text-orange-500 border-orange-500/20 dark:text-orange-400',
 }
 
 /**
- * 渲染策略类消息 — 策略名黄色、新入选绿、移出红、其余白色。
+ * 渲染策略类消息 — 策略名黄色、进入红/移出绿 (A 股红涨绿跌惯例)、其余白色。
  */
 function renderMessage(source: string, message: string) {
   if (source !== 'strategy') {
     return <span className="text-secondary">{message}</span>
   }
-  const m = message.match(/^(策略「)([^」]+)(」)(新入选|移出)( .*)$/)
+  const m = message.match(/^(策略「)([^」]+)(」)(新入选|进入|移出)( .*)$/)
   if (!m) return <span className="text-foreground">{message}</span>
   const [, pre, strategyName, mid, direction, post] = m
   return (
@@ -49,7 +56,7 @@ function renderMessage(source: string, message: string) {
       <span className="text-foreground/80">{pre}</span>
       <span className="text-amber-400 font-medium">{strategyName}</span>
       <span className="text-foreground/80">{mid}</span>
-      <span className={direction === '新入选' ? 'text-emerald-400 font-medium' : 'text-danger font-medium'}>{direction}</span>
+      <span className={direction === '移出' ? 'text-bear font-medium' : 'text-danger font-medium'}>{direction}</span>
       <span className="text-foreground/80">{post}</span>
     </>
   )
@@ -110,9 +117,22 @@ export function Monitor() {
   const qc = useQueryClient()
   const [editorOpen, setEditorOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<MonitorRule | null>(null)
+  const [editorPreset, setEditorPreset] = useState<Partial<MonitorRule> | null>(null)
+
+  // 深链: /monitor?new=abnormal (异动监控页「告警规则」入口) → 直接弹出预置类型的编辑器
+  const [searchParams, setSearchParams] = useSearchParams()
+  useEffect(() => {
+    const kind = searchParams.get('new')
+    if (kind === 'abnormal') {
+      setEditingRule(null)
+      setEditorPreset({ type: 'abnormal', threshold_pct: 70, direction: 'both', abnormal_window: 'any', scope: 'all' })
+      setEditorOpen(true)
+      setSearchParams({}, { replace: true })
+    }
+  }, [searchParams, setSearchParams])
 
   // 触发记录: 过滤 + 统计 (提升到主组件, 供 header 行使用)
-  const [filter, setFilter] = useState<'all' | 'strategy' | 'signal' | 'price' | 'market'>('all')
+  const [filter, setFilter] = useState<'all' | 'strategy' | 'signal' | 'price' | 'market' | 'sector' | 'abnormal'>('all')
   const [confirmClear, setConfirmClear] = useState(false)
   const [confirmClearRules, setConfirmClearRules] = useState(false)
 
@@ -131,8 +151,8 @@ export function Monitor() {
   const alertsQuery = useQuery({
     queryKey: [...QK.alerts(filter === 'all' ? undefined : filter), extColumnsParam ?? ''],
     queryFn: () => api.alertsList({ days: 7, limit: 500, source: filter === 'all' ? undefined : filter, extColumns: extColumnsParam }),
+    // 10s 轮询仅作 SSE strategy_alert 事件的兜底; 后台标签页不再拉 500 条全量
     refetchInterval: 10000,
-    refetchIntervalInBackground: true,
   })
   const total = alertsQuery.data?.total ?? 0
 
@@ -173,7 +193,7 @@ export function Monitor() {
               <SectionHeader icon={BellRing} title="触发记录" />
               {/* 过滤标签 */}
               <div className="flex flex-wrap items-center gap-0.5">
-                {(['all', 'strategy', 'signal', 'price', 'market'] as const).map(f => (
+                {(['all', 'strategy', 'signal', 'price', 'market', 'sector', 'abnormal'] as const).map(f => (
                   <button
                     key={f}
                     onClick={() => setFilter(f)}
@@ -221,7 +241,7 @@ export function Monitor() {
               <span className="rounded-md bg-elevated/50 px-1.5 py-0.5 text-[10px] font-medium text-muted">{rulesCount}</span>
               <div className="ml-auto flex items-center gap-1">
                 <button
-                  onClick={() => { setEditingRule(null); setEditorOpen(true) }}
+                  onClick={() => { setEditingRule(null); setEditorPreset(null); setEditorOpen(true) }}
                   title="新建规则"
                   className="inline-flex h-6 w-6 items-center justify-center rounded-lg border border-border/60 bg-surface text-muted transition-all hover:border-accent/40 hover:text-accent hover:shadow-sm cursor-pointer"
                 >
@@ -250,7 +270,8 @@ export function Monitor() {
       <RuleEditorDialog
         open={editorOpen}
         rule={editingRule}
-        onClose={() => { setEditorOpen(false); setEditingRule(null) }}
+        preset={editorPreset}
+        onClose={() => { setEditorOpen(false); setEditingRule(null); setEditorPreset(null) }}
       />
 
       <ConfirmDialog
@@ -292,6 +313,7 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
   monitorExtFields: { concept: MonitorExtFieldItem | null; industry: MonitorExtFieldItem | null }
 }) {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const [confirmTs, setConfirmTs] = useState<number | null>(null)
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [previewEv, setPreviewEv] = useState<AlertEvent | null>(null)
@@ -336,19 +358,17 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
         <EmptyState
           icon={Bell}
           title="暂无触发记录"
-          hint="监控规则命中后,触发记录会出现在这里。可在右侧配置规则,或在个股详情页加入监控。"
+          hint="监控规则命中后,触发记录会出现在这里。可在右侧配置规则,或在标的详情页加入监控。"
         />
       ) : (
         <div className="space-y-2">
-              {events
-                .filter((ev: any) => !(ev.source === 'strategy' && !ev.symbol))
-                .map((ev: any, i: number) => {
+              {events.map((ev: any, i: number) => {
             const sev = SEVERITY_CONFIG[ev.severity ?? 'info'] ?? SEVERITY_CONFIG.info
             const SevIcon = sev.icon
             const isNew = ev.ts > enterTs
             return (
               <motion.div
-                key={`${ev.ts}-${i}`}
+                key={`${ev.ts}-${ev.symbol ?? ''}-${ev.rule_name ?? ''}`}
                 initial={isNew ? { opacity: 0, y: -8, scale: 0.98 } : { opacity: 0, y: 4 }}
                 animate={isNew ? {
                   opacity: [0, 1, 1, 0.85, 1],
@@ -367,9 +387,8 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                 </div>
                 <div className="min-w-0 flex-1">
                   {ev.source === 'strategy' ? (() => {
-                    const sm = ev.message?.match(/策略「([^」]+)」/)
-                    const sname = sm ? sm[1] : ''
-                    const isNew = ev.type === 'new_entry'
+                    const sname = strategyName(ev.message ?? '')
+                    const eventMeta = strategyEventMeta(ev.type)
                     const _pct = ev.change_pct ?? 0
                     return (
                       <>
@@ -408,19 +427,52 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                             {sname}
                           </span>
                         </div>
-                        <div className="mt-1 flex items-center gap-1.5">
-                          <span className={cn('text-[11px] font-medium', isNew ? 'text-danger' : 'text-emerald-400')}>
-                            {isNew ? '进入' : '移出'}
-                          </span>
-                          <span className="text-[11px] text-foreground/80">策略</span>
-                          <span className="text-[11px] font-medium text-amber-400">「{sname}」</span>
-                        </div>
+                        {ev.symbol ? (
+                          <div className="mt-1 flex min-w-0 items-center gap-1.5">
+                            <span className={cn('shrink-0 text-[11px] font-medium', eventMeta.className)}>
+                              {eventMeta.action}
+                            </span>
+                            {sname
+                              ? <span className="text-[11px] font-medium text-amber-400">「{sname}」</span>
+                              : ev.message && <span className="truncate text-[10px] text-muted">{ev.message}</span>}
+                          </div>
+                        ) : (
+                          <div className="mt-1 truncate text-[11px] text-muted">{ev.message}</div>
+                        )}
+                        {ev.signals && ev.signals.length > 0 && (
+                          <div className="mt-1.5 flex flex-wrap gap-1">
+                            {ev.signals.map((signal: string) => (
+                              <span key={signal} className="rounded bg-accent/8 px-1.5 py-0.5 text-[9px] text-accent/70">{cnSignal(signal)}</span>
+                            ))}
+                          </div>
+                        )}
                       </>
                     )
                   })() : (
                     <>
                       <div className="flex items-center gap-2 flex-wrap">
-                        {ev.symbol && (() => {
+                        {ev.source === 'sector' && (
+                          <button
+                            onClick={() => {
+                              if (ev.sector_kind === 'index' && ev.symbol) {
+                                navigate(`/indices?symbol=${encodeURIComponent(ev.symbol)}`)
+                              } else if (ev.sector_source_field && ev.sector_value) {
+                                setDimensionTarget({
+                                  kind: ev.sector_kind as DimensionKind,
+                                  value: ev.sector_value,
+                                  sourceField: ev.sector_source_field,
+                                })
+                              }
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded px-1 -mx-1 text-xs font-medium text-foreground transition-colors hover:bg-elevated/50 hover:text-accent cursor-pointer"
+                            title={ev.sector_kind === 'index' ? '打开指数详情' : '查看成分股'}
+                          >
+                            <Tags className="h-3.5 w-3.5 text-cyan-600 dark:text-cyan-300" />
+                            <span>{ev.sector_name ?? ev.name}</span>
+                            {ev.symbol && <span className="font-mono text-[10px] text-muted">{ev.symbol}</span>}
+                          </button>
+                        )}
+                        {ev.symbol && ev.source !== 'sector' && (() => {
                           const board = boardTag(ev.symbol)
                           return (
                             <button
@@ -581,6 +633,31 @@ function RulesList({ rulesQuery, onEdit }: {
 
   const rules: MonitorRule[] = (rulesQuery.data as any)?.rules ?? []
 
+  // 分组作用域规则: 拉取分组定义与成员, 展示分组名/成员数 chip (点击跳转自选页对应分组)
+  const hasGroupRules = rules.some(r => r.scope === 'watchlist_group')
+  const groupsQ = useQuery({
+    queryKey: QK.watchlistGroups,
+    queryFn: api.watchlistGroups,
+    enabled: hasGroupRules,
+  })
+  const watchlistQ = useQuery({
+    queryKey: QK.watchlist,
+    queryFn: api.watchlistList,
+    enabled: hasGroupRules,
+  })
+  const groupMeta = useMemo(() => {
+    const meta: Record<string, { name: string; color: string; count: number }> = {}
+    for (const g of groupsQ.data?.groups ?? []) {
+      meta[g.id] = { name: g.name, color: g.color, count: 0 }
+    }
+    for (const entry of watchlistQ.data?.symbols ?? []) {
+      for (const gid of entry.group_ids ?? []) {
+        if (meta[gid]) meta[gid].count += 1
+      }
+    }
+    return meta
+  }, [groupsQ.data, watchlistQ.data])
+
   // 收集所有规则的股票代码, 批量查名称
   const allSymbols = useMemo(() => {
     const set = new Set<string>()
@@ -633,11 +710,11 @@ function RulesList({ rulesQuery, onEdit }: {
         <EmptyState
           icon={RadioTower}
           title="暂无监控规则"
-          hint="点击标题栏「+」新建规则,或在个股详情页点「加监控」快速添加。"
+          hint="点击标题栏「+」新建规则,或在标的详情页点「加监控」快速添加。"
         />
       ) : (
         rules.map(r => {
-          // 名称截取: "策略监控 · MACD金叉" → "MACD金叉", "个股信号监控 · 300750.SZ" → "个股信号监控"
+          // 名称截取: "策略监控 · MACD金叉" → "MACD金叉", "信号监控 · 300750.SZ" → "信号监控"
           const dotIdx = r.name.indexOf(' · ')
           const displayName = dotIdx >= 0 ? r.name.slice(dotIdx + 3) : r.name
           return (
@@ -662,7 +739,10 @@ function RulesList({ rulesQuery, onEdit }: {
                   <span className={cn('shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold', SOURCE_BADGE_STYLE[r.type] ?? 'bg-elevated text-muted')}>
                     {TYPE_LABEL[r.type]}
                   </span>
-                  {/* 个股类型: 直接显示可点击的代码+名称; 其他类型显示规则名 */}
+                  {r.asset_type === 'index' && (
+                    <span className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold bg-sky-500/10 text-sky-400">指数</span>
+                  )}
+                  {/* 个股类型: 直接显示可点击的代码+名称; 分组类型: 分组chip跳自选页; 其他类型显示规则名 */}
                   {r.scope === 'symbols' && r.symbols.length > 0 ? (
                     <button
                       onClick={() => setPreviewSymbol(r.symbols[0])}
@@ -672,6 +752,25 @@ function RulesList({ rulesQuery, onEdit }: {
                       <span className="font-mono text-xs font-medium text-foreground hover:text-accent">{r.symbols[0]}</span>
                       {symbolNames[r.symbols[0]] && <span className="text-xs text-secondary truncate">{symbolNames[r.symbols[0]]}</span>}
                     </button>
+                  ) : r.scope === 'watchlist_group' && r.group_id ? (
+                    (() => {
+                      const meta = groupMeta[r.group_id]
+                      if (!meta) {
+                        return <span className="text-xs text-warning truncate" title={r.name}>分组已删除</span>
+                      }
+                      return (
+                        <Link
+                          to={`/watchlist?group=${r.group_id}`}
+                          className="inline-flex min-w-0 items-center gap-1.5 rounded px-0.5 transition-colors hover:bg-elevated/50 cursor-pointer"
+                          title={`「${meta.name}」分组 · 当前 ${meta.count} 只 · 点击查看分组`}
+                        >
+                          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${resolveWatchlistGroupColor(meta.color).dot}`} />
+                          <span className="truncate text-xs font-medium text-foreground hover:text-accent">{meta.name}</span>
+                          <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted">{meta.count}只</span>
+                          <span className="shrink-0 text-[9px] text-muted/60">· 分组作用域</span>
+                        </Link>
+                      )
+                    })()
                   ) : (
                     <h3 className={cn('text-xs font-medium truncate', r.enabled ? 'text-foreground' : 'text-muted')}>{displayName}</h3>
                   )}
@@ -723,10 +822,50 @@ function RulesList({ rulesQuery, onEdit }: {
                 </div>
               )}
 
-              {/* 第二行: 策略类型显示选股池变更监控 */}
-              {r.type === 'strategy' && r.strategy_id ? (
-                <div className="mt-0.5 flex items-center gap-2 pl-0.5">
-                  <span className="text-[9px] text-secondary">选股池变更监控</span>
+              {/* 第二行: 类型摘要 */}
+              {r.type === 'sector' ? (
+                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 pl-0.5">
+                  {(r.sector_targets ?? []).slice(0, 3).map(target => (
+                    <span key={target.key} className="max-w-28 truncate rounded bg-cyan-500/8 px-1.5 py-0.5 text-[9px] text-cyan-700 dark:text-cyan-300">
+                      {target.name}
+                    </span>
+                  ))}
+                  {(r.sector_targets?.length ?? 0) > 3 && (
+                    <span className="text-[9px] text-muted">+{(r.sector_targets?.length ?? 0) - 3}</span>
+                  )}
+                  <span className="text-[9px] text-secondary">·</span>
+                  <span className="text-[9px] text-secondary">
+                    {r.sector_trigger === 'momentum' ? `${r.window_minutes ?? 5}分钟异动` : '涨跌幅'}
+                    {r.direction === 'down' ? ' ≤ -' : ' ≥ '}{r.threshold_pct ?? 1}%
+                  </span>
+                </div>
+              ) : r.type === 'abnormal' ? (
+                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 pl-0.5">
+                  <span className="rounded bg-orange-500/8 px-1.5 py-0.5 text-[9px] text-orange-500 dark:text-orange-400">
+                    接近度 ≥ {r.threshold_pct ?? 70}%
+                  </span>
+                  <span className="rounded bg-elevated px-1.5 py-0.5 text-[9px] text-secondary">
+                    {r.abnormal_window && r.abnormal_window !== 'any' ? `${r.abnormal_window.toUpperCase()} 窗口` : '全部窗口'}
+                  </span>
+                  <span className="rounded bg-elevated px-1.5 py-0.5 text-[9px] text-secondary">
+                    {r.direction === 'up' ? '涨势偏离' : r.direction === 'down' ? '跌势偏离' : '涨跌双向'}
+                  </span>
+                </div>
+              ) : r.type === 'strategy' && r.strategy_id ? (
+                <div className="mt-1 flex flex-wrap items-center gap-1 pl-0.5">
+                  {(r.score_min != null || r.score_max != null) && (
+                    <span className="rounded bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-mono text-amber-500 dark:text-amber-300">
+                      评分 {r.score_min ?? 0}–{r.score_max ?? 100}
+                    </span>
+                  )}
+                  {(r.notify_events ?? LEGACY_STRATEGY_NOTIFY_EVENTS).map(event => {
+                    const option = STRATEGY_NOTIFY_EVENT_OPTIONS.find(item => item.key === event)
+                    return option ? (
+                      <span key={event} className="rounded bg-elevated px-1.5 py-0.5 text-[9px] text-secondary">
+                        {option.label}
+                      </span>
+                    ) : null
+                  })}
                 </div>
               ) : r.conditions.length > 0 && (
                 <div className="mt-0.5 flex items-center gap-1 pl-0.5">
@@ -761,7 +900,13 @@ function RulesList({ rulesQuery, onEdit }: {
 }
 
 // ── 规则编辑对话框 ────────────────────────────────────
-function RuleEditorDialog({ open, rule, onClose }: { open: boolean; rule: MonitorRule | null; onClose: () => void }) {
+function RuleEditorDialog({ open, rule, preset, onClose }: {
+  open: boolean
+  rule: MonitorRule | null
+  preset?: Partial<MonitorRule> | null
+  onClose: () => void
+}) {
+  const backdrop = useDialogBackdrop(onClose)
   return (
     <AnimatePresence>
       {open && (
@@ -770,7 +915,7 @@ function RuleEditorDialog({ open, rule, onClose }: { open: boolean; rule: Monito
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           className="fixed inset-0 z-50 flex items-start justify-center overflow-auto bg-black/40 backdrop-blur-sm p-4"
-          onClick={onClose}
+          {...backdrop}
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.96, y: 8 }}
@@ -782,6 +927,7 @@ function RuleEditorDialog({ open, rule, onClose }: { open: boolean; rule: Monito
           >
             <RuleEditor
               rule={rule}
+              preset={preset ?? undefined}
               onClose={onClose}
               onSaved={onClose}
             />

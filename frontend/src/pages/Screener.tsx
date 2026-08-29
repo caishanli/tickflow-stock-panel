@@ -3,16 +3,17 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
+import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus } from '@/lib/useSharedQueries'
 import { useWatchlistBatchAdd } from '@/lib/useSharedMutations'
-import { isExpertOrAbove } from '@/lib/capability-labels'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { DatePicker } from '@/components/DatePicker'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { useStrategyPool } from '@/lib/useStrategyPool'
 import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
@@ -21,6 +22,7 @@ import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDi
 import { StrategyPoolDialog } from '@/components/screener/StrategyPoolDialog'
 import { StrategyBuilderDialog } from '@/components/screener/StrategyBuilderDialog'
 import { StrategyStoreDialog } from '@/components/screener/StrategyStoreDialog'
+import { CompositeStrategyDialog } from '@/components/screener/CompositeStrategyDialog'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { useTableSort } from '@/components/stock-table/useTableSort'
 import { resolveCandleConfig } from '@/lib/list-columns'
@@ -32,6 +34,9 @@ import {
   saveScreenerColumnConfig,
   type ColumnConfig,
 } from '@/lib/screener-columns'
+
+// 获取策略为占位功能, 暂时隐藏入口; 恢复时改回 true
+const SHOW_STRATEGY_STORE = false
 
 export function Screener() {
   const [assetType, setAssetType] = useState<'stock' | 'etf'>('stock')
@@ -47,6 +52,7 @@ export function Screener() {
   const [showBuilder, setShowBuilder] = useState(false)
   const [builderMode, setBuilderMode] = useState<'create' | 'modify'>('create')
   const [showStore, setShowStore] = useState(false)
+  const [showComposite, setShowComposite] = useState(false)
   const { pool, addToPool, removeFromPool, reorderPool, prune } = useStrategyPool()
   const [cardSize, setCardSize] = useState<CardSize>(loadCardSize)
   // 日k蜡烛图显示开关（仅当 candle 列可见时才有意义；持久化）
@@ -111,10 +117,12 @@ export function Screener() {
     setFilter(filterMap.current.get(strategyId) ?? { ...defaultFilter })
   }, [])
 
-  // 对原始结果应用过滤
-  const filteredRows = result
-    ? applyFilter(result.rows, filter)
-    : []
+  // 对原始结果应用过滤 (memo: 否则每次渲染都对全部结果行过滤,
+  // 且新数组身份会击穿下游 displayRows 的 memo)
+  const filteredRows = useMemo(
+    () => (result ? applyFilter(result.rows, filter) : []),
+    [result, filter],
+  )
 
   const { data: prefs } = usePreferences()
   const screenerAutoRun = prefs?.screener_auto_run ?? true
@@ -231,6 +239,24 @@ export function Screener() {
     [visiblePool, summaryQuery.data, asOf],
   )
   const cacheCoversPool = visiblePool.length > 0 && missingStrategyIds.length === 0
+
+  // 防止 reload / auto-run / StrictMode 叠出并发 run_all（后端 Numba 会崩溃）
+  // 用 ref 同步门闩，避免同一渲染周期内 isPending 尚未更新导致重复触发
+  const runAllPendingRef = useRef(false)
+  const requestRunAll = useCallback((
+    vars: { date?: string; strategyIds?: string[] } = {},
+    options?: Parameters<typeof runAll.mutate>[1],
+  ) => {
+    if (runAllPendingRef.current || runAll.isPending) return
+    runAllPendingRef.current = true
+    runAll.mutate(vars, {
+      ...options,
+      onSettled: (...args) => {
+        runAllPendingRef.current = false
+        options?.onSettled?.(...args)
+      },
+    })
+  }, [runAll])
 
   // 摘要只同步当前日期的卡片数量，避免旧日期缓存短暂显示成当前结果。
   useEffect(() => {
@@ -372,13 +398,13 @@ export function Screener() {
     columns.find(c => c.source.type === 'builtin' && c.source.key === 'intraday' && c.visible),
     [columns],
   )
-  // 分时图需 Pro+ (kline.minute.batch), 低档用户开了列也不拉数据
+  // 分时图依赖分钟K批量数据 (kline.minute.batch), 无数据时开了列也不拉
   const caps = useCapabilities()
   const hasMinuteBatch = !!caps.data?.capabilities?.['kline.minute.batch']
   const intradayVisible = !!intradayColumn && hasMinuteBatch && intradayChartVisible
 
   // 分时数据加载策略 (与自选页一致, 简洁优先):
-  //  - 全量加载当前列表 symbol, 但按套餐 batch 上限截断 (Pro=100 / Expert=200),
+  //  - 全量加载当前列表 symbol, 但按数据源 batch 上限截断,
   //    超出时只取前 batch 只并提示用户, 避免一次性发太多请求打爆 rpm 配额
   //  - 刷新: minute_intraday_refresh 偏好开启时按用户设定间隔轮询; 否则仅首次加载,
   //    用户可点表头刷新按钮手动更新
@@ -393,9 +419,7 @@ export function Screener() {
     [displayRows],
   )
   const intradayTruncated = intradayVisible && allIntradaySymbols.length > minuteBatchCap
-  // 是否已是最高档 (Expert+): 最高档时截断提示不再建议"升级套餐"
-  const isMaxTier = isExpertOrAbove(caps.data?.label ?? '')
-  // 截断到 batch 上限 (Pro=100 / Expert=200), 一次请求 = 一次 TickFlow 调用
+  // 截断到 batch 上限, 一次请求 = 一次数据源调用
   const intradaySymbols = useMemo(
     () => intradayTruncated ? allIntradaySymbols.slice(0, minuteBatchCap) : allIntradaySymbols,
     [allIntradaySymbols, intradayTruncated, minuteBatchCap],
@@ -433,8 +457,8 @@ export function Screener() {
     // 未覆盖: 受系统开关控制
     if (!screenerAutoRun) return
     runAllDateRef.current = runKey
-    runAll.mutate({ date: asOf, strategyIds: missingStrategyIds })
-  }, [asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, runAll.isPending])
+    requestRunAll({ date: asOf, strategyIds: missingStrategyIds })
+  }, [asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, runAll.isPending, requestRunAll])
 
   const run = useMutation({
     mutationFn: ({ id, date }: { id: string; date: string }) =>
@@ -488,8 +512,17 @@ export function Screener() {
 
   // 单只股票加入/移出自选
   const toggleWatchlist = useMutation({
-    mutationFn: ({ symbol, inList }: { symbol: string; inList: boolean }) =>
-      inList ? api.watchlistRemove(symbol) : api.watchlistAdd(symbol),
+    mutationFn: ({
+      symbol,
+      action,
+      groupId,
+    }: {
+      symbol: string
+      action: 'add' | 'remove'
+      groupId?: string | null
+    }) => action === 'remove'
+      ? api.watchlistRemove(symbol)
+      : api.watchlistAdd(symbol, '', groupId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: QK.watchlist })
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
@@ -501,7 +534,7 @@ export function Screener() {
     mutationFn: api.strategyReload,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['screener-strategies'] })
-      if (asOf) runAll.mutate({ date: asOf })
+      if (asOf) requestRunAll({ date: asOf })
     },
   })
 
@@ -536,6 +569,7 @@ export function Screener() {
         sector: null,
         strategy_id: strategyId,
         direction: 'entry',
+        notify_events: [...DEFAULT_STRATEGY_NOTIFY_EVENTS],
         conditions: [],
         logic: 'or',
         cooldown_seconds: 3600,
@@ -545,10 +579,10 @@ export function Screener() {
     }
   }
 
-  const handleBatchAdd = () => {
+  const handleBatchAdd = (groupId: string | null) => {
     if (!displayRows.length) return
     const symbols = displayRows.map((r: any) => r.symbol)
-    batchAdd.mutate(symbols, {
+    batchAdd.mutate({ symbols, groupId }, {
       onSuccess: (data) => {
         setBatchMsg(`已添加 ${data.added} 只到自选`)
         setTimeout(() => setBatchMsg(''), 3000)
@@ -646,6 +680,16 @@ export function Screener() {
                 {visiblePool.length}/{strategyPresets.length}
               </span>
             </button>
+            {/* 创建叠加策略 */}
+            <button
+              onClick={() => setShowComposite(true)}
+              className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
+                text-xs font-medium text-teal-400 border border-teal-500/20 bg-teal-500/5
+                hover:bg-teal-500/15 transition-colors cursor-pointer"
+            >
+              <Layers className="h-3.5 w-3.5" />
+              叠加策略
+            </button>
             {/* 创建策略 */}
             <button
               onClick={() => { setBuilderMode('create'); setShowBuilder(true) }}
@@ -656,16 +700,18 @@ export function Screener() {
               <Sparkles className="h-3.5 w-3.5" />
               创建策略 · AI
             </button>
-            {/* 获取策略（占位，敬请期待） */}
-            <button
-              onClick={() => setShowStore(true)}
-              className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
-                border border-border bg-surface text-xs font-medium text-secondary
-                hover:text-accent hover:border-accent/50 transition-colors cursor-pointer"
-            >
-              <Store className="h-3.5 w-3.5" />
-              获取策略
-            </button>
+            {/* 获取策略（占位，敬请期待）— 暂时隐藏 */}
+            {SHOW_STRATEGY_STORE && (
+              <button
+                onClick={() => setShowStore(true)}
+                className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
+                  border border-border bg-surface text-xs font-medium text-secondary
+                  hover:text-accent hover:border-accent/50 transition-colors cursor-pointer"
+              >
+                <Store className="h-3.5 w-3.5" />
+                获取策略
+              </button>
+            )}
           </div>
         }
       />
@@ -783,16 +829,19 @@ export function Screener() {
                     </div>
                   )}
                   {displayRows.length > 0 && (
-                    <button
-                      onClick={handleBatchAdd}
+                    <WatchlistAddMenu
+                      onSelect={handleBatchAdd}
                       disabled={batchAdd.isPending}
-                      className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-btn
+                      align="right"
+                      title="批量加自选"
+                      ariaLabel="批量加入自选"
+                      triggerClassName="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-btn
                         border border-accent/40 bg-accent/10 text-accent text-xs font-medium
                         hover:bg-accent/20 disabled:opacity-50 transition-colors duration-150 cursor-pointer"
                     >
                       <Star className="h-3 w-3" />
                       {batchAdd.isPending ? '添加中…' : '批量加自选'}
-                    </button>
+                    </WatchlistAddMenu>
                   )}
                   <button
                     onClick={() => setCustomizerOpen(true)}
@@ -814,11 +863,10 @@ export function Screener() {
                       <span className="num">{result.elapsed_ms.toFixed(1)} ms</span>
                     </div>
                   )}
-                  {/* 分时截断提示: 超套餐上限时在工具栏内联显示, 可关闭 */}
+                  {/* 分时截断提示: 超数据源批量上限时在工具栏内联显示, 可关闭 */}
                   {intradayTruncated && !intradayCapDismissed && (
                     <span className="inline-flex items-center gap-1 text-xs text-warning/90">
-                      分时仅前 {minuteBatchCap}/{allIntradaySymbols.length}
-                      {!isMaxTier && ', 可升级'}
+                      分时仅前 {minuteBatchCap}/{allIntradaySymbols.length} · 受数据源批量上限限制
                       <button
                         type="button"
                         onClick={() => setIntradayCapDismissed(true)}
@@ -863,7 +911,8 @@ export function Screener() {
                     activeStrategy={activeStrategy}
                     watchlistSet={watchlistSet}
                     onPreview={(symbol, name) => { setPreviewSymbol(symbol); setPreviewName(name) }}
-                    onToggleWatchlist={(symbol, inList) => toggleWatchlist.mutate({ symbol, inList })}
+                    onAddToWatchlist={(symbol, groupId) => toggleWatchlist.mutate({ symbol, action: 'add', groupId })}
+                    onRemoveFromWatchlist={symbol => toggleWatchlist.mutate({ symbol, action: 'remove' })}
                     watchlistPending={toggleWatchlist.isPending}
                     klineData={klineData}
                     dailyKChartVisible={dailyKChartVisible}
@@ -971,6 +1020,15 @@ export function Screener() {
           if (!data.presets.some(s => s.id === id)) {
             throw new Error(`策略 ${id} 已保存但未加载，请检查策略代码`)
           }
+          addToPool(id)
+        }}
+      />
+
+      <CompositeStrategyDialog
+        open={showComposite}
+        onClose={() => setShowComposite(false)}
+        onSavedId={async id => {
+          await qc.fetchQuery({ queryKey: QK.screenerStrategies('all'), queryFn: () => api.screenerStrategies(), staleTime: 0 })
           addToPool(id)
         }}
       />

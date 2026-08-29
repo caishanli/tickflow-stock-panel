@@ -11,19 +11,22 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import polars as pl
 
 from app.backtest.engine import BacktestEngine, MatcherConfig, SimResult, SimulationOptions
+from app.backtest.fundamentals import FUNDAMENTAL_FACTOR_NAMES
 from app.backtest.matrix import (
     MarketDataMatrix,
     MatrixCacheProfile,
     MatrixComputeCache,
     MatrixPipelineConfig,
+    MatrixPrewarmCancelledError,
     MatrixStrategyPipeline,
     apply_time_masks,
     build_market_matrix,
@@ -41,7 +44,15 @@ from app.indicators.pipeline import (
     get_signal_dependencies,
 )
 from app.strategy.engine import StrategyDataContext, StrategyDef, StrategyEngine
-from app.strategy.scoring import scoring_dependencies, scoring_value_expr
+from app.strategy.scoring import (
+    SCORING_DIRECTION_LOW,
+    effective_scoring,
+    effective_scoring_directions,
+    materialize_scoring_columns,
+    scoring_dependencies,
+    scoring_value_expr,
+    scoring_warmup_bars,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +61,7 @@ _EXECUTION_COLUMNS = frozenset({
     "symbol", "date", "open", "high", "low", "close", "volume",
     "name", "score", "signal_limit_up", "signal_limit_down",
 })
-_LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high"})
+_LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high", "raw_low"})
 _INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares"})
 
 
@@ -72,6 +83,8 @@ class ResolvedFeaturePlan:
     warmup_bars: int
     full_feature_fallback: bool = False
     execution_backend: str = "polars_expr"
+    # 财务因子列不落 enriched 存储, 由 engine 在加载口按公告日门控附加。
+    fundamental_columns: frozenset[str] = frozenset()
 
 
 def _merge_resolved_feature_plans(
@@ -99,6 +112,7 @@ def _merge_resolved_feature_plans(
         warmup_bars=max(plan.warmup_bars for plan in plans),
         full_feature_fallback=any(plan.full_feature_fallback for plan in plans),
         execution_backend="matrix_native",
+        fundamental_columns=_union("fundamental_columns"),
     )
 
 
@@ -115,8 +129,10 @@ class StrategyDependencyResolver:
         exit_signals: list[str],
         overrides: dict | None = None,
         minute_fill: bool = False,
+        asset_type: str = "stock",
     ) -> ResolvedFeaturePlan:
         overrides = overrides or {}
+        basic_filter = _basic_filter_for_asset(basic_filter, asset_type)
         if strategy.execution_backend == "matrix_native":
             return self._resolve_matrix_native(
                 strategy,
@@ -133,8 +149,7 @@ class StrategyDependencyResolver:
         }
         required_signals.update({"signal_limit_up", "signal_limit_down"})
 
-        scoring = dict(strategy.meta.get("scoring", {}) or {})
-        scoring.update(overrides.get("scoring") or {})
+        scoring = effective_scoring(strategy.meta.get("scoring"), overrides)
         required_features.update(scoring_dependencies(scoring))
         order_by = strategy.meta.get("order_by")
         if order_by and order_by != "score":
@@ -186,7 +201,7 @@ class StrategyDependencyResolver:
         plan = FeaturePlan(
             required_features=frozenset(required_features),
             required_signals=frozenset(required_signals),
-            warmup_bars=max(60, int(strategy.lookback_days or 1)),
+            warmup_bars=max(60, int(strategy.lookback_days or 1), scoring_warmup_bars(scoring)),
         )
         return ResolvedFeaturePlan(
             base_columns=base_columns,
@@ -198,6 +213,9 @@ class StrategyDependencyResolver:
             warmup_bars=plan.warmup_bars,
             full_feature_fallback=full_fallback,
             execution_backend=strategy.execution_backend,
+            fundamental_columns=frozenset(
+                required_features & FUNDAMENTAL_FACTOR_NAMES
+            ),
         )
 
     @staticmethod
@@ -216,9 +234,20 @@ class StrategyDependencyResolver:
 
         required_features = set(strategy.required_features)
         required_features.update(strategy.matrix_strategy.required_fields())
+        parameter_fields = getattr(
+            strategy.matrix_strategy,
+            "required_fields_for_params",
+            None,
+        )
+        parameter_scoring: dict[str, float] = {}
+        if callable(parameter_fields):
+            parameter_scoring = {
+                str(name): 1.0
+                for name in parameter_fields(params)
+            }
+            required_features.update(scoring_dependencies(parameter_scoring))
         required_features.update(_basic_filter_dependencies(basic_filter))
-        scoring = dict(strategy.meta.get("scoring", {}) or {})
-        scoring.update(overrides.get("scoring") or {})
+        scoring = effective_scoring(strategy.meta.get("scoring"), overrides)
         required_features.update(scoring_dependencies(scoring))
         order_by = strategy.meta.get("order_by")
         if order_by and order_by != "score":
@@ -228,7 +257,12 @@ class StrategyDependencyResolver:
         base_columns = frozenset(set(base_columns) | set(_LIMIT_BASE_COLUMNS))
         instrument_columns = frozenset(required_features & set(_INSTRUMENT_COLUMNS))
         instrument_columns = frozenset(set(instrument_columns) | {"name"})
-        warmup_bars = max(60, int(strategy.matrix_strategy.required_warmup_bars(params)))
+        warmup_bars = max(
+            60,
+            int(strategy.matrix_strategy.required_warmup_bars(params)),
+            scoring_warmup_bars(scoring),
+            scoring_warmup_bars(parameter_scoring),
+        )
         matrix_columns = set(base_columns) | set(instrument_columns) | {
             "signal_limit_up",
             "signal_limit_down",
@@ -243,6 +277,9 @@ class StrategyDependencyResolver:
             warmup_bars=warmup_bars,
             full_feature_fallback=False,
             execution_backend="matrix_native",
+            fundamental_columns=frozenset(
+                required_features & FUNDAMENTAL_FACTOR_NAMES
+            ),
         )
 
 
@@ -294,6 +331,7 @@ def build_matrix_cache_profile(
             exit_signals=strategy.exit_signals,
             overrides={},
             minute_fill=False,
+            asset_type=asset_type,
         ))
         forward_bars = max(forward_bars, int(strategy.max_hold_days or 0))
 
@@ -335,10 +373,13 @@ def prewarm_matrix_cache(
     asset_type: str,
     latest_date: date,
     years: int = 5,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
     """Build the shared full-universe mmap outside a user backtest request."""
     if years <= 0:
         raise ValueError("matrix cache prewarm years must be positive")
+    if cancel_event is not None and cancel_event.is_set():
+        raise MatrixPrewarmCancelledError("matrix cache prewarm cancelled")
     profile = build_matrix_cache_profile(
         strategy_engine,
         asset_type,
@@ -379,6 +420,7 @@ def prewarm_matrix_cache(
         cache_profile=profile,
         coverage_start=coverage_start,
         coverage_end=latest_date,
+        cancel_event=cancel_event,
     )
     result = {
         "asset_type": asset_type,
@@ -431,6 +473,31 @@ def _basic_filter_dependencies(config: dict) -> set[str]:
     return dependencies
 
 
+_SHARE_CAP_FILTER_KEYS = (
+    "market_cap_min",
+    "market_cap_max",
+    "float_cap_min",
+    "float_cap_max",
+)
+
+
+def _basic_filter_for_asset(basic_filter: dict, asset_type: str) -> dict:
+    """非股票资产没有股本数据 (etf/index 维表只有 symbol/name), 市值与流通
+    市值界对它们既无意义也不可满足: 依赖解析前先置 None, 避免解析出
+    total_shares/float_shares 字段需求导致矩阵加载直接失败。
+
+    运行期过滤无需同步修改 —— polars 侧有列守卫 (engine._basic_filter_expr),
+    矩阵侧 _optional_field 对缺失字段返回全 NaN 且 _apply_bound 跳过全 NaN
+    界, 二者对缺失股本列本就降级为 no-op。
+    """
+    if asset_type == "stock" or not basic_filter:
+        return basic_filter
+    sanitized = dict(basic_filter)
+    for key in _SHARE_CAP_FILTER_KEYS:
+        sanitized[key] = None
+    return sanitized
+
+
 def _resolve_base_columns(features: set[str]) -> frozenset[str]:
     storage = set(ENRICHED_STORAGE_COLS)
     base = {"symbol", "date"} | (features & storage)
@@ -473,6 +540,9 @@ class StrategyBacktestConfig:
     holding_days: int = 5
     # 分钟K精确成交: 开启后用当日分钟K确定穿越价/VWAP (需 Pro+ 分钟K能力)
     minute_fill: bool = False
+    # 市场环境过滤: {"states": ["strong",...], "min_score": 60}。
+    # 强制 T-1: regime[T-1] 决定 entry[T](防未来函数)。None=不过滤。
+    regime_filter: dict | None = None
 
     def __post_init__(self) -> None:
         if self.entry_fill is None:
@@ -598,6 +668,130 @@ class StrategyBacktestService:
             config.holding_days,
             config.minute_fill,
             json.dumps(config.overrides or {}, sort_keys=True, ensure_ascii=False, default=str),
+            json.dumps(config.regime_filter or {}, sort_keys=True, ensure_ascii=False, default=str),
+        )
+
+    def _resolve_composite_feature_plan(
+        self,
+        strategy: StrategyDef,
+        *,
+        params: dict,
+        basic_filter: dict,
+        overrides: dict,
+        asset_type: str = "stock",
+    ) -> tuple[ResolvedFeaturePlan, list[tuple[StrategyDef, dict, dict]]]:
+        """解析 composite 回测的特征计划: 所有子策略 feature_plan 的并集。
+
+        返回 (合并 feature_plan, [(子策略定义, 子params, 子pipeline_config_dict), ...])。
+        子策略必须全为 matrix_native, 否则 fail-closed(首版硬约束)。
+        """
+        from app.strategy import composite as composite_mod
+        from app.strategy.engine import _parse_composite_children
+
+        assert strategy.composite is not None
+        # 权重: override.children 优先, 否则 META 声明。
+        override_children = overrides.get("children")
+        if isinstance(override_children, list) and override_children:
+            spec = _parse_composite_children(override_children)
+            children = spec.children
+        else:
+            children = strategy.composite.children
+
+        resolver = StrategyDependencyResolver()
+        plans: list[ResolvedFeaturePlan] = []
+        resolved_children: list[tuple[StrategyDef, dict, dict]] = []
+        for child in children:
+            child_def = self.strategy_engine.get(child.strategy_id)
+            if child_def.execution_backend != "matrix_native":
+                raise ValueError(
+                    f"叠加回测暂仅支持矩阵子策略; {child.strategy_id!r} "
+                    f"是 {child_def.execution_backend}"
+                )
+            if child_def.matrix_strategy is None:
+                raise ValueError(f"子策略 {child.strategy_id!r} 未注册矩阵策略")
+            # 加载子策略的用户 override(参数/评分等), 保证回测与单独跑子策略同口径。
+            child_override: dict = {}
+            loader = getattr(self.strategy_engine, "_override_loader", None)
+            if loader is not None:
+                try:
+                    loaded = loader(child.strategy_id)
+                    if isinstance(loaded, dict):
+                        child_override = dict(loaded)
+                except Exception:  # noqa: BLE001
+                    pass
+            child_params = self.strategy_engine.resolve_params(child_def, overrides=child_override)
+            child_plan = resolver.resolve(
+                child_def,
+                params=child_params,
+                basic_filter=basic_filter,  # 统一 basic_filter(计划 §3.3)
+                entry_signals=[],
+                exit_signals=[],
+                overrides=child_override,
+                asset_type=asset_type,
+            )
+            plans.append(child_plan)
+            # pipeline 用 composite 统一的 basic_filter; scoring 用子策略自己的
+            # (默认 + 用户 override), 因为子策略内部排序影响合并器的排名融合。
+            child_scoring = effective_scoring(child_def.meta.get("scoring"), child_override)
+            child_pipeline_cfg = MatrixPipelineConfig(
+                basic_filter=basic_filter,
+                scoring=child_scoring,
+                scoring_directions=effective_scoring_directions(child_override),
+                order_by=child_def.meta.get("order_by"),
+                descending=bool(child_def.meta.get("descending", True)),
+                protect_strategy_cache=False,
+            )
+            resolved_children.append((child_def, child_params, child_pipeline_cfg))
+
+        merged_plan = _merge_resolved_feature_plans(plans)
+        # composite 模块用于合并时读取权重列表(顺序对齐 resolved_children)。
+        self._composite_children_weights = [(c.strategy_id, c.weight) for c in children]
+        _ = composite_mod  # 确保模块可导入(回测时由调用方使用)
+        return merged_plan, resolved_children
+
+    def _generate_composite_signal_matrix(
+        self,
+        resolved_children: list[tuple[StrategyDef, dict, dict]],
+        market_data: MarketDataMatrix,
+        merge_mode: str,
+        min_confirm: int,
+        max_hold: int,
+        timing_ms: dict[str, float],
+    ):
+        """逐子策略计算 SignalMatrix, 再合并为单个 SignalMatrix(回测合并)。
+
+        合并语义见 app.strategy.composite.merge_signal_matrices:
+        - entry: union/intersect
+        - exit: 来源投影(每个子的 exit 仅在自己持仓窗口生效, 不串平)
+        - score: 标准化排名加权
+        """
+        from app.strategy import composite as composite_mod
+
+        t_signals = time.perf_counter()
+        sigs = []
+        for child_def, child_params, child_pipeline_cfg in resolved_children:
+            try:
+                child_sig = MatrixStrategyPipeline().run(
+                    child_def.matrix_strategy,
+                    market_data,
+                    child_params,
+                    child_pipeline_cfg,
+                )
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"子策略 {child_def.meta.get('id')} 信号计算失败: {e}") from e
+            sigs.append(child_sig)
+        timing_ms["strategy_signals"] = round((time.perf_counter() - t_signals) * 1000, 1)
+
+        children_weights = getattr(self, "_composite_children_weights", None) or [
+            (cd.meta.get("id", ""), 1.0) for cd, _, _ in resolved_children
+        ]
+        return composite_mod.merge_signal_matrices(
+            market_data.shape,
+            sigs,
+            children_weights,
+            merge_mode,
+            min_confirm,
+            max_hold,
         )
 
     def prepare_matrix_optimization(
@@ -650,6 +844,7 @@ class StrategyBacktestService:
                 exit_signals=exit_signals,
                 overrides=overrides,
                 minute_fill=config.minute_fill,
+                asset_type=config.asset_type,
             ))
         feature_plan = _merge_resolved_feature_plans(plans)
 
@@ -711,6 +906,8 @@ class StrategyBacktestService:
         timing_ms["load_panel"] = direct_load_ms
         timing_ms["market_data_matrix_build"] = 0.0
         timing_ms["market_data_direct_load"] = direct_load_ms
+        # 环境过滤下正式起点=矩阵首日时顺延 (首日让渡为预热), 见 _clamp_regime_formal_start
+        first = self._clamp_regime_formal_start(first, market_data.timestamp_labels)
         formal_range = self._matrix_date_range_mask(
             market_data.timestamp_labels,
             first.start,
@@ -726,6 +923,15 @@ class StrategyBacktestService:
             first.start,
             first.end,
         )
+        # 市场环境过滤(优化器共享, 用首个 config 的 regime_filter)
+        _rm = self._build_regime_mask(
+            market_data.timestamp_labels, first.regime_filter,
+            getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
+            required_start=first.start,
+            required_end=first.end,
+        )
+        if _rm is not None:
+            entry_time_mask = entry_time_mask & _rm
         exit_time_mask = self._matrix_date_range_mask(
             market_data.timestamp_labels,
             first.start,
@@ -856,15 +1062,28 @@ class StrategyBacktestService:
             score_min, score_max = None, None
 
         try:
-            feature_plan = StrategyDependencyResolver().resolve(
-                s,
-                params=params,
-                basic_filter=basic_filter,
-                entry_signals=entry_signals,
-                exit_signals=exit_signals,
-                overrides=overrides,
-                minute_fill=config.minute_fill,
-            )
+            if s.execution_backend == "composite":
+                # composite 回测: 子策略必须全为 matrix_native(否则 fail-closed),
+                # feature_plan 取所有子策略计划的并集(_merge_resolved_feature_plans)。
+                feature_plan, composite_children_resolved = self._resolve_composite_feature_plan(
+                    s,
+                    params=params,
+                    basic_filter=basic_filter,
+                    overrides=overrides,
+                    asset_type=config.asset_type,
+                )
+            else:
+                composite_children_resolved = None
+                feature_plan = StrategyDependencyResolver().resolve(
+                    s,
+                    params=params,
+                    basic_filter=basic_filter,
+                    entry_signals=entry_signals,
+                    exit_signals=exit_signals,
+                    overrides=overrides,
+                    minute_fill=config.minute_fill,
+                    asset_type=config.asset_type,
+                )
         except ValueError as e:
             return _err(str(e))
 
@@ -904,7 +1123,12 @@ class StrategyBacktestService:
             matrix_data_cache_status = prepared.market_data.cache_status
             matrix_data_cache_hit = matrix_data_cache_status in {"exact", "covering"}
             matrix_data_cache_timing_ms = prepared.market_data.cache_timing_ms
-        elif s.execution_backend == "matrix_native":
+            # 环境过滤下正式起点=矩阵首日时顺延 (首日让渡为预热)
+            if config.regime_filter:
+                config = self._clamp_regime_formal_start(
+                    config, prepared.market_data.timestamp_labels
+                )
+        elif s.execution_backend in ("matrix_native", "composite"):
             t_load = time.perf_counter()
             max_hold_for_profile = self._override_value(
                 overrides,
@@ -949,6 +1173,11 @@ class StrategyBacktestService:
             matrix_data_cache_status = market_data.cache_status
             matrix_data_cache_hit = matrix_data_cache_status in {"exact", "covering"}
             matrix_data_cache_timing_ms = market_data.cache_timing_ms
+            # 环境过滤下正式起点=矩阵首日时顺延 (首日让渡为预热)
+            if config.regime_filter:
+                config = self._clamp_regime_formal_start(
+                    config, market_data.timestamp_labels
+                )
             formal_time_mask = self._matrix_date_range_mask(
                 market_data.timestamp_labels,
                 config.start,
@@ -972,6 +1201,13 @@ class StrategyBacktestService:
             timing_ms["load_panel"] = round((time.perf_counter() - t_load) * 1000, 1)
             if panel.is_empty():
                 return _err("无数据，请检查日期范围或先运行盘后管道")
+            # 环境过滤下正式起点=面板首日时顺延 (首日让渡为预热)
+            if config.regime_filter:
+                date_labels = tuple(
+                    str(value)[:10]
+                    for value in panel.get_column("date").unique().sort().to_list()
+                )
+                config = self._clamp_regime_formal_start(config, date_labels)
             formal_range = self._date_range_mask(panel, config.start, config.end)
             if not formal_range.any():
                 return _err("正式回测区间内无数据")
@@ -1002,7 +1238,101 @@ class StrategyBacktestService:
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
 
-        if s.execution_backend == "matrix_native":
+        if s.execution_backend == "composite":
+            # composite 回测信号生成: 复用 matrix 数据加载, 逐子策略算信号后合并。
+            # 退出采用来源投影(composite.merge_signal_matrices), 不串平其他子策略仓位。
+            if composite_children_resolved is None:
+                return _err("叠加策略子策略解析失败")
+            if market_data is None:
+                return _err("矩阵回测缺少基础行情矩阵")
+            entry_time_mask = self._matrix_date_range_mask(
+                market_data.timestamp_labels,
+                config.start,
+                config.end,
+            )
+            # 市场环境过滤(强制 T-1): 只叠加 entry, 不影响 exit
+            try:
+                _rm = self._build_regime_mask(
+                    market_data.timestamp_labels, config.regime_filter,
+                    getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
+                    required_start=config.start,
+                    required_end=config.end,
+                )
+            except ValueError as e:
+                return _err(str(e))
+            if _rm is not None:
+                entry_time_mask = entry_time_mask & _rm
+            exit_time_mask = self._matrix_date_range_mask(
+                market_data.timestamp_labels,
+                config.start,
+                load_end if config.mode == "full" else config.end,
+            )
+            sim_time_mask = self._matrix_date_range_mask(
+                market_data.timestamp_labels,
+                config.start,
+                sim_end,
+            )
+            time_ids = np.flatnonzero(sim_time_mask)
+            if time_ids.size == 0:
+                return _err("正式回测区间内无数据")
+            start_id = int(time_ids[0])
+            stop_id = int(time_ids[-1]) + 1
+            panel_rows = int(np.isfinite(market_data.close[start_id:stop_id]).sum())
+            panel_columns = len(feature_plan.matrix_columns)
+            reference_price = (
+                rolling_mean(market_data.close, 5)[start_id:stop_id]
+                if matcher_config.minute_fill
+                else None
+            )
+
+            merge_mode = str(params.get("merge_mode") or "union")
+            min_confirm = int(params.get("min_confirm") or 0)
+            # max_hold 用于退出投影窗口封顶; 无值时给一个足够大的兜底(仅靠信号退出)。
+            composite_max_hold = max(int(max_hold_days or 0), 1) if max_hold_days else 250
+            try:
+                signal_matrix = self._generate_composite_signal_matrix(
+                    composite_children_resolved,
+                    market_data,
+                    merge_mode,
+                    min_confirm,
+                    composite_max_hold,
+                    timing_ms,
+                )
+            except ValueError as e:
+                return _err(str(e))
+
+            sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
+            sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
+            sim_signal_matrix = apply_time_masks(
+                sim_signal_matrix,
+                entry_time_mask[start_id:stop_id],
+                exit_time_mask[start_id:stop_id],
+            )
+            timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
+            if not sim_signal_matrix.entry.any():
+                return _err("在指定区间内未产生买入信号")
+
+            raw_candidates = int(sim_signal_matrix.entry.sum())
+            selection_stats = {
+                "strategy_matches": raw_candidates,
+                "entry_candidates": raw_candidates,
+                "entry_trigger_filtered": 0,
+                "entry_trigger_enabled": False,
+            }
+            del market_data, signal_matrix
+
+            t_matrix = time.perf_counter()
+            market_matrix = build_market_matrix_from_signals(
+                sim_market_data,
+                sim_signal_matrix,
+                entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
+                exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                reference_price=reference_price,
+                minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+            )
+            timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
+            del sim_market_data, sim_signal_matrix
+        elif s.execution_backend == "matrix_native":
             if s.matrix_strategy is None:
                 return _err("矩阵策略未注册")
             if self._has_matrix_signal_override(s, overrides):
@@ -1025,6 +1355,17 @@ class StrategyBacktestService:
                     config.start,
                     config.end,
                 )
+                try:
+                    _rm = self._build_regime_mask(
+                        market_data.timestamp_labels, config.regime_filter,
+                        getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
+                        required_start=config.start,
+                        required_end=config.end,
+                    )
+                except ValueError as e:
+                    return _err(str(e))
+                if _rm is not None:
+                    entry_time_mask = entry_time_mask & _rm
                 exit_time_mask = self._matrix_date_range_mask(
                     market_data.timestamp_labels,
                     config.start,
@@ -1048,12 +1389,12 @@ class StrategyBacktestService:
                     else None
                 )
 
-            scoring = dict(s.meta.get("scoring", {}) or {})
-            scoring.update(overrides.get("scoring") or {})
+            scoring = effective_scoring(s.meta.get("scoring"), overrides)
             try:
                 pipeline_config = MatrixPipelineConfig(
                     basic_filter=basic_filter,
                     scoring=scoring,
+                    scoring_directions=effective_scoring_directions(overrides),
                     order_by=s.meta.get("order_by"),
                     descending=bool(s.meta.get("descending", True)),
                     protect_strategy_cache=prepared is not None,
@@ -1129,6 +1470,27 @@ class StrategyBacktestService:
             formal_candidate_mask = candidate_mask & formal_range
             entry_mask = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
             entry_mask = entry_mask & formal_range
+            if config.regime_filter:
+                date_values = panel.get_column("date").unique().sort().to_list()
+                date_labels = tuple(str(value)[:10] for value in date_values)
+                try:
+                    regime_time_mask = self._build_regime_mask(
+                        date_labels,
+                        config.regime_filter,
+                        getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
+                        required_start=config.start,
+                        required_end=config.end,
+                    )
+                except ValueError as e:
+                    return _err(str(e))
+                if regime_time_mask is not None:
+                    allowed_dates = [
+                        value for value, allowed in zip(date_values, regime_time_mask, strict=True)
+                        if allowed
+                    ]
+                    regime_row_mask = panel.get_column("date").is_in(allowed_dates).fill_null(False)
+                    formal_candidate_mask = formal_candidate_mask & regime_row_mask
+                    entry_mask = entry_mask & regime_row_mask
             raw_exit_mask = self._build_signal_mask(panel, exit_signals, "_exit")
             exit_range = self._date_range_mask(panel, config.start, load_end) if config.mode == "full" else formal_range
             exit_mask = raw_exit_mask & exit_range
@@ -1244,6 +1606,19 @@ class StrategyBacktestService:
             "score_max": score_max,
             "source": s.source,
             "execution_backend": s.execution_backend,
+            **(
+                {
+                    "composite_children": [
+                        {
+                            "id": cid,
+                            "weight": cw,
+                        }
+                        for cid, cw in getattr(self, "_composite_children_weights", [])
+                    ]
+                }
+                if s.execution_backend == "composite"
+                else {}
+            ),
         } if result_policy.include_strategy_info else {}
 
         selected_stats = result_policy.select_stats(result.stats)
@@ -1292,6 +1667,61 @@ class StrategyBacktestService:
             (start_text <= label[:10] <= end_text for label in timestamp_labels),
             dtype=bool,
             count=len(timestamp_labels),
+        )
+
+    @staticmethod
+    def _clamp_regime_formal_start(
+        config: StrategyBacktestConfig, labels: tuple[str, ...] | list[str]
+    ) -> StrategyBacktestConfig:
+        """环境过滤下正式起点=面板首日 (无前驱交易日) 时, 顺延到第二个交易日。
+
+        数据边界即正式起点 (如「全部」范围) 时, T-1 环境校验会 fail-closed 拒绝;
+        首日降级为预热后, 其环境即成为次日的 T-1, 仅损失 1 个正式交易日。
+        """
+        from app.backtest.regime_alignment import clamp_formal_start_for_regime
+
+        shifted = clamp_formal_start_for_regime(labels, config.start, config.regime_filter)
+        if shifted is not None and shifted != config.start:
+            return replace(config, start=shifted)
+        return config
+
+    @staticmethod
+    def _build_regime_mask(
+        timestamp_labels: tuple[str, ...],
+        regime_filter: dict | None,
+        data_dir: Path | None,
+        *,
+        required_start: date | None = None,
+        required_end: date | None = None,
+    ) -> np.ndarray | None:
+        """构造逐日 T-1 regime mask, 保留历史静态入口兼容调用方。"""
+        if not regime_filter:
+            return None
+        allowed_states = set(regime_filter.get("states") or [])
+        min_score = regime_filter.get("min_score")
+        if not allowed_states and min_score is None:
+            return None
+        if data_dir is None:
+            raise ValueError("市场环境过滤不可用: 未找到环境数据目录")
+
+        from app.backtest.regime_alignment import build_regime_filter_mask
+        from app.services import regime_builder
+
+        regime_df = regime_builder.load_regime_history(data_dir)
+        regime_by_date = {
+            row["date"]: {
+                "state": row.get("state", ""),
+                "score": row.get("score", 0),
+            }
+            for row in regime_df.iter_rows(named=True)
+            if row.get("date") is not None
+        }
+        return build_regime_filter_mask(
+            timestamp_labels,
+            regime_filter,
+            regime_by_date,
+            required_start=required_start,
+            required_end=required_end,
         )
 
     def _build_candidate_filter_mask(
@@ -1600,6 +2030,7 @@ class StrategyBacktestService:
             "mode": c.mode,
             "holding_days": c.holding_days,
             "minute_fill": c.minute_fill,
+            "regime_filter": c.regime_filter,
         }
 
     @staticmethod
@@ -1609,12 +2040,11 @@ class StrategyBacktestService:
         overrides: dict | None,
         universe_mask: pl.Series | None = None,
     ) -> pl.DataFrame:
-        scoring = s.meta.get("scoring", {})
-        scoring_overrides = (overrides or {}).get("scoring")
-        if scoring_overrides:
-            scoring = {**scoring, **scoring_overrides}
+        scoring = effective_scoring(s.meta.get("scoring"), overrides)
+        directions = effective_scoring_directions(overrides)
 
-        work = panel
+        work = materialize_scoring_columns(panel, scoring.keys())
+        temporary_scoring_columns = [name for name in scoring if name not in panel.columns and name in work.columns]
         has_universe = universe_mask is not None and len(universe_mask) == len(panel)
         if has_universe:
             work = work.with_columns(universe_mask.rename("_score_universe"))
@@ -1625,18 +2055,23 @@ class StrategyBacktestService:
             return value
 
         def _finish(df: pl.DataFrame) -> pl.DataFrame:
-            return df.drop("_score_universe") if "_score_universe" in df.columns else df
+            temporary = [
+                name
+                for name in ["_score_universe", *temporary_scoring_columns]
+                if name in df.columns
+            ]
+            return df.drop(temporary) if temporary else df
 
         if scoring:
             executable = [
-                (value, weight)
+                (str(col), value, weight)
                 for col, weight in scoring.items()
                 if weight and (value := scoring_value_expr(work.columns, str(col))) is not None
             ]
-            total_weight = sum(weight for _, weight in executable)
+            total_weight = sum(weight for _, _, weight in executable)
             if total_weight > 0:
                 score_parts: list[pl.Expr] = []
-                for score_value, weight in executable:
+                for name, score_value, weight in executable:
                     w = weight / total_weight
                     value = _value_in_universe(score_value)
                     col_min = value.min().over("date")
@@ -1645,6 +2080,8 @@ class StrategyBacktestService:
                     normalized = pl.when(col_range > 0).then(
                         (score_value - col_min) / col_range
                     ).otherwise(pl.lit(0.5))
+                    if directions.get(name) == SCORING_DIRECTION_LOW:
+                        normalized = 1.0 - normalized
                     if has_universe:
                         normalized = pl.when(pl.col("_score_universe")).then(normalized).otherwise(0.0)
                     score_parts.append(normalized * w)

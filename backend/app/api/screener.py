@@ -14,6 +14,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import strategy_cache
 from app.services.screener import ScreenerService
 from app.strategy import config as strategy_config
@@ -68,9 +69,6 @@ def _one_word_limit_expr(status_main: str, columns: list[str]) -> Any:
     ).fill_null(False)
 
 
-_EXT_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
-
-
 def _safe_ext_value(value: Any) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -79,8 +77,7 @@ def _safe_ext_value(value: Any) -> Any:
     return value
 
 
-def _quote_ident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+# 标识符安全原语 (转义 + 白名单) 集中在 app.db_safe, 见 Issue #150 注入防护。
 
 
 # ── 扩展列 value_map 缓存 ────────────────────────────────────────────
@@ -144,7 +141,7 @@ def _load_ext_value_maps(repo, ext_columns: str | None) -> dict[str, dict[str, A
             else:
                 view_name = f"ext_{config_id}"
                 ext_df = pl.from_arrow(db.query(
-                    f"SELECT symbol, {_quote_ident(field_name)} FROM {view_name}"
+                    f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
                 ).arrow())
 
             if ext_df.is_empty() or "symbol" not in ext_df.columns or field_name not in ext_df.columns:
@@ -241,6 +238,8 @@ def strategies(
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
     presets = []
     for meta in engine.list_strategies():
+        if meta.get("research_only"):
+            continue
         if asset_type not in meta.get("asset_types", ["stock"]):
             continue
         if timeframe not in meta.get("timeframes", ["1d"]):
@@ -294,6 +293,8 @@ def run_preset(req: PresetRequest, request: Request):
 
     try:
         if not engine.has(req.strategy_id):
+            raise ValueError(f"unknown strategy: {req.strategy_id}")
+        if engine.get(req.strategy_id).meta.get("research_only"):
             raise ValueError(f"unknown strategy: {req.strategy_id}")
         params = dict(overrides.get("params") or {})
         context = svc.build_strategy_context(
@@ -523,14 +524,19 @@ def run_all(request: Request, body: dict | None = None):
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
-        unknown = [sid for sid in all_ids if not engine.has(sid)]
+        unknown = [
+            sid
+            for sid in all_ids
+            if not engine.has(sid) or engine.get(sid).meta.get("research_only")
+        ]
         if unknown:
             raise HTTPException(status_code=404, detail=f"unknown strategies: {unknown}")
     else:
         all_ids = [
             meta["id"]
             for meta in engine.list_strategies()
-            if asset_type in meta.get("asset_types", ["stock"])
+            if not meta.get("research_only")
+            and asset_type in meta.get("asset_types", ["stock"])
             and timeframe in meta.get("timeframes", ["1d"])
         ]
 
@@ -710,7 +716,9 @@ def limit_ladder(
     sealed_ready = False
     sealed_age: float | None = None
     if depth_svc:
-        sealed_map = depth_svc.get_sealed_map(as_of, is_down=is_down)
+        # 复用上方双方向计数已读取的 sealed map: 同一请求、同一 as_of、同一对象,
+        # 不再第三次读取 (内存路径含全量浅拷贝, parquet 路径含整文件读)。
+        sealed_map = down_map if is_down else up_map
         sealed_ready = bool(sealed_map) and depth_svc.is_sealed_ready(as_of)
         sealed_age = depth_svc.get_sealed_age(as_of) if sealed_ready else None
 
@@ -785,7 +793,7 @@ def limit_ladder(
             ext_col_name = f"{config_id}__{field_name}"
             try:
                 ext_df = pl.from_arrow(db.query(
-                    f"SELECT symbol, \"{field_name}\" FROM {view_name}"
+                    f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
                 ).arrow())
                 if not ext_df.is_empty() and "symbol" in ext_df.columns:
                     ext_df = ext_df.rename({field_name: ext_col_name})
@@ -860,7 +868,7 @@ def _parse_ext_columns(ext_columns: str) -> list[tuple[str, str]]:
         field_name = field_name.strip()
         if not config_id or not field_name:
             continue
-        if not _EXT_IDENT_RE.match(config_id) or "\x00" in field_name:
+        if not is_valid_ext_ident(config_id) or "\x00" in field_name:
             continue
         result.append((config_id, field_name))
     return result

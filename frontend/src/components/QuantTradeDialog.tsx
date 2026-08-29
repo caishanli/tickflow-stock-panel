@@ -306,7 +306,9 @@ export function QuantTradeDialog({
                 financialMetrics={financials.data?.data?.[0]}
                 onMonitor={() => setShowMonitorEditor(true)}
                 inWatchlist={inWatchlist}
-                onToggleWatchlist={() => toggleWatchlist.mutate()}
+                onAddToWatchlist={() => { if (!inWatchlist) toggleWatchlist.mutate() }}
+                onRemoveFromWatchlist={() => { if (inWatchlist) toggleWatchlist.mutate() }}
+                watchlistPending={toggleWatchlist.isPending}
               />
 
               {/* 视图切换器 */}

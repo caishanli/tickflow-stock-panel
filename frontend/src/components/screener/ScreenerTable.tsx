@@ -8,7 +8,7 @@
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import { Check, Plus, Eye, EyeOff, RefreshCw } from 'lucide-react'
 import type { KlineRow, MinuteKlineRow } from '@/lib/api'
-import { fmtPrice } from '@/lib/format'
+import { fmtPrice, formatExtNumber } from '@/lib/format'
 import type { ColumnConfig } from '@/lib/screener-columns'
 import { getSignals, signalCls } from '@/lib/stock-table'
 import { boardTag, renderBuiltinDataCell } from '@/components/stock-table/primitives'
@@ -16,6 +16,7 @@ import { resolveCandleConfig, resolveIntradayConfig } from '@/lib/list-columns'
 import { MiniCandlestick } from '@/components/stock-table/MiniCandlestick'
 import { MiniIntraday } from '@/components/stock-table/MiniIntraday'
 import { StockDataTable, type SortState } from '@/components/stock-table/StockDataTable'
+import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import {
   DimensionMembersDialog,
   dimensionKindForSourceField,
@@ -30,7 +31,8 @@ interface ScreenerTableProps {
   activeStrategy: string | null
   watchlistSet: Set<string>
   onPreview: (symbol: string, name: string) => void
-  onToggleWatchlist: (symbol: string, inList: boolean) => void
+  onAddToWatchlist: (symbol: string, groupId: string | null) => void
+  onRemoveFromWatchlist: (symbol: string) => void
   watchlistPending: boolean
   /** symbol → 日k 数据，仅当启用日k列时传入 */
   klineData?: Record<string, KlineRow[]>
@@ -121,7 +123,12 @@ function renderExtValue(
 ): ReactNode {
   if (val == null || Number.isNaN(val)) return <span className="text-muted">—</span>
   if (typeof val === 'number') {
-    const displayVal = Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val)
+    // 数字格式化: 千分位 + 单位换算 + 小数位(由列配置控制)
+    const cfg = col.extDisplay
+    const hasNumFmt = cfg?.thousandSeparator || (cfg?.unitConvert && cfg.unitConvert !== 'none')
+    const displayVal = hasNumFmt
+      ? formatExtNumber(val, { thousandSeparator: cfg?.thousandSeparator, unitConvert: cfg?.unitConvert, unitDecimals: cfg?.unitDecimals })
+      : (Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val))
     return <span className="tabular-nums">{displayVal}</span>
   }
   if (typeof val === 'boolean') {
@@ -142,7 +149,7 @@ function renderExtValue(
 
 export function ScreenerTable({
   rows, columns, strategyIdToName, symbolStrategyMap, activeStrategy,
-  watchlistSet, onPreview, onToggleWatchlist, watchlistPending, klineData = {},
+  watchlistSet, onPreview, onAddToWatchlist, onRemoveFromWatchlist, watchlistPending, klineData = {},
   dailyKChartVisible = true, onToggleDailyKChart,
   minuteData = {}, intradayChartVisible = true, onToggleIntradayChart,
   intradayAutoRefresh = false, onRefreshIntraday, intradayRefreshing = false,
@@ -240,20 +247,27 @@ export function ScreenerTable({
                   失效
                 </span>
               ) : (
-                <button
-                  type="button"
-                  onClick={() => onToggleWatchlist(r.symbol, inWatchlist)}
-                  disabled={watchlistPending}
-                  className={`shrink-0 inline-flex items-center justify-center w-5 h-5 rounded-full border transition-colors cursor-pointer
-                    disabled:opacity-50
-                    ${inWatchlist
-                      ? 'border-accent/40 bg-accent/10 text-accent'
-                      : 'border-border text-muted hover:border-accent/40 hover:text-accent'
-                    }`}
-                  title={inWatchlist ? '移出自选' : '加入自选'}
-                >
-                  {inWatchlist ? <Check className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
-                </button>
+                inWatchlist ? (
+                  <button
+                    type="button"
+                    onClick={() => onRemoveFromWatchlist(r.symbol)}
+                    disabled={watchlistPending}
+                    className="shrink-0 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-accent/40 bg-accent/10 text-accent transition-colors disabled:opacity-50"
+                    title="移出自选"
+                    aria-label={`将 ${r.symbol} 移出自选`}
+                  >
+                    <Check className="h-3 w-3" />
+                  </button>
+                ) : (
+                  <WatchlistAddMenu
+                    onSelect={groupId => onAddToWatchlist(r.symbol, groupId)}
+                    disabled={watchlistPending}
+                    triggerClassName="shrink-0 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                    ariaLabel={`将 ${r.symbol} 加入自选`}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </WatchlistAddMenu>
+                )
               )}
             </div>
           </td>
