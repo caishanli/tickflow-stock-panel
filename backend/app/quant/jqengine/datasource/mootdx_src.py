@@ -4,12 +4,19 @@ import datetime as _dt_mod
 import logging
 import socket
 import time
+import warnings
 
 import pandas as pd
 from mootdx.quotes import Quotes
 from mootdx.utils import get_stock_market
 
 from .base import DataSource, DataSourceError
+
+# pytdx 已停止维护，其 block_reader.py:128 的 `if code is not ''` 在 Python 3.12+
+# 触发 SyntaxWarning（'' 为 interned 单例，`is not` 与 `!=` 行为等价，无实际影响）。
+# 本模块是项目内唯一 import pytdx 的入口（函数内懒加载），在此按模块名精确静音，
+# 早于任何 pytdx 首次编译，且不影响项目自身代码的语法警告检查。
+warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"pytdx\.")
 
 logger = logging.getLogger(__name__)
 

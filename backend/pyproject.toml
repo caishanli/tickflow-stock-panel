@@ -19,6 +19,13 @@ dependencies = [
     "pyarrow>=16.0",
     "baostock>=0.9",              # 全市场 5min/日线/复权因子回源 (backfill_baostock_3y)
     "akshare>=1.18,<2",           # ETF 单位净值回源 (etf_nav_service)
+    # stockdata 服务由主后端 guardian 用 sys.executable 直接 spawn，是常驻进程，
+    # 其回源实现（mootdx_service/mootdx_src/rt_sources）的依赖必须在基础依赖里：
+    # 放 extras 时 uv sync 默认不装，venv 重建即复现 ModuleNotFoundError
+    # （08-11 pytdx、08-29 mootdx 两次事故同因）。
+    "mootdx>=0.11.7",             # stockdata 回源 (mootdx_service)
+    "pytdx>=1.72",                # mootdx_src 用 pytdx 替换 mootdx 内置 tdxpy（mootdx 只声明 tdxpy）
+    "requests>=2.31",             # stockdata rt_sources/sources 直接 import
     "pandas>=2.2",                # 仅在 BacktestService 边界使用,见 §7.4 / ADR-19
     "psutil>=5.9",                # 独立回测 worker 的峰值 RSS 与退出后内存指标
     # llvmlite 不再提供 macOS Intel wheel；该平台使用 Matrix 纯 Python fallback。
@@ -64,15 +71,10 @@ desktop = [
     "pywebview>=5.0",
 ]
 
-# 量化回测/模拟盘依赖 (RQAlpha + 多源)。启用: uv sync --extra quant
+# 量化回测/模拟盘依赖 (RQAlpha)。启用: uv sync --extra quant
+# （mootdx/pytdx/requests 已提为基础依赖——stockdata 服务常驻进程必需，见 dependencies 注释）
 quant = [
     "rqalpha>=0.26",
-    "mootdx>=0.11.7",
-    # mootdx_src.py 用 pytdx 替换 mootdx 内置 tdxpy（tdxpy 0.2.7 协议不兼容），
-    # 是运行期硬依赖。mootdx 自身不声明它（只依赖 tdxpy），若不显式声明会在
-    # 重建 venv 时被丢弃，导致全市场分钟/日线回源失败（08-11 服务器事故）。
-    "pytdx>=1.72",
-    "requests>=2.31",
 ]
 
 dev = [
@@ -130,7 +132,7 @@ ignore = ["E501"]   # 长行交给 fmt
 "tests/quant/test_stockdata_rt_sources.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 "tests/quant/test_stockdata_sources.py" = ["RUF001", "RUF002", "RUF003", "RUF100"]
 
-# quant extra 的 mootdx==0.11.7 硬锁 httpx<0.26，与基础依赖 httpx>=0.27 冲突。
+# mootdx==0.11.7 硬锁 httpx<0.26，与基础依赖 httpx>=0.27 冲突。
 # 用 override 强制 httpx>=0.27（mootdx 仅作多源降级备用，内部 httpx 用法兼容）。
 [tool.uv]
 override-dependencies = ["httpx>=0.27"]
