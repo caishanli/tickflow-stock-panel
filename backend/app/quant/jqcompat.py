@@ -24,7 +24,6 @@ import types
 
 import numpy as np
 import pandas as pd
-
 from rqalpha.api import register_api
 from rqalpha.const import INSTRUMENT_TYPE, MARKET, TRADING_CALENDAR_TYPE
 from rqalpha.core.events import EVENT
@@ -843,9 +842,9 @@ class _JqOrderProxy:
 
 # 原生下单函数必须在 register_api 覆盖前捕获（否则 from rqalpha.api import *
 # 拿到的是我们自己的 shim，无限递归）
+from rqalpha.api import order_shares as _RQ_OS  # noqa: E402
 from rqalpha.api import order_target_value as _RQ_OTV  # noqa: E402
 from rqalpha.api import order_value as _RQ_OV  # noqa: E402
-from rqalpha.api import order_shares as _RQ_OS  # noqa: E402
 
 
 def order_target_value(security, value, limit_price=None):
@@ -1358,6 +1357,7 @@ def _load_share_events_cached():
     out: dict = {}
     try:
         import polars as pl
+
         from app.services.tdx_financials import DATA_ROOT as _DATA_ROOT
         f = _DATA_ROOT / "pools" / "stock_xdxr_events.parquet"
         df = pl.read_parquet(f).filter(pl.col("category") == 5)
@@ -1954,7 +1954,7 @@ def _limit_rate(code, name=None):
     return 0.10
 
 
-def _limit_prices_from_prev_close(close: "pd.Series", rate: float = 0.10):
+def _limit_prices_from_prev_close(close: pd.Series, rate: float = 0.10):
     """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。
 
     交易所口径以昨收为基准（此前用当根 high×1.1/low×0.9，导致
@@ -2701,7 +2701,8 @@ def _install_barcache_mod():
                             except Exception as e:
                                 # 策略调度回调异常必须可见（rqalpha 会把 root
                                 # logging 压到 ERROR，warning 静默丢失）
-                                import os as _os, traceback as _tb
+                                import os as _os
+                                import traceback as _tb
                                 if _os.getenv("JQ_QUIET_ERRORS") != "1":
                                     print("daily_at(%s) 回调异常: %s" % (hm, e),
                                           flush=True)
@@ -2738,7 +2739,8 @@ def _install_barcache_mod():
                             except Exception as e:
                                 # 策略调度回调异常必须可见（rqalpha 会把 root
                                 # logging 压到 ERROR，warning 静默丢失）
-                                import os as _os, traceback as _tb
+                                import os as _os
+                                import traceback as _tb
                                 if _os.getenv("JQ_QUIET_ERRORS") != "1":
                                     print("daily_at(%s) 回调异常: %s" % (hm, e),
                                           flush=True)
@@ -2766,9 +2768,9 @@ def _install_barcache_mod():
 # 补丁：Position / Portfolio / StrategyContext
 # ---------------------------------------------------------------------------
 def _patch_rqalpha_objects():
-    from rqalpha.portfolio.position import Position, PositionProxy
-    from rqalpha.portfolio import Portfolio
     from rqalpha.core.strategy_context import StrategyContext
+    from rqalpha.portfolio import Portfolio
+    from rqalpha.portfolio.position import Position, PositionProxy
     try:
         from rqalpha.mod.rqalpha_mod_sys_accounts.position_model import StockPositionProxy
     except Exception:

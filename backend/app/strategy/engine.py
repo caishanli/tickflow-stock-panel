@@ -247,7 +247,7 @@ class StrategyEngine:
                 )
         except ValueError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             # 文件读不到/语法错等: 不阻断, 让下方 exec_module 抛原样错误
             pass
 

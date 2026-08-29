@@ -23,5 +23,6 @@ def save_state(account_id: str, state: dict) -> None:
 
 def is_paused(account_id: str) -> bool:
     import os
+
     from ..config import CONFIG
     return os.path.exists(os.path.join(CONFIG.runtime_dir, f"{account_id}.pause"))

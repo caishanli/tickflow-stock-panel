@@ -13,7 +13,7 @@ logger = logging.getLogger("app.services.stockdata.server")
 
 
 class _Handler(socketserver.BaseRequestHandler):
-    def handle(self) -> None:  # noqa: D102
+    def handle(self) -> None:
         src: DataSources = self.server.data_sources  # type: ignore[attr-defined]
         try:
             while True:
@@ -22,7 +22,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 try:
                     t, data = handle(msg["m"], msg.get("p") or {}, src)
                     resp = protocol.encode_response(req_id, True, t, data)
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     logger.warning("[stockdata] method=%s 失败: %s", msg.get("m"), e)
                     resp = protocol.encode_response(
                         req_id, False, "json",
@@ -30,7 +30,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 self.request.sendall(resp)
         except (EOFError, ConnectionError):
             return
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("[stockdata] 连接处理异常")
 
 

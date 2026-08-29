@@ -266,7 +266,7 @@ class JobStore:
         try:
             start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
             elapsed = (datetime.now(start_dt.tzinfo) - start_dt).total_seconds()
-        except Exception:  # noqa: BLE001
+        except Exception:
             return
         if elapsed > effective_timeout:
             logger.warning("reap_stale: 强制取消卡死 job %s (已运行 %.0fs, 阈值 %ss)",
@@ -313,7 +313,7 @@ def _duration_s(j: dict[str, Any]) -> float | None:
         s = datetime.fromisoformat(j["started_at"])
         e = datetime.fromisoformat(j["finished_at"])
         return round((e - s).total_seconds(), 2)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 

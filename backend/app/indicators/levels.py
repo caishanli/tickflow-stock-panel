@@ -587,7 +587,7 @@ def compute_levels(df: pl.DataFrame) -> dict[str, list[dict]]:
             "fib": _fibonacci_levels(df),
             "round": _round_numbers(df),
         }
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("compute_levels failed: %s", e)
         return {k: [] for k in LEVEL_TYPES}
 

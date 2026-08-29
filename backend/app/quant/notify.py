@@ -52,6 +52,6 @@ def send_dingtalk(webhook_url: str, secret: str, title: str, text: str) -> bool:
             return True
         log.warning("钉钉推送失败: %s", data)
         return False
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("钉钉推送异常: %s", e)
         return False

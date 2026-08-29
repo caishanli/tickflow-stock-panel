@@ -88,7 +88,7 @@ def _extract(df, stat: str) -> pl.DataFrame:
     import pandas as pd
 
     pdf = df.reset_index()
-    data: dict[str, "pd.Series"] = {"code": pdf["code"].astype(str)}
+    data: dict[str, pd.Series] = {"code": pdf["code"].astype(str)}
     for tdx_name, std_name in _COLUMN_MAP:
         if tdx_name not in pdf.columns:
             logger.warning("gpcw %s 缺列: %s", stat, std_name)
@@ -147,7 +147,7 @@ def sync_financials(quarters: int = 8, force: bool = False) -> dict:
                     os.replace(tmp, part_file)
                     res["synced"].append(stat)
                     logger.info("financials: %s 落盘 %s 行", stat, out.height)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning("financials: %s 回源失败: %s", stat, exc)
                     res["failed"][stat] = str(exc)[:200]
         finally:

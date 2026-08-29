@@ -1119,7 +1119,7 @@ class StrategyBacktestService:
                 if expr is not None:
                     try:
                         basic_mask = panel.select(expr.alias("_basic"))["_basic"].fill_null(False).cast(pl.Boolean)
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:
                         logger.warning("basic_filter mask failed: %s", e)
                         return _err(f"基础过滤计算失败: {e}")
 

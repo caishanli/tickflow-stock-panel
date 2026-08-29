@@ -639,6 +639,7 @@ _RANK_CACHE: dict = {"ts": 0.0, "data": None}
 def _measure_server(ip, port, timeout=5.0):
     """对服务器发一次真实日线请求：(延迟 ms, 行数)。失败返回 (inf, 0)。"""
     import time as _t
+
     from pytdx.hq import TdxHq_API
     api = TdxHq_API()
     try:

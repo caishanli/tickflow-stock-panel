@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-# ruff: noqa: RUF002, RUF003
 """统一 Parquet 分区存储：分区内文件命名归一为 part.parquet。
-
 - 分区内文件命名统一为 part.parquet（现有 data_*.parquet 合并重命名）
 - 注意：volume 单位不做盘上换算，保留原始数据（A股日线为手，读取层再 ×100）
 - 删除每股票缓存与 stock.duckdb 遗留
 """
 from __future__ import annotations
-
 import os
 import sys
 from pathlib import Path
-
 import polars as pl
-
 DATA_ROOT = Path(os.environ.get(
     "PARTITION_DATA_ROOT",
     os.path.join(
@@ -21,8 +16,6 @@ DATA_ROOT = Path(os.environ.get(
         "data",
     ),
 ))
-
-
 def _normalize_partition_files(partition_dir: Path) -> int:
     """把分区目录内多个 data_*.parquet 合并为 part.parquet，返回重命名数。"""
     files = sorted(partition_dir.glob("*.parquet"))
@@ -51,8 +44,6 @@ def _normalize_partition_files(partition_dir: Path) -> int:
         if f.name != "part.parquet":
             f.unlink()
     return len(files)
-
-
 def normalize_partitions(partition_root: str = str(DATA_ROOT)) -> dict:
     root = Path(partition_root)
     stats = {"renamed": 0, "deleted": 0, "skipped": 0}
@@ -75,8 +66,6 @@ def normalize_partitions(partition_root: str = str(DATA_ROOT)) -> dict:
         path.unlink()
         stats["deleted"] += 1
     return stats
-
-
 if __name__ == "__main__":
     print(normalize_partitions())
     sys.exit(0)

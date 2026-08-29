@@ -218,7 +218,7 @@ def _get_stock_info(repo, symbol: str) -> dict:
             "SELECT name, total_shares, float_shares FROM instruments WHERE symbol = ? LIMIT 1",
             [symbol],
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
     if not row:
         return {}
@@ -310,9 +310,9 @@ def get_daily(
     request: Request,
     symbol: str = Query(..., description="标的代码,如 000001.SZ"),
     days: int = Query(120, ge=10, le=2000),
-    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD, 优先于 days"),
-    end_date: Optional[str] = Query(None, description="截止日期 YYYY-MM-DD, 默认今天"),
-    ext_columns: Optional[str] = Query(None, description="逗号分隔的 ext 列: config_id.field_name"),
+    start_date: str | None = Query(None, description="起始日期 YYYY-MM-DD, 优先于 days"),
+    end_date: str | None = Query(None, description="截止日期 YYYY-MM-DD, 默认今天"),
+    ext_columns: str | None = Query(None, description="逗号分隔的 ext 列: config_id.field_name"),
     data_source: str = Query("default", description="default=现状; stockdata=弹窗专用, 本地 stockdata 服务优先"),
 ):
     """读取本地 enriched 表中某只股票的日 K。
@@ -380,7 +380,7 @@ def get_daily(
             from app.tickflow.capabilities import Cap
             if capset and capset.has(Cap.ADJ_FACTOR):
                 factors = kline_sync.fetch_adj_factor_single(symbol)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
         enriched = compute_enriched(raw, factors=factors)
         rows = enriched.tail(days).to_dicts()
@@ -398,7 +398,7 @@ def get_daily(
     return _attach_ext(resp, repo, symbol, ext_columns)
 
 
-def _attach_ext(resp: dict, repo, symbol: str, ext_columns: Optional[str]) -> dict:
+def _attach_ext(resp: dict, repo, symbol: str, ext_columns: str | None) -> dict:
     """按 ext_columns 规格为单只股票 LEFT JOIN 扩展数据，平铺到 stock_info['ext']。
 
     key 形如 "{config_id}__{field_name}"，与自选列表 enriched 接口保持一致。
@@ -422,11 +422,11 @@ def _attach_ext(resp: dict, repo, symbol: str, ext_columns: Optional[str]) -> di
     import polars as pl
     data_dir = repo.store.data_dir
     try:
-        from app.services.ext_data import ExtConfigStore
         from app.api.ext_data import _read_ext_dataframe
+        from app.services.ext_data import ExtConfigStore
         ext_store = ExtConfigStore(data_dir)
         configs = {c.id: c for c in ext_store.load_all()}
-    except Exception:  # noqa: BLE001
+    except Exception:
         configs = {}
 
     ext_values: dict = {}
@@ -453,7 +453,7 @@ def _attach_ext(resp: dict, repo, symbol: str, ext_columns: Optional[str]) -> di
                 )
                 if not row.is_empty():
                     value = row[field_name][0]
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("kline ext join failed for %s.%s: %s", config_id, field_name, e)
         ext_values[ext_col_name] = value
 
@@ -492,7 +492,7 @@ def _maybe_inject_live_candle(request: Request, symbol: str, rows: list[dict], a
         if not q:
             return rows
         q = q[0]
-    except Exception:  # noqa: BLE001
+    except Exception:
         return rows
 
     close_price = q.get("close")
@@ -561,8 +561,9 @@ def get_daily_batch(request: Request, body: dict):
     days = max(5, min(60, days))
 
     repo = request.app.state.repo
-    import polars as pl
     from datetime import date, timedelta
+
+    import polars as pl
 
     end = date.today()
     start = end - timedelta(days=days * 2)  # 多取一些确保交易日够
@@ -592,7 +593,9 @@ def get_minute_batch(request: Request, body: dict):
     - 需 Pro+ 权限 (kline.minute.batch)
     """
     from datetime import datetime
+
     import polars as pl
+
     from app.tickflow.capabilities import Cap
 
     symbols: list[str] = body.get("symbols", [])
@@ -860,8 +863,13 @@ async def sync_minute(request: Request):
     """
     import asyncio
 
-    from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot, LONG_JOB_TIMEOUT_S
     from app.api.data import invalidate_storage_cache
+    from app.services.pipeline_jobs import (
+        LONG_JOB_TIMEOUT_S,
+        job_store,
+        release_run_slot,
+        try_acquire_run_slot,
+    )
     from app.services.preferences import get_minute_sync_days
     from app.tickflow.capabilities import Cap
     from app.tickflow.pools import get_pool
@@ -877,7 +885,7 @@ async def sync_minute(request: Request):
     body = {}
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     override_days = body.get("days")
     extend_flag = body.get("extend")
@@ -907,7 +915,7 @@ async def sync_minute(request: Request):
                     import polars as pl
                     inst = pl.read_parquet(inst_path, columns=["symbol"])
                     universe = sorted(set(universe) | set(inst["symbol"].to_list()))
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
             progress("sync_minute", 10, f"标的池 {len(universe)} 只")
 
@@ -936,7 +944,7 @@ async def sync_minute(request: Request):
             progress("done", 100, f"分钟 K 同步完成,{written} 行")
             job_store.succeed(job_id, {"minute_rows": written, "universe_size": len(universe)})
             invalidate_storage_cache()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             job_store.fail(job_id, str(e))
             invalidate_storage_cache()
         finally:
@@ -1003,7 +1011,7 @@ async def clear_minute(request: Request):
         try:
             result = repo.db.execute("SELECT COUNT(*) AS cnt FROM kline_minute").fetchone()
             removed = result[0] if result else 0
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         # 仅删 kline_minute 目录, 绝不触碰其他目录
         shutil.rmtree(minute_dir, ignore_errors=True)
@@ -1044,9 +1052,9 @@ async def extend_history(request: Request):
         if not capset.has(Cap.KLINE_DAILY_BATCH):
             raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
 
+        from app.api.data import invalidate_storage_cache
         from app.services.extend_history import run_extend_history
         from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
-        from app.api.data import invalidate_storage_cache
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1123,9 +1131,9 @@ async def repair_daily(request: Request):
         if not capset.has(Cap.KLINE_DAILY_BATCH):
             raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
 
-        from app.services.repair_daily import run_repair_daily
-        from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
+        from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
+        from app.services.repair_daily import run_repair_daily
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1184,8 +1192,8 @@ async def rebuild_enriched(request: Request):
     try:
         repo = request.app.state.repo
 
-        from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
+        from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1257,4 +1265,5 @@ async def rebuild_enriched(request: Request):
 
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）
 import concurrent.futures as _cf
+
 _long_task_executor = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="long-task")

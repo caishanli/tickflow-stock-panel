@@ -7,7 +7,7 @@ import math
 import re
 import shutil
 import tempfile
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -26,8 +26,8 @@ from app.services.ext_data import (
     fix_symbol_format,
     infer_fields_from_df,
     parse_upload_file,
-    write_ext_parquet,
     rows_to_parquet,
+    write_ext_parquet,
 )
 from app.services.ext_pull import fetch_and_ingest, pull_scheduler
 
@@ -639,8 +639,9 @@ async def test_pull(request: Request, config_id: str):
         raise HTTPException(400, "拉取未配置或 URL 为空")
 
     # 临时构建一个带新配置的 config 用于测试
-    from app.services.ext_pull import _extract_rows, _apply_field_map
     import httpx
+
+    from app.services.ext_pull import _apply_field_map, _extract_rows
 
     pull = config.pull
     try:
@@ -684,7 +685,7 @@ async def run_pull(request: Request, config_id: str):
         updated = store.get(config_id)
         if updated and updated.pull:
             from datetime import datetime, timezone
-            updated.pull.last_run = datetime.now(timezone.utc).isoformat()
+            updated.pull.last_run = datetime.now(UTC).isoformat()
             updated.pull.last_status = "success"
             updated.pull.last_message = f"{n} rows @ {d}"
             updated.pull.last_rows = n
@@ -695,7 +696,7 @@ async def run_pull(request: Request, config_id: str):
         failed = store.get(config_id)
         if failed and failed.pull:
             from datetime import datetime, timezone
-            failed.pull.last_run = datetime.now(timezone.utc).isoformat()
+            failed.pull.last_run = datetime.now(UTC).isoformat()
             failed.pull.last_status = "error"
             failed.pull.last_message = str(e)[:200]
             store.upsert(failed)
@@ -797,8 +798,9 @@ def _find_row_arrays(data, prefix: str = "", limit: int = 8) -> list[str]:
 @router.post("/detect-url")
 async def detect_url(body: DetectUrlReq):
     """请求外部 URL，自动检测 JSON 行数据的字段和标的代码列。"""
-    from app.services.ext_pull import _extract_rows, _apply_field_map
     import httpx
+
+    from app.services.ext_pull import _apply_field_map, _extract_rows
 
     method = body.method.upper()
     if method not in ("GET", "POST"):

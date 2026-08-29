@@ -29,7 +29,7 @@ def _resolve_name(code: str) -> str:
     try:
         from . import names
         return names.resolve_name(code)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return code
 
 

@@ -132,7 +132,7 @@ def sync_etf_nav(day: _date | None = None) -> int:
     if part.exists():
         try:
             n_existing = pl.read_parquet(part, columns=["symbol"]).height
-        except Exception:  # noqa: BLE001
+        except Exception:
             n_existing = 0
         # 已有分区不稀疏（不比本次快照少）→ 幂等跳过；稀疏（过早写入的占位）→ 覆盖重写
         if n_existing > 0 and n_existing >= df.height:
@@ -173,7 +173,7 @@ def _latest_valid_nav_date() -> _date | None:
             continue
         try:
             n = pl.read_parquet(part, columns=["symbol"]).height
-        except Exception:  # noqa: BLE001
+        except Exception:
             n = 0
         if n > 0:
             d = _date.fromisoformat(ds)

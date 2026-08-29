@@ -8,7 +8,6 @@ from . import api
 from .context import Context, G
 from .portfolio import Portfolio
 
-
 # Fake jqdata module so "from jqdata import *" in strategies doesn't crash
 _jqdata = types.ModuleType("jqdata")
 _jqdata.__all__ = []

@@ -18,8 +18,8 @@ from typing import Any
 
 import yaml
 
-from app.config import settings
 from app import secrets_store
+from app.config import settings
 
 from .capabilities import Cap, CapabilityLimits, CapabilitySet
 
@@ -93,7 +93,7 @@ def _call_with_retry(fn, attempts: int = 3, backoff: float = 0.6) -> None:
         try:
             fn()
             return
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_exc = e
             # 权限/参数类错误:重试无意义,立即抛出交给 try_call 归类
             if not _is_transient(e):
@@ -117,7 +117,8 @@ def _probe_real(tiers: dict) -> tuple[CapabilitySet, list[str], set[Cap]]:
     返回 (capset, probe_log)。
     """
     from tickflow import TickFlow
-    from .client import _base_url, PAID_ENDPOINT
+
+    from .client import PAID_ENDPOINT, _base_url
 
     key = secrets_store.get_tickflow_key()
     # 探测专用客户端:强制走付费端点验证 key。
@@ -145,7 +146,7 @@ def _probe_real(tiers: dict) -> tuple[CapabilitySet, list[str], set[Cap]]:
             _elapsed = time.perf_counter() - _t0
             log.append(f"✓ {cap}")
             logger.info("能力探测完成: %s ✓ (%.2fs)", cap.value, _elapsed)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             _elapsed = time.perf_counter() - _t0
             msg = str(e).lower()
             cls = e.__class__.__name__
@@ -280,7 +281,7 @@ def _load_cached_capset(cache_path: Path) -> CapabilitySet | None:
         if cached.get("schema_version") != _CACHE_SCHEMA_VERSION:
             return None
         return _capset_from_json(cached)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -307,7 +308,7 @@ def _augment_custom_sources(capset: CapabilitySet) -> None:
             if custom_sources.provider_has_dataset(provider, "minute"):
                 capset.grant(Cap.KLINE_MINUTE_BATCH)
                 logger.info("custom minute source '%s' detected: granted KLINE_MINUTE_BATCH", provider)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("custom source augment skipped: %s", e)
 
 

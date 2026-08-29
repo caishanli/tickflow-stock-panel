@@ -10,16 +10,25 @@ from pydantic import BaseModel
 
 from .. import db
 from ..config import CONFIG
-from ..service import (
-    submit_backtest, terminate_backtest, account_create, account_start, account_pause,
-    account_reset, account_delete,
-)
-from ..strategies.store import (
-    list_strategies, get_strategy, save_strategy, delete_strategy,
-    export_strategy, import_strategy,
-)
 from ..datasource.manager import QuantDataProvider
+from ..service import (
+    account_create,
+    account_delete,
+    account_pause,
+    account_reset,
+    account_start,
+    submit_backtest,
+    terminate_backtest,
+)
 from ..simulate.names import resolve_name
+from ..strategies.store import (
+    delete_strategy,
+    export_strategy,
+    get_strategy,
+    import_strategy,
+    list_strategies,
+    save_strategy,
+)
 
 router = APIRouter(prefix="/api/quant", tags=["quant"])
 
@@ -401,12 +410,12 @@ def _build_trade_days(account: dict, trades: list[dict]) -> list[str]:
         days = StockDataClient().get_trade_days(start, today)
         if days:
             return sorted({str(d)[:10] for d in days})
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     try:
         import pandas as _pd
         return [d.strftime("%Y-%m-%d") for d in _pd.bdate_range(start, today)]
-    except Exception:  # noqa: BLE001
+    except Exception:
         return [start, today]
 
 
@@ -462,9 +471,10 @@ def sim_stream(aid: str, since_id: int | None = None):
 
     与 backtest_stream 同机制：按 rowid 偏移增量推送，避免前端每 4s 全量轮询。
     """
-    from fastapi.responses import StreamingResponse
     import asyncio
     import json as _json
+
+    from fastapi.responses import StreamingResponse
 
     if not db.get_sim_account(aid):
         raise HTTPException(404, "not found")
@@ -481,7 +491,7 @@ def sim_stream(aid: str, since_id: int | None = None):
             if _snaps:
                 _bench = _build_benchmark_map(str(_snaps[0].get("dt", ""))[:10],
                                               str(_snaps[-1].get("dt", ""))[:10])
-        except Exception:  # noqa: BLE001
+        except Exception:
             _bench = {}
         last_status = None
         last_state_sig = None
@@ -586,7 +596,7 @@ def datasource_verify():
         src = MootdxSource()
         ok, msg = src.test_connection()
         return {"data": {"ok": ok, "error": msg if not ok else None}}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {"data": {"ok": False, "error": str(e)}}
 
 

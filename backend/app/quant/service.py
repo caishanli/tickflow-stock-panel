@@ -200,7 +200,7 @@ def account_ensure_running(aid: str) -> None:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             db.insert_sim_log(aid, str(datetime.datetime.now()), "error",
                               f"守护自动重启失败: {e}")
             return
@@ -223,7 +223,7 @@ def account_pause(aid: str) -> None:
             os.kill(int(pid), 15)
         except (ProcessLookupError, ValueError):
             pass
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("account_pause kill %s failed: %s", pid, e)
     db.update_sim_account(aid, status="paused")
 

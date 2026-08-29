@@ -1040,7 +1040,7 @@ def run_pipeline(data_dir: Path | None = None,
     instruments = pl.DataFrame()
     try:
         instruments = scan_parquet_compat(inst_glob, cast_options=_cast).collect()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("instruments 读取失败: %s", e)
     historical_shares = load_share_history(d)
 
@@ -1320,7 +1320,7 @@ def _load_factors(factor_path: Path) -> pl.DataFrame:
         return pl.DataFrame()
     try:
         return pl.read_parquet(factor_path)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("复权因子读取失败: %s", e)
         return pl.DataFrame()
 
@@ -1346,7 +1346,7 @@ def _load_recent_history(enriched_base: Path, symbols: list[str], days: int) -> 
                                  "volume", "amount", "raw_close", "raw_high", "raw_low"]
                     if c in lf.schema]
         return lf.select(hist_cols).collect()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("历史数据加载失败: %s", e)
         return pl.DataFrame()
 

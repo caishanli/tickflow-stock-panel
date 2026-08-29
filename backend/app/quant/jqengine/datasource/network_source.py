@@ -67,5 +67,5 @@ class NetworkSource(DataSource):
         try:
             self.client.ping()
             return True, "stockdata 服务连接正常"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             return False, str(e)

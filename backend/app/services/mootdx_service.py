@@ -82,7 +82,7 @@ def _append_failure(sym: str, reason: str) -> None:
         line = f"{sym},{reason},{_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         with open(FAILURE_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: 失败记录写入失败: %s", sym)
 
 
@@ -100,7 +100,7 @@ def _manifest_load() -> dict:
     import json
     try:
         return json.loads(MANIFEST_PATH.read_text())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
 
 
@@ -223,7 +223,7 @@ def sync_etf_minute(day: _date | None = None) -> dict:
                 df = src.get_minute(jq, max_bars=40000, since=day)
             else:
                 df = src.get_minute_recent(jq, pages=2)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
             return None
         if df is None or df.empty:
@@ -409,7 +409,7 @@ def _existing_minute_symbols() -> set[str]:
     try:
         df = pl.read_parquet(latest, columns=["symbol"])
         return set(df["symbol"].to_list())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return set()
 
 
@@ -519,9 +519,9 @@ def _listing_date_map() -> dict[str, _date]:
                 else:
                     d = _date(int(s[:4]), int(s[4:6]), int(s[6:8]))
                 out[sym] = d
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("mootdx_service: 上市日期读取失败: %s", e)
     return out
 
@@ -628,7 +628,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
             # 超时：pool 已重建该 worker source（坏 socket 不残留）
             _append_failure(sym, "timeout")
             raise
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
             return None
@@ -745,7 +745,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
         except TimeoutError:
             _append_failure(sym, "timeout")
             raise
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
             return None
@@ -831,7 +831,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
         except TimeoutError:
             _append_failure(sym, "timeout")
             raise
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
             return None
@@ -893,26 +893,26 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
         try:
             sync_daily(day)
             result["daily_days"].append(str(day))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             result["errors"].append(f"daily {day}: {e}")
     for day in missing.get("kline_index_daily", []):
         try:
             _repair_index_day(day)
             result["index_daily_days"].append(str(day))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             result["errors"].append(f"index_daily {day}: {e}")
     for day in missing.get("kline_etf_minute", []):
         try:
             sync_etf_minute(day)
             result["etf_minute_days"].append(str(day))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             result["errors"].append(f"etf_minute {day}: {e}")
     min_days = missing.get("kline_minute", [])
     if min_days:
         try:
             sync_stock_minute_range(min_days)
             result["stock_minute_days"].extend(str(d) for d in min_days)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             result["errors"].append(f"stock_minute {min_days}: {e}")
 
     for day in missing.get("etf_nav", []):
@@ -920,7 +920,7 @@ def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
             from app.services import etf_nav_service
             etf_nav_service.sync_etf_nav(day)
             result["etf_nav_days"].append(str(day))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             result["errors"].append(f"etf_nav {day}: {e}")
 
     return result
@@ -954,7 +954,7 @@ def _partition_symbols(root: Path, day: _date) -> set[str]:
     for p in sorted(pdir.glob("*.parquet")):
         try:
             syms |= set(pl.read_parquet(p, columns=["symbol"])["symbol"].to_list())
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
     return syms
 
@@ -989,15 +989,15 @@ def check_and_repair_day(day: _date) -> dict:
     results: dict[str, dict] = {}
     try:
         stocks = _stock_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         stocks = []
     try:
         etf_tf = set(_to_tf_symbol(c) for c in _etf_universe())
-    except Exception:  # noqa: BLE001
+    except Exception:
         etf_tf = set()
     try:
         idx = _index_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         idx = []
 
     for key, root, target, repair in [
@@ -1018,7 +1018,7 @@ def check_and_repair_day(day: _date) -> dict:
         try:
             repair()
             results[key] = {"status": "repaired", "coverage": round(cov, 4), "symbols": have}
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 单日补齐 %s %s 失败: %s", key, day, e)
             results[key] = {"status": "failed", "coverage": round(cov, 4), "symbols": have}
 
@@ -1035,7 +1035,7 @@ def check_and_repair_day(day: _date) -> dict:
             sync_stock_minute_day(day, symbols=sorted(missing))
             results["stock_minute"] = {"status": "repaired", "coverage": round(cov, 4),
                                        "symbols": have}
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 单日补齐 stock_minute %s 失败: %s", day, e)
             results["stock_minute"] = {"status": "failed", "coverage": round(cov, 4),
                                        "symbols": have}
@@ -1337,7 +1337,7 @@ def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
             # mootdx get_daily 忽略 start 参数返回全历史，需显式过滤下界
             return sorted(d.date() for d in df.index
                           if start <= d.date() <= end)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
     days = []
     d = start
@@ -1529,7 +1529,7 @@ def _safe_universe_segment_missing() -> list[str]:
     """读取宇宙并返回缺失段；宇宙读取失败时降级为空（不阻断巡检）。"""
     try:
         codes = _etf_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: ETF 宇宙读取失败，跳过段校验", exc_info=True)
         return []
     if not codes:
@@ -1564,7 +1564,7 @@ def _incomplete_partition_days(root: Path, target: set[str], recent: int,
             try:
                 df = pl.read_parquet(p, columns=["symbol"])
                 syms |= set(df["symbol"].to_list())
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
         coverage = len(syms & target) / len(target)
         if coverage < min_coverage:
@@ -1579,7 +1579,7 @@ def _incomplete_stock_daily_days(recent: int | None = None) -> list[_date]:
     """股票日线内容残缺分区（symbol 覆盖率 << 股票宇宙）。"""
     try:
         codes = _stock_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: 股票宇宙读取失败，跳过股票日线内容校验",
                        exc_info=True)
         return []
@@ -1592,7 +1592,7 @@ def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
     """ETF 日线内容残缺分区（symbol 覆盖率 << ETF 宇宙）。"""
     try:
         codes = _etf_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: ETF 宇宙读取失败，跳过 ETF 日线内容校验",
                        exc_info=True)
         return []
@@ -1612,7 +1612,7 @@ def _incomplete_index_daily_days(recent: int | None = None) -> list[_date]:
     """
     try:
         codes = _index_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: 指数宇宙读取失败，跳过指数日线内容校验",
                        exc_info=True)
         return []
@@ -1627,7 +1627,7 @@ def _incomplete_etf_minute_days(recent: int | None = None) -> list[_date]:
     """ETF 分钟内容残缺分区（symbol 覆盖率 << ETF 宇宙）。"""
     try:
         codes = _etf_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: ETF 宇宙读取失败，跳过 ETF 分钟内容校验",
                        exc_info=True)
         return []
@@ -1643,7 +1643,7 @@ def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
     """股票分钟内容残缺分区（symbol 覆盖率 << 股票宇宙）。"""
     try:
         codes = _stock_universe()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: 股票宇宙读取失败，跳过分钟内容校验",
                        exc_info=True)
         return []
@@ -1691,7 +1691,7 @@ def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
     def _run() -> None:
         try:
             box["df"] = src.get_daily(sym, start, end)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             box["err"] = e
 
     t = _th.Thread(target=_run, daemon=True)
@@ -1732,7 +1732,7 @@ def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
     def _run() -> None:
         try:
             box["df"] = src.get_minute(sym, max_bars=max_bars, since=since)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             box["err"] = e
 
     if timeout is None:
@@ -1779,7 +1779,7 @@ def sync_daily(day: _date) -> dict:
     def _fetch_one(src, sym):
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             raise _QueryFailedError(sym) from e
         if df is None:
             raise _QueryFailedError(sym)
@@ -1899,7 +1899,7 @@ def _index_universe() -> list[str]:
             syms = df["symbol"].to_list()
             if syms:
                 return sorted(syms)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("mootdx_service: instruments_index 读取失败, 用兜底指数")
     return ["000300.SH", "000510.SH", "399006.SZ", "399101.SZ"]
 
@@ -1933,7 +1933,7 @@ def sync_index_daily(day: _date) -> dict:
                 "volume": [float(row["volume"])],
                 "amount": [float(row["amount"])],
             })
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
 
     result = _backfill_pool().map(_fetch_one, indices)
@@ -1995,7 +1995,7 @@ def _partition_symbol_sets(root: Path, lookback: int) -> list[tuple[Path, set]]:
             continue
         try:
             syms = set(pl.read_parquet(p, columns=["symbol"])["symbol"].to_list())
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
         out.append((d, syms))
     return out
@@ -2053,7 +2053,7 @@ def _missing_vs_baseline(root: Path, day: _date,
         return sorted(base_syms)
     try:
         syms = set(pl.read_parquet(pdir, columns=["symbol"])["symbol"].to_list())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return sorted(base_syms)
     return sorted(base_syms - syms)
 
@@ -2098,7 +2098,7 @@ def _repair_index_day(day: _date,
         try:
             n_cross = _cross_source_index_repair(day, missing) or 0
             logger.info("mootdx_service: 跨源补齐 %s 完成 +%d 行", day, n_cross)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 跨源补齐 %s 失败: %s", day, e)
     elif missing:
         logger.warning(
@@ -2165,7 +2165,7 @@ def _adj_factor_stale() -> bool:
         factor_latest = df["trade_date"].max()
         if not isinstance(factor_latest, _date):
             return True
-    except Exception:  # noqa: BLE001
+    except Exception:
         return True
     etf_days = _partition_dates(ETF_DAILY_ROOT)
     if not etf_days:
@@ -2194,7 +2194,7 @@ def _notify_missing(missing: dict) -> None:
         if webhook:
             from app.quant.notify import send_dingtalk
             send_dingtalk(webhook, secret, "模拟盘数据回源缺口", msg)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("mootdx_service: 钉钉缺口通知失败（忽略）")
 
 
@@ -2241,7 +2241,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             _df = pl.read_parquet(ADJ_FACTOR_PATH, columns=["trade_date"])
             if not _df.is_empty():
                 adj_factor_latest = str(_df["trade_date"].max())
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     content = _DAILY_CHECK_RECENT_PARTITIONS
@@ -2289,7 +2289,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             result["minute_rows"] += res["rows"]
             result.setdefault("query_failed", []).extend(
                 [f"etf_minute:{x}" for x in res["query_failed"]])
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 分钟回源 %s 失败: %s", day, e)
             result["errors"].append(f"minute {day}: {e}")
 
@@ -2322,7 +2322,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             if query_failed:
                 result.setdefault("query_failed", []).extend(
                     [f"daily:{x}" for x in query_failed])
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 日线回源 %s 失败: %s", day, e)
             result["errors"].append(f"daily {day}: {e}")
 
@@ -2342,7 +2342,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             w["cross"] = cross
             for k, v in w.items():
                 result["index_daily_written"][k] = result["index_daily_written"].get(k, 0) + v
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 指数日线回源 %s 失败: %s", day, e)
             result["errors"].append(f"index_daily {day}: {e}")
 
@@ -2350,7 +2350,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     if result["missing"]["adj_factor_etf"]["missing"] or not ADJ_FACTOR_PATH.exists():
         try:
             result["adj_factor"] = sync_adj_factor()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 因子表回源失败: %s", e)
             result["errors"].append(f"adj_factor: {e}")
 
@@ -2363,7 +2363,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             n = sync_stock_minute_range(min_days)
             result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
             result["stock_minute_days"] = [d.isoformat() for d in min_days]
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 股票分钟残缺/缺失分区重写失败 %s: %s",
                            sorted(incomplete_minute), e)
             result["errors"].append(f"stock_minute_range {sorted(incomplete_minute)}: {e}")
@@ -2372,7 +2372,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
         result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + res["rows"]
         result.setdefault("query_failed", []).extend(
             [f"stock_minute:{x}" for x in res["query_failed"]])
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("mootdx_service: 股票分钟回源失败: %s", e)
         result["errors"].append(f"stock_minute: {e}")
 
@@ -2381,7 +2381,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
         try:
             etf_nav_service.sync_etf_nav(day)
             result["etf_nav_days"].append(str(day))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("mootdx_service: 净值回源 %s 失败: %s", day, e)
             result["errors"].append(f"etf_nav {day}: {e}")
 

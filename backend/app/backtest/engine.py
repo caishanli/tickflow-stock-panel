@@ -520,7 +520,7 @@ class BacktestEngine:
                     elapsed = (time.perf_counter() - t0) * 1000
                     logger.info("load_panel(cache): %.0fms, %d rows, %d columns", elapsed, len(cached), len(cached.columns))
                     return cached
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("backtest load panel cache miss: %s", e)
 
         from app.tickflow.repository import enriched_dirname
@@ -584,8 +584,8 @@ class BacktestEngine:
         entries: pl.Series | None,
         exits: pl.Series | None,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None" = None,
-        cancel_event: "threading.Event | None" = None,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
         entry_signal_ids: list[str] | None = None,
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:
@@ -614,8 +614,8 @@ class BacktestEngine:
         matrix: MarketMatrix,
         raw_candidates: int,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None",
-        cancel_event: "threading.Event | None",
+        progress_cb: Callable[[dict], None] | None,
+        cancel_event: threading.Event | None,
         options: SimulationOptions | None = None,
     ) -> SimResult:
         options = options or SimulationOptions()
@@ -928,8 +928,8 @@ class BacktestEngine:
         matrix: MarketMatrix,
         raw_candidates: int,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None" = None,
-        cancel_event: "threading.Event | None" = None,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
         options: SimulationOptions | None = None,
     ) -> SimResult:
         """Run independent-candidate simulation on a prebuilt MarketMatrix."""
@@ -943,8 +943,8 @@ class BacktestEngine:
         entries: pl.Series | None,
         exits: pl.Series | None,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None" = None,
-        cancel_event: "threading.Event | None" = None,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
         entry_signal_ids: list[str] | None = None,
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:
@@ -1520,7 +1520,7 @@ class BacktestEngine:
             batch = date_objs[i:i + BATCH]
             try:
                 df = repo.get_minute_by_dates(symbols, batch, asset_type=asset_type)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("minute fill data load failed (batch %d-%d): %s", i, i + len(batch), e)
                 continue
             if df.is_empty():
@@ -1546,8 +1546,8 @@ class BacktestEngine:
         entries: pl.Series | None,
         exits: pl.Series | None,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None" = None,
-        cancel_event: "threading.Event | None" = None,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
         entry_signal_ids: list[str] | None = None,
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:
@@ -1573,8 +1573,8 @@ class BacktestEngine:
         self,
         matrix: MarketMatrix,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None" = None,
-        cancel_event: "threading.Event | None" = None,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
         options: SimulationOptions | None = None,
     ) -> SimResult:
         """Run the production Python matcher on a prebuilt MarketMatrix."""
@@ -1586,8 +1586,8 @@ class BacktestEngine:
         self,
         matrix: MarketMatrix,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None",
-        cancel_event: "threading.Event | None",
+        progress_cb: Callable[[dict], None] | None,
+        cancel_event: threading.Event | None,
         options: SimulationOptions | None = None,
     ) -> SimResult:
         options = options or SimulationOptions()
@@ -2051,8 +2051,8 @@ class BacktestEngine:
         entries: pl.Series | None,
         exits: pl.Series | None,
         config: MatcherConfig,
-        progress_cb: "Callable[[dict], None] | None" = None,
-        cancel_event: "threading.Event | None" = None,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
         entry_signal_ids: list[str] | None = None,
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:

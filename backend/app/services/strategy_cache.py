@@ -91,7 +91,7 @@ def _read_cache_unlocked(data_dir: Path) -> dict | None:
         if not text.strip():
             return None
         cached = json.loads(text)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("读取策略缓存失败: %s", e)
         return None
 
@@ -186,5 +186,5 @@ def _write_cache_locked(
         total_rows = sum(len(r.get("rows", [])) for r in merged_results.values())
         total_ever = sum(len(v) for v in today_ever_matched.values())
         logger.info("策略缓存已写入: %s, %d 策略, %d 命中, %d 曾命中", as_of, len(merged_results), total_rows, total_ever)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("写入策略缓存失败: %s", e)

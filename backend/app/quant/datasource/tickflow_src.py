@@ -28,8 +28,8 @@ class TickflowSource(DataSource):
     name = "tickflow"
 
     def __init__(self):
-        from app.tickflow.repository import KlineRepository, DataStore
         from app.parquet import scan_enriched_parquet
+        from app.tickflow.repository import DataStore, KlineRepository
         self._store = DataStore()
         self._repo = KlineRepository(self._store)
         self._scan = scan_enriched_parquet

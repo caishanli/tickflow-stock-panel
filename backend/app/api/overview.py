@@ -76,9 +76,9 @@ def _read_ext_rows(data_dir, config: ExtConfig, dimension_field: str) -> list[di
     except TypeError:
         try:
             df = pl.read_parquet(files)
-        except Exception:  # noqa: BLE001
+        except Exception:
             return []
-    except Exception:  # noqa: BLE001
+    except Exception:
         return []
     if df.is_empty() or dimension_field not in df.columns:
         return []
@@ -269,7 +269,7 @@ def _index_quotes(request: Request, as_of: date | None = None) -> list[dict]:
                     """,
                     [*CORE_INDEX_SYMBOLS, as_of, as_of],
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 db_rows = []
             for symbol, dt, last_price, prev_close in db_rows:
                 change_amount = None

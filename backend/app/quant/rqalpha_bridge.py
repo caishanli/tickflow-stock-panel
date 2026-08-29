@@ -22,13 +22,13 @@ import uuid
 
 import numpy as np
 import pandas as pd
-
 from rqalpha.const import INSTRUMENT_TYPE, MARKET, SIDE, TRADING_CALENDAR_TYPE
 from rqalpha.interface import ExchangeRate
 from rqalpha.model.instrument import Instrument
 
 from . import db
 from .config import CONFIG, QuantConfig
+
 # 涨跌停幅度分档公共函数（与 jqcompat 同口径复用，避免两处各写一份分档规则）
 from .jqcompat import _dt_to_int, _is_st_name, _limit_rate
 from .jqengine.config import CONFIG as _JQ_ENGINE_CONFIG
@@ -37,17 +37,17 @@ from .jqengine.config import CONFIG as _JQ_ENGINE_CONFIG
 # 'mode.use_inf_as_na' 选项（pd.option_context 直接抛 OptionError，导致有成交的
 # 回测在收尾阶段整体判失败）。pandas 3 中 inf 已按 NA 语义处理，这里重新注册为
 # 无副作用的占位选项（module 级 pandas 未导出 register_option，走内部 config API）。
-try:  # noqa: BLE001
+try:
     from pandas._config import config as _pd_config
 
     _pd_config.register_option("mode.use_inf_as_na", False)
-except Exception:  # noqa: BLE001
+except Exception:
     pass
 
 try:
     from rqalpha import subscribe_event
     from rqalpha.core.events import EVENT
-except Exception:  # noqa: BLE001
+except Exception:
     subscribe_event = None
     EVENT = None
 
@@ -138,7 +138,7 @@ def _engine_ts(env) -> str:
         dt = getattr(env, "trading_dt", None)
         if dt is not None:
             return pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return _now()
 
@@ -153,7 +153,7 @@ def _log_progress(run_id: str | None, msg: str, level: str = "INFO") -> None:
         return
     try:
         db.insert_log(run_id, _now(), level, msg)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -548,6 +548,7 @@ def _install_bridge_mod():
 
     def load_mod():
         from rqalpha.interface import AbstractMod
+
         from app.quant import jqcompat as _jq
 
         class _QuantBridgeMod(AbstractMod):
@@ -613,7 +614,7 @@ def _install_live_mod():
                     return
                 try:
                     db.insert_log(_LIVE_RUN_ID, self._ts_fn(), record.levelname, self.format(record))
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
         class _LiveMod(AbstractMod):
@@ -649,7 +650,7 @@ def _install_live_mod():
                     _jq.logger.setLevel(_logging.INFO)
                     _jq.logger.addHandler(h)
                     self._handlers.append(("logging", _jq.logger, h))
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
             def _benchmark_nav(self, dt):
@@ -679,7 +680,7 @@ def _install_live_mod():
                     if not self._bench_base_close:
                         return 1.0
                     return close / self._bench_base_close
-                except Exception:  # noqa: BLE001
+                except Exception:
                     return 1.0
 
             def _on_after_trading(self, event):
@@ -696,7 +697,7 @@ def _install_live_mod():
                         float(getattr(acct, "cash", 0.0) or 0.0),
                         float(getattr(acct, "market_value", 0.0) or 0.0),
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("live equity 写入失败")
 
             def _on_trade(self, event):
@@ -720,7 +721,7 @@ def _install_live_mod():
                         pnl, pnl_pct,
                         float(getattr(t, "transaction_cost", 0.0) or 0.0),
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("live trade 写入失败")
 
             def tear_down(self, *args):
@@ -730,7 +731,7 @@ def _install_live_mod():
                             target.LIVE_SINK = None
                         elif kind == "logging":
                             target.removeHandler(h)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         pass
                 self._handlers = []
 
@@ -1115,7 +1116,7 @@ def run_backtest(strategy_code: str, params: dict, provider=None, db_path: str |
                 finished_at=_now(),
             )
         return {"run_id": run_id, "metrics": metrics}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("回测失败 run=%s", run_id)
         db.insert_log(run_id, _now(), "ERROR", str(e))
         db.update_run(run_id, "failed", error=str(e)[:500], finished_at=_now())
@@ -1232,7 +1233,7 @@ def _read_etf_snapshot(path):
         names = dict(snap.get("names") or {})
         list_dates = {k: tuple(v) for k, v in dict(snap.get("list_dates") or {}).items()}
         return fetched_at, codes, names, list_dates
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -1332,8 +1333,8 @@ def run_jq_backtest(strategy_path: str, params: dict,
             db.upsert_run(_rid, params.get("strategy_id", ""), params.get("name", ""),
                           json.dumps(params, ensure_ascii=False), "running")
 
-    from app.quant.jqengine.datasource.manager import DataManager, get_data_manager
     from app.quant.jqengine.datasource.base import DataSourceError
+    from app.quant.jqengine.datasource.manager import DataManager, get_data_manager
 
     with open(strategy_path, "r", encoding="utf-8") as f:
         strategy_text = f.read()
@@ -1447,7 +1448,7 @@ def run_jq_backtest(strategy_path: str, params: dict,
         try:
             import app.quant.jqcompat as _jqcompat_mod
             _jqcompat_mod.LIVE_SINK = None
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -1574,7 +1575,7 @@ def _pt_account_stop_source(stop_loss: float) -> str:
 def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
                            max_universe=None, strategy_path=""):
     """run_jq_backtest 主体（独立成函数，便于上层用 try/finally 恢复 dm._offline）。"""
-    from .jqcompat import install_jqcompat, JqDataSource
+    from .jqcompat import JqDataSource, install_jqcompat
 
     _log_progress(params.get("run_id"), "预加载日线缓存…")
     dm.preload_daily()
@@ -1827,7 +1828,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             "metrics": metrics,
             "universe_size": len(etf_universe),
         }
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("聚宽回测失败: %s", e)
         # 失败必须落库（日志 + failed 状态）：否则 run 永远停在 queued/running，
         # 前端看不到任何运行情况（子进程 stdout/stderr 被 DEVNULL，不写库即不可见）。
@@ -1837,7 +1838,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
                 try:
                     db.insert_log(_rid, _now(), "ERROR", str(e))
                     db.update_run(_rid, "failed", error=str(e)[:500], finished_at=_now())
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         return {"error": str(e)}
 
@@ -1995,8 +1996,8 @@ def run_ptrade_backtest(strategy_path: str, params: dict,
 def _run_ptrade_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
                                max_universe=None, strategy_path=""):
     """run_ptrade_backtest 主体（独立函数，便于上层 try/finally 恢复 dm._offline）。"""
-    from .ptradecompat import install_ptradecompat
     from .jqcompat import JqDataSource, _is_jq_etf_code
+    from .ptradecompat import install_ptradecompat
 
     _log_progress(params.get("run_id"), "预加载日线缓存…")
     dm.preload_daily()
@@ -2188,7 +2189,7 @@ def _run_ptrade_backtest_inner(dm, strategy_text, params, benchmark, start, end,
             "metrics": metrics,
             "universe_size": len(etf_universe),
         }
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("PTrade 回测失败: %s", e)
         if db_path:
             _rid = params.get("run_id")
@@ -2196,6 +2197,6 @@ def _run_ptrade_backtest_inner(dm, strategy_text, params, benchmark, start, end,
                 try:
                     db.insert_log(_rid, _now(), "ERROR", str(e))
                     db.update_run(_rid, "failed", error=str(e)[:500], finished_at=_now())
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         return {"error": str(e)}

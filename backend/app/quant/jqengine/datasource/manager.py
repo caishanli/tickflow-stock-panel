@@ -12,11 +12,11 @@ from dotenv import set_key
 
 logger = logging.getLogger("jqengine.dm")
 
+from ..config import CONFIG, REPO_ROOT
+from .base import DataSourceError
 from .cache import DataCache
 from .mootdx_src import MootdxSource
-from .base import DataSourceError
 from .network_source import NetworkSource
-from ..config import CONFIG, REPO_ROOT
 
 SOURCES = {"network": NetworkSource}
 
@@ -529,11 +529,13 @@ class DataManager:
             return {}
         try:
             import glob as _glob
-            import polars as pl
+
             # 只扫描「回看窗口内」的日期分区：策略动量回看 ~65 日、流动性 3 日，
             # 全历史扫描（kline_etf_daily 自 2005 年、5211 分区）纯属浪费——
             # 从目录名反推下限，只读最近 lookback 天，回测预加载从 ~17s 降到秒级。
             from datetime import timedelta
+
+            import polars as pl
             _limit_date = None
             if asof is not None:
                 _limit_date = (pd.Timestamp(asof).normalize()
@@ -715,7 +717,7 @@ class DataManager:
                     s = pd.to_datetime(df[c], errors="coerce").dropna()
                     if len(s):
                         return (s.min(), s.max())
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
         return None
 

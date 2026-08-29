@@ -41,7 +41,7 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
         loader = _load_recent_via_client
     try:
         fresh_frames = loader(dm, list(dict.fromkeys(codes)), now) or {}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("[live_feed] 实时帧拉取失败，本轮无更新: %s", e)
         fresh_frames = {}
     prices, latest, price_ts = {}, None, {}
@@ -60,7 +60,7 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
             dm._minute_cov[code] = (merged.index.min(), merged.index.max())
             if fresh_acc is not None:
                 fresh_acc[code] = fresh
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.warning("[live_feed] %s 实时分钟刷新失败，沿用旧帧: %s", code, e)
             merged = dm._minute_mem.get(code)
         if merged is None or (hasattr(merged, "empty") and merged.empty):

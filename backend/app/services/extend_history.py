@@ -28,7 +28,7 @@ from app.tickflow.repository import KlineRepository
 logger = logging.getLogger(__name__)
 
 
-def _noop(stage: str, pct: int, msg: str, **kwargs) -> None:  # noqa: ARG001
+def _noop(stage: str, pct: int, msg: str, **kwargs) -> None:
     pass
 
 
@@ -48,10 +48,13 @@ def _resolve_universe(capset: CapabilitySet) -> list[str]:
         except Exception as e:
             logger.warning("CN_Equity_A pool unavailable: %s", e)
 
-    from app.tickflow.pools import DEMO_SYMBOLS, get_pool as _get_pool
-    from app.config import settings
     from pathlib import Path
+
     import polars as pl
+
+    from app.config import settings
+    from app.tickflow.pools import DEMO_SYMBOLS
+    from app.tickflow.pools import get_pool as _get_pool
     base: set[str] = set(DEMO_SYMBOLS)
     base.update(_get_pool("watchlist"))
     d = Path(settings.data_dir)

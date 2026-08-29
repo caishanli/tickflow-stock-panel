@@ -42,7 +42,7 @@ class SingleFlight:
         if is_leader:
             try:
                 flight.result = loader()
-            except BaseException as e:  # noqa: BLE001
+            except BaseException as e:
                 flight.error = e
             finally:
                 with self._lock:

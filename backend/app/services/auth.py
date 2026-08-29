@@ -53,7 +53,7 @@ def _load() -> dict:
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("auth.json malformed: %s", e)
     return {}
 
@@ -210,5 +210,5 @@ def _restore_sessions() -> None:
 # 模块加载时恢复会话
 try:
     _restore_sessions()
-except Exception as e:  # noqa: BLE001
+except Exception as e:
     logger.warning("restore sessions failed: %s", e)

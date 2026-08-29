@@ -137,7 +137,7 @@ class DataStore:
             except OSError:
                 logger.warning("legacy dir %s not empty, kept", legacy_dir)
             logger.info("legacy data migration done")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("legacy data migration failed (startup continues): %s", e)
 
     def _register_views(self) -> None:
@@ -192,7 +192,7 @@ class DataStore:
         for sql in statements:
             try:
                 self.db.execute(sql)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 # 空数据目录(首次启动)或权限问题时 DuckDB 会抛 IOException;
                 # 跨版本/平台也可能抛 CatalogException 等。空目录缺视图不影响启动
                 # (后续同步写入数据后会重新刷新视图),这里一律降级为 debug 日志。
@@ -280,7 +280,7 @@ class DataStore:
                 continue
             try:
                 self.db.execute(f"CREATE OR REPLACE VIEW {name} AS " + " UNION ALL BY NAME ".join(parts))
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.debug("unified view %s skipped: %s", name, e)
 
 
@@ -415,7 +415,7 @@ class KlineRepository:
                 self._refresh_enriched()
                 logger.info("enriched warmup thread done (%.1fs)", time.perf_counter() - t0)
                 self._notify_refresh_done()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("enriched warmup thread failed")
             finally:
                 with self._warmup_lock:
@@ -424,7 +424,7 @@ class KlineRepository:
                 if cb is not None:
                     try:
                         cb()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning("enriched warmup callback failed", exc_info=True)
 
         self._warmup_thread = threading.Thread(
@@ -438,7 +438,7 @@ class KlineRepository:
             return
         try:
             callback()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("repository refresh callback failed", exc_info=True)
 
     @property
@@ -518,7 +518,12 @@ class KlineRepository:
             # 300 日历天 ≈ 210 交易日, 覆盖 filter_history 最大 lookback(90) + warmup(60)
             try:
                 from datetime import timedelta
-                from app.indicators.pipeline import compute_indicators, compute_signals, compute_limit_signals
+
+                from app.indicators.pipeline import (
+                    compute_indicators,
+                    compute_limit_signals,
+                    compute_signals,
+                )
                 start_full = latest - timedelta(days=300)
                 read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
                                          "volume", "amount", "raw_close", "raw_high", "raw_low"]
@@ -589,7 +594,7 @@ class KlineRepository:
                         logger.info("enriched 缓存已计算: %d 只, 日期 %s (即时计算)", len(df_today), latest)
                         logger.info("enriched refresh done (%.2fs)", time.perf_counter() - started)
                         return
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("enriched 即时计算失败, 使用原始 14 列缓存: %s", e)
 
             # 降级: 直接使用 14 列数据 + 构建 live_agg
@@ -602,7 +607,7 @@ class KlineRepository:
 
             logger.info("enriched 缓存已加载: %d 只, 日期 %s", len(df_latest), latest)
             logger.info("enriched refresh done fallback (%.2fs)", time.perf_counter() - started)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("enriched 缓存刷新失败: %s", e)
 
     def _build_live_agg(self, latest: date) -> None:
@@ -611,6 +616,7 @@ class KlineRepository:
         优化: 优先使用 _enriched_history_cache (启动时已计算), 避免重复 compute_indicators。
         """
         from datetime import timedelta
+
         from app.indicators.pipeline import _ema_alpha
 
         started = time.perf_counter()
@@ -799,7 +805,7 @@ class KlineRepository:
             if row and row[0]:
                 d = row[0]
                 return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return latest
 
@@ -857,6 +863,7 @@ class KlineRepository:
                 return
 
             from datetime import timedelta
+
             from app.indicators.pipeline import compute_indicators, compute_signals
             start_full = latest - timedelta(days=300)
             read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
@@ -876,7 +883,7 @@ class KlineRepository:
                 df_full = compute_signals(compute_indicators(df_hist))
                 self._etf_enriched_cache = df_full.filter(pl.col("date") == latest).sort(["symbol"])
             self._etf_enriched_cache_date = latest
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("ETF enriched 缓存刷新跳过: %s", e)
 
     def _refresh_instruments(self) -> None:
@@ -886,7 +893,7 @@ class KlineRepository:
             if not df.is_empty():
                 self._instruments_cache = df
                 logger.info("instruments 缓存已加载: %d 只", len(df))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("instruments 缓存刷新失败: %s", e)
 
     def _refresh_index_instruments(self) -> None:
@@ -897,7 +904,7 @@ class KlineRepository:
                 self._index_instruments_cache = df
                 self._index_symbol_set_cache = None
                 logger.info("index instruments 缓存已加载: %d 只", len(df))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("index instruments 缓存刷新跳过: %s", e)
 
     def _refresh_etf_instruments(self) -> None:
@@ -907,7 +914,7 @@ class KlineRepository:
             df = pl.scan_parquet(self._etf_inst_glob).collect()
             if not df.is_empty():
                 parts.append(df)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("etf instruments 缓存刷新跳过(new): %s", e)
         try:
             legacy = self.get_index_instruments()
@@ -915,7 +922,7 @@ class KlineRepository:
                 legacy = legacy.filter(pl.col("asset_type") == "etf")
                 if not legacy.is_empty():
                     parts.append(legacy)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("etf instruments legacy fallback skipped: %s", e)
         if parts:
             df_all = pl.concat(parts, how="diagonal_relaxed").unique(subset=["symbol"], keep="last").sort("symbol")
@@ -1282,7 +1289,7 @@ class KlineRepository:
                 (pl.col("symbol") == symbol)
                 & (pl.col("datetime").dt.date() == trade_date)
             ).sort("datetime").collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("分钟K查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1304,7 +1311,7 @@ class KlineRepository:
                 pl.col("symbol").is_in(symbols)
                 & (pl.col("datetime").dt.date() == trade_date)
             ).sort(["symbol", "datetime"]).collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("批量分钟K查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1336,7 +1343,7 @@ class KlineRepository:
                 .sort(["symbol", "datetime"])
                 .collect(streaming=True)
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("分钟K范围查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1377,7 +1384,7 @@ class KlineRepository:
                 .sort(["symbol", "datetime"])
                 .collect(streaming=True)
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("分钟K按日期查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1387,7 +1394,12 @@ class KlineRepository:
 
     def _compute_enriched_range(self, df: pl.DataFrame) -> pl.DataFrame:
         """对14列enriched数据即时计算完整指标+信号。输入应含足够预热行数。"""
-        from app.indicators.pipeline import compute_indicators, compute_signals, compute_limit_signals, filter_halt_days
+        from app.indicators.pipeline import (
+            compute_indicators,
+            compute_limit_signals,
+            compute_signals,
+            filter_halt_days,
+        )
         if df.is_empty() or df.height < 2:
             return df
         # 兜底过滤历史脏数据中的停牌日 (close 可能被填充为前收盘价)
@@ -1403,7 +1415,7 @@ class KlineRepository:
                 instruments,
                 historical_shares=self.get_historical_shares(),
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("on-demand compute failed: %s", e)
         return df
 
@@ -1415,7 +1427,7 @@ class KlineRepository:
         try:
             df = compute_indicators(df)
             df = compute_signals(df)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("index on-demand compute failed: %s", e)
         return df
 
@@ -1446,7 +1458,7 @@ class KlineRepository:
                 existing = [c for c in columns if c in schema_names]
                 lf = lf.select(existing)
             return lf.collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("日K查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1463,7 +1475,7 @@ class KlineRepository:
                 existing = [c for c in columns if c in schema_names]
                 lf = lf.select(existing)
             return lf.collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("日K批量查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1480,7 +1492,7 @@ class KlineRepository:
                 existing = [c for c in columns if c in schema_names]
                 lf = lf.select(existing)
             return lf.collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("指数日K查询失败: %s", e)
             return pl.DataFrame()
 
@@ -1497,7 +1509,7 @@ class KlineRepository:
                 existing = [c for c in columns if c in schema_names]
                 lf = lf.select(existing)
             return lf.collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("ETF 日K查询跳过: %s", e)
             return pl.DataFrame()
 
@@ -1563,7 +1575,7 @@ class KlineRepository:
                 ).fetchone()
             if row and row[0]:
                 return row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0]))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
 
     def earliest_daily_date(self) -> date | None:
@@ -1678,7 +1690,7 @@ class KlineRepository:
             if res and res[0]:
                 d = res[0]
                 return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
         return None
 
@@ -1793,7 +1805,7 @@ class KlineRepository:
             try:
                 with self._lock:
                     self.db.execute(sql)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.debug("index/etf view refresh skipped: %s", e)
         with self._lock:
             self.store._register_unified_views()
@@ -1828,7 +1840,7 @@ class KlineRepository:
                         f"CREATE OR REPLACE VIEW {name} AS "
                         f"SELECT * FROM read_parquet('{path}', union_by_name=true)"
                     )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("rebuild view %s failed: %s", name, e)
         with self._lock:
             self.store._register_unified_views()

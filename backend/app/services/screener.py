@@ -91,7 +91,7 @@ class ScreenerService:
 
         try:
             df = pl.read_parquet(target_parquet)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("load_enriched_for_date failed: %s", e)
             return pl.DataFrame()
 
@@ -124,7 +124,7 @@ class ScreenerService:
             try:
                 lf = pl.scan_parquet(target_parquet)
                 cols = lf.collect_schema().names()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("load_prior_consecutive scan failed for %s: %s", candidate, e)
                 return pl.DataFrame()
             # 存储列理论上必含 consec_col; 若该分区缺列则继续向前找 (与旧循环一致)
@@ -135,7 +135,7 @@ class ScreenerService:
                     "symbol",
                     pl.col(consec_col).alias("prev_consec"),
                 ).collect()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("load_prior_consecutive read failed for %s: %s", candidate, e)
                 return pl.DataFrame()
         return pl.DataFrame()
@@ -168,7 +168,7 @@ class ScreenerService:
             )
             available = [c for c in read_cols if c in lf.schema]
             df_hist = lf.select(available).collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("warmup history load failed: %s", e)
             df_hist = df_target
 
@@ -256,7 +256,7 @@ class ScreenerService:
             )
             available = [c for c in read_cols if c in lf.collect_schema().names()]
             df_hist = lf.select(available).collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("load_enriched_history failed: %s", e)
             return pl.DataFrame()
 
@@ -347,14 +347,14 @@ class ScreenerService:
             if limit:
                 sql += f" LIMIT {limit}"
             df_result = con.execute(sql).pl()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("screener SQL query failed: %s", e)
             df_result = pl.DataFrame()
         finally:
             if con is not None:
                 try:
                     con.close()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
         rows = df_result.to_dicts() if not df_result.is_empty() else []
@@ -419,6 +419,6 @@ class ScreenerService:
             if res and res[0]:
                 d = res[0]
                 return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
         return None

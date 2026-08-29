@@ -83,7 +83,7 @@ class StockDataClient:
                     n = int.from_bytes(self._recv_exact(_HEADER), "big")
                     resp = msgpack.unpackb(self._recv_exact(n), raw=False)
                     break
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     last = e
                     try:
                         if self._sock is not None:

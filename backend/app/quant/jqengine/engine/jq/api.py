@@ -13,21 +13,19 @@
 - 涨跌停：``_state["no_buy"]`` / ``_state["no_sell"]`` 集合（由驱动方按轮注入）。
 """
 
+import logging
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday, nearest_workday
 from pandas.tseries.offsets import CustomBusinessDay
 
-from types import SimpleNamespace
-
+from ...datasource.base import DataSourceError
 from . import jq_names
 from .context import Context, G, Position
 from .portfolio import Portfolio
-from ...datasource.base import DataSourceError
-
-import logging
 
 _logger = logging.getLogger("jqengine.api")
 

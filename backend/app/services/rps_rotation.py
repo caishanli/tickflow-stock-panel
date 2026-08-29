@@ -20,13 +20,13 @@ from datetime import date, timedelta
 
 import polars as pl
 
+from app.services.ext_data import ExtConfigStore
 from app.services.market_overview_builder import (
     _dimension_field,
     _dimension_values,
     _read_ext_rows,
     _symbol_keys,
 )
-from app.services.ext_data import ExtConfigStore
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def invalidate_cache() -> None:
 
 def _latest_enriched_date(repo) -> date | None:
     """取 enriched 缓存里的最新交易日(矩阵的右端=最新日期)。"""
-    cache = repo._enriched_history_cache  # noqa: SLF001 —— 缓存字段无公开 getter
+    cache = repo._enriched_history_cache
     if cache is None or cache.is_empty() or "date" not in cache.columns:
         return None
     return cache["date"].max()

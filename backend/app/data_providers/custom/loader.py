@@ -55,7 +55,7 @@ def load_all(path: Path | None = None) -> None:
                 provider.close()
                 continue
             _PROVIDERS[config.name] = provider
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("custom data source load failed %s: %s", file, e)
             _LOAD_ERRORS.append({"path": str(file), "errors": [str(e)]})
 
@@ -158,7 +158,7 @@ def install_plugin(name: str) -> tuple[bool, str]:
             return False, f"runtime={runtime} 无需安装依赖"
     except subprocess.TimeoutExpired:
         return False, "安装超时 (5分钟), 请检查网络后重试"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return False, f"安装失败: {e}"
 
     if result.returncode != 0:
@@ -197,7 +197,7 @@ def uninstall_plugin(name: str) -> tuple[bool, str]:
         try:
             _shutil.rmtree(nm)
             return True, "已删除 node_modules"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             return False, f"删除 node_modules 失败: {e}"
 
     if runtime == "python":
@@ -220,7 +220,7 @@ def uninstall_plugin(name: str) -> tuple[bool, str]:
             if result.returncode != 0:
                 return False, f"卸载失败: {(result.stderr or '').strip()[-300:]}"
             return True, f"已卸载 {len(pkgs)} 个包"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             return False, f"卸载失败: {e}"
 
     return False, f"runtime={runtime} 无需卸载"
@@ -434,7 +434,7 @@ def _load_builtin_plugins() -> None:
         try:
             manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
             _register_one_plugin(manifest)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("插件 %s 清单解析失败: %s", plugin_dir.name, e)
 
 
@@ -466,7 +466,7 @@ def _register_one_plugin(manifest: dict) -> None:
         provider.builtin = True  # 标记为内置 (list_sources 过滤, 不可被用户编辑/删除)
         _PROVIDERS[name] = provider
         logger.info("内置插件 %s 已注册 (runtime=%s)", name, runtime)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         # 声称可用但 import 失败 → 标记不可用, 避免启动崩溃
         _PLUGIN_STATUS[name]["available"] = False
         _PLUGIN_STATUS[name]["status"] = f"加载失败: {e}"
@@ -487,7 +487,7 @@ def _call_check(check_ref: str | None) -> tuple[bool, str]:
         if isinstance(result, tuple):
             return bool(result[0]), str(result[1])
         return bool(result), "ok" if result else "不可用"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return False, str(e)
 
 

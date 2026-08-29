@@ -17,16 +17,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
-from . import live_feed
-from . import names
-from .protocol import read_state, save_state, is_paused
-from .matcher import Matcher
+from app.config import settings
+
 from .. import db
 from ..config import CONFIG
 from ..datasource.manager import QuantDataProvider
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
-from app.config import settings
+from . import live_feed, names
+from .matcher import Matcher
+from .protocol import is_paused, read_state, save_state
 
 log = logging.getLogger("app.quant.simulate.runner")
 
@@ -81,7 +81,7 @@ def _prev_close(provider: QuantDataProvider, code: str, today: str):
     try:
         start = str(datetime.date.fromisoformat(str(today)) - datetime.timedelta(days=45))
         df = provider.get_daily(code, start, str(today))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("[runner] %s 日线获取失败，本轮跳过跌停判定: %s", code, e)
         return None
     if df is None or df.empty:
@@ -106,7 +106,7 @@ def _step_once(account_id: str, provider: QuantDataProvider, matcher: Matcher,
             df = provider.get_minute(c, today)
             if df is None or df.empty:
                 raise RuntimeError("get_minute返回空")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             # M2：停牌/节假日/数据源抖动 → 跳过该持仓并告警，不再 raise 搞死进程
             log.warning("[runner] 持仓 %s 分钟数据缺失，本轮跳过: %s", c, e)
             continue
@@ -162,7 +162,7 @@ def _emit_log(account_id: str, level: str, message: str,
     """
     try:
         db.insert_sim_log(account_id, ts or str(datetime.datetime.now()), level, message)
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.warning("[runner] 日志落库失败(%s): %s", level, message)
     if level == "notify":
         if account_id in _replay_active_ids:
@@ -181,7 +181,7 @@ def _dispatch_dingtalk(account_id: str, message: str, ts: str | None = None) -> 
         acct = db.get_sim_account(account_id) or {}
         if acct.get("dingtalk_enabled"):
             _DINGTALK_EXECUTOR.submit(_send_dingtalk_async, account_id, message, ts)
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.warning("[runner] 钉钉推送调度失败: %s", message)
 
 
@@ -205,7 +205,7 @@ def _send_dingtalk_async(account_id: str, msg: str, ts: str | None = None) -> No
         text = f"### {title}\n\n{msg}\n\n> 时间: {now}  \n> 账户: {account_id}"
         from ..notify import send_dingtalk
         send_dingtalk(webhook_url, secret, title, text)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("[runner] 钉钉推送异常: %s", e)
 
 
@@ -366,7 +366,7 @@ def _is_trading_day(dm, today) -> bool:
             else:
                 raise RuntimeError("指数日线无日期列")
         return bool(len(idx)) and pd.Timestamp(idx[-1]).date() == pd.Timestamp(today).date()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("[runner] 交易日判定失败，降级 weekday: %s", e)
         return pd.Timestamp(today).weekday() < 5
 
@@ -378,7 +378,7 @@ def _prev_close_dm(dm, code: str, today: str, conv=None):
         if conv is not None:
             code = conv[0](code)
         df = dm.fetch("get_daily", code, start, str(today))
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     if df is None or df.empty:
         return None
@@ -461,7 +461,7 @@ def _entry_ts_str(ts) -> str | None:
         return None
     try:
         return str(ts)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -524,7 +524,7 @@ def _safe_call(account_id: str, func, ctx, tag: str) -> None:
     """策略回调保护性调用：异常落 sim_logs，不中断主循环。"""
     try:
         func(ctx)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         name = getattr(func, "__name__", "?")
         _emit_log(account_id, "error", f"策略回调 {name}({tag}) 异常: {e}")
 
@@ -581,7 +581,7 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
         prev = [d for d in days if pd.Timestamp(d).date() < now.date()]
         if prev:
             ctx.previous_date = pd.Timestamp(prev[-1]).date()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     # 盘前日线新鲜度由按需取数保证（get_price/get_history 走网络批量读最新分区，
     # 服务端 LRU 命中），不再整体预载全市场日线（见 _make_dm 注释）。
@@ -656,7 +656,7 @@ def _revalue_at_close(dm, ctx, state: dict, bar_dt) -> None:
                 df = dm.fetch("get_daily", engine_code, str(today.date()), str(today.date()))
                 if df is not None and not (hasattr(df, "empty") and df.empty):
                     price = float(df["close"].iloc[-1])
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 log.warning("[runner] %s 收盘价重估失败: %s", code, e)
         if price is None:
             log.warning("[runner] %s 收盘重估无价，保留现价 %.4f", code, pos.price)
@@ -771,7 +771,7 @@ def _hist_feed(dm, codes, now, _acc):
         return prices, None, price_ts
     try:
         snap = client.current_snapshot(list(dict.fromkeys(codes)), as_of=now_ts)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("[hist_feed] 当日实时兜底取数失败: %s", e)
         return prices, None, price_ts
     for code, df in (snap or {}).items():
@@ -1123,7 +1123,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     cash = float(st["cash"]) if has_saved else start_cash
     try:
         bundle = jq_loader.load_strategy(code, dm, CONFIG.fee_rate, CONFIG.slippage, cash)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         db.update_sim_account(account_id, status="failed")
         _emit_log(account_id, "error", f"策略编译失败: {e}")
         return
@@ -1137,7 +1137,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     _emit_log(account_id, "info", "策略编译完成，正在初始化数据与指标…")
     try:
         bundle.init_fn(ctx)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         db.update_sim_account(account_id, status="failed")
         _emit_log(account_id, "error", f"策略 init 异常: {e}")
         return

@@ -122,7 +122,7 @@ def sync_daily_batch(symbols: list[str],
             else:
                 raw = tf.klines.batch(chunk, period="1d", count=count or 250, adjust="none",
                                       as_dataframe=True, show_progress=False)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("batch fetch failed for %d symbols (chunk %d/%d): %s",
                            len(chunk), i + 1, len(chunks), e)
             failed_syms.extend(chunk)
@@ -192,7 +192,7 @@ def sync_and_persist_daily_batch(
                     f"""CREATE OR REPLACE VIEW kline_daily AS
                         SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("refresh view failed: %s", e)
             return df.height
         # 自定义源未配置 daily → 回退 TickFlow
@@ -222,7 +222,7 @@ def sync_and_persist_daily_batch(
             f"""CREATE OR REPLACE VIEW kline_daily AS
                 SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("refresh view failed: %s", e)
 
     return df.height
@@ -425,7 +425,7 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
             if not normalized.is_empty():
                 all_dfs.append(normalized)
             logger.debug("adj_factor chunk %d/%d: %d symbols", i + 1, len(chunks), len(chunk))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("adj_factor chunk %d/%d failed: %s", i + 1, len(chunks), e)
             failed_syms.extend(chunk)
 
@@ -583,7 +583,7 @@ def _resolve_minute_provider(
             return (None, True, None)
         provider = custom_sources.get_provider(provider_name)
         return (provider, False, None)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return (None, True, str(e))
 
 
@@ -635,7 +635,7 @@ def _try_custom_minute(
             asset_type=asset_type, freq=freq, on_chunk_done=wrapped_cb,
         )
         return (df, False)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("custom minute provider %s call failed, falling back to TickFlow: %s",
                        provider_name, e)
         return (None, True)
@@ -732,7 +732,7 @@ def sync_minute_batch(
                     raw = tf.klines.batch(chunk, period="1m", count=count or 1200,
                                           adjust="forward",
                                           as_dataframe=True, show_progress=False)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("minute batch fetch failed for %d symbols: %s", len(chunk), e)
                 continue
 
@@ -850,7 +850,7 @@ def fetch_intraday_monitor_batch(
         elif source == "minute_single":
             raw = tf.klines.get(symbols[0], period="1m", count=300, as_dataframe=True)
             frames.extend(_normalize_intraday_raw(raw, default_symbol=symbols[0]))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("intraday monitor fetch failed (%s, %d symbols): %s", source, len(symbols), e)
         return pl.DataFrame()
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
@@ -907,7 +907,7 @@ def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
     tf = get_client()
     try:
         raw = tf.klines.ex_factors([symbol], as_dataframe=True, show_progress=False)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("fetch_adj_factor_single(%s) failed: %s", symbol, e)
         return pl.DataFrame()
     return _normalize_adj_factor(raw)
@@ -922,7 +922,7 @@ def _latest_minute_datetime(repo: KlineRepository) -> datetime | None:
             if isinstance(d, datetime):
                 return d
             return datetime.fromisoformat(str(d))
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return None
 
@@ -936,7 +936,7 @@ def _earliest_minute_datetime(repo: KlineRepository) -> datetime | None:
             if isinstance(d, datetime):
                 return d
             return datetime.fromisoformat(str(d))
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return None
 
@@ -957,7 +957,7 @@ def _cleanup_null_datetime_minute(repo: KlineRepository) -> None:
                 f.unlink()
                 n += 1
             logger.info("cleaned %d corrupted minute-K parquet files (null datetime)", n)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("minute cleanup check failed: %s", e)
 
 
@@ -982,7 +982,7 @@ def _migrate_symbol_to_date_partition(repo: KlineRepository) -> None:
                     df = df.filter(pl.col("datetime").is_not_null())
                 if not df.is_empty():
                     all_frames.append(df)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     if not all_frames:
@@ -1116,7 +1116,7 @@ def sync_and_persist_minute(
             f"""CREATE OR REPLACE VIEW kline_minute AS
                 SELECT * FROM read_parquet('{d}/kline_minute/**/*.parquet', union_by_name=true)"""
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("refresh kline_minute view failed: %s", e)
 
     logger.info("minute K synced: %d rows (%d symbols)", written, len(symbols))

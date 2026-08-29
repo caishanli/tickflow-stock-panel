@@ -305,8 +305,8 @@ async def analyze_rotation_stream(
         focus: 用户追加的关注点。
         quote_service / depth_service: 可选, 大盘背景装配依赖。
     """
-    from app.services.rps_rotation import build_rps_rotation
     from app.services.market_overview_builder import build_market_overview
+    from app.services.rps_rotation import build_rps_rotation
 
     # 1. 取轮动矩阵
     rotation = build_rps_rotation(repo, days)
@@ -326,7 +326,7 @@ async def analyze_rotation_stream(
     # 3. 大盘背景 (失败不阻断, 降级为空)
     try:
         overview = build_market_overview(repo, quote_service, depth_service)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("rotation analyze: 大盘背景获取失败, 降级为空: %s", e)
         overview = {}
 
@@ -339,7 +339,7 @@ async def analyze_rotation_stream(
 
     # 5. 构建 prompt + 流式调用 LLM
     try:
-        from app.services.ai_provider import stream_ai_text, ai_configured
+        from app.services.ai_provider import ai_configured, stream_ai_text
 
         if not ai_configured():
             yield json.dumps({
@@ -359,7 +359,7 @@ async def analyze_rotation_stream(
         ):
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("AI concept rotation analyze failed: %s", e)
         yield json.dumps({"type": "error", "message": f"AI 轮动分析失败: {e}"}, ensure_ascii=False)
 
