@@ -307,6 +307,25 @@ class NetworkPuller:
         frame = _as_datetime(pl.from_pandas(pdf[_MINUTE_COLS]))
         return frame if not frame.is_empty() else None
 
+    def _seed_synth_from_frame(self, tf: str, frame: pl.DataFrame) -> None:
+        """自举帧末行播种合成器：半程真实 bar + 累计量额基线（防首拍零量覆盖）。
+
+        mootdx 分钟量纲=股，与合成器一致；累计基线=全帧 volume/amount 求和。
+        """
+        try:
+            rows = frame.sort("datetime").tail(1).to_dicts()
+            if not rows:
+                return
+            last = rows[0]
+            self.synth.seed(tf, last["datetime"],
+                            float(last["open"]), float(last["high"]),
+                            float(last["low"]), float(last["close"]),
+                            float(last["volume"]), float(last["amount"]),
+                            float(frame["volume"].sum() or 0.0),
+                            float(frame["amount"].sum() or 0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[sources] %s 合成器播种失败: %s", tf, e)
+
     def fetch_many(self, codes: list[str]) -> list[pl.DataFrame]:
         with self._chain_lock:
             tf_codes = [_tf_symbol(c) for c in codes]
@@ -320,11 +339,16 @@ class NetworkPuller:
                     out[tf] = hit[1]
                 else:
                     todo.append(tf)
-            # ② 冷启动自举：交易时段、无任何当日记录的标的，mootdx 拉「今日迄今」一次
-            for tf in list(todo):
-                if self._bootstrap_needed(tf):
+            # ② 冷启动自举：交易时段、无任何当日记录的标的，mootdx 拉「今日迄今」一次。
+            # 池内并行（与⑤同款线程本地源）——自举发生在链锁内，串行会把冷启动后
+            # 首个请求拖成 N×单只耗时并堵死所有并发 fetch_many
+            boot_syms = [tf for tf in todo if self._bootstrap_needed(tf)]
+            if boot_syms:
+                futures = {self._pool.submit(self._pull_mootdx_one, c): c
+                           for c in boot_syms}
+                for f, tf in futures.items():
                     try:
-                        frame = self._pull_mootdx_one(tf)
+                        frame = f.result()
                     except Exception as e:  # noqa: BLE001
                         logger.warning("[sources] %s 自举失败(非超时): %s", tf, e)
                         frame = None
@@ -333,6 +357,7 @@ class NetworkPuller:
                         out[tf] = frame
                         self._cache_put(tf, frame)
                         todo.remove(tf)
+                        self._seed_synth_from_frame(tf, frame)
             # ③④ 腾讯批量 → 新浪批量 → 合成；forced=mootdx 跳过 HTTP 链
             forced = os.getenv("STOCKDATA_RT_SOURCE", "auto") or "auto"
             if forced != "mootdx" and todo:
@@ -342,7 +367,7 @@ class NetworkPuller:
                 missing = [s for s in todo if s not in quotes]
                 if missing and self.sina is not None:
                     quotes.update(self.sina.fetch(missing))
-                still_missing = [s for s in todo if s not in quotes]
+                emitted: set[str] = set()
                 if quotes:
                     self.synth.reset_if_new_day(_dt.date.today())
                     for df in self.synth.update(quotes):
@@ -350,7 +375,10 @@ class NetworkPuller:
                             sub = df.filter(pl.col("symbol") == sym)
                             out[sym] = sub
                             self._cache_put(sym, sub)
-                todo = still_missing
+                            emitted.add(sym)
+                # 快照在册但未出 bar（停牌冻结时刻被合成器守卫跳过等）→ 与解析
+                # 缺失同等下传 mootdx 兜底
+                todo = [s for s in todo if s not in emitted]
             # ⑤ mootdx 逐只兜底（池内并行）
             if todo:
                 futures = {self._pool.submit(self._pull_mootdx_one, c): c

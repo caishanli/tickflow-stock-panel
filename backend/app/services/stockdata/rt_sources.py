@@ -218,6 +218,28 @@ class BarSynthesizer:
         with self._lock:
             return self._quote_ts.get(symbol)
 
+    def seed(self, symbol: str, bar_dt: _dt.datetime, open_: float, high: float,
+             low: float, close: float, volume: float, amount: float,
+             cum_volume: float, cum_amount: float) -> None:
+        """自举帧末行播种：当前半程真实 bar 状态 + 累计量额差分基线。
+
+        使自举后的首个快照在同分钟内直接差分累加（量额真实、OHLC 保留半程高低），
+        而非按首拍零基线建 v=0 空 bar 覆盖自举真实行。已有状态或 bar_dt 非当日
+        （自举返回停牌旧数据）时忽略。线程安全。
+        """
+        with self._lock:
+            if symbol in self._state or bar_dt.date() != self._day:
+                return
+            st = _SymState()
+            st.bar_dt = bar_dt
+            st.o, st.h, st.l, st.c = open_, high, low, close
+            st.v, st.amt = volume, amount
+            st.last_price = close
+            st.last_vol = cum_volume
+            st.last_amt = cum_amount
+            self._state[symbol] = st
+            self._quote_ts[symbol] = bar_dt
+
     def update(self, quotes: dict[str, RTQuote],
                now: _dt.datetime | None = None) -> list[pl.DataFrame]:
         now = now or _dt.datetime.now()
@@ -226,6 +248,11 @@ class BarSynthesizer:
         with self._lock:
             for sym, q in quotes.items():
                 if q.price <= 0:
+                    continue
+                if q.quote_time.date() != self._day:
+                    # 停牌冻结快照：价格>0 但行情时间停在停牌时刻（过去日期）——
+                    # 照建会造出过去日期的 v=0 幽灵 bar，经内存库 keep-last 覆盖
+                    # 真实 bar。跳过，由编排链按「未出 bar」下传 mootdx 兜底
                     continue
                 st = self._state.get(sym)
                 if st is None:
