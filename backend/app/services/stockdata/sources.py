@@ -278,6 +278,11 @@ class NetworkPuller:
         if self._bootstrap_day != today:
             self._bootstrap_day = today
             self._bootstrapped.clear()
+            # 跨日残留会让 has_record 误判「当日已有记录」：_result_cache key 永不淘汰，
+            # synth 快照戳原要到收到新快照（晚于本判定）才重置——不清则自举退化为
+            # 每进程一次，次日早间分钟历史整天缺失
+            self._result_cache.clear()
+            self.synth.reset_if_new_day(today)
         has_record = (code_tf in self._bootstrapped
                       or code_tf in self._result_cache
                       or self.synth.last_quote_time(code_tf) is not None)

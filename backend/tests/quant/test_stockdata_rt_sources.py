@@ -483,6 +483,28 @@ def test_bootstrap_once_per_day(monkeypatch):
         assert len(src_obj.calls) == n_after_first
 
 
+def test_bootstrap_day_rollover_ignores_yesterday_residue(monkeypatch):
+    """跨日残留（昨日缓存 key / 昨日快照时间戳）不得让次日跳过自举。
+
+    回归 P1：_result_cache 永不淘汰、synth 快照戳要到收到新快照才重置，
+    两者均晚于换日分支的 _bootstrapped.clear()——曾使自举退化为每进程一次，
+    次日早间分钟历史整天缺失。
+    """
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    with _mk_puller(monkeypatch, forced="mootdx") as p:
+        yesterday = _dt.datetime.combine(_dt.date.today() - _dt.timedelta(days=1),
+                                         _dt.time(14, 55))
+        p._result_cache["600000.SH"] = (0.0, pl.DataFrame())  # 昨日缓存残留（TTL 早已过期）
+        p.synth.update({"600000.SH": _q("600000.SH", 9.0, 100.0, 900.0, yesterday)})
+        p.synth._day = yesterday.date()        # 跨日进程：合成器还停在昨日
+        p._bootstrap_day = _dt.date.today() - _dt.timedelta(days=1)
+        src_obj = p._source()
+        p.fetch_many(["600000.XSHG"])
+        assert len(src_obj.calls) >= 1                        # 次日首请求重新自举
+        assert p.synth.last_quote_time("600000.SH") is None   # 昨日快照戳已随换日清掉
+
+
 def test_bootstrap_non_timeout_error_contained(monkeypatch):
     """自举期非超时异常不得炸掉整个 fetch_many（对齐旧池路径的逐只容错）。"""
     monkeypatch.setattr("app.services.stockdata.sources._in_trading",
