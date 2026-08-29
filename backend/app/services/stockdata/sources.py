@@ -8,7 +8,9 @@
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
+import functools
 import json as _json
 import logging
 import os
@@ -16,7 +18,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import polars as pl
 
@@ -277,6 +279,11 @@ class NetworkPuller:
         if self._bootstrap_day != today:
             self._bootstrap_day = today
             self._bootstrapped.clear()
+            # 跨日残留会让 has_record 误判「当日已有记录」：_result_cache key 永不淘汰，
+            # synth 快照戳原要到收到新快照（晚于本判定）才重置——不清则自举退化为
+            # 每进程一次，次日早间分钟历史整天缺失
+            self._result_cache.clear()
+            self.synth.reset_if_new_day(today)
         has_record = (code_tf in self._bootstrapped
                       or code_tf in self._result_cache
                       or self.synth.last_quote_time(code_tf) is not None)
@@ -300,6 +307,25 @@ class NetworkPuller:
         frame = _as_datetime(pl.from_pandas(pdf[_MINUTE_COLS]))
         return frame if not frame.is_empty() else None
 
+    def _seed_synth_from_frame(self, tf: str, frame: pl.DataFrame) -> None:
+        """自举帧末行播种合成器：半程真实 bar + 累计量额基线（防首拍零量覆盖）。
+
+        mootdx 分钟量纲=股，与合成器一致；累计基线=全帧 volume/amount 求和。
+        """
+        try:
+            rows = frame.sort("datetime").tail(1).to_dicts()
+            if not rows:
+                return
+            last = rows[0]
+            self.synth.seed(tf, last["datetime"],
+                            float(last["open"]), float(last["high"]),
+                            float(last["low"]), float(last["close"]),
+                            float(last["volume"]), float(last["amount"]),
+                            float(frame["volume"].sum() or 0.0),
+                            float(frame["amount"].sum() or 0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[sources] %s 合成器播种失败: %s", tf, e)
+
     def fetch_many(self, codes: list[str]) -> list[pl.DataFrame]:
         with self._chain_lock:
             tf_codes = [_tf_symbol(c) for c in codes]
@@ -313,11 +339,16 @@ class NetworkPuller:
                     out[tf] = hit[1]
                 else:
                     todo.append(tf)
-            # ② 冷启动自举：交易时段、无任何当日记录的标的，mootdx 拉「今日迄今」一次
-            for tf in list(todo):
-                if self._bootstrap_needed(tf):
+            # ② 冷启动自举：交易时段、无任何当日记录的标的，mootdx 拉「今日迄今」一次。
+            # 池内并行（与⑤同款线程本地源）——自举发生在链锁内，串行会把冷启动后
+            # 首个请求拖成 N×单只耗时并堵死所有并发 fetch_many
+            boot_syms = [tf for tf in todo if self._bootstrap_needed(tf)]
+            if boot_syms:
+                futures = {self._pool.submit(self._pull_mootdx_one, c): c
+                           for c in boot_syms}
+                for f, tf in futures.items():
                     try:
-                        frame = self._pull_mootdx_one(tf)
+                        frame = f.result()
                     except Exception as e:  # noqa: BLE001
                         logger.warning("[sources] %s 自举失败(非超时): %s", tf, e)
                         frame = None
@@ -326,6 +357,7 @@ class NetworkPuller:
                         out[tf] = frame
                         self._cache_put(tf, frame)
                         todo.remove(tf)
+                        self._seed_synth_from_frame(tf, frame)
             # ③④ 腾讯批量 → 新浪批量 → 合成；forced=mootdx 跳过 HTTP 链
             forced = os.getenv("STOCKDATA_RT_SOURCE", "auto") or "auto"
             if forced != "mootdx" and todo:
@@ -335,7 +367,7 @@ class NetworkPuller:
                 missing = [s for s in todo if s not in quotes]
                 if missing and self.sina is not None:
                     quotes.update(self.sina.fetch(missing))
-                still_missing = [s for s in todo if s not in quotes]
+                emitted: set[str] = set()
                 if quotes:
                     self.synth.reset_if_new_day(_dt.date.today())
                     for df in self.synth.update(quotes):
@@ -343,7 +375,10 @@ class NetworkPuller:
                             sub = df.filter(pl.col("symbol") == sym)
                             out[sym] = sub
                             self._cache_put(sym, sub)
-                todo = still_missing
+                            emitted.add(sym)
+                # 快照在册但未出 bar（停牌冻结时刻被合成器守卫跳过等）→ 与解析
+                # 缺失同等下传 mootdx 兜底
+                todo = [s for s in todo if s not in emitted]
             # ⑤ mootdx 逐只兜底（池内并行）
             if todo:
                 futures = {self._pool.submit(self._pull_mootdx_one, c): c
@@ -402,10 +437,10 @@ class DataSources:
 
     def __init__(self, data_root: str | None = None, mootdx_factory: Callable | None = None,
                  fetch_workers: int | None = None):
-        self.data_root = data_root or os.getenv(
-            "PARTITION_DATA_ROOT",
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data"),
-        )
+        self.data_root = (data_root
+                          or os.getenv("PARTITION_DATA_ROOT")
+                          or os.path.join(os.path.dirname(__file__),
+                                          "..", "..", "..", "..", "data"))
         if fetch_workers is None:
             try:
                 fetch_workers = int(os.getenv("STOCKDATA_FETCH_WORKERS", "") or 16)
@@ -417,6 +452,7 @@ class DataSources:
         self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
         self._names_map: dict[str, str] | None = None
         self._names_cache_file = os.path.join(self.data_root, ".stock_names_cache.json")
+        self._index_pool_cache: dict[str, tuple[float, list[str]]] = {}
 
     # ---- 去重透传 ----
     def get_or_fetch(self, key: str, ttl: float, loader: Callable[[], _T]) -> _T:
@@ -499,7 +535,7 @@ class DataSources:
         for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
             for day in self._existing_day_files(subdir, lo, hi):
                 frame = self.dayfile_cache.get_or_load(
-                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                    subdir, day, functools.partial(self._read_day_file, subdir, day))
                 if frame is None or frame.is_empty():
                     continue
                 if is_stock:
@@ -517,16 +553,16 @@ class DataSources:
         # （rqalpha_bridge 传入）两种格式。分区名恒为 ISO（date=YYYY-MM-DD），
         # 字符串比较；'20260601' 与 '2026-06-01' 比较恒 False 会把全部分区跳过。
         # 统一转 ISO 再比较。
-        start_date = str(pd_to_date(start_date)) if start_date else None
-        end_date = str(pd_to_date(end_date)) if end_date else None
+        lo = str(pd_to_date(start_date)) if start_date else None
+        hi = str(pd_to_date(end_date)) if end_date else None
 
         syms = {_tf_symbol(c) for c in codes}
         parts = []
         for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
                                  ("kline_index_daily", False)):
-            for day in self._existing_day_files(subdir, start_date, end_date):
+            for day in self._existing_day_files(subdir, lo, hi):
                 frame = self.dayfile_cache.get_or_load(
-                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                    subdir, day, functools.partial(self._read_day_file, subdir, day))
                 if frame is None or frame.is_empty():
                     continue
                 sub = frame.filter(pl.col("symbol").is_in(syms))
@@ -686,19 +722,146 @@ class DataSources:
             pl.lit(None, dtype=pl.Utf8).alias("list_date"))
 
     def get_security_info(self, code: str) -> dict:
-        df = self.get_all_securities(None, None)
         sym = _tf_symbol(code)
-        row = df.filter(pl.col("symbol") == sym)
-        if row.is_empty():
-            return {}
-        r = row.to_dicts()[0]
-        return {"code": code, "name": r.get("name"), "type": r.get("type"),
-                "start_date": r.get("list_date"), "end_date": None}
+        info = self.get_security_infos([code]).get(sym)
+        if info is None:
+            # instruments 快照未覆盖（如仅 OHLCV 分区）：退回分区名录，字段可空
+            df = self.get_all_securities(None, None)
+            row = df.filter(pl.col("symbol") == sym)
+            if row.is_empty():
+                return {}
+            r = row.to_dicts()[0]
+            return {"code": code, "name": r.get("name"), "type": r.get("type"),
+                    "start_date": r.get("list_date"), "end_date": None}
+        return {"code": code, "name": info.get("name"), "type": info.get("type"),
+                "start_date": info.get("start_date"), "end_date": None}
+
+    def get_security_infos(self, codes=None) -> dict:
+        """批量元数据：{symbol: {name, start_date, type}}。
+
+        数据源：本地 instruments 快照（含 listing_date）。codes 为空返回全部。
+        进程内缓存（instruments 为日级快照，TTL 600s 足够）。
+        """
+        def _load():
+            import polars as _pl
+            p = os.path.join(self.data_root, "instruments", "instruments.parquet")
+            if not os.path.exists(p):
+                return {}
+            df = _pl.read_parquet(p)
+            out = {}
+            for r in df.iter_rows(named=True):
+                sym = str(r.get("symbol") or "")
+                if not sym:
+                    continue
+                ld = r.get("listing_date")
+                out[sym] = {
+                    "name": r.get("name"),
+                    "start_date": str(ld) if ld else None,
+                    "type": r.get("type"),
+                }
+            return out
+
+        allmap = self.get_or_fetch("security_infos", 600.0, _load)
+        if not codes:
+            return dict(allmap)
+        want = {_tf_symbol(str(c)) for c in codes}
+        return {k: v for k, v in allmap.items() if k in want}
 
     def get_index_stocks(self, index_code: str, date: str | None) -> list[str]:
-        # 成分股暂以全市场股票日线标的近似（不维护成分表）；有成分表后替换
-        df = self._scan_partitions("kline_daily", None, None, None, ["symbol"])
-        return sorted(set(df["symbol"].to_list()))
+        """真实指数成分（当前成员快照；date 参数暂忽略，成分历史不入库）。
+
+        来源：沪深300/上证50/中证500 → baostock 官方接口；其余（含国证系
+        399xxx，如 399101 中小综指）→ 国证官网 sample-detail 接口。
+        结果落 ``data/pools/<code6>.json`` 磁盘缓存；网络失败时回退最近一次
+        快照（宁可陈旧也不返回全市场假成分）。
+        """
+        import json as _json
+        code6 = str(index_code).split(".")[0].strip()
+        pool_file = os.path.join(self.data_root, "pools", f"{code6}.json")
+
+        def _read_pool():
+            try:
+                with open(pool_file, encoding="utf-8") as f:
+                    return [str(s) for s in (_json.load(f).get("stocks") or [])]
+            except Exception:
+                return []
+
+        now = time.time()
+        hit = self._index_pool_cache.get(code6)
+        if hit and now - hit[0] < 86400.0:
+            return list(hit[1])
+        stocks = self._fetch_index_stocks_live(code6)
+        if not stocks:
+            # 网络失败 → 最近磁盘快照兜底（宁可陈旧也不返回全市场假成分）
+            stocks = _read_pool()
+            if stocks:
+                logger.warning("index_stocks %s 网络失败，回退磁盘快照 %d 只",
+                               code6, len(stocks))
+                return stocks
+            return []
+        self._index_pool_cache[code6] = (now, list(stocks))
+        try:
+            os.makedirs(os.path.dirname(pool_file), exist_ok=True)
+            with open(pool_file, "w", encoding="utf-8") as f:
+                _json.dump({"date": _dt.date.today().isoformat(),
+                            "stocks": stocks}, f, ensure_ascii=False)
+        except Exception:
+            pass
+        return stocks
+
+    _BAOSTOCK_INDEX: ClassVar[dict] = {"000300": "query_hs300_stocks",
+                                       "000016": "query_sz50_stocks",
+                                       "000905": "query_zz500_stocks"}
+
+    def _fetch_index_stocks_live(self, code6: str) -> list[str]:
+        # 1) baostock 覆盖的中证指数（fields: updateDate, sh.600000, 名称）
+        fn = self._BAOSTOCK_INDEX.get(code6)
+        if fn:
+            try:
+                import baostock as _bs
+                lg = _bs.login()
+                try:
+                    if lg and getattr(lg, "error_code", "1") != "0":
+                        raise RuntimeError("baostock login failed")
+                    rs = getattr(_bs, fn)()
+                    out = []
+                    while rs.next():
+                        row = rs.get_row_data()
+                        # fields: [updateDate, 'sh.600000', 名称]
+                        if len(row) >= 2 and "." in row[1]:
+                            mkt, _, sym = row[1].partition(".")
+                            out.append(sym + (".XSHG" if mkt == "sh" else ".XSHE"))
+                    if out:
+                        return sorted(set(out))
+                finally:
+                    with contextlib.suppress(Exception):
+                        _bs.logout()
+            except Exception:
+                logger.warning("index_stocks %s baostock 拉取失败", code6,
+                               exc_info=True)
+        # 2) 其余走国证官网（399101 中小综指等）
+        if code6.startswith(("39", "98")):
+            try:
+                import requests as _rq
+                params: dict[str, str | int] = {
+                    "indexcode": code6, "pageNum": 1, "rows": 3000}
+                r = _rq.get(
+                    "http://www.cnindex.com.cn/sample-detail/detail",
+                    params=params,
+                    timeout=20)
+                rows = (r.json().get("data") or {}).get("rows") or []
+                out = []
+                for it in rows:
+                    sec = str(it.get("seccode") or "")
+                    if sec.isdigit() and len(sec) == 6:
+                        # 国证接口仅深市指数成分（000/002/300 开头）
+                        out.append(sec + ".XSHE")
+                if out:
+                    return sorted(set(out))
+            except Exception:
+                logger.warning("index_stocks %s cnindex 拉取失败", code6,
+                               exc_info=True)
+        return []
 
     def _build_name_map(self) -> dict[str, str]:
         """构建 {纯6位代码: 名称} 映射：优先读本地缓存命中，否则本地 instruments（股票）
@@ -778,6 +941,14 @@ class DataSources:
         # 因子表仅除权事件/15:35 同步后变化：TTL 300s 去重即可，
         # 避免每次调用 recursive glob + 全量 scan_parquet（含 lf.columns schema 解析）。
         return self.get_or_fetch("adj_factors", 300.0, self._load_adj_factors)
+
+    def get_financials(self) -> pl.DataFrame:
+        """全量季频财务长表（tdx gpcw 落盘分区），TTL 600s 去重。"""
+        return self.get_or_fetch("financials", 600.0, self._load_financials)
+
+    def _load_financials(self) -> pl.DataFrame:
+        from ..tdx_financials import load_financials
+        return load_financials()
 
     def _load_adj_factors(self) -> pl.DataFrame:
         root = os.path.join(self.data_root, "adj_factor_etf")

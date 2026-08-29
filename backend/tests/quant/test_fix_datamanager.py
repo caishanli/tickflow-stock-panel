@@ -828,3 +828,216 @@ def test_minute_diag_logs_on_today_missing(tmp_path, monkeypatch, caplog):
     msgs = [r.getMessage() for r in caplog.records]
     assert any("盘中取数空" in m and CODE in m for m in msgs), msgs
     assert CODE not in dm._minute_empty
+
+
+# ---- 近端历史陈旧窗口：previous_date 锚定查询不再绕过 _is_stale ----
+
+def test_recent_history_end_window():
+    """end 在近 14 天内 → 需要回源；更老/None → 不检查；坏值 → 保守检查。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+
+    now = pd.Timestamp.now()
+    assert mgr_mod._is_recent_history_end(now) is True                    # 今天
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=6)) is True
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=10)) is True  # 长假场景
+    assert mgr_mod._is_recent_history_end(now - pd.Timedelta(days=15)) is False  # 远端历史
+    assert mgr_mod._is_recent_history_end(None) is False
+    assert mgr_mod._is_recent_history_end("not-a-date") is True           # 坏值保守放行检查
+
+
+def test_daily_mem_near_history_always_refetch(tmp_path, monkeypatch):
+    """近端历史（end 近 7 天内）每次查询都回源取最新，不信任进程缓存；
+    且回源后缓存尾部被拼接刷新（保远古广度）。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    today = pd.Timestamp("2026-08-26")
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: today))
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+    dm._offline = False
+    dm.cache = DataCache(str(tmp_path / "cache"))
+    fetched = {'n': 0}
+
+    class _Net:
+        def get_daily(self, code, start, end):
+            fetched['n'] += 1
+            idx = pd.DatetimeIndex([pd.Timestamp(end)])
+            return pd.DataFrame({"close": [1.5 + fetched['n']]}, index=idx)
+
+    dm.sources = {"network": _Net()}
+    dm._priority = lambda: ["network"]
+    dm._src_fail = {}
+    dm._maybe_demote = lambda name: None
+
+    # 昨日收盘重估写入的旧帧（覆盖 end=08-25）：近端查询必须无视它直接回源
+    stale_frame = pd.DataFrame(
+        {"close": [1.5, 1.5]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-08-20"), pd.Timestamp("2026-08-25")]),
+    )
+    key = f"get_daily_{CODE}"
+    dm._daily_mem[key] = stale_frame
+    out = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
+    assert fetched['n'] == 1, "近端历史必须每次都回源"
+    assert float(out["close"].iloc[-1]) == 2.5
+    # 第二次查询同样回源（不信任同日缓存）
+    out2 = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
+    assert fetched['n'] == 2 and float(out2["close"].iloc[-1]) == 3.5
+    # 回源结果拼接进缓存：头部保留远古行 + 尾部为最新值
+    mem = dm._daily_mem[key]
+    assert mem.index.min() == pd.Timestamp("2026-08-20")
+    assert float(mem["close"].iloc[-1]) == 3.5
+
+
+def test_daily_mem_far_history_served_from_cache(tmp_path, monkeypatch):
+    """远端历史（end 早于近端窗口）照旧走缓存，不回源。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    today = pd.Timestamp("2026-08-26")
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: today))
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+    dm._offline = False
+    dm.cache = DataCache(str(tmp_path / "cache"))
+    fetched = {'n': 0}
+
+    class _Net:
+        def get_daily(self, code, start, end):
+            fetched['n'] += 1
+            return pd.DataFrame({"close": [9.9]},
+                                index=pd.DatetimeIndex([pd.Timestamp(end)]))
+
+    dm.sources = {"network": _Net()}
+    dm._priority = lambda: ["network"]
+    dm._src_fail = {}
+    dm._maybe_demote = lambda name: None
+
+    frame = pd.DataFrame(
+        {"close": [1.5]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-06-01")]),
+    )
+    dm._daily_mem[f"get_daily_{CODE}"] = frame
+    out = dm.fetch("get_daily", CODE, "2026-05-01", "2026-06-01")
+    assert fetched['n'] == 0 and float(out["close"].iloc[-1]) == 1.5
+
+
+def test_daily_mem_offline_mode_exempt_from_refetch(tmp_path):
+    """离线/回测模式数据冻结，近端历史也直接服务缓存，不回源。"""
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._daily_mem = {}
+    dm._daily_ver = 0
+    dm._offline = True
+    dm.cache = DataCache(str(tmp_path / "cache-off"))
+    frame = pd.DataFrame(
+        {"close": [1.5]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-08-25")]),
+    )
+    dm._daily_mem[f"get_daily_{CODE}"] = frame
+    out = dm.fetch("get_daily", CODE, "2026-08-01", "2026-08-25")
+    assert float(out["close"].iloc[-1]) == 1.5
+
+
+# ---- 复权缓存每日重建（live）/ 冻结（离线）----
+
+def test_adj_cache_rebuilds_on_new_day(tmp_path, monkeypatch):
+    """live 模式：跨日后复权因子/事件缓存必须重建（15:35 同步写入新事件）。"""
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._adj_factor = {"510300.XSHG": {pd.Timestamp("2026-08-01"): 1.0}}
+    dm._adj_events_cache = {"510300.XSHG": []}
+    dm._adj_built_day = "2026-08-25"   # 昨天构建
+    dm._offline = False
+
+    import polars as pl
+    import os
+    root = tmp_path / "part"
+    (root / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"],
+        "trade_date": [pd.Timestamp("2026-08-01")],
+        "ex_factor": [1.0],
+    }).write_parquet(root / "adj_factor_etf" / "all.parquet")
+
+    class _Client:
+        def get_adj_factors(self):
+            return pd.DataFrame()   # 空，走本地
+
+    dm._partition_root = lambda: str(root)
+    dm._to_jq_code = lambda s: s
+    dm.client = _Client()
+    dm._offline = False
+
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-26 10:00:00")))
+    fmap = dm._adj_factor_map()
+    assert dm._adj_built_day == "2026-08-26", "跨日必须重建因子表"
+    assert fmap["510300.XSHG"][pd.Timestamp("2026-08-01")] == 1.0
+    # 同日再取：命中缓存不重建（用失败注入验证不触发读取）
+    monkeypatch.setattr(pl, "scan_parquet", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    fmap2 = dm._adj_factor_map()
+    assert fmap2["510300.XSHG"][pd.Timestamp("2026-08-01")] == 1.0
+
+
+def test_adj_cache_frozen_offline():
+    """离线/回测：复权缓存构建一次即固定，不随日期变化重建。"""
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._adj_factor = {"X": {pd.Timestamp("2026-08-01"): 1.0}}
+    dm._adj_events_cache = {"X": []}
+    dm._adj_built_day = "2026-08-01"   # 很久以前构建
+    dm._offline = True
+    assert dm._adj_fresh() is True
+
+
+def test_adj_events_rebuild_across_days_no_none_crash(tmp_path, monkeypatch):
+    """跨日触发 _adj_factor_map 重建时 _adj_events 不得因 events_cache 被
+    置 None 而崩溃（08-27 review 发现的重建竞态）。"""
+    import polars as pl
+    from app.quant.jqengine.datasource import manager as mgr_mod
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    root = tmp_path / "part"
+    (root / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG", "510300.XSHG"],
+        "trade_date": [pd.Timestamp("2026-08-01"), pd.Timestamp("2026-08-04")],
+        # 相邻因子 1.0 → 0.5（÷2 除权跳变，>10% 阈值 → 必须生成事件）
+        "ex_factor": [1.0, 0.5],
+    }).write_parquet(root / "adj_factor_etf" / "all.parquet")
+
+    dm = DataManager.__new__(DataManager)
+    dm._offline = False
+    dm._adj_factor = None
+    dm._adj_events_cache = None
+    dm._adj_built_day = None
+    dm._partition_root = lambda: str(root)
+    dm._to_jq_code = lambda s: s
+
+    class _Client:
+        def get_adj_factors(self):
+            return pd.DataFrame()
+
+    dm.client = _Client()
+    events_day1 = dm._adj_events()
+    assert ("2026-08-04 00:00:00", 2.0) == tuple(events_day1["510300.XSHG"][0]) or \
+           events_day1["510300.XSHG"][0][1] == 2.0
+
+    # 跨日：built_day 标记为昨天 → 触发 map+events 全量重建路径
+    dm._adj_built_day = "2026-08-25"
+    monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
+                        classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-26 09:00:00")))
+    events_day2 = dm._adj_events()   # 不应 AttributeError
+    assert events_day2["510300.XSHG"][0][1] == 2.0
+    assert dm._adj_built_day == "2026-08-26"

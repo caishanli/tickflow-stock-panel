@@ -104,6 +104,12 @@ def _backfill_loop():
             _scheduler_state["last_backfill"] = str(_dt.datetime.now())
             _scheduler_state["backfill_result"] = res
         logger.info("stockdata startup backfill done: %s", res)
+        # 季频财务（gpcw）幂等回源：已有分区秒级跳过，新季度才下载
+        from app.services import tdx_financials
+        fin = tdx_financials.sync_financials()
+        with _lock:
+            _scheduler_state["financials_sync"] = fin
+        logger.info("stockdata financials sync done: %s", fin)
     except Exception:  # noqa: BLE001
         logger.exception("stockdata startup backfill failed")
     finally:
@@ -319,11 +325,18 @@ def _dayfile_sweep_loop(data_sources, interval: float = 10.0) -> None:
 def trigger_sync(kind: str, **params) -> dict:
     """手动触发同步（供 handler 调用）。
 
-    kind: backfill|daily|etf_minute|stock_minute|adj_factor|check_day|check_full
+    kind: backfill|daily|etf_minute|stock_minute|adj_factor|financials|check_day|check_full
     check_day 需传 ``day``（YYYY-MM-DD）。
     """
     if kind == "backfill":
         threading.Thread(target=_backfill_loop, daemon=True).start()
+    elif kind == "financials":
+        def _fin() -> None:
+            from app.services import tdx_financials
+            res = tdx_financials.sync_financials(force=bool(params.get("force")))
+            with _lock:
+                _scheduler_state["financials_sync"] = res
+        threading.Thread(target=_fin, daemon=True).start()
     elif kind == "check_day":
         threading.Thread(target=_run_check_day, args=(params["day"],),
                          daemon=True).start()

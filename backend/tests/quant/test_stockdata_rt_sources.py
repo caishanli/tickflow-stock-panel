@@ -82,6 +82,20 @@ def test_parse_sina_empty_fields_dropped():
     assert parse_sina_payload(text) == {}
 
 
+def test_parse_drops_unparseable_timestamp():
+    """时间戳坏行整行丢弃——不回退 now()（否则快照被记到当前分钟，造错分钟 bar）。"""
+    fields = ["1"] + ["x"] * 37          # 腾讯需 ≥38 字段
+    fields[3] = "9.50"                   # 现价 >0，确保只因时间戳被丢
+    fields[30] = "not-a-time"
+    assert parse_tencent_payload(f'v_sz000002="{"~".join(fields)}";') == {}
+
+    sfields = ["1"] + ["x"] * 31         # 新浪需 ≥32 字段
+    sfields[3] = "9.50"
+    sfields[30] = "2026/08/25"
+    sfields[31] = "10:00:00"
+    assert parse_sina_payload(f'var hq_str_sz000002="{",".join(sfields)}";') == {}
+
+
 def test_sources_http_roundtrip(monkeypatch):
     """HTTP 层：mock requests.Session.get，验证 URL/头/GBK 解码/批量拼接。"""
     captured = {}
@@ -147,7 +161,7 @@ def test_source_fetch_chunks_large_batches(monkeypatch):
         pure, suf = sym.split(".")
         return (f'v_{"sh" if suf == "SH" else "sz"}{pure}="1~X~{pure}~9.08~9.22~9.24~'
                 f'881756~1~1~9.08~1~9.08~1~9.07~1~9.06~1~9.05~1~9.04~1~9.08~1~9.09~'
-                f'1~9.10~1~9.11~1~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
+                f'1~9.10~1~9.11~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
                 f'9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06";')
 
     class ChunkSession:
@@ -196,7 +210,7 @@ def test_source_fetch_midloop_failure_keeps_surrounding_chunks(monkeypatch):
         pure, suf = sym.split(".")
         return (f'v_{"sh" if suf == "SH" else "sz"}{pure}="1~X~{pure}~9.08~9.22~9.24~'
                 f'881756~1~1~9.08~1~9.08~1~9.07~1~9.06~1~9.05~1~9.04~1~9.08~1~9.09~'
-                f'1~9.10~1~9.11~1~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
+                f'1~9.10~1~9.11~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
                 f'9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06";')
 
     class ChunkSession:
@@ -243,6 +257,7 @@ def _q(sym, price, cum_vol, cum_amt, ts):
 def test_synthesizer_same_minute_updates_hlc():
     from app.services.stockdata.rt_sources import BarSynthesizer
     syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))   # 守卫按 _day 判快照归属日，先钉住
     t0 = _dt.datetime(2026, 8, 25, 10, 0, 30)
     frames = syn.update({"600000.SH": _q("600000.SH", 9.0, 100_000, 900_000, t0)})
     assert len(frames) == 1
@@ -265,6 +280,7 @@ def test_synthesizer_same_minute_updates_hlc():
 def test_synthesizer_minute_rollover_opens_new_bar():
     from app.services.stockdata.rt_sources import BarSynthesizer
     syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
     syn.update({"600000.SH": _q("600000.SH", 9.0, 100_000, 900_000,
                                 _dt.datetime(2026, 8, 25, 10, 0, 30))})
     frames = syn.update({"600000.SH": _q("600000.SH", 9.1, 160_000, 1_450_000,
@@ -282,6 +298,7 @@ def test_synthesizer_minute_rollover_opens_new_bar():
 def test_synthesizer_out_of_order_tick_folds_into_current_bar():
     from app.services.stockdata.rt_sources import BarSynthesizer
     syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
     syn.update({"600000.SH": _q("600000.SH", 9.0, 100_000, 900_000,
                                 _dt.datetime(2026, 8, 25, 10, 0, 30))})
     syn.update({"600000.SH": _q("600000.SH", 9.1, 160_000, 1_450_000,
@@ -292,8 +309,17 @@ def test_synthesizer_out_of_order_tick_folds_into_current_bar():
     df = frames[0]
     assert df["datetime"].to_list() == [_dt.datetime(2026, 8, 25, 10, 1)]
     row = df.to_dicts()[0]
-    assert row["close"] == 9.15                      # 价格并入当前 bar
-    assert row["volume"] == pytest.approx(70_000)    # 差分并入当前 bar (10k+60k)
+    assert row["high"] == 9.15                       # 极值并入当前 bar
+    assert row["close"] == 9.1                       # close 不被旧价污染（下一 bar 以它开盘）
+    assert row["volume"] == pytest.approx(70_000)    # 差分并入当前 bar (60k+10k)
+    # 迟到 tick 不得回退累计基线：下一拍以最新累计(160k)差分，无重复计数
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.2, 180_000, 1_650_000,
+                                         _dt.datetime(2026, 8, 25, 10, 1, 30))})
+    row = frames[0].to_dicts()[0]
+    assert row["volume"] == pytest.approx(90_000)    # 60k + 10k + 20k(180k-160k)
+    assert row["close"] == 9.2
+    # 快照时间戳不因迟到 tick 回退
+    assert syn.last_quote_time("600000.SH") == _dt.datetime(2026, 8, 25, 10, 1, 30)
 
 
 def test_synthesizer_negative_delta_clamps_zero():
@@ -303,6 +329,7 @@ def test_synthesizer_negative_delta_clamps_zero():
         return df.sort("datetime")["volume"].to_list()[-1]
 
     syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
     syn.update({"600000.SH": _q("600000.SH", 9.0, 500_000, 4_500_000,
                                 _dt.datetime(2026, 8, 25, 10, 0))})
     # 累计量回落（源重置）：clamp 0 并以本次值重建基线
@@ -318,6 +345,7 @@ def test_synthesizer_negative_delta_clamps_zero():
 def test_synthesizer_multi_symbol_frames():
     from app.services.stockdata.rt_sources import BarSynthesizer
     syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
     ts = _dt.datetime(2026, 8, 25, 10, 0)
     frames = syn.update({
         "600000.SH": _q("600000.SH", 9.0, 100_000, 900_000, ts),
@@ -345,6 +373,7 @@ def test_synthesizer_reset_if_new_day():
 def test_synthesizer_last_quote_time():
     from app.services.stockdata.rt_sources import BarSynthesizer
     syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
     assert syn.last_quote_time("600000.SH") is None
     syn.update({"600000.SH": _q("600000.SH", 9.0, 100, 900,
                                 _dt.datetime(2026, 8, 25, 10, 0, 17))})
@@ -381,13 +410,15 @@ def _mk_puller(monkeypatch, tencent_quotes=None, sina_quotes=None,
             if mootdx_empty:
                 return pd.DataFrame()
             day = _dt.date.today().isoformat()
+            # 列名对齐真实 mootdx get_minute_recent（vol→volume 已改名）
             return pd.DataFrame({
                 "datetime": [pd.Timestamp(f"{day} 09:31:00")],
                 "open": [1.0], "close": [1.0], "high": [1.0], "low": [1.0],
-                "vol": [100.0], "amount": [100.0],
+                "volume": [100.0], "amount": [100.0],
             }).set_index("datetime")
 
-    p = NetworkPuller(factory=lambda: FakeSrc(), workers=1)
+    fake = FakeSrc()   # 单实例：自举已池内并行，worker 线程与主线程须记到同一 calls
+    p = NetworkPuller(factory=lambda: fake, workers=1)
     p.tencent = type("T", (), {
         "fetch": staticmethod(lambda syms: tencent_quotes or {}),
         "close": staticmethod(lambda: None)})()
@@ -483,6 +514,106 @@ def test_bootstrap_once_per_day(monkeypatch):
         assert len(src_obj.calls) == n_after_first
 
 
+def test_bootstrap_day_rollover_ignores_yesterday_residue(monkeypatch):
+    """跨日残留（昨日缓存 key / 昨日快照时间戳）不得让次日跳过自举。
+
+    回归 P1：_result_cache 永不淘汰、synth 快照戳要到收到新快照才重置，
+    两者均晚于换日分支的 _bootstrapped.clear()——曾使自举退化为每进程一次，
+    次日早间分钟历史整天缺失。
+    """
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    with _mk_puller(monkeypatch, forced="mootdx") as p:
+        yesterday = _dt.datetime.combine(_dt.date.today() - _dt.timedelta(days=1),
+                                         _dt.time(14, 55))
+        p._result_cache["600000.SH"] = (0.0, pl.DataFrame())  # 昨日缓存残留（TTL 早已过期）
+        p.synth._quote_ts["600000.SH"] = yesterday            # 昨日快照戳残留（跨日进程）
+        p.synth._day = yesterday.date()
+        p._bootstrap_day = _dt.date.today() - _dt.timedelta(days=1)
+        src_obj = p._source()
+        p.fetch_many(["600000.XSHG"])
+        assert len(src_obj.calls) >= 1                        # 次日首请求重新自举
+        # 昨日残留已随换日清掉，并被自举播种的今日 09:31 bar 取代
+        assert p.synth.last_quote_time("600000.SH") == _dt.datetime.combine(
+            _dt.date.today(), _dt.time(9, 31))
+
+
+def test_synthesizer_skips_frozen_suspended_quote():
+    """停牌冻结快照（价格>0、行情时间停在昨日）：不建 bar、不进合成器状态。"""
+    from app.services.stockdata.rt_sources import BarSynthesizer
+    syn = BarSynthesizer()
+    syn.reset_if_new_day(_dt.date(2026, 8, 25))
+    frozen = _dt.datetime(2026, 8, 24, 14, 57)
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.0, 100.0, 900.0, frozen)})
+    assert frames == []
+    assert syn.last_quote_time("600000.SH") is None
+
+
+def test_bootstrap_seeds_synth_baseline(monkeypatch):
+    """自举后首个快照同分钟差分累加：量额真实，不再按零基线建 v=0 空覆盖真实半程 bar。"""
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    monkeypatch.delenv("STOCKDATA_RT_SOURCE", raising=False)
+    with _mk_puller(monkeypatch) as p:
+        p._result_ttl = 0.0                    # 第二轮强制走 HTTP 链
+        p.tencent = type("T", (), {
+            "fetch": staticmethod(lambda syms: {
+                "600000.SH": _q("600000.SH", 9.0, 1_000.0, 9_000.0,
+                                _dt.datetime.combine(_dt.date.today(),
+                                                     _dt.time(9, 31, 30)))}),
+            "close": staticmethod(lambda: None)})()
+        p.fetch_many(["600000.XSHG"])          # 自举：FakeSrc 今日 09:31 bar（vol=100）
+        frames = p.fetch_many(["600000.XSHG"]) # 腾讯快照 cum=1000 → 同分钟差分 900
+        df = next(r for r in frames if r["symbol"][0] == "600000.SH")
+        row = df.to_dicts()[0]
+        assert row["datetime"] == _dt.datetime.combine(_dt.date.today(),
+                                                       _dt.time(9, 31))
+        assert row["volume"] == pytest.approx(1_000.0)   # 100(自举半程) + 900(差分)
+        assert row["close"] == 9.0 and row["high"] == 9.0
+
+
+def test_frozen_quote_falls_through_to_mootdx(monkeypatch):
+    """交易中停牌股：冻结快照被合成器守卫跳过后下传 mootdx 兜底（停牌前真实分钟）。"""
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    monkeypatch.delenv("STOCKDATA_RT_SOURCE", raising=False)
+    frozen_ts = _dt.datetime(2026, 8, 20, 14, 57)
+
+    def fake_fetch(syms):
+        calls.append(list(syms))
+        return {"600000.SH": _q("600000.SH", 9.0, 500.0, 4_500.0, frozen_ts)}
+
+    calls = []
+    with _mk_puller(monkeypatch) as p:
+        p._result_ttl = 0.0
+        p.tencent = type("T", (), {"fetch": staticmethod(fake_fetch),
+                                   "close": staticmethod(lambda: None)})()
+        p.fetch_many(["600000.XSHG"])          # 自举（此后有记录不再自举）
+        frames = p.fetch_many(["600000.XSHG"]) # 冻结快照 → 守卫跳过 → mootdx 兜底
+        assert len(calls) == 1                 # 腾讯确实被请求过
+        src_obj = p._source()
+        assert len(src_obj.calls) == 2         # 自举一次 + 兜底一次
+        df = next(r for r in frames if r["symbol"][0] == "600000.SH")
+        assert df["datetime"].to_list() == [_dt.datetime.combine(
+            _dt.date.today(), _dt.time(9, 31))]
+        # 冻结快照未污染合成器：仅剩自举播种的今日 bar 时间
+        assert p.synth.last_quote_time("600000.SH") == _dt.datetime.combine(
+            _dt.date.today(), _dt.time(9, 31))
+
+
+def test_bootstrap_covers_all_symbols(monkeypatch):
+    """冷启动自举池内并行 gather 后逐只登记，整批标的都拿到今日迄今历史。"""
+    monkeypatch.setattr("app.services.stockdata.sources._in_trading",
+                        lambda *a, **k: True)
+    with _mk_puller(monkeypatch, forced="mootdx") as p:
+        frames = p.fetch_many(["600000.XSHG", "000001.XSHE", "510300.XSHG"])
+        src_obj = p._source()
+        # FakeSrc 收到的是 TF 符号形态（fetch_many 统一转换后下传）
+        assert sorted(src_obj.calls) == ["000001.SZ", "510300.SH", "600000.SH"]
+        assert {r["symbol"][0] for r in frames} == {
+            "600000.SH", "000001.SZ", "510300.SH"}
+
+
 def test_bootstrap_non_timeout_error_contained(monkeypatch):
     """自举期非超时异常不得炸掉整个 fetch_many（对齐旧池路径的逐只容错）。"""
     monkeypatch.setattr("app.services.stockdata.sources._in_trading",
@@ -511,13 +642,14 @@ def test_bootstrap_non_timeout_error_contained(monkeypatch):
             df.index.name = "open"         # 构造合法；reset_index() → ValueError
             return df
 
-    p = NetworkPuller(factory=lambda: MalformedFrameSrc(), workers=1)
+    shared = MalformedFrameSrc()   # 单实例：自举池内并行，worker 线程的调用也要可见
+    p = NetworkPuller(factory=lambda: shared, workers=1)
     try:
         monkeypatch.setattr(p, "tencent", type("T", (), {
             "fetch": staticmethod(lambda syms: {"600000.SH": ok}),
             "close": staticmethod(lambda: None)})())
         frames = p.fetch_many(["600000.XSHG"])   # 自举炸(非超时) → 腾讯接住
         assert frames and frames[0]["symbol"][0] == "600000.SH"
-        assert p._source().calls == ["600000.SH"]     # 自举确实尝试过且只一次
+        assert shared.calls == ["600000.SH"]     # 自举确实尝试过且只一次
     finally:
         p.shutdown()

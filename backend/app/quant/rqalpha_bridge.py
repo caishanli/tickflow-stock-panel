@@ -1580,6 +1580,7 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     dm.preload_daily()
     dm.set_minute_window(start, end)
 
+
     # 分钟数据覆盖告警：回测起点早于本地分钟数据首日时，覆盖前时段动量/停牌
     # 判定全部按「盘中临时停牌」跳过，结果不可信——显式提示而非静默产出。
     _cov_warn = _minute_coverage_warning(start, dm.minute_coverage_start())

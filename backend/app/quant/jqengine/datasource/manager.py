@@ -26,6 +26,25 @@ SOURCES = {"network": NetworkSource}
 # 几乎全 miss), 是 stockdata CPU 风暴的根源. 下游 DataCache._covers 发现
 # 覆盖不足时会带显式日期重取, 不丢数据. 
 _DAILY_FETCH_LOOKBACK_DAYS = 400
+# 近端历史陈旧窗口：end 落在该窗口内的日线请求每次回源取最新（天）。
+# 需覆盖最长节假日（春节/国庆 8 天）+ 缓冲：长假后首个交易日 previous_date
+# 若落在窗口外会退回缓存路径，旧帧可能早于节前最后一次同步修订。
+_RECENT_HISTORY_STALE_WINDOW_DAYS = 14
+
+
+def _is_recent_history_end(req_end) -> bool:
+    """请求 end 是否落在近端历史陈旧窗口内（需要做新鲜度检查）。"""
+    if req_end is None:
+        return False
+    try:
+        _end_date = pd.Timestamp(req_end).date()
+        _recent_floor = (
+            pd.Timestamp.now().normalize()
+            - pd.Timedelta(days=_RECENT_HISTORY_STALE_WINDOW_DAYS)
+        ).date()
+        return _end_date >= _recent_floor
+    except Exception:
+        return True
 
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
@@ -230,6 +249,16 @@ class DataManager:
         # 真实价，与聚宽 use_real_price 行为一致）。
         self._adj_factor = None  # 惰性：None=未加载，{} = 已加载但空
         self._adj_events_cache = None  # 惰性：从因子表重建的除权事件
+        # 复权缓存构建日期：live 模式每天重建一次（因子表 15:35 同步会写入
+        # 新事件），离线/回测数据冻结不重建。与日线近端回源同一哲学：
+        # "进程内存里的数据不能假设永远等于磁盘/服务端最新"。
+        self._adj_built_day = None
+
+    def _adj_fresh(self) -> bool:
+        """复权缓存是否可复用：离线冻结 或 当日已构建。"""
+        if getattr(self, "_offline", False):
+            return self._adj_built_day is not None
+        return self._adj_built_day == pd.Timestamp.now().normalize().date().isoformat()
 
     def _adj_factor_map(self) -> dict[str, dict]:
         """加载前复权因子表: {jq_code: {trade_date(date): ex_factor}}。
@@ -239,9 +268,10 @@ class DataManager:
         stockdata 网络服务因子表 (服务端读同一 adj_factor_etf 目录);
         任一来源不可用/离线时另一来源兜底。
         """
-        if self._adj_factor is not None:
+        if self._adj_factor is not None and self._adj_fresh():
             return self._adj_factor
         self._adj_factor = {}
+        self._adj_events_cache = None  # 因子表重建 → 事件表一并失效
         import glob as _glob
         roots = [
             os.path.join(self._partition_root(), "adj_factor_etf"),
@@ -273,6 +303,7 @@ class DataManager:
                     self._adj_factor.setdefault(jq, {})[pd.Timestamp(row["trade_date"])] = float(row["ex_factor"])
         except Exception as e:
             logger.warning("[DataManager] adj_factor 网络加载失败: %s", e)
+        self._adj_built_day = pd.Timestamp.now().normalize().date().isoformat()
         return self._adj_factor
 
     def _apply_qfq(self, pdf: pd.DataFrame, jq: str, cutoff=None) -> pd.DataFrame:
@@ -314,10 +345,13 @@ class DataManager:
         聚宽 pre/none 比值含 4 位价格精度噪声（±0.1% 级微小波动），需过滤：
         仅保留因子明显偏离 1 的真实除权事件（阈值 10%），忽略噪声。
         """
-        if self._adj_events_cache is not None:
+        if self._adj_events_cache is not None and self._adj_fresh():
             return self._adj_events_cache
-        self._adj_events_cache = {}
+        # 先构建局部 dict 再赋值：下方 _adj_factor_map() 判定需要重建时会把
+        # self._adj_events_cache 置 None，直接写入实例属性会 AttributeError。
+        out = {}
         fmap = self._adj_factor_map()
+        self._adj_built_day = pd.Timestamp.now().normalize().date().isoformat()
         for jq, m in fmap.items():
             items = sorted(m.items())
             if len(items) < 2:
@@ -333,7 +367,8 @@ class DataManager:
                     if (f < 0.9 or f > 1.1) and 0.0 < f < 10.0:
                         events.append((cur_dt, f))
             if events:
-                self._adj_events_cache[jq] = events
+                out[jq] = events
+        self._adj_events_cache = out
         return self._adj_events_cache
 
     def set_minute_window(self, start, end):
@@ -596,16 +631,15 @@ class DataManager:
                 # 下方 cache.get 回源补齐。
                 req_start = args[1] if len(args) > 1 else None
                 req_end = args[2] if len(args) > 2 else None
-                # 只在实时请求（end >= 今天）时检查过期；历史请求直接用内存数据
-                _is_live_req = False
-                if req_end is not None:
-                    try:
-                        _end_date = pd.Timestamp(req_end).date()
-                        _is_live_req = _end_date >= pd.Timestamp.now().normalize().date()
-                    except Exception:
-                        _is_live_req = True
+                # 近端历史（end 落在近 N 天）**永远回源，不信任进程缓存**：
+                # 帧末日期=昨天的缓存可能早于最近一次 mootdx/服务端回源落盘修订
+                # （15:35 同步才修正当日 bar），长命进程据此对同一 previous_date
+                # 查询返回不同历史（08-26 d092ad90 与克隆盘同刻动量排名整表
+                # 分歧、同策略同持仓做出相反调仓的根因）。只有不修订的远古
+                # 历史（end 早于窗口）才走缓存；离线/回测模式数据冻结一律走缓存。
                 if (DataCache._covers(mem, req_start, req_end)
-                        and not (self.cache._is_stale(mem) and _is_live_req)):
+                        and (getattr(self, "_offline", False)
+                             or not _is_recent_history_end(req_end))):
                     return mem
             # 覆盖不足不预先删除旧帧：先回源，成功才经 _put_daily_mem_protected
             # 覆盖写入；失败则保留旧帧并抛错。原实现"先删后取"，回源瞬时失败会让
@@ -713,7 +747,26 @@ class DataManager:
                 new_lo, new_hi = new_cov
                 old_covers_new = old_lo <= new_lo and old_hi >= new_hi
                 if old_covers_new:
-                    return  # 已有更全缓存，保留，不覆盖
+                    # 已有更全缓存。仅当新帧刷新了尾部（end >= 旧帧 end，
+                    # 即近端回源/补日场景）才拼接合并，让 15:35 同步的修订
+                    # 进得来又不丢远古广度；子区间查询（end 更早，如
+                    # _trade_days_between）不改变缓存。
+                    if new_hi >= old_hi:
+                        try:
+                            base = old.copy()
+                            if (isinstance(base.index, pd.DatetimeIndex)
+                                    and isinstance(new_df.index, pd.DatetimeIndex)
+                                    and len(new_df.index)):
+                                cut = new_df.index.min()
+                                merged = pd.concat(
+                                    [base[base.index < cut], new_df])
+                                merged = (merged[~merged.index.duplicated(keep="last")]
+                                          .sort_index())
+                                self._daily_mem[cache_key] = merged
+                                self._daily_ver += 1
+                        except Exception:
+                            pass
+                    return
         self._daily_mem[cache_key] = new_df
         self._daily_ver += 1
 

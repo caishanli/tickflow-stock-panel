@@ -21,7 +21,11 @@ logger = logging.getLogger("app.services.stockdata.rt_sources")
 _UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 _TENCENT_URL = "https://qt.gtimg.cn/q="
 _SINA_URL = "https://hq.sinajs.cn/list="
-_HTTP_TIMEOUT = 3.0
+# 单请求 HTTP 超时（env 可调；import 时读一次，与 RT_BATCH_SIZE 同口径）
+try:
+    _HTTP_TIMEOUT = float(os.getenv("STOCKDATA_RT_HTTP_TIMEOUT", "") or 3.0)
+except ValueError:
+    _HTTP_TIMEOUT = 3.0
 # 单请求标的上限：实测腾讯 6870 只单 URL(61KB) 会吃 HTTP 414；200 只/块
 # 全市场 35 请求 0.5s 内拉完且无限流（2026-08-26 实测）。env 可调, 建议 50~500。
 try:
@@ -61,13 +65,15 @@ def _tf_to_vendor(symbol: str) -> str | None:
     return None
 
 
-def _parse_ts(raw: str) -> _dt.datetime:
+def _parse_ts(raw: str) -> _dt.datetime | None:
+    """解析腾讯/新浪时间戳；已知两种格式外返回 None（坏行由解析层丢弃，
+    不回退 now()——那会把快照记到当前分钟，造出错分钟 bar）。"""
     for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S"):
         try:
             return _dt.datetime.strptime(raw.strip(), fmt)
         except ValueError:
             continue
-    return _dt.datetime.now()
+    return None
 
 
 def parse_tencent_payload(text: str) -> dict[str, RTQuote]:
@@ -81,6 +87,9 @@ def parse_tencent_payload(text: str) -> dict[str, RTQuote]:
         price = _f(v[3])
         if price <= 0:
             continue
+        ts = _parse_ts(v[30])
+        if ts is None:
+            continue
         suffix = "SH" if m.group(0).startswith("v_sh") else "SZ"
         out[f"{code}.{suffix}"] = RTQuote(
             symbol=f"{code}.{suffix}",
@@ -91,7 +100,7 @@ def parse_tencent_payload(text: str) -> dict[str, RTQuote]:
             low=_f(v[34]),
             cum_volume=_f(v[6]) * 100.0,
             cum_amount=_f(v[37]) * 1e4,
-            quote_time=_parse_ts(v[30]),
+            quote_time=ts,
         )
     return out
 
@@ -107,6 +116,9 @@ def parse_sina_payload(text: str) -> dict[str, RTQuote]:
         price = _f(v[3])
         if price <= 0:
             continue
+        ts = _parse_ts(f"{v[30]} {v[31]}")
+        if ts is None:
+            continue
         suffix = "SH" if m.group(0).startswith("hq_str_sh") else "SZ"
         out[f"{code}.{suffix}"] = RTQuote(
             symbol=f"{code}.{suffix}",
@@ -117,7 +129,7 @@ def parse_sina_payload(text: str) -> dict[str, RTQuote]:
             low=_f(v[5]),
             cum_volume=_f(v[8]),
             cum_amount=_f(v[9]),
-            quote_time=_parse_ts(f"{v[30]} {v[31]}"),
+            quote_time=ts,
         )
     return out
 
@@ -136,7 +148,7 @@ class _HttpSource:
         if not vendor:
             return {}
         out: dict[str, RTQuote] = {}
-        timeout = float(os.getenv("STOCKDATA_RT_HTTP_TIMEOUT", "") or _HTTP_TIMEOUT)
+        timeout = _HTTP_TIMEOUT
         chunks = (len(vendor) + RT_BATCH_SIZE - 1) // RT_BATCH_SIZE
         failed = 0
         for i in range(0, len(vendor), RT_BATCH_SIZE):
@@ -218,6 +230,28 @@ class BarSynthesizer:
         with self._lock:
             return self._quote_ts.get(symbol)
 
+    def seed(self, symbol: str, bar_dt: _dt.datetime, open_: float, high: float,
+             low: float, close: float, volume: float, amount: float,
+             cum_volume: float, cum_amount: float) -> None:
+        """自举帧末行播种：当前半程真实 bar 状态 + 累计量额差分基线。
+
+        使自举后的首个快照在同分钟内直接差分累加（量额真实、OHLC 保留半程高低），
+        而非按首拍零基线建 v=0 空 bar 覆盖自举真实行。已有状态或 bar_dt 非当日
+        （自举返回停牌旧数据）时忽略。线程安全。
+        """
+        with self._lock:
+            if symbol in self._state or bar_dt.date() != self._day:
+                return
+            st = _SymState()
+            st.bar_dt = bar_dt
+            st.o, st.h, st.l, st.c = open_, high, low, close
+            st.v, st.amt = volume, amount
+            st.last_price = close
+            st.last_vol = cum_volume
+            st.last_amt = cum_amount
+            self._state[symbol] = st
+            self._quote_ts[symbol] = bar_dt
+
     def update(self, quotes: dict[str, RTQuote],
                now: _dt.datetime | None = None) -> list[pl.DataFrame]:
         now = now or _dt.datetime.now()
@@ -227,6 +261,11 @@ class BarSynthesizer:
             for sym, q in quotes.items():
                 if q.price <= 0:
                     continue
+                if q.quote_time.date() != self._day:
+                    # 停牌冻结快照：价格>0 但行情时间停在停牌时刻（过去日期）——
+                    # 照建会造出过去日期的 v=0 幽灵 bar，经内存库 keep-last 覆盖
+                    # 真实 bar。跳过，由编排链按「未出 bar」下传 mootdx 兜底
+                    continue
                 st = self._state.get(sym)
                 if st is None:
                     st = _SymState()
@@ -235,15 +274,16 @@ class BarSynthesizer:
                 dv = max(q.cum_volume - st.last_vol, 0.0) if has_bar else 0.0
                 da = max(q.cum_amount - st.last_amt, 0.0) if has_bar else 0.0
                 bar_dt = _floor_minute(q.quote_time or now)
-                if not has_bar:
+                cur_dt = st.bar_dt
+                if cur_dt is None:
                     # 首拍：只建价格 bar，量额记 0（保守不虚增）
                     st.o = st.h = st.l = st.c = q.price
                     st.v = st.amt = 0.0
                     st.bar_dt = bar_dt
-                elif st.bar_dt is not None and bar_dt > st.bar_dt:
+                elif bar_dt > cur_dt:
                     # 封口旧 bar → done；开新 bar：上一拍价格开盘
-                    # （仅向前滚动：迟到旧分钟 tick 走 else 并入当前 bar，不重开封口 bar）
-                    done_rows.append((sym, st.bar_dt, st.o, st.h, st.l,
+                    # （仅向前滚动：迟到旧分钟 tick 走末分支，不重开封口 bar）
+                    done_rows.append((sym, cur_dt, st.o, st.h, st.l,
                                       st.c, st.v, st.amt))
                     st.o = st.c
                     st.h = max(st.c, q.price)
@@ -252,13 +292,27 @@ class BarSynthesizer:
                     st.v = dv
                     st.amt = da
                     st.bar_dt = bar_dt
-                else:
-                    # 同分钟（含迟到旧分钟 tick 折入当前 bar）：更新 HLC、量额差分累加
+                elif bar_dt == cur_dt:
+                    # 同分钟：更新 HLC、量额差分累加
                     st.h = max(st.h, q.price)
                     st.l = min(st.l, q.price)
                     st.c = q.price
                     st.v += dv
                     st.amt += da
+                else:
+                    # 迟到旧分钟 tick：价格属于已封口历史——极值并入当前 bar 的
+                    # H/L、量额 clamp 后并入；不动 close（下一 bar 以 close 开盘，
+                    # 不能被旧价污染），不回退累计基线（回退会让下一拍差分重复计数）
+                    st.h = max(st.h, q.price)
+                    st.l = min(st.l, q.price)
+                    st.v += dv
+                    st.amt += da
+                    prev_qt = self._quote_ts.get(sym)
+                    self._quote_ts[sym] = max(q.quote_time, prev_qt) if prev_qt \
+                        else q.quote_time
+                    cur_rows.append((sym, cur_dt, st.o, st.h, st.l,
+                                     st.c, st.v, st.amt))
+                    continue
                 st.last_price = q.price
                 st.last_vol = q.cum_volume
                 st.last_amt = q.cum_amount
