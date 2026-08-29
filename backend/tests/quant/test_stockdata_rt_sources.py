@@ -82,6 +82,20 @@ def test_parse_sina_empty_fields_dropped():
     assert parse_sina_payload(text) == {}
 
 
+def test_parse_drops_unparseable_timestamp():
+    """时间戳坏行整行丢弃——不回退 now()（否则快照被记到当前分钟，造错分钟 bar）。"""
+    fields = ["1"] + ["x"] * 37          # 腾讯需 ≥38 字段
+    fields[3] = "9.50"                   # 现价 >0，确保只因时间戳被丢
+    fields[30] = "not-a-time"
+    assert parse_tencent_payload(f'v_sz000002="{"~".join(fields)}";') == {}
+
+    sfields = ["1"] + ["x"] * 31         # 新浪需 ≥32 字段
+    sfields[3] = "9.50"
+    sfields[30] = "2026/08/25"
+    sfields[31] = "10:00:00"
+    assert parse_sina_payload(f'var hq_str_sz000002="{",".join(sfields)}";') == {}
+
+
 def test_sources_http_roundtrip(monkeypatch):
     """HTTP 层：mock requests.Session.get，验证 URL/头/GBK 解码/批量拼接。"""
     captured = {}
@@ -147,7 +161,7 @@ def test_source_fetch_chunks_large_batches(monkeypatch):
         pure, suf = sym.split(".")
         return (f'v_{"sh" if suf == "SH" else "sz"}{pure}="1~X~{pure}~9.08~9.22~9.24~'
                 f'881756~1~1~9.08~1~9.08~1~9.07~1~9.06~1~9.05~1~9.04~1~9.08~1~9.09~'
-                f'1~9.10~1~9.11~1~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
+                f'1~9.10~1~9.11~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
                 f'9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06";')
 
     class ChunkSession:
@@ -196,7 +210,7 @@ def test_source_fetch_midloop_failure_keeps_surrounding_chunks(monkeypatch):
         pure, suf = sym.split(".")
         return (f'v_{"sh" if suf == "SH" else "sz"}{pure}="1~X~{pure}~9.08~9.22~9.24~'
                 f'881756~1~1~9.08~1~9.08~1~9.07~1~9.06~1~9.05~1~9.04~1~9.08~1~9.09~'
-                f'1~9.10~1~9.11~1~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
+                f'1~9.10~1~9.11~9.12~~20260825150000~-0.14~-1.52~9.28~9.06~'
                 f'9.08/881756/804478557~881756~80448~0.26~5.90~~9.28~9.06";')
 
     class ChunkSession:
@@ -295,8 +309,17 @@ def test_synthesizer_out_of_order_tick_folds_into_current_bar():
     df = frames[0]
     assert df["datetime"].to_list() == [_dt.datetime(2026, 8, 25, 10, 1)]
     row = df.to_dicts()[0]
-    assert row["close"] == 9.15                      # 价格并入当前 bar
-    assert row["volume"] == pytest.approx(70_000)    # 差分并入当前 bar (10k+60k)
+    assert row["high"] == 9.15                       # 极值并入当前 bar
+    assert row["close"] == 9.1                       # close 不被旧价污染（下一 bar 以它开盘）
+    assert row["volume"] == pytest.approx(70_000)    # 差分并入当前 bar (60k+10k)
+    # 迟到 tick 不得回退累计基线：下一拍以最新累计(160k)差分，无重复计数
+    frames = syn.update({"600000.SH": _q("600000.SH", 9.2, 180_000, 1_650_000,
+                                         _dt.datetime(2026, 8, 25, 10, 1, 30))})
+    row = frames[0].to_dicts()[0]
+    assert row["volume"] == pytest.approx(90_000)    # 60k + 10k + 20k(180k-160k)
+    assert row["close"] == 9.2
+    # 快照时间戳不因迟到 tick 回退
+    assert syn.last_quote_time("600000.SH") == _dt.datetime(2026, 8, 25, 10, 1, 30)
 
 
 def test_synthesizer_negative_delta_clamps_zero():
