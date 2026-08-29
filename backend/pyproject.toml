@@ -141,3 +141,10 @@ addopts = "-m 'not integration'"
 markers = [
     "integration: 集成测试，需真实 data/ 分区与 stock data 服务（默认跳过，显式 -m integration 运行）",
 ]
+
+[tool.mypy]
+# baostock 官方无类型标注、pandas 未引入 pandas-stubs：按 Any 处理（import-untyped）
+
+[[tool.mypy.overrides]]
+module = ["baostock", "pandas"]
+ignore_missing_imports = true

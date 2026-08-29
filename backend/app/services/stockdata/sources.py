@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import functools
 import json as _json
 import logging
 import os
@@ -408,10 +409,10 @@ class DataSources:
 
     def __init__(self, data_root: str | None = None, mootdx_factory: Callable | None = None,
                  fetch_workers: int | None = None):
-        self.data_root = data_root or os.getenv(
-            "PARTITION_DATA_ROOT",
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data"),
-        )
+        self.data_root = (data_root
+                          or os.getenv("PARTITION_DATA_ROOT")
+                          or os.path.join(os.path.dirname(__file__),
+                                          "..", "..", "..", "..", "data"))
         if fetch_workers is None:
             try:
                 fetch_workers = int(os.getenv("STOCKDATA_FETCH_WORKERS", "") or 16)
@@ -506,7 +507,7 @@ class DataSources:
         for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False)):
             for day in self._existing_day_files(subdir, lo, hi):
                 frame = self.dayfile_cache.get_or_load(
-                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                    subdir, day, functools.partial(self._read_day_file, subdir, day))
                 if frame is None or frame.is_empty():
                     continue
                 if is_stock:
@@ -524,16 +525,16 @@ class DataSources:
         # （rqalpha_bridge 传入）两种格式。分区名恒为 ISO（date=YYYY-MM-DD），
         # 字符串比较；'20260601' 与 '2026-06-01' 比较恒 False 会把全部分区跳过。
         # 统一转 ISO 再比较。
-        start_date = str(pd_to_date(start_date)) if start_date else None
-        end_date = str(pd_to_date(end_date)) if end_date else None
+        lo = str(pd_to_date(start_date)) if start_date else None
+        hi = str(pd_to_date(end_date)) if end_date else None
 
         syms = {_tf_symbol(c) for c in codes}
         parts = []
         for subdir, is_stock in (("kline_daily", True), ("kline_etf_daily", False),
                                  ("kline_index_daily", False)):
-            for day in self._existing_day_files(subdir, start_date, end_date):
+            for day in self._existing_day_files(subdir, lo, hi):
                 frame = self.dayfile_cache.get_or_load(
-                    subdir, day, lambda s=subdir, d=day: self._read_day_file(s, d))
+                    subdir, day, functools.partial(self._read_day_file, subdir, day))
                 if frame is None or frame.is_empty():
                     continue
                 sub = frame.filter(pl.col("symbol").is_in(syms))
@@ -814,9 +815,11 @@ class DataSources:
         if code6.startswith(("39", "98")):
             try:
                 import requests as _rq
+                params: dict[str, str | int] = {
+                    "indexcode": code6, "pageNum": 1, "rows": 3000}
                 r = _rq.get(
                     "http://www.cnindex.com.cn/sample-detail/detail",
-                    params={"indexcode": code6, "pageNum": 1, "rows": 3000},
+                    params=params,
                     timeout=20)
                 rows = (r.json().get("data") or {}).get("rows") or []
                 out = []
