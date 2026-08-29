@@ -29,6 +29,12 @@ if [[ -n "$BACKEND_EXTRAS" ]]; then
     BACKEND_EXTRA_ARGS+=(--extra "$extra")
   done
 fi
+# dev 依赖（pytest/ruff/mypy）必须常驻 venv：uv sync/uv run 默认精确同步，
+# 不带的 extra 会被卸掉。stockdata 服务用同一 venv 由 guardian spawn，
+# 曾因 quant extra 被卸导致启动回源 ModuleNotFoundError 崩循环（08-11、08-29 事故）。
+if [[ ! " ${backend_extras[*]:-} " == *" dev "* ]]; then
+  BACKEND_EXTRA_ARGS+=(--extra dev)
+fi
 
 BLUE='\033[0;34m'
 GREEN='\033[0;32m'
@@ -162,7 +168,9 @@ echo
 
 (
   cd "$BACKEND_DIR"
-  uv run uvicorn app.main:app --host 0.0.0.0 --port "$BACKEND_PORT" 2>&1 \
+  # --no-sync：上面的显式 uv sync 已保证环境完整；裸 uv run 会隐式精确同步、
+  # 剥掉未指定的 extras（如 quant 的 rqalpha）。
+  uv run --no-sync uvicorn app.main:app --host 0.0.0.0 --port "$BACKEND_PORT" 2>&1 \
     | prefix_awk "$(printf "${BLUE}[backend ]${NC} ")"
 ) &
 PIDS+=("$!")
