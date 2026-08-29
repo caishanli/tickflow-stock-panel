@@ -25,6 +25,18 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
+def _env_path(name: str, default: str = "") -> str:
+    """路径类 env 覆盖: 相对值按项目根解析, 不随进程 CWD 漂移。
+    (cwd=backend 启动时, .env 里的 "data/quant.db" 曾解析到 backend/data/
+    遗留库, 导致策略/回测/模拟盘列表全空。)"""
+    v = os.environ.get(name, "")
+    if not v:
+        return default
+    if not os.path.isabs(v):
+        v = os.path.join(_PROJECT_ROOT, v)
+    return v
+
+
 def _data_path(sub: str) -> str:
     return os.path.join(_DATA_DIR, sub)
 
@@ -56,10 +68,10 @@ def load_config() -> QuantConfig:
         default_stop_loss=float(_env("QUANT_DEFAULT_STOP_LOSS", "0.03") or "0.03"),
         sim_account_mem_mb=float(_env("SIM_ACCOUNT_MEM_MB", "400.0") or "400.0"),
         sim_account_mem_min_mb=float(_env("SIM_ACCOUNT_MEM_MIN_MB", "300.0") or "300.0"),
-        db_path=_env("QUANT_DB_PATH", _data_path("quant.db")),
-        bundle_dir=_env("QUANT_BUNDLE_DIR", _data_path("quant_bundle")),
-        strategies_dir=_env("QUANT_STRATEGIES_DIR", _data_path("quant_strategies")),
-        runtime_dir=_env("QUANT_RUNTIME_DIR", _data_path("quant_sim")),
+        db_path=_env_path("QUANT_DB_PATH", _data_path("quant.db")),
+        bundle_dir=_env_path("QUANT_BUNDLE_DIR", _data_path("quant_bundle")),
+        strategies_dir=_env_path("QUANT_STRATEGIES_DIR", _data_path("quant_strategies")),
+        runtime_dir=_env_path("QUANT_RUNTIME_DIR", _data_path("quant_sim")),
     )
 
 
