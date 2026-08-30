@@ -956,6 +956,9 @@ class DataSources:
             return pl.DataFrame()
         import glob as _glob
         paths = _glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True)
+        # 排除 xdxr 事件表（同目录不同 schema，混入 scan 会炸掉整次因子加载）
+        paths = [p for p in paths
+                 if not os.path.basename(p).startswith("xdxr_events")]
         if not paths:
             return pl.DataFrame()
         lf = pl.scan_parquet(paths, hive_partitioning=True)

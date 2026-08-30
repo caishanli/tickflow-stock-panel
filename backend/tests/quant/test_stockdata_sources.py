@@ -514,3 +514,25 @@ def test_realtime_stale_gate_configurable(tmp_path, monkeypatch):
     finally:
         s.puller.shutdown()
         os.environ.pop("PARTITION_DATA_ROOT", None)
+
+
+def test_load_adj_factors_ignores_xdxr_events(tmp_path):
+    """xdxr 事件表（同目录异 schema）混入 glob 不得炸掉整次因子加载。
+
+    2026-08-30 案例：mootdx 因子重建把 xdxr_events.parquet 写进
+    adj_factor_etf/，事件字段（category/year/...）混入
+    scan_parquet 统一 schema → extra column 异常 → 因子表加载整体失败。
+    """
+    import polars as pl
+    root = tmp_path / "adj_factor_etf"
+    root.mkdir(parents=True)
+    pl.DataFrame({"symbol": ["510300.SH"], "trade_date": ["2026-08-01"],
+                  "ex_factor": [0.99]}).write_parquet(root / "all.parquet")
+    pl.DataFrame({"symbol": ["510300.SH"], "category": [1], "year": [2026],
+                  "month": [8], "day": [1], "suogu": [0.0], "fenhong": [0.0],
+                  "songzhuangu": [0.0], "peigu": [0.0], "peigujia": [0.0]}
+                 ).write_parquet(root / "xdxr_events.parquet")
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
+    df = s._load_adj_factors()
+    assert df["symbol"].to_list() == ["510300.SH"]
+    assert df["ex_factor"].to_list() == [0.99]

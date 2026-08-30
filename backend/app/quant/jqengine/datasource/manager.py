@@ -282,6 +282,10 @@ class DataManager:
             if os.path.isdir(r):
                 paths.extend(_glob.glob(
                     os.path.join(r, "**", "*.parquet"), recursive=True))
+        # 排除 xdxr 事件表（mootdx_service 写在 adj_factor_etf/ 下，schema 为
+        # 事件字段而非 trade_date/ex_factor，混入 scan 会炸掉整次因子加载）
+        paths = [p for p in paths
+                 if not os.path.basename(p).startswith("xdxr_events")]
         if paths:
             try:
                 import polars as pl
