@@ -34,6 +34,7 @@ import {
   DatabaseZap,
   Database,
   Loader2,
+  Menu,
   LayoutDashboard,
   Tags,
   TrendingUp,
@@ -317,10 +318,19 @@ export function Layout() {
     try { return localStorage.getItem('tf-nav-collapsed') === '1' } catch { return false }
   })
 
+  // 移动端 (<768px) 侧边栏渲染为 overlay 抽屉: 默认完全隐藏, 点菜单/遮罩/Esc 后自动收起;
+  // 桌面端维持 grid 收起(图标栏)行为不变
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches,
+  )
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  // 侧边栏实际展开态 — 桌面端跟随收起偏好, 移动端跟随抽屉开关
+  const sidebarExpanded = isMobile ? mobileNavOpen : !navCollapsed
+
   // 分组等权平均涨跌幅 — 复用 watchlist/enriched 查询缓存(与自选页同 key,
   // 盘中随 SSE 刷新)。可见性门控: 子菜单实际可见(侧栏展开 + 二级菜单展开)
   // 时才拉取, 收起状态下不为隐藏 UI 发请求。
-  const navGroupPctVisible = groupsInNav && !navCollapsed && watchlistNavExpanded
+  const navGroupPctVisible = groupsInNav && sidebarExpanded && watchlistNavExpanded
   const { data: navWatchlist } = useQuery({
     queryKey: QK.watchlist,
     queryFn: api.watchlistList,
@@ -374,8 +384,10 @@ export function Layout() {
   useEffect(() => {
     const compact = window.matchMedia('(max-width: 767px)')
     const syncSidebarWithViewport = (event: MediaQueryListEvent | MediaQueryList) => {
+      setIsMobile(event.matches)
       if (event.matches) {
         setNavCollapsed(true)
+        setMobileNavOpen(false)
         return
       }
       try { setNavCollapsed(localStorage.getItem('tf-nav-collapsed') === '1') } catch {}
@@ -384,6 +396,21 @@ export function Layout() {
     compact.addEventListener('change', syncSidebarWithViewport)
     return () => compact.removeEventListener('change', syncSidebarWithViewport)
   }, [])
+
+  // 移动端: 路由变化(点击菜单项/自选分组)后自动收起抽屉
+  useEffect(() => {
+    if (isMobile) setMobileNavOpen(false)
+  }, [isMobile, location.pathname, location.search])
+
+  // 移动端: Esc 关闭抽屉
+  useEffect(() => {
+    if (!isMobile || !mobileNavOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileNavOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [isMobile, mobileNavOpen])
   const toggleNavCollapsed = () => {
     setNavCollapsed(prev => {
       const next = !prev
@@ -543,18 +570,43 @@ export function Layout() {
   return (
     <div
       className="h-screen grid bg-base text-foreground overflow-hidden transition-[grid-template-columns] duration-200 ease-smooth"
-      style={{ gridTemplateColumns: navCollapsed ? '3.5rem 1fr' : '14rem 1fr' }}
+      style={{ gridTemplateColumns: isMobile ? '1fr' : (navCollapsed ? '3.5rem 1fr' : '14rem 1fr') }}
     >
-      <aside className="border-r border-border bg-surface flex flex-col h-full min-h-0 overflow-hidden">
-        <div className={cn('border-b border-border shrink-0', navCollapsed ? 'px-2 pt-3 pb-2' : 'px-4 pt-4 pb-3')}>
+      {/* 移动端: 抽屉遮罩 — 点击空白处收起菜单 */}
+      {isMobile && mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-[55] bg-black/50 backdrop-blur-sm"
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+      {/* 移动端: 抽屉收起时左上角悬浮菜单按钮 */}
+      {isMobile && !mobileNavOpen && (
+        <button
+          type="button"
+          onClick={() => setMobileNavOpen(true)}
+          aria-label="打开菜单"
+          className="fixed left-2 top-2 z-40 flex items-center justify-center rounded-full border border-border bg-surface/90 p-2.5 text-foreground shadow-lg backdrop-blur-md transition-colors hover:bg-elevated"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      )}
+      <aside
+        className={cn(
+          'border-r border-border bg-surface flex flex-col h-full min-h-0 overflow-hidden',
+          isMobile && 'fixed inset-y-0 left-0 z-[60] w-56 max-w-[85vw] shadow-2xl transition-transform duration-200 ease-smooth',
+          isMobile && (mobileNavOpen ? 'translate-x-0' : '-translate-x-full'),
+        )}
+      >
+        <div className={cn('border-b border-border shrink-0', sidebarExpanded ? 'px-2 pt-3 pb-2' : 'px-4 pt-4 pb-3')}>
           {/* Brand block — 收起时只显 logo 居中 */}
-          <div className={cn('flex', navCollapsed ? 'flex-col items-center gap-2' : 'items-center gap-2')}>
+          <div className={cn('flex', sidebarExpanded ? 'flex-col items-center gap-2' : 'items-center gap-2')}>
             <Logo
-              size={navCollapsed ? 24 : 26}
+              size={sidebarExpanded ? 26 : 24}
               className="shrink-0 drop-shadow-[0_0_8px_rgba(139,92,246,0.4)]"
               style={{ color: BRAND }}
             />
-            {!navCollapsed && (
+            {sidebarExpanded && (
               <div
                 className="font-bold text-[11px] uppercase tracking-[0.14em] text-foreground whitespace-nowrap"
                 style={{ textShadow: `0 0 10px ${BRAND}44` }}
@@ -562,24 +614,24 @@ export function Layout() {
                 Tick Stock Panel
               </div>
             )}
-            {/* 收起/展开 按钮 */}
+            {/* 收起/展开 按钮 — 移动端抽屉打开时点击即收起抽屉 */}
             <button
-              onClick={toggleNavCollapsed}
+              onClick={isMobile ? () => setMobileNavOpen(false) : toggleNavCollapsed}
               className={cn(
                 'flex items-center rounded-btn text-muted hover:text-foreground hover:bg-elevated/60 transition-colors duration-150 ease-smooth',
-                navCollapsed ? 'justify-center p-1.5' : 'ml-auto p-1.5',
+                sidebarExpanded ? 'ml-auto p-1.5' : 'justify-center p-1.5',
               )}
-              title={navCollapsed ? '展开菜单' : '收起菜单'}
+              title={sidebarExpanded ? '收起菜单' : '展开菜单'}
             >
-              {navCollapsed
-                ? <PanelLeftOpen className="h-3.5 w-3.5 shrink-0" />
-                : <PanelLeftClose className="h-3.5 w-3.5 shrink-0" />
+              {sidebarExpanded
+                ? <PanelLeftClose className="h-3.5 w-3.5 shrink-0" />
+                : <PanelLeftOpen className="h-3.5 w-3.5 shrink-0" />
               }
             </button>
           </div>
 
           {/* 状态卡 — 收起时隐藏 */}
-          {!navCollapsed && (
+          {sidebarExpanded && (
             <div className="mt-2.5 border-t border-border/60 pt-1">
               <TierBadge
                 label={caps?.label ?? ''}
@@ -599,7 +651,7 @@ export function Layout() {
         <nav className="flex-1 min-h-0 overflow-y-auto px-2 py-3 space-y-0.5">
           {visibleNavItems.map(({ to, label, icon: Icon, badge }) => {
             // 「自选」项 — 开启分组侧栏且未整体收起时, 渲染为可展开父项 + 二级分组
-            const isWatchlistExpandable = to === '/watchlist' && groupsInNav && !navCollapsed && watchlistGroups.length > 0
+            const isWatchlistExpandable = to === '/watchlist' && groupsInNav && sidebarExpanded && watchlistGroups.length > 0
             return (
               <div key={to}>
                 {isWatchlistExpandable ? (
@@ -630,11 +682,11 @@ export function Layout() {
                   /* 普通菜单项 */
                   <NavLink
                     to={to}
-                    title={navCollapsed ? label : undefined}
+                    title={sidebarExpanded ? label : undefined}
                     className={({ isActive }) =>
                       cn(
                         'group relative flex items-center rounded-btn text-sm transition-all duration-150 ease-smooth',
-                        navCollapsed ? 'justify-center px-0 py-2' : 'gap-3 px-3 py-2',
+                        sidebarExpanded ? 'gap-3 px-3 py-2' : 'justify-center px-0 py-2',
                         isActive
                           ? 'bg-elevated text-foreground font-medium'
                           : 'text-foreground/75 hover:bg-elevated/70 hover:text-foreground',
@@ -651,8 +703,8 @@ export function Layout() {
                           )}
                         />
                         <Icon className={cn('h-4 w-4 shrink-0 transition-colors', isActive ? 'text-accent' : 'text-foreground/60 group-hover:text-foreground/85')} />
-                        {!navCollapsed && <span className="flex-1">{label}</span>}
-                        {!navCollapsed && badge && (
+                        {sidebarExpanded && <span className="flex-1">{label}</span>}
+                        {sidebarExpanded && badge && (
                           <span className="ml-auto inline-flex items-center rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-400 shrink-0">
                             {badge}
                           </span>
@@ -887,7 +939,12 @@ export function Layout() {
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-        className="h-full overflow-auto scrollbar-gutter-stable"
+        className={cn(
+          'h-full overflow-auto scrollbar-gutter-stable',
+          // 移动端抽屉收起时左上角悬浮菜单按钮 (~48px) 悬于内容之上,
+          // 整体下移内容避免盖住页面标题 (如「量化模拟盘」)。
+          isMobile && 'pt-12',
+        )}
       >
         {streamStatus === 'reconnecting' && (
           <div
