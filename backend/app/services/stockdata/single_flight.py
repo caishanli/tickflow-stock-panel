@@ -64,6 +64,7 @@ class TTLCache:
     def __init__(self) -> None:
         self._items: dict[str, tuple[float, Any]] = {}
         self._lock = threading.Lock()
+        self._sets_since_purge = 0
 
     def get(self, key: str) -> Any | None:
         with self._lock:
@@ -79,6 +80,17 @@ class TTLCache:
     def set(self, key: str, value: Any, ttl: float) -> Any:
         with self._lock:
             self._items[key] = (time.monotonic() + ttl, value)
+            # 过期条目原先只在同 key 再次 get 时才删除；key 空间随天数/请求
+            # 组合增长（如 min:{codes}:{lo}:{hi} 每日每池一键、值含全池分钟
+            # 窗口帧）时，无人再访问的键连同大帧一起永久驻留 → 服务 RSS 随
+            # 运行时长膨胀到数 GB。每 32 次 set 摊销清理一次过期键。
+            self._sets_since_purge += 1
+            if self._sets_since_purge >= 32:
+                self._sets_since_purge = 0
+                now = time.monotonic()
+                expired = [k for k, (exp, _v) in self._items.items() if now > exp]
+                for k in expired:
+                    del self._items[k]
         return value
 
 

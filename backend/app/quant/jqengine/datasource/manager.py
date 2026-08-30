@@ -229,7 +229,7 @@ class DataManager:
         self._daily_preloaded_asof = None  # 上次 preload 的 asof（新交易日据此重载）
         # _daily_mem 数据版本号：每次写入/删除递增，money memo 键含版本据此失效
         self._daily_ver = 0
-        self._money_memo = {}  # (codes_tuple, daily_ver) -> 全量成交额明细 DataFrame
+        self._money_memo = {}  # memo 键 -> (全量明细 DataFrame, 逐行date数组, 唯一交易日数组)
         # 分钟线滑窗：回测中不持有整个回测区间的分钟数据，只保留最近 N 天，
         # 既省内存又避免每次按需加载都展开整段历史（见 get_minute / _ensure_minute_windowed）
         self.minute_lookback = pd.Timedelta(days=15)
@@ -290,7 +290,8 @@ class DataManager:
             try:
                 import polars as pl
                 lf = pl.scan_parquet(paths, hive_partitioning=True)
-                cols = lf.columns if isinstance(lf, pl.LazyFrame) else []
+                cols = (lf.collect_schema().names()
+                        if isinstance(lf, pl.LazyFrame) else [])
                 if "symbol" not in cols:
                     lf = lf.with_columns(pl.lit("").alias("symbol"))
                 df = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
@@ -1296,27 +1297,39 @@ class DataManager:
         过滤 + per-code tail（O(行数)），避免回测中每天对全市场 1600+ 只
         重复 to_datetime/过滤（原 ~1.1s/天 → 累计数分钟）。
         """
-        memo_key = (tuple(sorted(codes)), self._daily_ver)
-        full = self._money_memo.get(memo_key)
-        if full is None:
+        # 离线回测日线静态：memo 键不含 _daily_ver——否则 fetch/preload 的版本
+        # 自增让 memo 在回测期内反复失效，_build_money_full 对全市场重复重建
+        # （cProfile 实测 62 次重建 ≈ 20s）。
+        codes_key = tuple(sorted(codes))
+        memo_key = codes_key if self._offline else (codes_key, self._daily_ver)
+        memo = self._money_memo.get(memo_key)
+        if memo is None:
             full = self._build_money_full(codes)
             # 旧版本/旧 codes 的 memo 已无引用价值，清掉避免随版本号累积
             self._money_memo.clear()
-            self._money_memo[memo_key] = full
+            if full is None or full.empty:
+                memo = (full, None, None)
+            else:
+                # 预计算逐行 date（datetime64[D]）与全市场唯一交易日（升序）：
+                # 每次调用的窗口对齐走 searchsorted + 区间掩码，不再对几十万行
+                # 逐行 Python 迭代 .date()（cProfile 实测该 setcomp 占整场回测
+                # ~35%）。窗口语义与原实现一致（全市场日期集合对齐，非 per-code
+                # tail——退市/停牌标的不会把停牌前陈旧日期拖进窗口）。
+                d_arr = full["time"].to_numpy().astype("datetime64[D]")
+                memo = (full, d_arr, np.unique(d_arr))
+            self._money_memo[memo_key] = memo
+        full, d_arr, uniq_days = memo
         if full is None or full.empty:
             return pd.DataFrame(columns=["code", "time", "money"])
-        end_dt = pd.Timestamp(end_date).date()
-        sub = full[full["time"].dt.date <= end_dt]
-        if sub.empty:
+        end64 = np.datetime64(pd.Timestamp(end_date).date(), "D")
+        hi = int(np.searchsorted(uniq_days, end64, side="right"))
+        if hi == 0:
             return pd.DataFrame(columns=["code", "time", "money"])
-        # 窗口按「end_date 前最近 count 个交易日」对齐：full 含全市场所有 code
-        # 的行，其日期唯一集即为真实交易日。若按 per-code ``tail(count)``，已
-        # 退市/停牌 ETF（成交额被 sentinel 过滤后只剩停牌前的行）会取到陈旧
-        # 日期（如 560650 → 06-29/06-30/07-01），拖进策略"全市场ETF总成交额"
-        # 日志污染均值并拉低流动性阈值。改为取窗口内交易日、再过滤行，退市
-        # 标的在窗口内无数据即自然缺席（不产生陈旧日期行）。
-        window = sorted({d.date() for d in sub["time"]})[-count:]
-        out = sub[sub["time"].dt.date.isin(window)]
+        lo = max(0, hi - count)
+        # uniq_days[:hi] 恰为 <= end_date 的全部交易日，取末 count 个为窗口；
+        # d 落在窗口区间即等价原「先按 end_date 过滤再 isin 窗口」。退市标的
+        # 在窗口内无数据自然缺席，不产生陈旧日期行。
+        out = full[(d_arr >= uniq_days[lo]) & (d_arr <= uniq_days[hi - 1])]
         # full 已按 (code, time) 升序，保持行序即可（等价每只窗口内顺序）
         return out.reset_index(drop=True)
 

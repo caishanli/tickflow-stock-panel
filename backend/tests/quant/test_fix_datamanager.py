@@ -168,9 +168,18 @@ def test_money_memo_full_frame_and_version(tmp_path):
     assert res2["time"].max() <= pd.Timestamp("2026-02-27")
     assert res2["time"].max() < res1["time"].max()
 
-    # 模拟 fetch 写路径：_daily_mem 变更 + 版本号递增 → memo 必须重建
+    # 模拟 fetch 写路径：_daily_mem 变更 + 版本号递增 → memo 必须重建。
+    # 这是**在线**语义（模拟盘长进程，日线可能被回源修订）；切换前先断言
+    # 离线（回测）模式数据静态、memo 冻结不复检版本——fetch 在离线下不写
+    # 帧，ver 自增是伪信号，重建只会产出相同帧（性能：避免回测期内 60+ 次
+    # 全市场 _build_money_full 重建）。
+    assert dm._offline is True
     dm._daily_mem[f"get_daily_{CODE}"] = _daily_df(dates, 9e8)
     dm._daily_ver += 1
+    res_frozen = dm.get_daily_money_cached([CODE], "2026-03-31", count=2)
+    assert (res_frozen["money"] < 9e8).all()  # 离线 memo 冻结，仍用旧帧
+
+    dm._offline = False
     res3 = dm.get_daily_money_cached([CODE], "2026-03-31", count=2)
     assert (res3["money"] >= 9e8).all()
 

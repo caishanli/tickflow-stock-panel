@@ -155,6 +155,10 @@ def get_conn(run_id: str | None = None):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # WAL 下 NORMAL 不逐 commit fsync（掉电最多丢最近提交、无损坏风险）。
+    # 回测/模拟盘日志逐条 insert_log 各自 commit，默认 FULL 时每次 ~4ms
+    # fsync，单场回测 4600+ 条 ≈ 18s（cProfile 实测）。
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
