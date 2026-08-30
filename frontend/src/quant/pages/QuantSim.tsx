@@ -6,6 +6,7 @@ import { toast } from '@/components/Toast'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Plus, Play, Square, RotateCcw, Bell, Trash2 } from 'lucide-react'
 import * as api from '../api'
+import { computeSimMetrics } from '../metrics'
 import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
 import { DingtalkConfigDialog } from './DingtalkConfigDialog'
@@ -738,6 +739,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   const logList: any[] = Array.isArray(logs) ? logs : []
   const alertList: any[] = logList.filter((l: any) => l.level === 'warn' || l.level === 'error')
 
+  const simMetrics = useMemo(() => computeSimMetrics(tradeList, eq ?? []), [tradeList, eq])
+
   // 止损日志初始化：status 的 stop_loss 是历史全量，与 onTrade 增量去重合并
   useEffect(() => {
     if (stopLossList.length === 0) return
@@ -818,7 +821,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       </div>
 
       {/* 指标卡 */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+      <div className="grid grid-cols-2 sm:grid-cols-8 gap-2">
         <div className="rounded-card border border-border bg-surface px-3 py-2">
           <div className="text-[10px] text-muted">净值</div>
           <div className="text-sm font-medium text-foreground num">{fmtNum(state?.net_value)}</div>
@@ -841,6 +844,29 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           <div className="text-[10px] text-muted">收益率</div>
           <div className={`text-sm font-medium num ${displayRet == null ? '' : displayRet >= 0 ? 'text-bull' : 'text-bear'}`}>
             {fmtPct(displayRet)}
+          </div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">胜率</div>
+          <div className="text-sm font-medium text-foreground num">
+            {fmtPct(simMetrics.winRate)}
+            {simMetrics.totalCount > 0 && (
+              <span className="text-[10px] text-muted ml-1">
+                ({simMetrics.winCount}/{simMetrics.totalCount})
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">夏普比率</div>
+          <div className={`text-sm font-medium num ${simMetrics.sharpe == null ? 'text-muted' : simMetrics.sharpe >= 0 ? 'text-bull' : 'text-bear'}`}>
+            {fmtNum(simMetrics.sharpe)}
+          </div>
+        </div>
+        <div className="rounded-card border border-border bg-surface px-3 py-2">
+          <div className="text-[10px] text-muted">最大回撤</div>
+          <div className="text-sm font-medium num text-bear">
+            {fmtPct(simMetrics.maxDrawdown)}
           </div>
         </div>
       </div>
