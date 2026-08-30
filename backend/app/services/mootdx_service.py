@@ -1388,8 +1388,7 @@ def scan_missing_partitions(start: _date | None = None,
     missing_stock_daily = set(_missing_days_in(calendar, STOCK_DAILY_ROOT))
     missing_stock_daily |= set(_stale_daily_days(STOCK_DAILY_ROOT))
     missing_stock_daily |= set(_incomplete_stock_daily_days(recent=content))
-    for _d in _shortfall_days(STOCK_DAILY_ROOT):
-        missing_stock_daily.add(_d)
+    missing_stock_daily |= _drop_bj_only_shortfall(_shortfall_days(STOCK_DAILY_ROOT))
     missing_index_daily = set(_missing_days_in(calendar, INDEX_DAILY_ROOT))
     missing_index_daily |= set(_incomplete_index_daily_days(recent=content))
     missing_index_daily |= set(_index_shortfall_days())
@@ -2033,6 +2032,18 @@ def _shortfall_days(
     return out
 
 
+def _drop_bj_only_shortfall(days: dict[_date, list[str]]) -> set[_date]:
+    """剔除「缺失清单全为 .BJ」的 shortfall 日。
+
+    mootdx 无北交所数据、sync_daily 按设计跳过 .BJ——缺失全为 .BJ 的日经
+    mootdx 修复路径永远修不好，保留会让每次启动 backfill / 00:00 巡检都
+    全市场重拉一遍（08-30 案例：基线分区含 338 只跨源补入的 .BJ，mootdx
+    分区恒缺 6.1% > 5% 容忍 → 死循环）。含非 .BJ 缺失的日正常保留。
+    """
+    return {d for d, syms in days.items()
+            if any(not s.endswith(".BJ") for s in syms)}
+
+
 def _index_shortfall_days(
     lookback: int = _INDEX_SHORTFALL_LOOKBACK,
     ratio: float = _INDEX_SHORTFALL_RATIO,
@@ -2295,7 +2306,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
 
     # 2. 日线（股票 + ETF）——统一用一个交易日历；空时补最近窗口
     today = _date.today()
-    stock_daily_shortfall = (set(_shortfall_days(STOCK_DAILY_ROOT))
+    stock_daily_shortfall = (_drop_bj_only_shortfall(_shortfall_days(STOCK_DAILY_ROOT))
                              if shortfall_ok else set())
     etf_daily_shortfall = (set(_shortfall_days(ETF_DAILY_ROOT))
                            if shortfall_ok else set())

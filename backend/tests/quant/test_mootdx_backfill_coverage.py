@@ -324,6 +324,67 @@ def test_backfill_runs_sync_per_gap_day(monkeypatch, tmp_path):
     assert res["daily_days"] == ["2026-08-05", "2026-08-06"]
 
 
+def test_drop_bj_only_shortfall_keeps_mixed_missing():
+    """缺失含非 .BJ 的 shortfall 日保留；全为 .BJ 的剔除。"""
+    from datetime import date as _d
+    days = {
+        _d(2026, 8, 28): ["920000.BJ", "920001.BJ"],      # 全 .BJ → 剔除
+        _d(2026, 8, 27): ["600000.SH", "920000.BJ"],      # 混合 → 保留
+    }
+    assert ms._drop_bj_only_shortfall(days) == {_d(2026, 8, 27)}
+
+
+def test_backfill_skips_bj_only_shortfall_day(monkeypatch, tmp_path):
+    """缺失清单全为 .BJ 的 shortfall 日不应触发 sync_daily（mootdx 修不动）。
+
+    背景：基线分区含 338 只跨源补入的 .BJ，mootdx 分区（按设计跳过 .BJ）
+    恒缺 6.1% > 5% 容忍 → 每次启动/巡检都全市场重拉一遍的死循环。
+    """
+    from datetime import date as _d
+    monkeypatch.setattr(ms, "_date", type("D", (), {"today": staticmethod(lambda: _d(2026, 8, 30))})())
+    for name in ["kline_etf_minute", "kline_daily", "kline_etf_daily",
+                 "kline_index_daily", "kline_minute"]:
+        (tmp_path / name / "date=2026-08-28").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "adj_factor_etf").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["510300.XSHG"],
+        "trade_date": [_d(2026, 8, 28)],
+        "ex_factor": [1.0],
+    }).write_parquet(tmp_path / "adj_factor_etf" / "all.parquet")
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    stock_root = tmp_path / "kline_daily"
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", stock_root)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "ADJ_FACTOR_PATH", tmp_path / "adj_factor_etf" / "all.parquet")
+    _stub_etf_nav(monkeypatch, latest=["2026-08-28"])
+
+    monkeypatch.setattr(ms, "_missing_minute_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
+    monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
+    monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
+    monkeypatch.setattr(ms, "_shortfall_repair_allowed", lambda now=None: True)
+    bj_only = {_d(2026, 8, 28): ["920000.BJ", "920001.BJ"]}
+    monkeypatch.setattr(ms, "_shortfall_days",
+                        lambda root, **kw: dict(bj_only) if root == stock_root else {})
+    monkeypatch.setattr(ms, "_index_shortfall_days", lambda: {})
+    calls = {"n": 0}
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
+
+    res = ms.backfill_to_now()
+    assert calls["n"] == 0
+    assert res["daily_days"] == []
+
+
 def test_backfill_seeds_window_when_root_empty(monkeypatch, tmp_path):
     """股票日线根目录为空 → 用 _trade_days_up_to 窗口 seed。"""
     from datetime import date as _d
@@ -520,6 +581,30 @@ def test_scan_missing_partitions_flags_sparse_etf_daily(tmp_path, monkeypatch):
 
     missing = ms.scan_missing_partitions()
     assert _dt.date(2026, 8, 4) in missing["kline_etf_daily"]
+
+
+def test_scan_missing_partitions_skips_bj_only_shortfall(tmp_path, monkeypatch):
+    """scan_missing_partitions 对缺失全为 .BJ 的 shortfall 日不再判缺失。"""
+    import datetime as _dt
+
+    monkeypatch.setattr(ms, "DATA_ROOT", tmp_path)
+    stock_root = tmp_path / "kline_daily"
+    monkeypatch.setattr(ms, "STOCK_DAILY_ROOT", stock_root)
+    monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
+    monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "kline_index_daily")
+    monkeypatch.setattr(ms, "ETF_MINUTE_ROOT", tmp_path / "kline_etf_minute")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", tmp_path / "kline_minute")
+    monkeypatch.setattr(ms, "_trade_days_in_range", lambda s, e: [])
+    monkeypatch.setattr(ms, "_incomplete_stock_daily_days", lambda recent=None: [])
+    # 08-28 缺失全为 .BJ（应剔除）；08-27 混合缺失（应保留）
+    monkeypatch.setattr(ms, "_shortfall_days", lambda root, **kw: {
+        _dt.date(2026, 8, 28): ["920000.BJ", "920001.BJ"],
+        _dt.date(2026, 8, 27): ["600000.SH", "920000.BJ"],
+    } if root == stock_root else {})
+
+    missing = ms.scan_missing_partitions()
+    assert _dt.date(2026, 8, 28) not in missing["kline_daily"]
+    assert _dt.date(2026, 8, 27) in missing["kline_daily"]
 
 
 def test_backfill_to_now_resyncs_sparse_etf_daily(tmp_path, monkeypatch):
