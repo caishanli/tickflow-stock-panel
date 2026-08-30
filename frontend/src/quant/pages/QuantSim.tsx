@@ -753,7 +753,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   }, [stopLossList])
 
   return (
-    <div className="flex-1 overflow-auto p-4 space-y-4">
+    <div className="flex-1 min-h-0 overflow-y-auto flex flex-col p-4 space-y-4">
       {/* 顶栏：返回 + 账户信息 + 控制 */}
       <div className="flex items-center gap-3 flex-wrap rounded-card border border-border bg-surface px-4 py-2.5">
         <button onClick={onBack}
@@ -969,8 +969,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         )}
       </div>
 
-      {/* Tab：成交记录 / 止损日志 / 运行日志 */}
-      <div className="rounded-card border border-border bg-surface overflow-hidden">
+      {/* Tab：成交记录 / 止损日志 / 运行日志 —— 卡片吃掉剩余视口高度，列表在卡内滚动 */}
+      <div className="rounded-card border border-border bg-surface overflow-hidden flex flex-col flex-1 min-h-[16rem]">
         <div className="flex gap-1 px-3 pt-3 pb-2 border-b border-border/60">
           {([['trades', `成交记录 (${tradeList.length})`],
              ['stoploss', `止损日志 (${stoplossRows.length})`],
@@ -984,7 +984,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         </div>
         {tab === 'trades' && (
           tradeList.length > 0 ? (
-            <div className="overflow-auto max-h-64">
+            <div className="flex-1 min-h-[12rem] overflow-auto">
               <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
@@ -1059,11 +1059,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </tbody>
               </table>
             </div>
-          ) : <div className="px-4 py-4 text-xs text-muted">暂无成交</div>
+          ) : <div className="flex-1 px-4 py-4 text-xs text-muted">暂无成交</div>
         )}
         {tab === 'stoploss' && (
           stoplossRows.length > 0 ? (
-            <div className="overflow-auto max-h-64">
+            <div className="flex-1 min-h-[12rem] overflow-auto">
               <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
@@ -1102,10 +1102,10 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </tbody>
               </table>
             </div>
-          ) : <div className="px-4 py-4 text-xs text-muted">暂无止损</div>
+          ) : <div className="flex-1 px-4 py-4 text-xs text-muted">暂无止损</div>
         )}
         {tab === 'logs' && (
-          <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+          <div className="flex-1 min-h-[12rem] overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
             {logList.length > 0 ? [...logList].reverse().map((l: any, i: number) => (
               <div key={i} className={l.level === 'error' ? 'text-bear' : l.level === 'warn' ? 'text-warning' : ''}>
                 {`${l.ts ?? ''} [${l.level ?? 'info'}] ${l.message ?? ''}`}
@@ -1114,7 +1114,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           </div>
         )}
         {tab === 'alerts' && (
-          <div className="max-h-64 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+          <div className="flex-1 min-h-[12rem] overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
             {alertList.length > 0 ? [...alertList].reverse().map((l: any, i: number) => (
               <div key={i} className={l.level === 'error' ? 'text-bear' : 'text-warning'}>
                 {`${l.ts ?? ''} [${l.level ?? 'warn'}] ${l.message ?? ''}`}
