@@ -73,3 +73,24 @@ def test_ttl_cache_purge_expired_and_set_returns_value():
     assert c.get_or_fetch("live", ttl=60, loader=lambda: "other") == "keep"
     # set 返回值链路: get_or_fetch 必须拿到 loader 的结果而非 None
     assert c.get_or_fetch("k2", ttl=60, loader=lambda: {"v": 1}) == {"v": 1}
+
+
+def test_ttl_cache_set_triggered_purge_does_not_deadlock():
+    """回归 e583b73：set() 持有锁时摊销触发 purge_expired()，后者再次 `with
+    self._lock`。普通 threading.Lock 不可同线程重入 → 第 32 次 set 自死锁、
+    永久卡死该缓存并连带全部 get_minute 请求；锁必须可重入(RLock)。"""
+    c = TTLCache()
+    done = {}
+
+    def hammer():
+        for i in range(64):  # 超过 32，摊销清理触发两次
+            c.set(f"k{i}", i, ttl=60)
+        done["ok"] = True
+
+    t = threading.Thread(target=hammer)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "set 触发 purge 自死锁（锁须可重入）"
+    assert done.get("ok")
+    # 锁未卡死：其它线程仍能正常访问
+    assert c.get("k0") == 0

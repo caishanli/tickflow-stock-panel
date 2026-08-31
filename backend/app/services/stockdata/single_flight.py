@@ -63,7 +63,10 @@ class TTLCache:
 
     def __init__(self) -> None:
         self._items: dict[str, tuple[float, Any]] = {}
-        self._lock = threading.Lock()
+        # 必须用 RLock：set() 在持有锁时会调用 purge_expired()（每 32 次摊销清理），
+        # purge_expired 内部再次 `with self._lock`——普通 Lock 非同线程可重入，
+        # 同线程重入会永久阻塞并连带卡死全部 get_minute 请求（回归 e583b73）。
+        self._lock = threading.RLock()
         self._sets_since_purge = 0
 
     def get(self, key: str) -> Any | None:
