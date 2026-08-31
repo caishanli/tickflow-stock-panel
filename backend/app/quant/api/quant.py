@@ -515,6 +515,8 @@ def sim_stream(aid: str, since_id: int | None = None):
                        or max_eq > off_eq or status != last_status or state_changed)
             if has_new:
                 if status != last_status or state_changed:
+                    trades = db.get_sim_trades(aid)
+                    _augment_positions_with_cleared_today(state, trades)
                     yield f"event: status\ndata: {_json.dumps({'status': status, 'state': state}, ensure_ascii=False)}\n\n"
                     last_status = status
                     last_state_sig = state_sig

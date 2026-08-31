@@ -753,7 +753,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
   }, [stopLossList])
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto flex flex-col p-4 space-y-4">
+    <div className="flex-1 min-h-0 overflow-y-auto max-md:flex-none max-md:min-h-0 max-md:overflow-visible flex flex-col p-4 space-y-4">
       {/* 顶栏：返回 + 账户信息 + 控制 */}
       <div className="flex items-center gap-3 flex-wrap rounded-card border border-border bg-surface px-4 py-2.5">
         <button onClick={onBack}
@@ -885,9 +885,9 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           </div>
         </div>
         {Array.isArray(eq) && eq.length > 0 ? (
-          <ReactECharts option={curve} style={{ height: 300 }} notMerge />
+          <ReactECharts option={curve} style={{ height: typeof window !== 'undefined' && window.innerWidth < 640 ? 200 : 300 }} notMerge />
         ) : (
-          <div className="h-[300px] grid place-items-center text-xs text-muted">
+          <div className="h-[200px] sm:h-[300px] grid place-items-center text-xs text-muted">
             暂无净值数据（启动后开始累计）
           </div>
         )}
@@ -897,12 +897,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       <div className="rounded-card border border-border bg-surface overflow-hidden">
         <div className="px-4 pt-3 pb-2 text-xs text-foreground font-medium">持仓 ({posEntries.length})</div>
         {posEntries.length > 0 ? (
-          <div className="overflow-auto max-h-60">
+          <div className="overflow-auto">
             <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">买入时间</th>
-                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-30 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">买入时间</th>
+                    <th className="sticky top-0 z-30 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">数量</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">成本</th>
@@ -935,11 +935,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                           })
                         }}
                         className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                        <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
+                        <td className="max-md:sticky max-md:left-0 max-md:z-20 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={entryTs.full}>
                           <div className="num">{p.entry_ts ? entryTs.d : '—'}</div>
                           {p.entry_ts && entryTs.t && <div className="num">{entryTs.t}</div>}
                         </td>
-                        <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
+                        <td className="max-md:sticky max-md:left-20 max-md:z-20 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{p.name ?? ''}</td>
                         <td className="px-3 py-1.5 text-muted">{sym}</td>
                         <td className="px-3 py-1.5 num">{p.amount}</td>
                         <td className="px-3 py-1.5 num">{fmtNum(p.avg_cost, 3)}</td>
@@ -970,7 +970,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       </div>
 
       {/* Tab：成交记录 / 止损日志 / 运行日志 —— 卡片吃掉剩余视口高度，列表在卡内滚动 */}
-      <div className="rounded-card border border-border bg-surface overflow-hidden flex flex-col flex-1 min-h-[16rem]">
+      <div className="rounded-card border border-border bg-surface overflow-hidden flex flex-col flex-1 min-h-[16rem] max-md:flex-none max-md:min-h-0 max-md:h-96">
         <div className="flex gap-1 px-3 pt-3 pb-2 border-b border-border/60">
           {([['trades', `成交记录 (${tradeList.length})`],
              ['stoploss', `止损日志 (${stoplossRows.length})`],
@@ -984,12 +984,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         </div>
         {tab === 'trades' && (
           tradeList.length > 0 ? (
-            <div className="flex-1 min-h-[12rem] overflow-auto">
+            <div className="flex-1 min-h-[12rem] max-md:min-h-0 overflow-auto">
               <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
-                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-30 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky top-0 z-30 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">持仓时长</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
@@ -1015,11 +1015,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                         })
                       }}
                       className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
-                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                      <td className="max-md:sticky max-md:left-0 max-md:z-20 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
                       </td>
-                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
+                      <td className="max-md:sticky max-md:left-20 max-md:z-20 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       {(() => {
                         const holdDays = t.action === 'BUY'
@@ -1063,12 +1063,12 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         )}
         {tab === 'stoploss' && (
           stoplossRows.length > 0 ? (
-            <div className="flex-1 min-h-[12rem] overflow-auto">
+            <div className="flex-1 min-h-[12rem] max-md:min-h-0 overflow-auto">
               <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
-                    <th className="sticky top-0 z-20 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
-                    <th className="sticky top-0 z-20 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
+                    <th className="sticky top-0 z-30 bg-surface max-md:left-0 w-20 min-w-[5rem] leading-tight px-3 py-1.5 font-normal">时间</th>
+                    <th className="sticky top-0 z-30 bg-surface max-md:left-20 px-3 py-1.5 font-normal max-md:border-r max-md:border-border">名称</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">代码</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">方向</th>
                     <th className="sticky top-0 z-20 bg-surface px-3 py-1.5 font-normal">价格</th>
@@ -1081,11 +1081,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 <tbody className="text-foreground">
                   {[...stoplossRows].reverse().map((t: any, i: number) => (
                     <tr key={i} className="group border-t border-border/60 hover:bg-elevated/60 transition-colors">
-                      <td className="max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
+                      <td className="max-md:sticky max-md:left-0 max-md:z-20 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
                       </td>
-                      <td className="max-md:sticky max-md:left-20 max-md:z-10 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
+                      <td className="max-md:sticky max-md:left-20 max-md:z-20 max-md:bg-surface max-md:group-hover:bg-elevated px-3 py-1.5 max-md:border-r max-md:border-border">{t.name ?? ''}</td>
                       <td className="px-3 py-1.5 text-muted">{t.code ?? ''}</td>
                       <td className="px-3 py-1.5 text-bear">止损</td>
                       <td className="px-3 py-1.5 num">{fmtNum(t.price, 3)}</td>
@@ -1105,7 +1105,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           ) : <div className="flex-1 px-4 py-4 text-xs text-muted">暂无止损</div>
         )}
         {tab === 'logs' && (
-          <div className="flex-1 min-h-[12rem] overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+          <div className="flex-1 min-h-[12rem] max-md:min-h-0 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
             {logList.length > 0 ? [...logList].reverse().map((l: any, i: number) => (
               <div key={i} className={l.level === 'error' ? 'text-bear' : l.level === 'warn' ? 'text-warning' : ''}>
                 {`${l.ts ?? ''} [${l.level ?? 'info'}] ${l.message ?? ''}`}
@@ -1114,7 +1114,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           </div>
         )}
         {tab === 'alerts' && (
-          <div className="flex-1 min-h-[12rem] overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
+          <div className="flex-1 min-h-[12rem] max-md:min-h-0 overflow-auto p-3 space-y-0.5 text-[11px] text-muted font-mono">
             {alertList.length > 0 ? [...alertList].reverse().map((l: any, i: number) => (
               <div key={i} className={l.level === 'error' ? 'text-bear' : 'text-warning'}>
                 {`${l.ts ?? ''} [${l.level ?? 'warn'}] ${l.message ?? ''}`}
