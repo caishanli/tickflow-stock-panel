@@ -894,7 +894,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       </div>
 
       {/* 持仓 */}
-      <div className="rounded-card border border-border bg-surface overflow-hidden">
+      <div className="rounded-card border border-border bg-surface overflow-hidden shrink-0">
         <div className="px-4 pt-3 pb-2 text-xs text-foreground font-medium">持仓 ({posEntries.length})</div>
         {posEntries.length > 0 ? (
           <div className="overflow-auto">
