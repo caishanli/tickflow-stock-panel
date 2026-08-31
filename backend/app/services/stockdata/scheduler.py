@@ -307,11 +307,12 @@ def _midnight_clear_loop(data_sources) -> None:
 
 
 def _dayfile_sweep_loop(data_sources, interval: float = 10.0) -> None:
-    """每 10s 清扫日线日期文件缓存：先踢超 60s 未访问，再按最后访问踢旧至 ≤60。
+    """每 10s 清扫缓存：dayfile LRU 踢旧 + 结果缓存过期清理 + 归还空闲堆。
 
     纯后台清扫、访问时不清理（spec 2026-08-21-stockdata-daily-dayfile-lru-design
     第 1 节卸载规则）；异常只记日志不退出，下次循环继续。
     """
+    trim = _malloc_trim()
     while not _stop.is_set():
         time.sleep(interval)
         try:
@@ -320,6 +321,37 @@ def _dayfile_sweep_loop(data_sources, interval: float = 10.0) -> None:
                 logger.debug("stockdata dayfile cache sweep evicted %d files", evicted)
         except Exception:  # noqa: BLE001
             logger.warning("stockdata dayfile cache sweep failed", exc_info=True)
+        try:
+            # TTL 结果缓存（get_minute 大窗口帧等）过期清理不能只挂在 set 上：
+            # 回测/批量任务结束后流量归零，最后几个大帧会永久驻留（实测 RSS
+            # 停在 1.9GB 不回落），由本循环周期清掉。
+            purged = data_sources.dedup.purge_expired()
+            if purged:
+                logger.debug("stockdata result cache purge expired %d entries", purged)
+        except Exception:  # noqa: BLE001
+            logger.warning("stockdata result cache purge failed", exc_info=True)
+        if trim is not None:
+            try:
+                trim()
+            except Exception:  # noqa: BLE001
+                logger.warning("stockdata malloc_trim failed", exc_info=True)
+
+
+def _malloc_trim():
+    """glibc malloc_trim（Linux）：把已释放但未归还 OS 的堆页交还，RSS 回落。
+
+    polars/pandas 大帧释放后 glibc 常把内存留在 arena 不还 OS，服务 RSS 长期
+    停在峰值（匿名页 ~1.6GB）。无 glibc / 调用失败时返回 None 并跳过。
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim.argtypes = [ctypes.c_size_t]
+        libc.malloc_trim.restype = ctypes.c_int
+        return lambda: libc.malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def trigger_sync(kind: str, **params) -> dict:

@@ -61,3 +61,15 @@ def test_ttl_cache_expires():
     time.sleep(0.15)
     c.get_or_fetch("k", ttl=0.1, loader=loader)
     assert len(calls) == 2
+
+
+def test_ttl_cache_purge_expired_and_set_returns_value():
+    """purge_expired 主动清理过期键(无流量时由后台清扫调用); set 恒返回 value。"""
+    c = DedupCache()
+    assert c.get_or_fetch("big", ttl=0.1, loader=lambda: "frame") == "frame"
+    assert c.get_or_fetch("live", ttl=60, loader=lambda: "keep") == "keep"
+    time.sleep(0.15)
+    assert c.purge_expired() == 1  # 过期大帧被清, 无人访问也回收
+    assert c.get_or_fetch("live", ttl=60, loader=lambda: "other") == "keep"
+    # set 返回值链路: get_or_fetch 必须拿到 loader 的结果而非 None
+    assert c.get_or_fetch("k2", ttl=60, loader=lambda: {"v": 1}) == {"v": 1}

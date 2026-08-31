@@ -83,15 +83,26 @@ class TTLCache:
             # 过期条目原先只在同 key 再次 get 时才删除；key 空间随天数/请求
             # 组合增长（如 min:{codes}:{lo}:{hi} 每日每池一键、值含全池分钟
             # 窗口帧）时，无人再访问的键连同大帧一起永久驻留 → 服务 RSS 随
-            # 运行时长膨胀到数 GB。每 32 次 set 摊销清理一次过期键。
+            # 运行时长膨胀到数 GB。每次 set 摊销清理（每 32 次），流量内自愈。
             self._sets_since_purge += 1
             if self._sets_since_purge >= 32:
-                self._sets_since_purge = 0
-                now = time.monotonic()
-                expired = [k for k, (exp, _v) in self._items.items() if now > exp]
-                for k in expired:
-                    del self._items[k]
+                self.purge_expired()
         return value
+
+    def purge_expired(self) -> int:
+        """清理全部已过期条目，返回清理数。
+
+        set 内摊销触发只覆盖「有流量」的场景；回测/批量任务结束后流量归零，
+        最后几个大帧（全池分钟窗口）会一直驻留到期满后被人工访问或下次 set
+        ——所以还要由后台清扫线程周期调用，保证无流量时内存也回落。
+        """
+        now = time.monotonic()
+        with self._lock:
+            expired = [k for k, (exp, _v) in self._items.items() if now > exp]
+            for k in expired:
+                del self._items[k]
+            self._sets_since_purge = 0
+        return len(expired)
 
 
 class DedupCache:
@@ -108,3 +119,6 @@ class DedupCache:
         # 双检：并发时 single-flight 保证 loader 只执行一次
         return self._single.run(
             key, lambda: self._cache.set(key, loader(), ttl))
+
+    def purge_expired(self) -> int:
+        return self._cache.purge_expired()
