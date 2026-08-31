@@ -945,11 +945,16 @@ def get_security_name(code):
                 mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
         pure = code.split(".")[0]
         if pure in mootdx_names:
+            base_name = mootdx_names[pure]
+            # 智能分类模式：对 ETF 名称添加分类前缀
+            if _name_source() == "smart":
+                from ....smart_classification import get_smart_name
+                base_name = get_smart_name(code, base_name)
             if names is None:
                 names = {}
-            names[code] = mootdx_names[pure]
+            names[code] = base_name
             _state["sec_names"] = names
-            return mootdx_names[pure]
+            return base_name
         try:
             etfs = mgr.fetch("get_etf_list")
             if etfs:
@@ -962,7 +967,12 @@ def get_security_name(code):
                 _state["sec_names"] = names
         except Exception:
             pass
-    return names.get(code, code) if names else code
+    result = names.get(code, code) if names else code
+    # 智能分类模式：对未缓存的名称也添加分类前缀
+    if _name_source() == "smart" and result != code:
+        from ....smart_classification import get_smart_name
+        result = get_smart_name(code, result)
+    return result
 
 
 def _ts_code_to_jq_code(ts_code):
@@ -993,6 +1003,11 @@ def get_all_securities(types=None, date=None):
         jq = _jq_names()
         if jq:
             mootdx_names = {c.split(".")[0]: n for c, n in jq.items()}
+    # 智能分类模式：导入分类函数
+    smart_classify = None
+    if _name_source() == "smart":
+        from ....smart_classification import get_smart_name
+        smart_classify = get_smart_name
     records = []
     for t in types:
         try:
@@ -1007,6 +1022,9 @@ def get_all_securities(types=None, date=None):
                     code = _ts_code_to_jq_code(item)
                     pure = code.split(".")[0]
                     name = mootdx_names.get(pure, code)
+                    # 智能分类：添加分类前缀
+                    if smart_classify and name != code:
+                        name = smart_classify(code, name)
                     records.append({"code": code, "display_name": name,
                                     "name": name, "start_date": "2000-01-01",
                                     "end_date": "2200-01-01", "type": t})
@@ -1015,6 +1033,9 @@ def get_all_securities(types=None, date=None):
                     code = _ts_code_to_jq_code(ts_code)
                     pure = code.split(".")[0]
                     name = mootdx_names.get(pure, item.get("name", code))
+                    # 智能分类：添加分类前缀
+                    if smart_classify and name != code:
+                        name = smart_classify(code, name)
                     list_date = item.get("list_date", "")
                     if list_date and len(str(list_date)) == 8:
                         sd = f"{list_date[:4]}-{list_date[4:6]}-{list_date[6:8]}"

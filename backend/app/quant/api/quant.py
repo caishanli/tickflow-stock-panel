@@ -611,8 +611,8 @@ def sim_name_source_get():
 @router.put("/sim/settings/name-source")
 def sim_name_source_put(body: dict):
     src = body.get("source", "jq")
-    if src not in ("jq", "tdx"):
-        raise HTTPException(400, "source must be 'jq' or 'tdx'")
+    if src not in ("jq", "tdx", "smart"):
+        raise HTTPException(400, "source must be 'jq', 'tdx', or 'smart'")
     db.set_quant_setting("sim_strategy_name_source", src)
     return {"data": {"source": src}}
 

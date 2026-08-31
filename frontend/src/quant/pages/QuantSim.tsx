@@ -526,7 +526,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     queryKey: ['quant', 'sim', 'name-source'], queryFn: () => api.getSimNameSource(),
   })
   const toggleNameSource = useMutation({
-    mutationFn: (src: 'jq' | 'tdx') => api.setSimNameSource(src),
+    mutationFn: (src: 'jq' | 'tdx' | 'smart') => api.setSimNameSource(src),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['quant', 'sim', 'name-source'] }) },
   })
 
@@ -781,9 +781,13 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           初始资金 {fmtNum(acct.capital)} · 止损 {fmtStopLoss(acct.stop_loss)} · 策略 {strategyName(acct.strategy_id)} · {FREQ_LABEL[acct.frequency] ?? '分钟级'}
           {acct.start_date ? ` · 自 ${acct.start_date}` : ''}
         </span>
-        <button onClick={() => toggleNameSource.mutate(nameSource?.source === 'jq' ? 'tdx' : 'jq')}
+        <button onClick={() => {
+          const current = nameSource?.source || 'jq'
+          const next = current === 'jq' ? 'tdx' : current === 'tdx' ? 'smart' : 'jq'
+          toggleNameSource.mutate(next)
+        }}
           className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg bg-elevated text-foreground text-xs">
-           标的名称源：{nameSource?.source === 'tdx' ? '通达信' : '聚宽'}
+           标的名称源：{nameSource?.source === 'tdx' ? '通达信' : nameSource?.source === 'smart' ? '智能分类' : '聚宽'}
         </button>
         <div className="ml-auto flex gap-2">
           <button onClick={() => setShowDingtalkCfg(true)}
