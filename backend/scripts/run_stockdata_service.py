@@ -8,6 +8,13 @@ import os
 import signal
 import threading
 
+# polars 静态捆绑 rusty-jemalloc：释放的大帧以 MADV_FREE 惰性持有（smaps_rollup
+# 的 LazyFree 计数，实测回测后 ~1.5GB），内核按需零成本回收、MemAvailable 不受
+# 影响，属 RSS 表观滞留而非泄漏；该回收模式是编译期行为，env 无法改为强制归还。
+# decay 置 0 只对 dirty 层（MADV_DONTNEED 即时归还）有效，保留无害。须在任何
+# import 触发 jemalloc 初始化（即加载 polars）之前设置。
+os.environ.setdefault("_RJEM_MALLOC_CONF", "dirty_decay_ms:0,muzzy_decay_ms:0")
+
 from app.services.stockdata import scheduler
 from app.services.stockdata.server import StockDataServer
 from app.services.stockdata.sources import DataSources
