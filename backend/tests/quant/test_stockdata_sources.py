@@ -536,3 +536,46 @@ def test_load_adj_factors_ignores_xdxr_events(tmp_path):
     df = s._load_adj_factors()
     assert df["symbol"].to_list() == ["510300.SH"]
     assert df["ex_factor"].to_list() == [0.99]
+
+
+def test_get_minute_concurrent_past_purge_threshold_no_deadlock(tmp_path):
+    """回归 e583b73（08-31 生产事故）：s.get_minute 并发多键跨过 DedupCache 摊销
+    清理阈值（32 次 set）时不得自死锁。
+
+    事故链：第 32 次 set 持锁调 purge_expired → 重入不可重入 Lock → 锁永久被占，
+    全部 get_minute 请求排队卡死（当日 6 个模拟盘 13:10 流水线停摆 ~50 分钟）。
+    旧代码此用例必挂（线程 join 超时），修复（RLock）后通过。
+    """
+    import threading
+
+    day = _dt.date.today().isoformat()
+    # 写几个历史日的 ETF 分钟分区，让 get_minute 从分区取数
+    for d in ("2026-08-24", "2026-08-25", "2026-08-26", day):
+        rows = []
+        for sym in ("518880.SH", "513030.SH"):
+            for m in range(10):
+                rows.append({"symbol": sym, "datetime": f"{d} 09:{30 + m % 29:02d}:00",
+                             "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                             "volume": 1000, "amount": 1000.0})
+        _write_minute(str(tmp_path), "kline_etf_minute", d, rows)
+
+    s = DataSources(data_root=str(tmp_path), mootdx_factory=None, fetch_workers=2)
+    results = [None] * 40
+
+    def worker(i):
+        code = "518880.XSHG" if i % 2 == 0 else "513030.XSHG"
+        # 每个 worker 的 lo 窗口不同 → 40 个不同缓存键（>32）→ 触发摊销清理
+        lo = f"2026-08-{1 + i % 28:02d} 00:00:00"
+        hi = "2026-08-31 00:00:00"
+        try:
+            results[i] = len(s.get_minute([code], lo, hi))
+        except Exception as e:
+            results[i] = e
+
+    ts = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(40)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=8)
+    assert all(not t.is_alive() for t in ts), "s.get_minute 并发触发 purge 自死锁"
+    assert all(isinstance(r, int) and r >= 0 for r in results)

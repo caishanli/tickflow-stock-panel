@@ -55,6 +55,18 @@ uv run --extra dev mypy app               # 类型检查
   - 模拟盘对齐 `sim_260710`：`uv run python scripts/run_quant_sim.py --create --name align --capital 100000 --strategy-id e33bea48 --start-date 2026-07-10 --account-id wufu_v52_sim` 创建账户，再 `python scripts/run_quant_sim.py wufu_v52_sim` 历史补跑至今天。验收 = 补跑区间内（≤fixture 末日）交易组 100% 被 `live_transaction_list.csv` 覆盖、共同组成交价比中位 ≥0.999（2026-08-21 实测：17/17 全覆盖）。
   - 回测性能门禁：wufu-v5.2 `260401-260716` 全程 ≤120s——`uv run --extra dev pytest -m integration tests/quant/test_wufu_backtest_perf.py -q`。
 
+### 并发/锁纪律 + stockdata 测试（2026-08-31 死锁事故教训）
+
+- **事故**：`e583b73`（08-31 08:02）把 `TTLCache.set()` 内联的摊销清理重构为 `purge_expired()` 方法时，方法内再次 `with self._lock`——`threading.Lock` 不可同线程重入，**第 32 次 set 自死锁**、锁永久被占，之后全部 `get_minute` 请求排队卡死，6 个模拟盘 13:10 流水线停摆 ~50 分钟（本地账户 14:06 才用残缺数据补跑）。修复 `53e0114`（换 `RLock`）。
+- **纪律**：**任何锁类不得在持有锁时调用本类另一个取同一把锁的方法**（普通 Lock 即自死锁）；确需嵌套必须用 `threading.RLock()`。把"锁内逻辑"抽成 helper 方法时尤其容易踩（原逻辑在锁内是安全的，抽成方法后方法体再 `with self._lock` 就炸）。
+- **结构防护**：`tests/quant/test_stockdata_single_flight.py::test_stockdata_locks_no_reentrant_deadlock_pattern` 用 AST 静态扫描 `stockdata/` 各锁类，检测"锁内调本类加锁方法但锁非 RLock"并拒绝——防止将来再抽这类 helper 引入同类死锁。
+- **功能回归**（把 `TTLCache._lock` 改回 `Lock()` 时全部必挂）：
+  - `test_ttl_cache_set_triggered_purge_does_not_deadlock`：64 次 set 触发 2 轮 purge 不死锁；
+  - `test_dedup_cache_concurrent_stress_past_purge_threshold`：40 线程并发 >32 键跨阈值；
+  - `test_stockdata_sources.py::test_get_minute_concurrent_past_purge_threshold_no_deadlock`：DataSources 级并发 `get_minute`（生产事故同款链路）。
+- **并发/死锁类测试一律用 `daemon=True` 线程 + `join(timeout)` 断言**——否则回归时死锁线程（非 daemon）会阻塞 pytest 进程退出，把整个套件挂死而不是干净失败。
+- 跑 stockdata 测试：`uv run --extra dev pytest tests/quant/test_stockdata_single_flight.py tests/quant/test_stockdata_sources.py tests/quant/test_stockdata_dayfile_cache.py -q`。
+
 ## mootdx 数据服务（stock data 服务的数据源/回源实现）
 
 - `backend/app/services/mootdx_service.py`：stock data 服务内部多源之一（mootdx 回源），被 `stockdata/scheduler.py` 与 `stockdata/sources.py` 消费。
