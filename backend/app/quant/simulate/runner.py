@@ -1195,15 +1195,6 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     # 必须非 None，否则 ptrade 移植策略 _today().date() 直接 AttributeError
     # （960366ab 08-21 计算全局阈值异常根因之一）。
     _ensure_current_dt(ctx)
-    _emit_log(account_id, "info", "策略编译完成，正在初始化数据与指标…")
-    try:
-        bundle.init_fn(ctx)
-    except Exception as e:
-        db.update_sim_account(account_id, status="failed")
-        _emit_log(account_id, "error", f"策略 init 异常: {e}")
-        return
-    # initialize 后把策略 g.* 池子注入 universe（首次构建 + 打破回放取价死锁）
-    _seed_universe(ctx)
     aux = {"jq_api": jq_api, "start_cash": start_cash, "fired": set(),
            "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
            "frequency": (acct.get("frequency") or "minute"), "daily_done": None,
@@ -1233,7 +1224,18 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                     _replay_day_notifies.append((str(ts)[11:16], msg))
         else:
             _emit_log(account_id, level, msg)
+    # sink 必须先于 init_fn 注入：策略 initialize 里的 log.info（如走弱期判定）
+    # 才能落库，否则 init 阶段日志全部丢失（2026-09-02 无状态化验证发现）。
     jq_api._state["log_sink"] = _replay_log_sink
+    _emit_log(account_id, "info", "策略编译完成，正在初始化数据与指标…")
+    try:
+        bundle.init_fn(ctx)
+    except Exception as e:
+        db.update_sim_account(account_id, status="failed")
+        _emit_log(account_id, "error", f"策略 init 异常: {e}")
+        return
+    # initialize 后把策略 g.* 池子注入 universe（首次构建 + 打破回放取价死锁）
+    _seed_universe(ctx)
     start_date = (acct.get("start_date") or "").strip()
     _emit_log(account_id, "info",
               f"策略模拟盘启动: {sid} 资金 {start_cash}{'（恢复续跑）' if has_saved else ''}"
