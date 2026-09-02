@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 克隆模拟盘 d092ad90 为新账户（镜像当前状态），新账户策略在每天 11:30/13:01 发预买卖报告（预测 13:10 调仓，卖出按"最可能"排前3）到 log+钉钉。
+**Goal:** 克隆模拟盘 d092ad90 为新账户（镜像当前状态），新账户策略在每天 11:20/13:01 发预买卖报告（预测 13:10 调仓，卖出按"最可能"排前3）到 log+钉钉。
 
 **Architecture:** 策略文件副本内置两个 `run_daily` 预报告任务，复用现有 `get_final_ranked_etfs` 加 quiet 参数实现同口径预测；`log.notify` 自动落 sim_logs+推钉钉。`run_quant_sim.py` 加 `--clone-from` 克隆账户配置与 sim_state。
 
@@ -27,7 +27,7 @@
 
 **Interfaces:**
 - Produces: `get_final_ranked_etfs(context, quiet=False)`（原签名加参）；`pre_trade_report(context)`；`_build_pre_trade_message(context, tag, ranked)`；`_pre_report_target_codes(context, ranked)`；`PRE_REPORT_TOP_SELLS=3`
-- 引擎事实（已核实）：`_fire_session` 的去重 key 是 `(id(func), str(task_time))`——同一函数注册 11:30 与 13:01 各触发一次；`in_trading` 含 11:30 边界，11:30 bar 会处理。
+- 引擎事实（已核实）：`_fire_session` 的去重 key 是 `(id(func), str(task_time))`——同一函数注册 11:20 与 13:01 各触发一次；`in_trading` 含 11:20 边界，11:20 bar 会处理。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -51,7 +51,7 @@ def test_strategy_compiles():
 
 def test_strategy_registers_two_pre_reports_and_quiet_call():
     src = STRATEGY.read_text(encoding="utf-8")
-    assert "run_daily(pre_trade_report, time='11:30')" in src
+    assert "run_daily(pre_trade_report, time='11:20')" in src
     assert "run_daily(pre_trade_report, time='13:01')" in src
     assert "get_final_ranked_etfs(context, quiet=True)" in src
     assert src.count("if not quiet:") >= 4  # 头部2行info + 保护告警 + 全量表×2处
@@ -139,7 +139,7 @@ def test_report_sell_worst_rank_first_truncates_three():
     ns = _load_strategy()
     _prep(ns, holdings_num=1)                                # 目标仅 A
     ctx = _make_ctx({"C.XSHE": 100, "D.XSHG": 200, "E.XSHE": 300, "F.XSHE": 400})
-    msg = ns["_build_pre_trade_message"](ctx, "11:30", [FULL[0]])
+    msg = ns["_build_pre_trade_message"](ctx, "11:20", [FULL[0]])
     assert "📤 预计卖出（最可能前3）：" in msg
     lines = [ln for ln in msg.splitlines() if ln[:1].isdigit() or ln.startswith(("1️⃣", "2️⃣", "3️⃣"))]
     assert len(lines) == 3
@@ -214,14 +214,14 @@ cp data/quant_strategies/wufu-v5.4-ding-report.py backend/tests/fixtures/wufu_v5
 3a. 文件头注释块末尾（第 9 行 `#   静默跳过...不基于残缺排名换仓。` 之后）加一行：
 
 ```python
-# v5.4-report（2026-08-25）：克隆 wufu-v5.4-ding；每天 11:30/13:01 预买卖报告
+# v5.4-report（2026-08-25）：克隆 wufu-v5.4-ding；每天 11:20/13:01 预买卖报告
 #   （预测 13:10 调仓：预计买入 + 最可能卖出前3），log.notify 落库+推钉钉。
 ```
 
 3b. `initialize` 内，buy_routine 注册行之后插入两行：
 
 ```python
-    run_daily(pre_trade_report, time='11:30')           # 预买卖报告：午间场（预测 13:10 调仓）
+    run_daily(pre_trade_report, time='11:20')           # 预买卖报告：午间场（预测 13:10 调仓）
     run_daily(pre_trade_report, time='13:01')           # 预买卖报告：尾盘场（距决策9分钟）
 ```
 
@@ -271,7 +271,7 @@ PRE_REPORT_TOP_SELLS = 3       # 卖出候选最多展示前 3
 
 
 def pre_trade_report(context):
-    """11:30 / 13:01 预买卖报告：预测 13:10 调仓（预计买入 + 最可能卖出前3）。
+    """11:20 / 13:01 预买卖报告：预测 13:10 调仓（预计买入 + 最可能卖出前3）。
 
     直接复用 get_final_ranked_etfs(quiet=True)，与 13:10 正式管线完全同口径
     （含持仓宽容/数据缺失保护）。结果走 log.notify：落 sim_logs 并推钉钉。
@@ -393,7 +393,7 @@ Expected: cmp 无输出；测试全部 PASS。
 
 ```bash
 git add backend/tests/fixtures/wufu_v54/wufu-v5.4-ding-report.py backend/tests/quant/test_wufu_ding_report_strategy.py
-git commit -m "feat: wufu-v5.4-report 策略副本——11:30/13:01 预买卖报告（预测13:10调仓，卖前3）"
+git commit -m "feat: wufu-v5.4-report 策略副本——11:20/13:01 预买卖报告（预测13:10调仓，卖前3）"
 ```
 
 ---

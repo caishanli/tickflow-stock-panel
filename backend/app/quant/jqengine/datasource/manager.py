@@ -237,6 +237,10 @@ class DataManager:
         self._DAILY_LOOKBACK_DAYS = 400
         self._minute_real_cov = {}  # code -> (min_ts, max_ts) mootdx 真实分钟覆盖区间
         self._offline = False       # 回测离线模式：本地优先，缺失不联网回源
+        # 补跑模式：推演的是历史交易日，分区早已落盘、不会再被 15:35 同步修订，
+        # 因此日线允许走进程缓存，跳过"近端历史永远回源"的新鲜度检查（见 fetch）。
+        # 由 simulate.runner 在补跑历史日区间内置位、进入今日/实时后置回 False。
+        self._replay_mode = False
         # 数据源取数失败计数：同一源连续返回空/异常 N 次即自动降级到末位并持久化，
         # 避免低效源反复先试。
         self._src_fail = {}
@@ -646,6 +650,9 @@ class DataManager:
                 # 历史（end 早于窗口）才走缓存；离线/回测模式数据冻结一律走缓存。
                 if (DataCache._covers(mem, req_start, req_end)
                         and (getattr(self, "_offline", False)
+                             # 补跑：推演历史日，分区已定稿不会被修订，新鲜度
+                             # 回源纯属浪费（实测占补跑耗时 ~50%），豁免之。
+                             or getattr(self, "_replay_mode", False)
                              or not _is_recent_history_end(req_end))):
                     return mem
             # 覆盖不足不预先删除旧帧：先回源，成功才经 _put_daily_mem_protected

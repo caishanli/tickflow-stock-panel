@@ -15,7 +15,7 @@ def test_strategy_compiles():
 
 def test_strategy_registers_two_pre_reports_and_quiet_call():
     src = STRATEGY.read_text(encoding="utf-8")
-    assert "run_daily(pre_trade_report, time='11:30')" in src
+    assert "run_daily(pre_trade_report, time='11:20')" in src
     assert "run_daily(pre_trade_report, time='13:01')" in src
     assert "get_final_ranked_etfs(context, quiet=True)" in src
     assert src.count("if not quiet:") >= 4
@@ -106,7 +106,7 @@ def test_report_lists_top2_candidates():
     assert "🎯 过滤后候选前2：A 甲ETF → B 乙ETF" in msg
     # 持仓 E 也应出现在候选里（候选与买卖预测独立）
     ctx2 = _make_ctx({"E.XSHE": 2000})
-    msg2 = ns["_build_pre_trade_message"](ctx2, "11:30", [FULL[0]])
+    msg2 = ns["_build_pre_trade_message"](ctx2, "11:20", [FULL[0]])
     assert "🎯 过滤后候选前2：A 甲ETF → B 乙ETF" in msg2
     assert "📥 预计买入：A 甲ETF" in msg2                     # 目标 A 减持仓 E → 买 A
     # 排名为空（防御模式）时不列候选
@@ -120,7 +120,7 @@ def test_report_sell_worst_rank_first_truncates_three():
     ns = _load_strategy()
     _prep(ns, holdings_num=1)                                # 目标仅 A
     ctx = _make_ctx({"C.XSHE": 100, "D.XSHG": 200, "E.XSHE": 300, "F.XSHE": 400})
-    msg = ns["_build_pre_trade_message"](ctx, "11:30", [FULL[0]])
+    msg = ns["_build_pre_trade_message"](ctx, "11:20", [FULL[0]])
     assert "📤 预计卖出（最可能前3）：" in msg
     lines = [ln for ln in msg.splitlines() if ln.startswith(("1️⃣", "2️⃣", "3️⃣"))]
     assert len(lines) == 3

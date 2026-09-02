@@ -520,6 +520,45 @@ def _daily_due(task_time: str, bar_dt) -> bool:
     return t >= hhmm if hhmm else False
 
 
+def _daily_pending(bundle, bar_dt, fired, force_all: bool = False) -> bool:
+    """本 bar 是否会触发某个尚未执行的 run_daily 任务（every_bar 不算）。
+
+    与 :func:`_fire_session` 的触发判定保持同一口径（同一 ``fired`` 集合、
+    同一 :func:`_daily_due`），供补跑取价范围决策使用。
+    """
+    for func, t in getattr(bundle, "daily", ()) or ():
+        ts = str(t)
+        if ts in ("before_open", "after_close", "every_bar"):
+            continue
+        if force_all:
+            return True
+        if (id(func), ts) not in fired and _daily_due(ts, bar_dt):
+            return True
+    return False
+
+
+def _replay_feed_codes(ctx, bundle, aux, bar_dt):
+    """补跑取价范围决策：返回"只取这些标的"的列表，``None`` 表示取全池。
+
+    加速原理：每根 bar 对全池逐个 ``get_minute_price_at`` 是补跑热点之一
+    （实测 118 只 x 240 bar ≈ 2.8 万次/天）；而绝大多数 bar 上策略只用到
+    持仓价（分钟级止损 / 净值打标），非持仓标的可由 ``CurrentDataProxy``
+    按需惰性回看——其 ``last_price`` 对快照里缺失的 code 会回看截至
+    current_dt 的最后一分钟收盘，功能等价。
+
+    以下情况必须取全池，否则会丢判定：
+    - 会触发调仓/决策类 run_daily 的 bar：涨跌停禁买判定需要候选池现价
+    - 注册了 handle_data / run_minute 的每 bar 回调：可能读任意标的价
+    - 日频账户（force_all）：所有 run_daily 挤在同一 tick 触发
+    """
+    if getattr(bundle, "handle_data", None) or getattr(bundle, "minute", None):
+        return None
+    if _daily_pending(bundle, bar_dt, aux.get("fired") or set(),
+                      force_all=aux.get("frequency") == "daily"):
+        return None
+    return list(ctx.portfolio.positions.keys()) or None
+
+
 def _safe_call(account_id: str, func, ctx, tag: str) -> None:
     """策略回调保护性调用：异常落 sim_logs，不中断主循环。"""
     try:
@@ -931,6 +970,11 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                   f"开始历史补跑: {start_date} ~ {yesterday}，共 {len(days)} 个交易日"
                   + (f"，今日 {now.strftime('%H:%M')} 前已回放" if today_is_trading else ""),
                   ts=str(first_ts))
+        # 历史日：分钟/日线分区均已定稿（不会再被 15:35 同步修订），日线走
+        # 进程缓存，跳过 manager.fetch 的近端新鲜度回源——该项实测占补跑
+        # 总耗时约 50%，是补跑最慢的根因。
+        if dm is not None:
+            dm._replay_mode = True
         for day in full_days:
             if is_paused(account_id):
                 break
@@ -946,6 +990,9 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                       ts=str(datetime.datetime.combine(day, datetime.time(15, 5))))
         # 今天若已是交易日，把已走过（<= 当前时间）的 bar 也回补进来；
         # 今天不跑 _eod，剩余 bar / 收盘由主循环实时接管（last_bar 已推进避免重复触发）
+        # 今日分区可能尚未落盘、且会被 15:35 同步修订 → 恢复在线新鲜度回源。
+        if dm is not None:
+            dm._replay_mode = False
         if today_is_trading and not is_paused(account_id):
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
                         datetime.datetime.combine(today, datetime.time(9, 25)), aux)
@@ -969,6 +1016,9 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
                   ts=str(datetime.datetime.combine(days[-1], datetime.time(15, 5)))
                   if days else str(now))
     finally:
+        # 补跑结束（含异常退出）复位日线回源豁免，实时模式不受影响
+        if dm is not None:
+            dm._replay_mode = False
         _flush_replay_batch(account_id, aux)
         aux.pop("replay_mode", None)
         _replay_active_ids.discard(account_id)
@@ -1039,7 +1089,18 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         list(getattr(ctx, "universe", None) or [])
         + list(ctx.portfolio.positions.keys())))
     # 数据层用引擎码（JQ），feed 前转换；ptrade 策略域为 .SS/.SZ
-    prices, bar_dt, price_ts = feed(dm, [_to_engine(c) for c in watch], now, aux["fresh_frames"])
+    watch_codes = [_to_engine(c) for c in watch]
+    prices, bar_dt, price_ts = None, None, {}
+    # 补跑加速：非调仓 bar 只取持仓价，其余标的交给 CurrentDataProxy 惰性回看
+    # （见 _replay_feed_codes）。取不到价（无持仓 / 持仓停牌）时回退全池，
+    # 保证 bar_dt 判定与"停牌日跳过 bar"行为与原来完全一致。
+    if aux.get("replay_mode"):
+        hold = _replay_feed_codes(ctx, bundle, aux, pd.Timestamp(now))
+        if hold:
+            prices, bar_dt, price_ts = feed(
+                dm, [_to_engine(c) for c in hold], now, aux["fresh_frames"])
+    if not prices:
+        prices, bar_dt, price_ts = feed(dm, watch_codes, now, aux["fresh_frames"])
     if prices:
         prices = {_to_pt(c): v for c, v in prices.items()}
         price_ts = {_to_pt(c): v for c, v in (price_ts or {}).items()}

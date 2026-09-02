@@ -7,7 +7,7 @@
 # v5.4-ding（2026-08-13）：克隆 42f91131 版；所有买入/卖出/止损走 log.notify 推钉钉，账户止损见 Matcher。
 # v5.4.1（2026-08-21）：数据缺失保护——持仓在池内但未参与动量计算（取数瞬时失败被
 #   静默跳过，08-17~08-21 连续误换仓根因）时保守保留持仓 + 告警/推钉钉，不基于残缺排名换仓。
-# v5.4-report（2026-08-25）：克隆 wufu-v5.4-ding；每天 11:30/13:01 预买卖报告
+# v5.4-report（2026-08-25）：克隆 wufu-v5.4-ding；每天 11:20/13:01 预买卖报告
 #   （预测 13:10 调仓：预计买入 + 最可能卖出前3），log.notify 落库+推钉钉。
 
 import numpy as np
@@ -232,7 +232,7 @@ def initialize(context):
     run_daily(afternoon_routine, time='13:10')          #  动量计算与排序（需早于卖出时间）         
     run_daily(sell_routine, time='13:10')               #  卖出流水线（需早于买入时间）
     run_daily(buy_routine, time='13:10')                #  买入流水线
-    run_daily(pre_trade_report, time='11:30')           # 预买卖报告：午间场（预测 13:10 调仓）
+    run_daily(pre_trade_report, time='11:20')           # 预买卖报告：午间场（预测 13:10 调仓）
     run_daily(pre_trade_report, time='13:01')           # 预买卖报告：尾盘场（距决策9分钟）
     run_daily(reset_daily_flags, time='15:10')          # 15:10 收盘流水线：重置价格缓存
     run_daily(minute_level_stop_loss, time='every_bar') # 分钟级固定止损

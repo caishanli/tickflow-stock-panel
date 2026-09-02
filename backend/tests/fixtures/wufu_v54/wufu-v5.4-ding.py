@@ -7,6 +7,8 @@
 # v5.4-ding（2026-08-13）：克隆 42f91131 版；所有买入/卖出/止损走 log.notify 推钉钉，账户止损见 Matcher。
 # v5.4.1（2026-08-21）：数据缺失保护——持仓在池内但未参与动量计算（取数瞬时失败被
 #   静默跳过，08-17~08-21 连续误换仓根因）时保守保留持仓 + 告警/推钉钉，不基于残缺排名换仓。
+# v5.4-ding-report（2026-08-25）：每天 11:20/13:01 预买卖报告
+#   （预测 13:10 调仓：预计买入 + 最可能卖出前3），log.notify 落库+推钉钉。
 
 import numpy as np
 import math
@@ -230,6 +232,8 @@ def initialize(context):
     run_daily(afternoon_routine, time='13:10')          #  动量计算与排序（需早于卖出时间）         
     run_daily(sell_routine, time='13:10')               #  卖出流水线（需早于买入时间）
     run_daily(buy_routine, time='13:10')                #  买入流水线
+    run_daily(pre_trade_report, time='11:20')           # 预买卖报告：午间场（预测 13:10 调仓）
+    run_daily(pre_trade_report, time='13:01')           # 预买卖报告：尾盘场（距决策9分钟）
     run_daily(reset_daily_flags, time='15:10')          # 15:10 收盘流水线：重置价格缓存
     run_daily(minute_level_stop_loss, time='every_bar') # 分钟级固定止损
     
@@ -545,89 +549,26 @@ def update_sector_pool(context):
         '上海', '黄', '30', '50', '100', '300', '500', '1000', '2000', '大', '新', '四川', '浙江', '湖北',
     ])), key=len, reverse=True)
     
-    # ==================== 分组规则 v5.4.2（2026-08-23 分组算法优化） ====================
-    # 旧版问题（本地 2026-08-21 全 ETF 实测复核）：
-    #   1) 香港组单字母 'H' 关键词误吸 A 股行业 ETF：电力TH/红利GTHT/稀金属PH/AITH/畜牧TH/机器人YH；
-    #   2) 纯数字宽基排除误杀海外/港股 ETF：标普500、纳指100、美国50、港股通科技30、恒生50 等全军覆没
-    #      （美指组仅剩 16 只）；道琼斯/日经/德国/法国/沙特/巴西/亚太等无关键词落入普通组；
-    #   3) '中证/上证' 等编制机构词整词排除误杀行业 ETF：中证军工/中证电力被排而军工ETF/电力ETF保留，
-    #      同一行业是否入池全凭命名风格运气；
-    #   4) REIT/定开混合 LOF 混入分组：盐田港REIT 进香港组、科创板定开混合进科创组、沪港深主动LOF 进香港组。
-
-    def _norm_group_name(n):
-        """归一化：中文数字写法统一（科创五零→科创50），防规避宽基判定。"""
-        return n.replace('五零', '50')
-
-    # ① 产品形态硬排除（最先判）：REITs/定期开放/混合/灵活配置LOF/原油商品基金，非指数 ETF 不入池
-    product_exclude_kws = sorted(['REIT', '定开', '混合', '灵活配置', 'LOF', '原油'], key=len, reverse=True)
-
     SPECIAL_GROUPS = sorted([
-        {'name': '香港组',
-         'keywords': sorted(['恒生', '恒指', '港股通', '港股', '香港', '港', 'H股', 'HKC', 'HK', 'HS科技', '中概'], key=len, reverse=True),
-         'remove_words': sorted(['恒生', '恒指', '港股通', '港股', '香港', '港', 'H股', 'HKC', 'HK', 'HS', '中概'], key=len, reverse=True)},
-        {'name': '科创组',
-         'keywords': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创'], key=len, reverse=True),
-         'remove_words': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创'], key=len, reverse=True)},
-        {'name': '创业组',
-         'keywords': sorted(['创业板', '创业', '创板', '创成长'], key=len, reverse=True),
+        {'name': '香港组', 'keywords': sorted(['恒生', '恒指', '港股', '港股通', 'H股', '香港', '港', 'HKC', 'HK', 'HGS', 'H', '中概', 'HS科技'], key=len, reverse=True),
+         'remove_words': sorted(['恒生', '恒指', '港股', '港股通', 'H股', '香港', '港', 'HKC', 'HK', 'HGS', 'H', '中概', 'HS'], key=len, reverse=True)},
+        {'name': '科创组', 'keywords': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创'], key=len, reverse=True),
+         'remove_words': sorted(['科创', '科创板', '科综', 'KC', 'K C', '双创', '科创创业', '创创', '债券', '债汇', '债指', '债沪', '债易', '债基', '债兴', '债摩', '债', 'AAA'], key=len, reverse=True)},
+        {'name': '创业组', 'keywords': sorted(['创业板', '创业', '创板', '创成长'], key=len, reverse=True),
          'remove_words': sorted(['创业板', '创业', '创板', '创成长'], key=len, reverse=True)},
-        {'name': '美指组',
-         'keywords': sorted(['标普', '纳指', '纳斯达克', '道琼斯', '美国'], key=len, reverse=True),
-         'remove_words': sorted(['标普', '纳指', '纳斯达克', '道琼斯', '美国'], key=len, reverse=True)},
-        {'name': '全球组',
-         'keywords': sorted(['日经', '东证', '德国', '法国', '沙特', '巴西', '印度', '越南', '亚太', '东南亚', '新兴亚洲', '新兴市场', '中韩', '225'], key=len, reverse=True),
-         'remove_words': sorted(['日经', '东证', '德国', '法国', '沙特', '巴西', '印度', '越南', '亚太', '东南亚', '新兴亚洲', '新兴市场', '中韩', '225'], key=len, reverse=True)}
+        {'name': '美指组', 'keywords': sorted(['标普', '纳指', '纳斯达克'], key=len, reverse=True),
+         'remove_words': sorted(['标普', '纳指', '纳斯达克'], key=len, reverse=True)}
     ], key=lambda x: max(len(kw) for kw in x['keywords']), reverse=True)
-
-    # 关键词修订：去单字母 'H'（误配拉丁后缀 TH/PH/YH/GTHT）、去 'HGS'（沪港深宽基缩写非港股）；
-    # 美指组补 '道琼斯/美国'；新增全球组承接非美 QDII。科创板另按代码前缀 588/589 权威判定。
-    OVERSEAS_GROUP_NAMES = ('香港组', '美指组', '全球组')
-    STAR_CODE_PREFIXES = ('588', '589')
-    # 代码级覆盖：场内简称丢失市场标识、关键词无法判定的已知特例（代码主段 -> 组别名）
-    CODE_GROUP_OVERRIDES = {
-        '513160': '香港组',   # 科技30 = 银华恒生港股通中国科技
-        '513220': '香港组',   # 互联网30 = 招商中证全球中国互联网QDII（约7成港股仓位，与中概互联同族）
-        '517360': '香港组',   # AH科技 = 华安中证沪港深科技100
-    }
-
-    # 行业/主题语境词：出现即视为行业指数，规模数字与宽基编制机构词不再触发排除
-    sector_ctx_kws = sorted(list(set([
-        'TMT', 'AI', '5G', '科技', '信息', '信息技术', '信息安全', '计算机', '软件', '软件开发', '工业软件',
-        '云计算', '数据', '大数据', '数字经济', '人工智能', '智能', '智能车', '智能汽车', '智能网联', '智能驾驶',
-        '机器人', '卫星', '物联网', '芯片', '半导体', '集成电路', '芯', '电子', '消费电子', '消电', '通信',
-        '光伏', '风电', '核电', '储能', '电池', '锂电池', '锂电', '能源', '新能源', '绿电', '绿色电力', '电力',
-        '电网', '公用事业', '碳中和', '双碳', '低碳', '环保', '军工', '国防', '航空', '航天', '航空航天',
-        '通用航空', '通航', '船舶', '机械', '工程机械', '工业母机', '机床', '高端装备', '装备', '制造',
-        '工业互联网', '工业有色', '工业金属', '汽车', '汽车零部件', '电动车', '电动汽车', '有色', '有色金属',
-        '稀有金属', '稀金属', '稀土', '矿业', '黄金股', '钢铁', '煤炭', '化工', '石化', '石油', '油气',
-        '建材', '基建', '地产', '房地产', '农业', '现代农业', '养殖', '畜牧', '农牧', '农牧渔', '粮食',
-        '食品饮料', '食品', '酒', '消费', '可选消费', '线上消费', '在线消费', '旅游', '影视', '文娱', '游戏',
-        '传媒', '医疗', '医疗器械', '医疗设备', '医药', '生物医药', '生物科技', '生物', '创新药', '新药',
-        '中药', '中医药', '疫苗', '保健', '养老', '金融', '证券', '券商', '保险', '银行', '非银',
-        '金融科技', '金科', '交运', '交通运输', '物流', '快递',
-    ])), key=len, reverse=True)
-
-    # 宽基编制机构词：仅无行业语境时排除（沪深300 排除，中证军工 保留）
-    broad_marker_kws = ['沪深', '中证', '上证', '深证', '深成', '国证', '综指', '综合']
-    # 规模数字：无语境时视为宽基信号（医药50 有语境保留；标普500 属海外组直接放行）
-    number_kws = ['1000', '2000', '180', '300', '500', '800', '380', '580', '200', '100', '30', '50']
-
-    # ② 绝对排除：债券/货币/现金流因子/ESG/MSCI（原表去纯数字与编制机构词，改由语境规则处理）
+    
     exclude_keywords = sorted(list(set([
-        'A50', 'A100', 'A500', '深100',
+        '300', '500', '1000', '2000', '800', '30', '50', '100', '180', '200',
+        '沪深', '中证', '上证', '深证', '深成', 'A50', 'A100', 'A500', '深100',
         '短融', '可转债', '转债', '双债', '利率债', '国债', '地债', '政金债', '国开债', '基准国债', '新综债',
         '信用债', '企业债', '公司债', '城投债', '城投', '美元债', '沪公司债', '科创债', '科债', '科创AAA',
         '自由现金流', '现金流', '现金流E', '现金流基', '现金流TF', '现金流全', '300现金流', '800现金流',
         '货币', '现金', '快线', '快钱', '中银现金', '500现金', '800现金', '现金800', '现金自由', '现金指数',
         '全指现金', '现金全指', 'ESG', 'MSCI', 'MS', '债',
     ])), key=len, reverse=True)
-
-    def _has_sector_ctx(nm):
-        return any(w in nm for w in sector_ctx_kws)
-
-    def _has_size_number(nm):
-        return any(t in nm for t in number_kws)
-
     
     try:
         df_etf = get_all_securities(['etf'])
@@ -645,49 +586,31 @@ def update_sector_pool(context):
     
     for code in etf_list:
         try:
-            raw_name = g.etf_names_dict.get(code, str(code))
-            name = _norm_group_name(raw_name)
-            # ① 产品形态硬排除
-            if any(k in name or k in raw_name for k in product_exclude_kws):
-                excluded_count += 1
-                continue
-            # ② 债券/货币/ESG/MSCI 等绝对排除
-            if any(k in name for k in exclude_keywords):
-                excluded_count += 1
-                continue
-            # ③ 特殊组匹配：关键词 + 科创板代码前缀（588/589 权威判定，命名风格无关）
+            name = g.etf_names_dict.get(code, str(code))
+            is_special = False
             matched_group = None
             for group in SPECIAL_GROUPS:
                 for kw in group['keywords']:
                     if kw in name:
+                        is_special = True
                         matched_group = group['name']
                         break
-                if matched_group:
+                if is_special:
                     break
-            if not matched_group:
-                matched_group = CODE_GROUP_OVERRIDES.get(str(code).split('.')[0])
-            if not matched_group and str(code)[:3] in STAR_CODE_PREFIXES:
-                matched_group = '科创组'
-            if matched_group:
-                # 海外组数字合法（标普500/纳指100/恒生50）；科创/创业组内无行业语境的
-                # 宽基规模数字（科创50/双创50/创业板50/科100…）仍排除，
-                # 科创芯50/AI50双创/创业板人工智能 等带语境行业 ETF 保留
-                if matched_group in OVERSEAS_GROUP_NAMES or not (
-                        _has_size_number(name) and not _has_sector_ctx(name)):
+            is_excluded = False
+            for k in exclude_keywords:
+                if k in name:
+                    is_excluded = True
+                    excluded_count += 1
+                    break
+            if not is_excluded:
+                if is_special:
                     special_etfs.append(code)
                     special_group_map[code] = matched_group
                 else:
-                    excluded_count += 1
-                continue
-            # ④ 非特殊组：语境感知宽基排除（有行业语境词则规模数字/编制机构词不触发）
-            if ((_has_size_number(name) or any(m in name for m in broad_marker_kws))
-                    and not _has_sector_ctx(name)):
-                excluded_count += 1
-                continue
-            normal_etfs.append(code)
+                    normal_etfs.append(code)
         except Exception:
             continue
-
     
     group_counts = {}
     for code in special_etfs:
@@ -755,9 +678,7 @@ def update_sector_pool(context):
             money = normal_qualified[code]
             cleaned = clean_name(original_name, is_special=False)
             if cleaned == '':
-                # 清洗为空（如 纳指ETF/恒生ETF/黄金ETF易方达）不再整只丢弃，
-                # 回退用原名参与行业聚合，避免旗舰品种漏出动态池
-                cleaned = original_name.replace(' ', '')
+                continue
             industry_key = cleaned[:2] if len(cleaned) >= 2 else cleaned
             if industry_key not in normal_industry_groups:
                 normal_industry_groups[industry_key] = []
@@ -776,7 +697,7 @@ def update_sector_pool(context):
             money = special_qualified[code]
             cleaned = clean_name(original_name, is_special=True, matched_group_name=matched_group)
             if cleaned == '':
-                cleaned = original_name.replace(' ', '')
+                continue
             industry_key = cleaned[:2] if len(cleaned) >= 2 else cleaned
             group_key = f"{matched_group}_{industry_key}"
             if group_key not in special_industry_groups:
@@ -1612,6 +1533,144 @@ def check_defensive_etf_available(context):
         log.info(f"防御性ETF {defensive_etf} 当前跌停")
         return False
     return True
+
+
+# ==================== 预买卖报告（v5.4-report）====================
+PRE_REPORT_TOP_SELLS = 3       # 卖出候选最多展示前 3
+PRE_REPORT_TOP_CANDS = 2       # 买入候选展示条数（33天回放 coverage@2=100%）
+
+
+def _is_replay_past(context):
+    """是否处于"过去日期"的历史补跑（跳过）；今天的盘中补跑返回 False（允许触发）。"""
+    try:
+        lag_seconds = (datetime.now() - context.current_dt).total_seconds()
+    except Exception:
+        return False
+    return lag_seconds > 300 and context.current_dt.date() < datetime.now().date()
+
+
+def pre_trade_report(context):
+    """11:20 / 13:01 预买卖报告：预测 13:10 调仓（预计买入 + 最可能卖出前3）。
+
+    直接复用 get_final_ranked_etfs(quiet=True)，与 13:10 正式管线完全同口径
+    （含持仓宽容/数据缺失保护）。结果走 log.notify：落 sim_logs 并推钉钉。
+    """
+    if _is_replay_past(context):
+        return  # 历史日补跑：不浪费全池计算、不产生无用日志
+    if not getattr(g, 'merged_etf_pool', None):
+        # 盘中重启场景：09:00/09:40 晨间任务被种子标记为已触发，池子为空。
+        # 复用晨间管线重建合并池（走弱判定 + 池更新），保证预测与 13:10 同口径。
+        try:
+            check_a_share_weak_period(context)
+            midday_routine(context)
+        except Exception as e:
+            log.warning(f"【预买卖报告】池重建失败: {e}，跳过本次预报告")
+            return
+        if not getattr(g, 'merged_etf_pool', None) and getattr(g, 'is_a_share_weak', False):
+            # 走弱期 midday_routine 只建 filtered_global_pool，merged_etf_pool
+            # 由 13:10 afternoon_routine 合并（镜像其口径）。
+            g.merged_etf_pool = sorted(set(getattr(g, 'filtered_global_pool', None) or g.global_etf_pool))
+        if not getattr(g, 'merged_etf_pool', None):
+            log.info("【预买卖报告】合并池重建后仍为空，跳过本次预报告")
+            return
+    tag = context.current_dt.strftime('%H:%M')
+    log.info(f"▶️ 【预买卖报告 @{tag}】启动...")
+    try:
+        from app.quant.jqengine.datasource.manager import get_data_manager
+        dm = get_data_manager()
+        dm.preload_minute_for_pool(g.merged_etf_pool, context.current_dt)
+        log.info(f"📦 【预买卖报告】已预热 {len(g.merged_etf_pool)} 只分钟缓存")
+    except Exception as e:
+        log.warning(f"【预买卖报告】分钟线预加载失败（回退逐标的取数）: {e}")
+    ranked = get_final_ranked_etfs(context, quiet=True)
+    msg = _build_pre_trade_message(context, tag, ranked)
+    log.notify(msg)
+    log.info(f"⏸️ 【预买卖报告 @{tag}】执行完毕！")
+
+
+def _short_code(code):
+    return code.split('.')[0]
+
+
+def _pre_report_target_codes(context, ranked):
+    """与 execute_sell_trades 同口径的目标集推导：前 N 或防御兜底。"""
+    if ranked:
+        return [m['etf'] for m in ranked[:g.holdings_num]], False
+    if check_defensive_etf_available(context):
+        return [g.defensive_etf], True
+    return [], True
+
+
+def _build_pre_trade_message(context, tag, ranked):
+    """组装预买卖报告文本（纯展示逻辑，可单测）。
+
+    卖出候选排序＝"最可能被卖"优先：无过滤排名者最先，其余按完整过滤排名
+    位置从后往前（排名越差越先卖）；截断前 PRE_REPORT_TOP_SELLS。
+    """
+    holdings = [sec for sec, pos in context.portfolio.positions.items()
+                if pos.total_amount > 0]
+    regime = '🔴 大A走弱期' if getattr(g, 'is_a_share_weak', False) else '🟢 大A正常期'
+    pool_size = len(getattr(g, 'merged_etf_pool', []) or [])
+    head = (f"📋 预买卖报告 {context.current_dt.strftime('%m-%d')} {tag}"
+            f"（预测 13:10 调仓 | {regime} | 池{pool_size}只）")
+
+    target_codes, defensive_mode = _pre_report_target_codes(context, ranked)
+    hold_set = set(holdings)
+    target_set = set(target_codes)
+    lines = [head]
+    if defensive_mode:
+        lines.append("🛡️ 排名为空：走防御模式" if target_codes
+                     else "🛡️ 排名空且防御ETF不可用：走空仓模式")
+
+    buys = [c for c in target_codes if c not in hold_set]
+    if buys:
+        buy_strs = [f"{_short_code(c)} {get_security_name(c)}" for c in buys]
+        lines.append("📥 预计买入：" + " → ".join(buy_strs))
+    else:
+        lines.append("📥 预计买入：无")
+    # 防御模式（排名整体为空）下 ranked_candidates_full 可能是昨日残留值，
+    # 列出来会误导——仅常规模式展示候选。
+    cands = ([] if defensive_mode
+             else [m['etf'] for m in (getattr(g, 'ranked_candidates_full', []) or [])[:PRE_REPORT_TOP_CANDS]])
+    if cands:
+        cand_strs = [f"{_short_code(c)} {get_security_name(c)}" for c in cands]
+        lines.append("🎯 过滤后候选前2：" + " → ".join(cand_strs))
+
+    full_rank = getattr(g, 'ranked_candidates_full', []) or []
+    rank_pos = {m['etf']: i for i, m in enumerate(full_rank)}
+    score_of = {}
+    for m in full_rank:
+        score_of.setdefault(m['etf'], m.get('momentum_score'))
+    total = max(len(full_rank), 1)
+    assessed = set(getattr(g, '_assessed_codes', []) or [])
+    pool_set = set(getattr(g, 'merged_etf_pool', []) or [])
+
+    sells = []
+    for sec in holdings:
+        nm = get_security_name(sec)
+        pos_str = f"持仓{context.portfolio.positions[sec].total_amount:.0f}股"
+        if sec in target_set:
+            continue
+        if sec in assessed and sec not in pool_set:
+            lines.append(f"⚠️ 未参与评估（数据缺失保护，13:10 不会强卖）：{sec} {nm}")
+            continue
+        if sec in rank_pos:
+            rp = rank_pos[sec]
+            s_str = f"排名{rp+1}/{total}，动量{score_of.get(sec, 0):.4f}"
+        else:
+            s_str = "未入过滤排名，动量N/A"
+        sells.append((sec, nm, pos_str, s_str, rank_pos.get(sec, total)))
+    sells.sort(key=lambda x: x[4], reverse=True)
+    n = min(PRE_REPORT_TOP_SELLS, len(sells))
+    if sells:
+        lines.append(f"📤 预计卖出（最可能前{n}）：")
+        for i, (sec, nm, pos_str, s_str, _p) in enumerate(sells[:PRE_REPORT_TOP_SELLS]):
+            emoji = ["1️⃣", "2️⃣", "3️⃣"][i] if i < 3 else f"{i+1}."
+            lines.append(f"{emoji} {_short_code(sec)} {nm}（{pos_str}，{s_str}）")
+    else:
+        if target_codes:
+            lines.append(f"✅ 持仓全部在目标内（{len(holdings)}只），13:10 预计不动")
+    return "\n".join(lines)
 
 
 def trade(context):
