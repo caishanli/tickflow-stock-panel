@@ -76,6 +76,10 @@ class Matcher:
                 continue
             sell_amount = min(amount, sellable)
             fill = float(price) * (1 - slippage)  # 卖出滑点（主引擎滑点双边口径）
+            # 按最小报价单位取整（ETF/基金 0.001、股票 0.01），与 jqengine
+            # order() 撮合、回测侧 tick 取整同口径——否则止损成交价与两侧
+            # 常规成交/回测撮合价漂移半 tick
+            fill = round(fill, 3 if _is_etf(code) else 2)
             tax = 0.0 if _is_etf(code) else stamp_tax  # ETF 免印花税
             commission = max(sell_amount * fill * fee, min_commission)  # 佣金含最低兜底
             proceeds = sell_amount * fill - commission - sell_amount * fill * tax

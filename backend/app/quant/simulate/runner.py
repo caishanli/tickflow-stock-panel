@@ -1147,12 +1147,15 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     # 止损巡检（matcher 在 state 口径上工作，结果回写 portfolio）
     _state_from_portfolio(ctx, state)
     state["dt"] = str(bar_ts)
-    # 止损费率对齐 jq 引擎撮合：策略 set_order_cost 设置的 close_commission，
-    # 未设置时回退 CONFIG.fee_rate（与 order() 的 comm_rate 默认口径一致）
+    # 止损费率/滑点对齐 jq 引擎撮合：策略 set_order_cost / set_slippage 的生效值，
+    # 未设置时回退 CONFIG（与 order() 的 comm_rate/slippage 默认口径一致）。
+    # 此前滑点漏传、Matcher 用 CONFIG.slippage——策略 set_slippage(0.0001) 被
+    # 0.001 覆盖，止损成交价与引擎撮合/回测系统性差 1‰。
     fee_cfg = (jq_api._state.get("fee_config") or {})
     matcher.step(state, prices, no_sell=no_sell,
                  fee=fee_cfg.get("close_commission"),
-                 min_commission=fee_cfg.get("min_commission"))
+                 min_commission=fee_cfg.get("min_commission"),
+                 slippage=jq_api._state.get("slippage"))
     _apply_matcher_result(ctx, state)
     for code, pos in ctx.portfolio.positions.items():
         if code in prices:

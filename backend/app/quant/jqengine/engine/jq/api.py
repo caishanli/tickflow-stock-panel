@@ -606,7 +606,9 @@ def order(security, amount):
     fee = _state["fee"]
     slip = _state["slippage"]
     fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
-    fill = round(fill, 3)
+    # 按最小报价单位取整（ETF/基金 0.001、股票 0.01）：真实成交只落在 tick 上，
+    # 与回测侧 jqcompat._patch_matcher_tick_rounding、Matcher 止损同口径
+    fill = round(fill, 3 if _is_etf(security) else 2)
     turnover = abs(amount) * fill
     # Use separate buy/sell commission rates with minimum
     fee_cfg = _state.get("fee_config")
@@ -987,6 +989,66 @@ def _ts_code_to_jq_code(ts_code):
     return ts_code
 
 
+def _is_etf_jq_code(code):
+    """聚宽 get_all_securities(['etf']) 的 ETF 段判定（与 jqcompat._is_jq_etf_code
+    同口径；此处自包含以免 jqengine 反向依赖 jqcompat/rqalpha）。"""
+    pure, _, exch = code.partition(".")
+    exch = exch.upper()
+    if exch in ("XSHE", "SZ"):
+        return pure.startswith(("159", "161", "169", "180", "181"))
+    if exch in ("XSHG", "SH"):
+        if pure.startswith(("600", "601", "603", "605", "688", "689")):
+            return False
+        if pure.startswith(("501", "506")):
+            return True
+        return pure.startswith(("510", "511", "512", "513", "515", "516", "517",
+                                "518", "520", "526", "530", "551", "560", "561",
+                                "562", "563", "588", "589"))
+    return False
+
+
+def _universe_codes():
+    """ETF 宇宙对齐回测桥 _load_etf_universe 的双路径：
+
+    - 名录快照（data/etf_universe_snapshot.json）新鲜（≤30 天）→ 快照 codes；
+    - 快照过期/缺失 → 从 _daily_mem 缓存键派生（有日线数据的 ETF，与桥的
+      回退同口径）。
+
+    此前模拟盘 get_all_securities 走 fetch("get_etf_list") 实时名录——比回测
+    的缓存派生多出刚上市、尚无日线的标的（实测 1661 vs 1660），动态池构建
+    系统性分叉、同策略同窗口回测与补跑的选票翻转。两条路径都不可得时返回
+    None（回退实时名录，live 行为不变）。
+    """
+    try:
+        import datetime as _dt
+        import json as _json
+
+        from ....config import CONFIG as _JQCFG
+        path = os.path.join(_JQCFG.DATA_DIR, "etf_universe_snapshot.json")
+        with open(path, encoding="utf-8") as f:
+            snap = _json.load(f)
+        codes = list(snap.get("codes") or [])
+        fetched = _dt.datetime.fromisoformat(str(snap["fetched_at"]))
+        if codes and _dt.datetime.now() - fetched <= _dt.timedelta(days=30):
+            return codes
+    except Exception:
+        pass
+    try:
+        mgr = _state.get("manager")
+        if mgr is not None and hasattr(mgr, "preload_daily"):
+            # 缓存派生前确保全量日线已预载(幂等,asof 判定只载一次):模拟盘
+            # 的 _daily_mem 是懒加载的,首日调用时仅有个位数十只,派生宇宙会
+            # 比回测(全量预载后派生)少一个数量级
+            mgr.preload_daily()
+        codes = [k.split("get_daily_", 1)[1]
+                 for k in (getattr(mgr, "_daily_mem", None) or {})
+                 if k.startswith("get_daily_")]
+        codes = [c for c in codes if _is_etf_jq_code(c)]
+        return codes or None
+    except Exception:
+        return None
+
+
 def get_all_securities(types=None, date=None):
     mgr = _state.get("manager")
     if mgr is None:
@@ -1009,10 +1071,13 @@ def get_all_securities(types=None, date=None):
         from ....smart_classification import get_smart_name
         smart_classify = get_smart_name
     records = []
+    etf_universe = _universe_codes() if ("etf" in types) else None
     for t in types:
         try:
             if t == "etf":
-                items = mgr.fetch("get_etf_list")
+                # 宇宙对齐回测桥（快照优先/缓存派生，见 _universe_codes）；都不可得
+                # 才回退实时名录
+                items = etf_universe if etf_universe else mgr.fetch("get_etf_list")
             elif t == "stock":
                 items = mgr.fetch("get_stock_list")
             else:

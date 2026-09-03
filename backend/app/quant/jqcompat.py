@@ -787,6 +787,9 @@ def set_slippage(*args, **kwargs):
         if isinstance(a, FixedSlippage):
             _SLIPPAGE_OVERRIDE = a.value
             break
+        if isinstance(a, PriceRelatedSlippage) and getattr(a, "value", None) is not None:
+            _SLIPPAGE_OVERRIDE = float(a.value)
+            break
         if isinstance(a, (int, float)):
             _SLIPPAGE_OVERRIDE = float(a)
             break
@@ -987,8 +990,14 @@ def get_use_prev_close() -> bool:
 
 
 class PriceRelatedSlippage:
-    def __init__(self, *a, **k):
-        pass
+    def __init__(self, value=None, *a, **k):
+        # 保存比例滑点值：set_slippage 需要把它落到回测撮合器，否则策略
+        # set_slippage(PriceRelatedSlippage(0.0001)) 的意图在回测侧被静默丢弃
+        # （与 jqengine api 同名类口径一致）。
+        try:
+            self.value = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            self.value = None
 
 
 class OrderCost:
@@ -2934,6 +2943,35 @@ def _register_jq_apis():
     sys.modules.setdefault("jqlib.technical_analysis", _jqlib_ta_mod)
 
 
+def _patch_matcher_tick_rounding():
+    """回测撮合成交价按最小报价单位取整（ETF/基金 0.001、股票 0.01）。
+
+    模拟盘 jqengine 撮合 fill=round(price*(1±slip), 3)、Matcher 止损同口径；
+    rqalpha 滑点后不取整——同一策略回测成交价 2.1322 vs 补跑 tick 价 2.132，
+    每笔 ±0.0001 价差使净值与边缘选票系统性漂移，回测与补跑无法逐笔对齐。
+    与 jqengine/Matcher 的取整口径统一。幂等。
+    """
+    try:
+        from rqalpha.mod.rqalpha_mod_sys_simulation.matcher.base import BaseMatcher
+    except Exception:
+        return
+    if getattr(BaseMatcher, "_jq_tick_patched", False):
+        return
+
+    _orig_gep = BaseMatcher._get_execution_price
+
+    def _tick_gep(self, order, deal_price, open_auction):
+        px = _orig_gep(self, order, deal_price, open_auction)
+        try:
+            step = 0.001 if (order.order_book_id or "").split(".")[0].startswith(("5", "15", "16")) else 0.01
+            return round(round(px / step) * step, 10)
+        except Exception:
+            return px
+
+    BaseMatcher._get_execution_price = _tick_gep
+    BaseMatcher._jq_tick_patched = True
+
+
 def _patch_price_board():
     """让 rqalpha 的下单定价（get_last_price / 涨跌停）在标的未订阅时，
     回退到 DataManager 支撑的 1m/日线价格（与聚宽参考一致），避免全量订阅 1600+
@@ -3014,4 +3052,5 @@ def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=N
     _register_jq_apis()
     _patch_rqalpha_objects()
     _patch_price_board()
+    _patch_matcher_tick_rounding()
     _install_barcache_mod()
