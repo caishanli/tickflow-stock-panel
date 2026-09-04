@@ -1088,7 +1088,10 @@ class DataManager:
             pos = df.index.searchsorted(dt_ts, side="right") - 1
             if pos < 0:
                 return None
-            return float(df["close"].iloc[pos])
+            px = float(df["close"].iloc[pos])
+            # as-of 早于拆股事件时撤销前复权（与 jqcompat 分钟侧同语义）
+            f = self.revoke_future_split_factor(code, dt_ts)
+            return px * f if f != 1.0 else px
         except Exception:
             return None
 
@@ -1127,6 +1130,29 @@ class DataManager:
             if np.isfinite(ratio) and ratio > 0:
                 out.append((pd.Timestamp(split_date), float(ratio)))
         return out
+
+    def revoke_future_split_factor(self, code, asof) -> float:
+        """as-of 时刻应撤销的拆股复权乘数（供分钟价查询侧调用）。
+
+        ``_load_minute_merged`` 把帧内检测到的拆股事件无条件前复权到最新口径；
+        as-of 早于事件除权日时必须除回去，否则回测/补跑用未来口径看历史
+        （2026-09-03 长窗对齐实锤：562590 07-06 拆股，06-23 补跑现价被压到
+        1.116，动量 R²≈0 全毁；回测侧 jqcompat._apply_minute_split_dt 早有
+        同语义撤销，本函数是模拟盘侧补齐）。返回应乘回价格的系数（无事返回 1.0）。
+        """
+        try:
+            evs = (getattr(self, "_minute_split_events", None) or {}).get(code) or []
+            if not evs:
+                return 1.0
+            a = pd.Timestamp(asof).normalize()
+            f = 1.0
+            for ex, ratio in evs:
+                if (ratio and float(ratio) > 0 and np.isfinite(float(ratio))
+                        and pd.Timestamp(ex).normalize() > a):
+                    f /= float(ratio)
+            return f
+        except Exception:
+            return 1.0
 
     @staticmethod
     def _adjust_for_splits(df, events=None):

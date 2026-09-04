@@ -212,9 +212,9 @@ def test_m3_stock_sell_fee_stamp_tax_and_slippage(tmp_quant):
     out = m.step(state, {"600000.XSHG": 9.0},
                  fee=0.0003, stamp_tax=0.0005, slippage=0.001)
     # 股票成交价按最小报价单位 0.01 取整（与 jqengine order()/回测撮合同口径，
-    # 回测↔补跑逐笔对齐），滑点后再 tick 化：8.991 → 8.99
-    fill = round(9.0 * (1 - 0.001), 2)
-    expected = 5000.0 * fill * (1 - 0.0003 - 0.0005)
+    # 回测↔补跑逐笔对齐）：滑点后 8.991 → tick 化为 8.99。期望写死 8.99，不用
+    # round() 自算——否则实现与断言用同一表达式，错了也测不出。
+    expected = 5000.0 * 8.99 * (1 - 0.0003 - 0.0005)
     assert out["cash"] == pytest.approx(expected, abs=1e-2)
     assert "600000.XSHG" not in out["positions"]
 

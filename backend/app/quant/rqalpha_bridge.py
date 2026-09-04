@@ -567,6 +567,13 @@ def _install_bridge_mod():
                 # 原生只读）；PriceBoard 补丁保证未订阅标的的定价/涨跌停可回退取数。
                 _jq._patch_rqalpha_objects()
                 _jq._patch_price_board()
+                # 成交价按最小报价单位取整：与模拟盘 jqengine/Matcher 撮合对齐，
+                # 否则回测成交价带滑点尾数、与补跑逐笔对不齐。双布局都没命中时
+                # 告警（6.x 重构曾让旧补丁静默 no-op，见 jqcompat 注释）。
+                if not _jq._patch_matcher_tick_rounding():
+                    import logging as _logging
+                    _logging.getLogger("rqalpha_bridge").warning(
+                        "[bridge] tick 取整补丁未命中任何 rqalpha 布局")
                 if getattr(_ptc, "_ACTIVE", False):
                     _ptc._patch_rqalpha_objects()
                 ds = _consume_pending_data_source()

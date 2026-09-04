@@ -79,6 +79,16 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
                         code, bar_dt_last.date())
             continue
         prices[code] = float(sub["close"].iloc[-1])
+        # as-of 早于拆股事件时撤销分钟前复权（与 jqcompat 分钟侧同语义；
+        # 2026-09-03 长窗对齐实锤：不撤销则拆股前决策看到未来口径价）。
+        try:
+            _revoke = getattr(dm, "revoke_future_split_factor", None)
+            if _revoke is not None:
+                _f = _revoke(code, now)
+                if _f != 1.0:
+                    prices[code] = prices[code] * _f
+        except Exception:
+            pass
         bar = sub.index[-1]
         ts_str = str(bar)
         price_ts[code] = ts_str[:-3] if ts_str.endswith(":00") else ts_str

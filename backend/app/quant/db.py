@@ -183,6 +183,22 @@ def upsert_run(run_id, strategy_id, name, params_json, status="running"):
         )
 
 
+def try_insert_run(run_id, strategy_id, name, params_json, status="queued") -> bool:
+    """原子占位：行不存在时插入返回 True；行已存在时不覆盖、返回 False。
+
+    submit_backtest 并发去重依赖本函数的原子性——sqlite 写串行化保证
+    多进程下同时只有一个调用者拿到 True。拿到 False 的调用方再读行判断
+    是"活任务拒绝"还是"死行接管"（见 service.submit_backtest）。
+    """
+    with get_conn(run_id) as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO backtest_runs(id,strategy_id,name,params_json,status)"
+            " VALUES(?,?,?,?,?)",
+            (run_id, strategy_id, name, params_json, status),
+        )
+        return cur.rowcount == 1
+
+
 def update_run(run_id, status, metrics_json=None, error=None, finished_at=None):
     with get_conn(run_id) as c:
         c.execute(

@@ -51,6 +51,9 @@ def kill_process_group(pid) -> bool:
         return False
 
 
+_BACKTEST_SPAWN_LOCK = threading.Lock()
+
+
 def submit_backtest(params: dict, compile_mode: bool = False) -> str:
     if compile_mode:
         run_id = f"c_{uuid.uuid4().hex[:8]}"
@@ -58,29 +61,73 @@ def submit_backtest(params: dict, compile_mode: bool = False) -> str:
     else:
         run_id = params.get("run_id") or uuid.uuid4().hex[:8]
     params = dict(params, run_id=run_id)
-    db.insert_run(
-        run_id,
-        params.get("strategy_id", ""),
-        params.get("name", ""),
-        json.dumps(params, ensure_ascii=False),
-        "queued",
-    )
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, _script("run_quant_backtest.py"), run_id],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception as e:
-        # M5：Popen 失败不留永久 queued 行
-        db.update_run(run_id, "failed", error=f"spawn failed: {e}")
-        raise
-    # M5：pid 落库，terminate 时按 pid 杀进程组（Popen 被 patch 时容错）
-    pid = getattr(proc, "pid", None)
-    if pid:
-        db.set_run_pid(run_id, pid)
+    payload = json.dumps(params, ensure_ascii=False)
+
+    # 并发/重复提交防护：同一 run_id 只允许一个活任务。
+    # try_insert_run 原子占位（sqlite 写串行化，多进程下同时只有一个调用者
+    # 拿到 True；同进程线程另有本锁串行化 spawn 全程）：
+    # - 抢到占位 → 本次负责 spawn；
+    # - 未抢到 → 读既有行：queued/running 且 pid 存活则拒绝（幂等报错，
+    #   调用方据此去轮询既有 run，而不是再起一个 worker 导致双跑翻倍净值）；
+    #   否则（queued 无进程、进程已死、终端态重跑）复位为 queued 后由本次接管。
+    # compile run_id 恒为新 uuid，走正常占位 + spawn（缺了这步编译运行会静默
+    # no-op：拿到 run_id 却永远没有 worker）。
+    # 已知残留窗口：多进程下两个提交同时撞上"有行但无 pid"（对方刚占位、
+    # Popen 未返回）时会双 spawn——窗口约一个 Popen 时长；单进程内本锁全闭合。
+    # 同 run_id 跨进程并发属于病态调用（uuid 每次都不同），不值得加 token 栏。
+    with _BACKTEST_SPAWN_LOCK:
+        if not db.try_insert_run(
+            run_id, params.get("strategy_id", ""), params.get("name", ""), payload, "queued"
+        ):
+            existing = db.get_run(run_id)
+            if (
+                existing
+                and existing.get("status") in ("queued", "running")
+                and _pid_alive(existing.get("pid"))
+            ):
+                raise RuntimeError(
+                    f"run {run_id} 已在运行 (pid={existing.get('pid')})，拒绝重复提交")
+            db.upsert_run(
+                run_id, params.get("strategy_id", ""), params.get("name", ""),
+                payload, "queued",
+            )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, _script("run_quant_backtest.py"), run_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            # M5：Popen 失败不留永久 queued 行 → 置 failed
+            db.update_run(run_id, "failed", error=f"spawn failed: {e}")
+            raise
+        # M5：pid 落库，terminate 时按 pid 杀进程组（Popen 被 patch 时容错）
+        pid = getattr(proc, "pid", None)
+        if pid:
+            db.set_run_pid(run_id, pid)
     return run_id
+
+
+def _pid_alive(pid) -> bool:
+    """pid 存活校验（os.kill(pid, 0) 不发信号，只校验进程存在）。
+
+    PermissionError 表示进程存在、只是无权发信号 → 视为存活（此前误判为
+    死亡，会导致活任务被重复拉起，正好与本函数目标相反）。
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        # ValueError/TypeError：pid 非数字（如脏数据）→ 按死亡处理，
+        # 调用方走接管分支而不是 500。
+        return False
 
 
 def _sweep_compile_stale(max_age_days: int = 7) -> None:

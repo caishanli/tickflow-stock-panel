@@ -22,6 +22,7 @@ import pandas as pd
 from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday, nearest_workday
 from pandas.tseries.offsets import CustomBusinessDay
 
+from ....tick import round_to_tick
 from ...datasource.base import DataSourceError
 from . import jq_names
 from .context import Context, G, Position
@@ -34,9 +35,11 @@ DEFAULT_STAMP_TAX = float(os.environ.get("QUANT_SIM_STAMP_TAX", "0.0005"))
 
 
 def _is_etf(code):
-    """简单代码前缀判定：沪市 5 开头、深市 15/16 开头为基金（免印花税）。"""
+    """简单代码前缀判定：沪市 5 开头、深市 15/16/18 开头为基金（免印花税）。
+
+    只用于税费判定，成交价取整走 tick.round_to_tick（勿混用）。"""
     num = (code or "").split(".")[0]
-    return num.startswith(("5", "15", "16"))
+    return num.startswith(("5", "15", "16", "18"))
 
 _state = {
     "ctx": None,
@@ -222,8 +225,70 @@ def clear_current_data_cache():
         _current_data_proxy._daily.clear()
 
 
+_TRACE_CODES = None
+
+
+def _trace_codes():
+    """QUANT_TRACE_CODES 指定的追踪标的（逗号分隔，全码或纯数字均可）。
+
+    对齐排障专用：仅命中标的写 /tmp/quant_trace.log，平时 env 为空零开销。
+    """
+    global _TRACE_CODES
+    if _TRACE_CODES is None:
+        raw = os.getenv("QUANT_TRACE_CODES", "")
+        _TRACE_CODES = {c.strip() for c in raw.replace(";", ",").split(",") if c.strip()}
+    return _TRACE_CODES
+
+
+def _trace(code, msg):
+    codes = _trace_codes()
+    if not codes:
+        return
+    if code not in codes and (code or "").split(".")[0] not in codes:
+        return
+    try:
+        ctx = _state.get("ctx")
+        dt = getattr(ctx, "current_dt", None)
+        with open("/tmp/quant_trace.log", "a", encoding="utf-8") as f:
+            f.write(f"{dt} {code} {msg}\n")
+    except Exception:
+        pass
+
+
+def _frame_desc(df):
+    try:
+        idx = df.index
+        return f"{idx.min().date()}~{idx.max().date()}n={len(df)}"
+    except Exception:
+        return "?"
+
+
+def _mem_daily_usable(df, start_ts, end_ts, count):
+    """内存日线帧是否覆盖本次批量查询（与单标的 fetch 路径的覆盖语义对齐）。
+
+    2026-09-03 长窗对齐实锤：批量路径曾无条件信任 ``_daily_mem``，早期窄窗口
+    取数（如交易日历计算）先写入的窄/陈旧帧会被长回看（动量 25d+）直接使用——
+    短帧 R²/风控全是垃圾值 → 选票翻转（06-23 562590），且静默无告警。单标的
+    路径有覆盖检查+回源，此处必须同口径，否则同一 dm 两条路径读出两套历史。
+    """
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return False
+    idx = getattr(df, "index", None)
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) == 0:
+        return False
+    norm = idx.normalize()
+    if end_ts is not None and norm.max() < end_ts:
+        return False  # 末端早于请求末端：陈旧帧
+    lo = start_ts if start_ts is not None else norm.min()
+    n = int(((norm >= lo) & (norm <= end_ts)).sum()) if end_ts is not None else len(df)
+    return not (count and n < int(count))  # 起点太晚：窄帧撑不满回看窗口
+
+
 def _get_price_batch_daily(security, start_date, end_date, count, fields, panel):
-    """批量日线查询：直接从 _daily_mem 取，避免逐标的 copy/filter/reset_index。"""
+    """批量日线查询：直接从 _daily_mem 取，避免逐标的 copy/filter/reset_index。
+
+    内存帧未覆盖请求区间时走原 fetch 路径回源（见 _mem_daily_usable）。
+    """
     mgr = _state["manager"]
     ctx = _state.get("ctx")
     current_dt = ctx.current_dt if ctx and ctx.current_dt else None
@@ -237,7 +302,11 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
     frames = []
     for sec in security:
         df = mgr._daily_mem.get(f"get_daily_{sec}")
-        if df is None or (hasattr(df, "empty") and df.empty):
+        # tracing 关闭时不算帧描述（热路径零开销；_trace 内部会再查一次开关）
+        _mem_state = (_frame_desc(df) if df is not None else "MISS") if _trace_codes() else ""
+        if not _mem_daily_usable(df, start_ts, end_ts, count):
+            _trace(sec, f"batch end={end_ts.date() if end_ts else None} count={count} "
+                        f"mem={_mem_state} verdict=REFETCH")
             # 兜底：走原 fetch 路径（触发加载并缓存到 _daily_mem）。
             # 重试一次：回源瞬时失败曾导致单标的整体缺席动量计算
             # （08-21 黄金ETF误换仓根因之一），失败必须留痕告警。
@@ -250,7 +319,12 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
                     df = None
             if df is None or (hasattr(df, "empty") and df.empty):
                 _logger.warning("批量日线取数最终失败，标的缺席本次历史数据: %s", sec)
+                _trace(sec, "fetch FAILED skip")
                 continue
+            _trace(sec, f"fetched frame={_frame_desc(df)}")
+        else:
+            _trace(sec, f"batch end={end_ts.date() if end_ts else None} count={count} "
+                        f"mem={_mem_state} verdict=MEMHIT")
         idx = df.index
         if not isinstance(idx, pd.DatetimeIndex):
             continue
@@ -266,7 +340,10 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
         if count and len(sub) > count:
             sub = sub.tail(count)
         if sub.empty:
+            _trace(sec, f"masked EMPTY (memrange={_frame_desc(df) if _trace_codes() else ''})")
             continue
+        if _trace_codes():
+            _trace(sec, f"rows={len(sub)} d0={sub.index.min().date()} d1={sub.index.max().date()}")
         sub = sub.copy()
         sub["code"] = sec
         sub["time"] = sub.index
@@ -384,6 +461,7 @@ def get_price(security, start_date=None, end_date=None, count=None,
                 raw = mgr.fetch("get_daily", sec,
                                 start_date or "20000101", end_date or "20300101")
             if raw is None or raw.empty:
+                _trace(sec, f"single freq={frequency} RAW_EMPTY")
                 continue
             # 高效切片：分钟单标的取数（count=1 等）用 searchsorted 直接定位末位，
             # 避免对整帧（数千行）做 normalize + 多次布尔掩膜遍历。
@@ -432,11 +510,41 @@ def get_price(security, start_date=None, end_date=None, count=None,
                     sub = sub.iloc[-count:]
                 df = sub.copy()
             if df.empty:
+                _trace(sec, f"single freq={frequency} MASKED_EMPTY")
                 continue
+            try:
+                if "volume" in df.columns and _trace_codes():
+                    _v = pd.to_numeric(df["volume"], errors="coerce")
+                    _trace(sec, f"single freq={frequency} rows={len(df)} "
+                                f"volNaN={int(_v.isna().sum())} vol0={int((_v == 0).sum())}")
+            except Exception:
+                pass
             for nc in ("open", "high", "low", "close", "volume",
                         "money", "amount", "vol"):
                 if nc in df.columns:
                     df[nc] = pd.to_numeric(df[nc], errors="coerce")
+            if frequency in ("1m", "minute", "1min"):
+                # 分钟帧可能含未来拆股的前复权：按 as-of（end/current 上界）
+                # 撤销（与 jqcompat 分钟侧、live_feed 同语义；volume 不动）。
+                try:
+                    _asof = None
+                    if end_date is not None:
+                        _asof = pd.Timestamp(end_date)
+                    _c = _state.get("ctx")
+                    if _c is not None and getattr(_c, "current_dt", None) is not None:
+                        _cdt = pd.Timestamp(_c.current_dt)
+                        _asof = _cdt if _asof is None else min(_asof, _cdt)
+                    if _asof is not None:
+                        _mgr2 = _state.get("manager")
+                        _rev = getattr(_mgr2, "revoke_future_split_factor", None)
+                        if _rev is not None:
+                            _ff = _rev(sec, _asof)
+                            if _ff != 1.0:
+                                for _pc in ("open", "high", "low", "close"):
+                                    if _pc in df.columns:
+                                        df[_pc] = df[_pc] * _ff
+                except Exception:
+                    pass
             if isinstance(df.index, pd.DatetimeIndex) and df.index.name is None:
                 df.index.name = "datetime"
             idx_name = df.index.name
@@ -606,9 +714,9 @@ def order(security, amount):
     fee = _state["fee"]
     slip = _state["slippage"]
     fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
-    # 按最小报价单位取整（ETF/基金 0.001、股票 0.01）：真实成交只落在 tick 上，
-    # 与回测侧 jqcompat._patch_matcher_tick_rounding、Matcher 止损同口径
-    fill = round(fill, 3 if _is_etf(security) else 2)
+    # 按最小报价单位取整（共享 tick.round_to_tick：真实成交只落在 tick 上，
+    # 与回测侧 jqcompat._patch_matcher_tick_rounding、Matcher 止损同口径）
+    fill = round_to_tick(fill, security)
     turnover = abs(amount) * fill
     # Use separate buy/sell commission rates with minimum
     fee_cfg = _state.get("fee_config")

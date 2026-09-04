@@ -771,6 +771,7 @@ def set_benchmark(code):
 
 
 _SLIPPAGE_OVERRIDE = None  # set_slippage(FixedSlippage(x)) 记录的值（None=未设置）
+_ORDER_COST_OVERRIDE = None  # set_order_cost(OrderCost(...)) 记录的费率（None=未设置）
 
 
 class FixedSlippage:
@@ -971,7 +972,49 @@ def run_weekly(func, weekday=1, time=None, *args, **kwargs):
 
 
 def set_order_cost(*args, **kwargs):
-    pass
+    """聚宽交易费用设置：记录并尽力同步到运行中的 rqalpha 费率决策器。
+
+    此前空实现——策略 set_order_cost(OrderCost(万1)) 在回测侧被静默丢弃，
+    回测按 params.fee（万3）收费、补跑按万1，19 笔累计差 ~420 元现金，
+    首个买不起整手的 dust 单即分叉（2026-09-03 dual_v55 08-06 513330 根因）。
+    与 set_slippage/_SLIPPAGE_OVERRIDE 同模式（initialize 在 mod start_up
+    之后执行，只能运行时覆盖）。
+    """
+    global _ORDER_COST_OVERRIDE
+    cost = None
+    for a in args:  # 首参惯例为 OrderCost；兼容后续位置参数
+        if isinstance(a, OrderCost):
+            cost = a
+            break
+    if cost is None:
+        return
+    _ORDER_COST_OVERRIDE = {
+        "open_commission": cost.open_commission,
+        "close_commission": cost.close_commission,
+        "close_today_commission": cost.close_today_commission,
+        "min_commission": cost.min_commission,
+    }
+    # 运行中 decider 覆盖：rqalpha StockTransactionCostDecider 只有单一
+    # multiplier（买卖同费率）+ 最小佣金；引擎侧买卖分费率，常见 open==close
+    # 时精确一致，不一致时取 close 口径（卖出实现损益与再买入现金精确；
+    # 买入侧股数差 dust 级，见注释）。
+    try:
+        from rqalpha.environment import Environment as _Env
+        from rqalpha.utils import INST_TYPE_IN_STOCK_ACCOUNT
+
+        env = _Env.get_instance()
+        mult = float(cost.close_commission) / 0.0008
+        for _it in INST_TYPE_IN_STOCK_ACCOUNT:
+            try:
+                _dec = env.get_transaction_cost_decider(_it)
+            except Exception:
+                continue
+            if hasattr(_dec, "commission_multiplier"):
+                _dec.commission_multiplier = mult
+            if hasattr(_dec, "min_commission"):
+                _dec.min_commission = float(cost.min_commission)
+    except Exception:
+        pass
 
 
 def set_option(*args, **kwargs):
@@ -1001,8 +1044,27 @@ class PriceRelatedSlippage:
 
 
 class OrderCost:
-    def __init__(self, *a, **k):
-        pass
+    """聚宽交易费用（字段与 jqengine.api.OrderCost 同口径）：仅记录值，
+    由 set_order_cost 落到 rqalpha 运行中的费率决策器。"""
+
+    def __init__(self, open_tax=0, close_tax=0, open_commission=0.0001,
+                 close_commission=0.0001, close_today_commission=0.0001,
+                 min_commission=5, *a, **k):
+        def _f(v, d):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float(d)
+
+        self.open_tax = _f(open_tax, 0)
+        self.close_tax = _f(close_tax, 0)
+        self.open_commission = _f(open_commission, 0.0001)
+        self.close_commission = _f(close_commission, 0.0001)
+        self.close_today_commission = _f(close_today_commission, 0.0001)
+        self.min_commission = _f(min_commission, 5)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 # ---- log shim ----
@@ -1986,10 +2048,11 @@ def _mem_daily_to_recarray(df, code=None):
     该帧已是 DatetimeIndex 且单调升序（服务端分区保证），直接按列填充可省去
     两次 DataFrame 重建。仅限 _daily_mem 来源帧；其它来源仍走 _daily_to_recarray。
 
-    total_turnover 复刻旧路径（normalize×2）行为：`_daily_to_recarray` 二次
-    normalize 时帧已无 money/amount 列，退化为 ``close × volume``——对齐必须
-    保持该口径（T15/16 对齐 fixture 即基于此），故此处同样用 close×volume，
-    不用 money。
+    total_turnover 用帧的 money 列（真实成交额）——2026-09-03 对齐验证实锤：
+    此前为"复刻旧路径"用的 close×volume，与 money 系统性差 ~1.5%（VWAP≠收盘），
+    流动性过滤阈值边缘 3 只码两边判定分叉 → 动态池 137 vs 135 → 08-19/08-28
+    选票翻转。money 缺失/非有限/为零时才回退 close×volume（与模拟盘
+    _get_price_batch_daily 直接读 money 列同口径）。
     """
     n = len(df)
     if n == 0:
@@ -2003,7 +2066,12 @@ def _mem_daily_to_recarray(df, code=None):
     ) * 1000000
     for f in ("open", "high", "low", "close", "volume"):
         arr[f] = df[f].to_numpy(dtype=np.float64)
-    arr["total_turnover"] = arr["close"] * arr["volume"]
+    if "money" in df.columns:
+        _m = df["money"].to_numpy(dtype=np.float64)
+        _cv = arr["close"] * arr["volume"]
+        arr["total_turnover"] = np.where(np.isfinite(_m) & (_m != 0), _m, _cv)
+    else:
+        arr["total_turnover"] = arr["close"] * arr["volume"]
     arr["limit_up"], arr["limit_down"] = _limit_prices_from_prev_close(
         df["close"], rate=_limit_rate(code) if code else 0.10)
     return arr
@@ -2092,22 +2160,28 @@ class _MinuteBarStore:
 def _fund_instrument_type(code):
     """按代码段判定基金/证券类型。
 
-    上交所(XSHG)：51/56/58 → ETF，50 → LOF；深交所(XSHE)：15 → ETF，16 → LOF；
-    其余 → CS。rqalpha 股票账户支持 ETF/LOF 交易（INST_TYPE_IN_STOCK_ACCOUNT），
+    上交所(XSHG)：50 → LOF，其余 5 开头（51/52/53/55/56/58，宇宙实证）
+    → ETF；深交所(XSHE)：15 → ETF，16 → LOF，18 → ETF（与宇宙过滤
+    _is_jq_etf_code 的 180/181 ETF 段一致）；其余 → CS。沪市无 5 开头股票，
+    深市 000xxx 是股票（见 mootdx _is_index 注释的反例），故后缀+前缀双判。
+    rqalpha 股票账户支持 ETF/LOF 交易（INST_TYPE_IN_STOCK_ACCOUNT），
     且 sys_transaction_cost 只对 CS 收卖出印花税 —— ETF/LOF 现实免税，
-    类型必须标对，否则回测多扣 0.05% 印花税。
+    类型必须标对，否则回测多扣 0.05% 印花税（2026-09-03 长窗对齐实锤：
+    520830 被误判 CS，04-08 一笔多扣 49.76 元并滚雪球）。
     """
     pure, _, exch = code.partition(".")
     if exch == "XSHG":
-        if pure.startswith(("51", "56", "58")):
-            return "ETF"
         if pure.startswith("50"):
             return "LOF"
+        if pure.startswith("5"):
+            return "ETF"
     elif exch == "XSHE":
         if pure.startswith("15"):
             return "ETF"
         if pure.startswith("16"):
             return "LOF"
+        if pure.startswith("18"):
+            return "ETF"
     return "CS"
 
 
@@ -2943,33 +3017,65 @@ def _register_jq_apis():
     sys.modules.setdefault("jqlib.technical_analysis", _jqlib_ta_mod)
 
 
-def _patch_matcher_tick_rounding():
-    """回测撮合成交价按最小报价单位取整（ETF/基金 0.001、股票 0.01）。
+def _patch_matcher_tick_rounding() -> bool:
+    """回测撮合成交价按最小报价单位取整（共享 tick.round_to_tick）。
 
-    模拟盘 jqengine 撮合 fill=round(price*(1±slip), 3)、Matcher 止损同口径；
-    rqalpha 滑点后不取整——同一策略回测成交价 2.1322 vs 补跑 tick 价 2.132，
-    每笔 ±0.0001 价差使净值与边缘选票系统性漂移，回测与补跑无法逐笔对齐。
-    与 jqengine/Matcher 的取整口径统一。幂等。
+    模拟盘 jqengine 撮合、Matcher 止损同口径；rqalpha 滑点后不取整——同一策略
+    回测成交价 2.1322 vs 补跑 tick 价 2.132，每笔 ±0.0001 价差使净值与边缘选票
+    系统性漂移，回测与补跑无法逐笔对齐。幂等，返回是否命中任一布局。
+
+    双布局兼容（血泪教训 2026-09-03）：rqalpha 5.x 的成交价漏斗是
+    ``matcher.base.BaseMatcher._get_execution_price``，6.x（uv.lock 锁定
+    6.2.1）重构为 ``matcher.py``（DefaultBarMatcher/DefaultTickMatcher），
+    漏斗变为 ``slippage.SlippageDecider.get_trade_price``。旧补丁在 6.x 下
+    import 失败被静默吞掉——回测 SELL 价带滑点尾数（2.1927807 vs 2.193），
+    逐笔对齐全毁，且没有任何报错。任一布局命中即算成功；都没命中返回 False
+    （调用方应告警，而不是静默跑下去）。
     """
+    from app.quant.tick import round_to_tick
+
+    hit = False
+    # 6.x 布局：滑点决策器是 bar/tick 双撮合的唯一成交价漏斗
     try:
-        from rqalpha.mod.rqalpha_mod_sys_simulation.matcher.base import BaseMatcher
+        from rqalpha.mod.rqalpha_mod_sys_simulation import slippage as _slip_mod
+        _decider_cls = _slip_mod.SlippageDecider
     except Exception:
-        return
-    if getattr(BaseMatcher, "_jq_tick_patched", False):
-        return
+        _decider_cls = None
+    if _decider_cls is not None:
+        if not getattr(_decider_cls, "_jq_tick_patched", False):
+            _orig_gtp = _decider_cls.get_trade_price
 
-    _orig_gep = BaseMatcher._get_execution_price
+            def _tick_gtp(self, order, price):
+                px = _orig_gtp(self, order, price)
+                try:
+                    return round_to_tick(px, getattr(order, "order_book_id", None))
+                except Exception:
+                    return px
 
-    def _tick_gep(self, order, deal_price, open_auction):
-        px = _orig_gep(self, order, deal_price, open_auction)
-        try:
-            step = 0.001 if (order.order_book_id or "").split(".")[0].startswith(("5", "15", "16")) else 0.01
-            return round(round(px / step) * step, 10)
-        except Exception:
-            return px
+            _decider_cls.get_trade_price = _tick_gtp
+            _decider_cls._jq_tick_patched = True
+        hit = True
+    # 5.x 布局（回退）：基类执行价方法
+    try:
+        from rqalpha.mod.rqalpha_mod_sys_simulation.matcher import base as _base_mod
+        _matcher_cls = _base_mod.BaseMatcher
+    except Exception:
+        _matcher_cls = None
+    if _matcher_cls is not None:
+        if not getattr(_matcher_cls, "_jq_tick_patched", False):
+            _orig_gep = _matcher_cls._get_execution_price
 
-    BaseMatcher._get_execution_price = _tick_gep
-    BaseMatcher._jq_tick_patched = True
+            def _tick_gep(self, order, deal_price, open_auction):
+                px = _orig_gep(self, order, deal_price, open_auction)
+                try:
+                    return round_to_tick(px, getattr(order, "order_book_id", None))
+                except Exception:
+                    return px
+
+            _matcher_cls._get_execution_price = _tick_gep
+            _matcher_cls._jq_tick_patched = True
+        hit = True
+    return hit
 
 
 def _patch_price_board():
@@ -3048,9 +3154,13 @@ def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=N
     _SECURITY_INFO_CACHE.clear()
     global _SLIPPAGE_OVERRIDE
     _SLIPPAGE_OVERRIDE = None
+    global _ORDER_COST_OVERRIDE
+    _ORDER_COST_OVERRIDE = None
 
     _register_jq_apis()
     _patch_rqalpha_objects()
     _patch_price_board()
-    _patch_matcher_tick_rounding()
+    if not _patch_matcher_tick_rounding():
+        logger.warning("[jqcompat] tick 取整补丁未命中任何 rqalpha 布局——回测成交价"
+                       "将带滑点尾数，与补跑逐笔错位")
     _install_barcache_mod()
