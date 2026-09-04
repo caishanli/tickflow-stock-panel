@@ -9,8 +9,11 @@ def round_buy_lot(amount: int) -> int:
 
 def affordable_shares(cash: float, price: float, slippage: float = 0.0,
                       fee_rate: float = 0.0) -> int:
-    """可用资金按 ``price×(1+slip)×(1+fee)`` 单价可买股数（向下取整）。"""
-    unit_cost = float(price) * (1 + float(slippage or 0.0)) * (1 + float(fee_rate or 0.0))
+    """可用资金按 ``price×(1+slip)×(1+fee)`` 单价可买股数（向下取整）。
+
+    ``slippage``/``fee_rate`` 为 None 时抛 TypeError（旧内联公式同行为；
+    禁止静默按 0 处理，见契约 §7.3）。"""
+    unit_cost = float(price) * (1 + float(slippage)) * (1 + float(fee_rate))
     if unit_cost <= 0:
         return 0
     return int(float(cash) // unit_cost)

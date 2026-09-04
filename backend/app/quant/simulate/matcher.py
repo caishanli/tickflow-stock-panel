@@ -11,14 +11,8 @@
 from __future__ import annotations
 
 from ..config import CONFIG
-from ..core import (
-    STAMP_TAX_RATE as DEFAULT_STAMP_TAX,
-)
-from ..core import (
-    commission,
-    fill_price,
-    stamp_tax_rate,
-)
+from ..core import STAMP_TAX_RATE as DEFAULT_STAMP_TAX
+from ..core import commission, fill_price, stamp_tax_rate
 
 
 def _resolve_name(code: str) -> str:

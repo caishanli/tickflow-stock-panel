@@ -32,6 +32,8 @@ def classify_fund(code: str) -> str:
     上交所(XSHG)：50 → LOF，其余 5 开头（51/52/53/55/56/58，宇宙实证）
     → ETF；深交所(XSHE)：15 → ETF，16 → LOF，18 → ETF；其余 → CS。
     注意深市 ``000xxx`` 是股票不是指数（后缀+前缀双判）。
+    血泪：52 系曾被误判 CS 致单笔多扣 49.76 元印花税并滚雪球（2026-09-03 长窗
+    对齐实锤；rqalpha_bridge 曾私藏过期副本，1 Core 已收敛）。
     """
     pure, _, exch = (code or "").partition(".")
     if exch == "XSHG":

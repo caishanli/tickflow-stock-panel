@@ -3,6 +3,8 @@
 真实数据层无 high_limit/low_limit/preclose 列，按昨收+分档幅度计算：
 - 沪 68/58、深 30/159 → ±20%；ST → ±5%；其余 ±10%。
 - limit = round(prev_close × (1±rate), 2)；首日无前收 → NaN（不估算）。
+- 北交所 8/4 开头实为 ±30%，但本代码体系（XSHG/XSHE 后缀）覆盖不到北交所标的，
+  不做分档，随主板 ±10%（旧 jqcompat 注释搬运，决策保留）。
 
 调用方差异只在两处，各自保留薄适配：
 - 码制：JQ（XSHG/XSHE）vs PTrade（SS/SZ）——调用方先归一化 ``exch`` 再调；

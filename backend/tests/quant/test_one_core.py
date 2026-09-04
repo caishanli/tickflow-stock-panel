@@ -123,11 +123,31 @@ _LIMIT_RATE_ALLOW = {
 
 
 def test_limit_rate_adapters_only():
+    # 正统（无下划线）唯一在 core；引擎侧薄适配（带下划线）只许允许表
+    assert set(_defs("limit_rate")) == {CORE + "limits.py"}, _defs("limit_rate")
     sites = set(_defs("_limit_rate"))
-    assert sites <= _LIMIT_RATE_ALLOW | {CORE + "limits.py"}, \
+    assert sites <= _LIMIT_RATE_ALLOW, \
         f"新增 _limit_rate 实现：{sites - _LIMIT_RATE_ALLOW}"
-    for path in sites - {CORE + "limits.py"}:
+    for path in sites:
         _assert_thin_adapter(path, "_limit_rate")
+
+
+def test_core_math_single_definition():
+    """core 数学函数零引擎侧重复定义（同名出现即有人另起炉灶）。"""
+    for name, canonical in (
+        ("fill_price", CORE + "fees.py"),
+        ("resolve_commission", CORE + "fees.py"),
+        ("commission", CORE + "fees.py"),
+        ("stamp_tax", CORE + "fees.py"),
+        ("stamp_tax_rate", CORE + "fees.py"),
+        ("round_buy_lot", CORE + "lots.py"),
+        ("affordable_shares", CORE + "lots.py"),
+        ("resolve_live_price", CORE + "pricing.py"),
+        ("limit_prices_from_prev_close", CORE + "limits.py"),
+        ("order_value_amount", CORE + "execution.py"),
+        ("target_percent_amount", CORE + "execution.py"),
+    ):
+        assert set(_defs(name)) == {canonical}, f"{name}: {_defs(name)}"
 
 
 # ---- 委托链：两 order() 必须调 execute_order ----

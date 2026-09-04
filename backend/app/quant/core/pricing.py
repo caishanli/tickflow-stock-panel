@@ -19,10 +19,9 @@ def resolve_live_price(snapshot, code, *, minute_mode=False, manager=None,
         return price
     if minute_mode and manager is not None and current_dt is not None:
         q = to_engine(code) if to_engine is not None else code
-        try:
-            p = manager.get_minute_price_at(q, current_dt)
-        except Exception:
-            p = None
+        # 故意不吞异常：get_minute_price_at 缺数返回 None（不抛），真抛出来说明
+        # 上游坏了，必须 loud（旧两引擎此处同样不捕获；契约 §7.3 禁止静默回退）。
+        p = manager.get_minute_price_at(q, current_dt)
         if p is not None:
             return p
     return fallback_price or 0

@@ -17,8 +17,11 @@ from .tick import round_to_tick
 
 
 def fill_price(price: float, side: str, slippage: float, code) -> float:
-    """成交价：买 ``price*(1+slip)`` / 卖 ``price*(1-slip)``，按 tick 取整。"""
-    slip = float(slippage or 0.0)
+    """成交价：买 ``price*(1+slip)`` / 卖 ``price*(1-slip)``，按 tick 取整。
+
+    ``slippage=None`` 时抛 TypeError（旧内联公式同行为；禁止静默按 0 处理，
+    见契约 §7.3）。"""
+    slip = float(slippage)
     raw = float(price) * (1 + slip) if side == "buy" else float(price) * (1 - slip)
     return round_to_tick(raw, code)
 
