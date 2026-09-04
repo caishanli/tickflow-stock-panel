@@ -9,6 +9,24 @@
 > 新增 API 面（新平台风格）只许做**翻译**（映射到本契约），不许做解释；
 > 契约没有的东西要么扩展 core（走评审+全矩阵重验），要么显式抛错。
 > Face 对等清单与禁静默 stub 由 `backend/tests/quant/test_core_contract.py` 锁死。
+> **1 Core 铁律**见 §0；收敛进度与允许表由 `backend/tests/quant/test_one_core.py` 锁死。
+
+## 0. 1 Core 铁律（长期有效，优先于一切便利）
+
+**一个语义只许有一个实现。** jq / ptrade 只是两种 API 方言（码制、签名、`_state` 形状），
+翻译层只许做翻译，不许重写语义。凡是影响成交价、费用、税、持仓、取数窗口的逻辑，
+唯一实现只能住在 `backend/app/quant/` 下的共享位置（`tick.py`、`simulate/matcher.py`、
+`jqcompat.py`、`jqengine/datasource/manager.py`，未来收敛到 `core/` 包——目录未建成就近共享，**不许另起第三份**）。
+
+1. **新语义只许进共享实现。** 需求先问"core 里有没有"：有就调，没有就加到共享处 + 两边同调；**禁止在引擎文件里就地写第二份公式**（哪怕"就三行"）。
+2. **别名必须真委托。** 过渡期允许薄适配（如 `_limit_rate` 的码制归一化 wrapper），
+但函数体只许是"至多一条解析赋值 + 一行 return"，不许出现算术/比较/分支
+（测试用 AST 校验；`test_one_core._assert_thin_adapter` 为准，违者失败）。
+3. **允许表只减不增。** 现存重复（`_is_etf` 三处、`DEFAULT_STAMP_TAX` 两处 env+一处硬编码→已收敛为全 env）记在 `test_one_core.py` 的 ALLOWLIST 里；新增任何同名语义定义即测试失败。每次收敛掉一处，就从表里删一处。
+4. **改共享实现 = 改两边。** 动 tick/费率/税/窗口/复权任一共享函数，必须重跑回测 vs 补跑双矩阵（jq 窗 + ptrade 窗）+ 全量 `tests/quant`，指标回到 §0 头验收线才算完。
+5. **码制转换不是语义。** `.SS/.SZ ↔ .XSHG/.XSHE`、`PtradePosition` 字段别名这类翻译永远留在引擎侧，不许反向污染共享实现（共享函数只认 JQ 码）。
+
+违反即视为引入新的静默分叉，按 §7 红线同等处理（打回）。
 
 ## 1. 订单与成交
 
@@ -39,10 +57,10 @@
 深交所：`15*` → ETF，`16*` → LOF，`18*` → ETF；
 其余 → CS（股票；注意深市 `000xxx` 是股票不是指数）。
 
-- 成交取整：`tick.tick_size`（0.001 / 0.01）
-- 回测税种：`jqcompat._fund_instrument_type`（ETF/LOF/CS，决定 rqalpha 是否收印花税）
-- 补跑税种：`simulate.matcher._is_etf` / `jqengine.api._is_etf`（免税判定）
-- **三处互相独立实现，禁止混用；一致性由测试对宇宙全量逐码校验，新前缀出现时测试失败驱动显式分类**（52 系曾漏判致单笔多扣 49.76 元）
+- 成交取整：`core.tick.tick_size`（0.001 / 0.01）
+- 回测税种：`core.instruments.classify_fund`（ETF/LOF/CS，决定 rqalpha 是否收印花税；`jqcompat` 与 `rqalpha_bridge` 均为其别名——bridge 曾私藏过期副本，误判 52/53/55/18，1 Core 已收敛）
+- 补跑税种：`core.instruments.is_etf`（免税判定；三引擎零本地定义）
+- **一致性由测试对宇宙全量逐码校验 + `test_one_core.py` 锁死零本地定义，新前缀出现时测试失败驱动显式分类**（52 系曾漏判致单笔多扣 49.76 元）
 
 ## 4. 数据窗口与复权
 
@@ -75,3 +93,7 @@
 - 补跑跨日首 bar 快照竞态：修复需动盘中实时核心路径，待交易日实盘验证。
 - vendor（聚宽/通达信）数据点差：逐点不可达，验收只看结构指标（§0）。
 - `open≠close` 佣金在 rqalpha 侧取 close 近似（dust 级，§2）。
+- **策略触发时刻差（1-core 范围外）**：分钟窗下 rqalpha 按 bar 触发策略 intraday 动作
+  （如 589800 04-29 10:06 卖），补跑侧同策略在 13:10 批量流水线才触发——决策层调度
+  /快照 feed 差异，非执行数学差异。1-core A/B 实锤代码中性（新旧码 bt 39/39 同价、
+  新旧码 sim 39/39 同价，旧码 bt 同样 10:06 卖）；验收仍看结构指标（覆盖率/翻转/价比中位）。

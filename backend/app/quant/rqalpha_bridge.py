@@ -28,6 +28,7 @@ from rqalpha.model.instrument import Instrument
 
 from . import db
 from .config import CONFIG, QuantConfig
+from .core import classify_fund as _fund_instrument_type
 
 # 涨跌停幅度分档公共函数（与 jqcompat 同口径复用，避免两处各写一份分档规则）
 from .jqcompat import _dt_to_int, _is_st_name, _limit_rate
@@ -55,29 +56,6 @@ except Exception:
 _LIVE_RUN_ID = None
 
 logger = logging.getLogger(__name__)
-
-
-def _fund_instrument_type(code: str) -> str:
-    """按代码段判定基金/证券类型（与 jqcompat._fund_instrument_type 同口径，随
-    本文件既有的 _DayBarStore/_CalendarStore 等复制惯例保留本地副本）。
-
-    上交所(XSHG)：51/56/58 → ETF，50 → LOF；深交所(XSHE)：15 → ETF，16 → LOF；
-    其余 → CS。rqalpha 股票账户支持 ETF/LOF（INST_TYPE_IN_STOCK_ACCOUNT），
-    sys_transaction_cost 只对 CS 收卖出印花税 —— ETF/LOF 现实免税，类型必须
-    标对，否则回测多扣 0.05% 印花税。
-    """
-    pure, _, exch = code.partition(".")
-    if exch == "XSHG":
-        if pure.startswith(("51", "56", "58")):
-            return "ETF"
-        if pure.startswith("50"):
-            return "LOF"
-    elif exch == "XSHE":
-        if pure.startswith("15"):
-            return "ETF"
-        if pure.startswith("16"):
-            return "LOF"
-    return "CS"
 
 
 def _norm_frequency(freq) -> str:

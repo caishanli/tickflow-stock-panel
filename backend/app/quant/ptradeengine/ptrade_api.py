@@ -17,14 +17,24 @@ from __future__ import annotations
 import types
 from typing import ClassVar
 
-import numpy as np
 import pandas as pd
 
+from ..core import (
+    execute_order,
+    order_value_amount,
+    resolve_live_price,
+    target_percent_amount,
+)
+from ..core import (
+    limit_prices_from_prev_close as _limit_prices_from_prev_close,
+)
+from ..core import (
+    limit_rate as _core_limit_rate,
+)
+from ..core.instruments import STAMP_TAX_RATE as DEFAULT_STAMP_TAX  # noqa: F401  # 兼容别名
+from ..core.instruments import is_etf as _is_etf  # noqa: F401  # 兼容别名
 from ..jqengine.datasource.manager import DataManager
-from ..tick import round_to_tick
 from .context import PtradeContext, PtradePortfolio, PtradePosition, ptrade_code_conv
-
-DEFAULT_STAMP_TAX = 0.0005  # 卖出印花税（A股 0.05%，ETF 免征）
 
 # 官方 get_history 输出字段（用于单标的列名判定）
 _PT_FIELDS = ("open", "high", "low", "close", "volume", "money", "price",
@@ -51,13 +61,6 @@ _conv = ptrade_code_conv()
 to_engine, to_pt = _conv
 
 
-def _is_etf(code):
-    """简单代码前缀判定：沪市 5 开头、深市 15/16/18 开头为基金（免印花税，与
-    jqengine/matcher 同口径；成交价取整走 tick.round_to_tick）。"""
-    num = (code or "").split(".")[0]
-    return num.startswith(("5", "15", "16", "18"))
-
-
 def _norm_freq(freq):
     freq = (freq or "1d").lower()
     if freq in ("daily", "day", "1d"):
@@ -79,23 +82,9 @@ def _is_st_name(code, name=None):
 
 
 def _limit_rate(code, name=None):
-    """按代码分档的涨跌停幅度：沪 68/58 与深 30/159 为 ±20%，ST ±5%，其余 ±10%。"""
+    """按代码分档的涨跌停幅度（1 Core 薄适配：码制归一化 + 本地 ST 名源，公式见 core.limits）。"""
     pure, _, exch = code.partition(".")
-    if exch in ("", "XSHG", "SS") and pure.startswith(("68", "58")):
-        return 0.20
-    if exch in ("", "XSHE", "SZ") and pure.startswith(("30", "159")):
-        return 0.20
-    if _is_st_name(code, name):
-        return 0.05
-    return 0.10
-
-
-def _limit_prices_from_prev_close(close, rate=0.10):
-    """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。"""
-    prev_close = close.shift(1)
-    limit_up = (prev_close * (1 + rate)).round(2)
-    limit_down = (prev_close * (1 - rate)).round(2)
-    return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+    return _core_limit_rate(pure, exch, _is_st_name(code, name))
 
 
 def _close_series(df):
@@ -150,104 +139,51 @@ def run_minute(func, minute="every"):
 
 
 def _live_price(security):
-    """当前价：优先 minute_prices 快照（PTrade 域），其次 manager 精确取点。"""
-    snap = _state.get("minute_prices") or {}
-    if snap.get(security):
-        return snap[security]
-    if _state.get("minute_mode"):
-        mgr = _state.get("manager")
-        ctx = _state.get("ctx")
-        if mgr and ctx and ctx.current_dt is not None:
-            p = mgr.get_minute_price_at(to_engine(security), ctx.current_dt)
-            if p is not None:
-                return p
-    return _state["ctx"].portfolio.get_position(security).price or 0
+    """当前价（1 Core：解析顺序见 core.pricing，PTrade 域经 to_engine 转 JQ 码取点）。"""
+    return resolve_live_price(
+        _state.get("minute_prices"), security,
+        minute_mode=_state.get("minute_mode"), manager=_state.get("manager"),
+        current_dt=_state.get("ctx").current_dt if _state.get("ctx") else None,
+        fallback_price=_state["ctx"].portfolio.get_position(security).price,
+        to_engine=to_engine,
+    )
 
 
 def order(security, amount):
-    """按股数下单（正买负卖）。PTrade 域：security 直接用 .SS/.SZ。"""
+    """按股数下单（正买负卖）。PTrade 域：security 直接用 .SS/.SZ。
+
+    1 Core：撮合真身在 ``core.execution.execute_order``，此处只做取价+委托。
+    """
     ctx = _state["ctx"]
-    p = ctx.portfolio
-    price = _live_price(security)
-    if price == 0 or amount == 0:
-        return False
-    amount = int(amount)
-    if amount > 0:
-        amount = amount // 100 * 100  # A股/ETF 买入整手（100 股向下取整）
-        if amount <= 0 or security in (_state.get("no_buy") or ()):
-            return False
-    existing = p.positions.get(security)
-    prev_cost = float(existing.avg_cost or 0.0) if existing else 0.0
-    if amount < 0:
-        if security in (_state.get("no_sell") or ()):
-            return False
-        closeable = float(existing.closeable_amount) if existing else 0.0
-        amount = -min(-amount, closeable)
-        if amount == 0:
-            return False
-    fee = _state["fee"]
-    slip = _state["slippage"]
-    fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
-    # 与 jqengine order()/回测撮合同口径（共享 tick 实现，见 quant-core-contract §1）
-    fill = round_to_tick(fill, security)
-    turnover = abs(amount) * fill
-    fee_cfg = _state.get("fee_config")
-    if fee_cfg:
-        comm_rate = fee_cfg["open_commission"] if amount > 0 else fee_cfg["close_commission"]
-        min_comm = fee_cfg["min_commission"]
-    else:
-        comm_rate = fee
-        min_comm = 0.0
-    fee_amount = round(max(turnover * comm_rate, min_comm), 2)
-    tax_amount = 0.0
-    if amount > 0:
-        cost = turnover + fee_amount
-        if cost > p.cash:
-            return False
-    else:
-        tax_amount = 0.0 if _is_etf(security) else round(turnover * DEFAULT_STAMP_TAX, 2)
-        cost = -(turnover - fee_amount - tax_amount)
-    pos = p.positions.setdefault(security, PtradePosition())
-    if amount > 0:
-        if float(pos.amount or 0.0) <= 0:
-            pos.entry_ts = ctx.current_dt
-        total_cost = pos.amount * pos.avg_cost + amount * fill
-        pos.amount += amount
-        pos.avg_cost = total_cost / pos.amount if pos.amount else 0.0
-        pos.today_amount = float(pos.today_amount or 0.0) + amount
-    else:
-        pos.amount += amount
-        if pos.amount <= 0:
-            pos.amount = 0
-            pos.avg_cost = 0.0
-            p.positions.pop(security, None)
-    pos.price = price
-    p.cash -= cost
-    _state["trades"].append({
-        "dt": ctx.current_dt, "code": security, "side": "buy" if amount > 0 else "sell",
-        "amount": amount, "price": fill, "fee": fee_amount, "tax": tax_amount,
-        "avg_cost": prev_cost,
-    })
-    return True
+    return execute_order(
+        portfolio=ctx.portfolio, position_factory=PtradePosition,
+        code=security, amount=amount, price=_live_price(security),
+        current_dt=ctx.current_dt, fee=_state["fee"], slippage=_state["slippage"],
+        fee_config=_state.get("fee_config"),
+        no_buy=_state.get("no_buy"), no_sell=_state.get("no_sell"),
+        trades=_state["trades"],
+    )
 
 
 def order_value(security, value):
+    """按金额下单（1 Core：股数换算走 core，成交走 order）。"""
     price = _live_price(security)
     if price == 0 or value == 0:
         return False
-    amount = int(value // (price * (1 + _state["fee"])))
-    return order(security, amount)
+    return order(security, order_value_amount(value, price, _state["fee"]))
 
 
 def order_target_percent(security, percent):
+    """调整到目标仓位比例（1 Core，与 jq 同口径含买力钳制）。"""
     p = _state["ctx"].portfolio
     price = _live_price(security)
     if price == 0:
         return False
-    target_value = p.value * percent
-    target_shares = int(target_value // price) if percent > 0 else 0
-    current_amount = p.get_position(security).amount
-    amount = target_shares - current_amount
+    amount = target_percent_amount(
+        portfolio_value=p.value, percent=percent, price=price,
+        current_amount=p.get_position(security).amount, cash=p.cash,
+        slippage=_state["slippage"], fee=_state["fee"],
+    )
     if amount != 0:
         return order(security, amount)
     return True

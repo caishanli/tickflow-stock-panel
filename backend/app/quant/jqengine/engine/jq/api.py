@@ -22,7 +22,14 @@ import pandas as pd
 from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday, nearest_workday
 from pandas.tseries.offsets import CustomBusinessDay
 
-from ....tick import round_to_tick
+from ....core import (
+    execute_order,
+    order_value_amount,
+    resolve_live_price,
+    target_percent_amount,
+)
+from ....core.instruments import STAMP_TAX_RATE as DEFAULT_STAMP_TAX  # noqa: F401  # 兼容别名
+from ....core.instruments import is_etf as _is_etf  # noqa: F401  # 兼容别名
 from ...datasource.base import DataSourceError
 from ...datasource.manager import DataManager
 from . import jq_names
@@ -30,17 +37,6 @@ from .context import Context, G, Position
 from .portfolio import Portfolio
 
 _logger = logging.getLogger("jqengine.api")
-
-# 印花税率（仅卖出，股票 0.05%，ETF 免征；与 simulate.matcher 同口径同环境变量）
-DEFAULT_STAMP_TAX = float(os.environ.get("QUANT_SIM_STAMP_TAX", "0.0005"))
-
-
-def _is_etf(code):
-    """简单代码前缀判定：沪市 5 开头、深市 15/16/18 开头为基金（免印花税）。
-
-    只用于税费判定，成交价取整走 tick.round_to_tick（勿混用）。"""
-    num = (code or "").split(".")[0]
-    return num.startswith(("5", "15", "16", "18"))
 
 _state = {
     "ctx": None,
@@ -167,23 +163,13 @@ class CurrentDataProxy:
             # 直接对预加载分钟帧切片取末值，避免每次 get_price 重建整帧
             p = mgr.get_minute_price_at(code, ctx.current_dt)
             if p is not None:
-                if code in ("159363.XSHE", "159381.XSHE"):
-                    import sys
-                    print(f"[DBG live] {code} dt={ctx.current_dt} price={p}", file=sys.stderr, flush=True)
                 return p
         if ctx and ctx.current_dt is not None:
             try:
                 df = get_price(code, count=1, frequency="1m")
                 if df is not None and not df.empty:
-                    p = float(df["close"].iloc[-1])
-                    if code in ("159363.XSHE", "159381.XSHE"):
-                        import sys
-                        print(f"[DBG live] {code} dt={ctx.current_dt} price={p} shape={df.shape}", file=sys.stderr, flush=True)
-                    return p
-            except Exception as e:
-                if code in ("159363.XSHE", "159381.XSHE"):
-                    import sys
-                    print(f"[DBG live] {code} dt={ctx.current_dt} EXC {e}", file=sys.stderr, flush=True)
+                    return float(df["close"].iloc[-1])
+            except Exception:
                 pass
         return None
 
@@ -191,11 +177,6 @@ class CurrentDataProxy:
         info = self._daily_info(code)
         lp = self._live_last_price(code)
         last = lp if lp is not None else 0.0
-        if code == "159363.XSHE" and _state.get("ctx") and _state["ctx"].current_dt:
-            import sys
-            dt = _state['ctx'].current_dt
-            if hasattr(dt, 'strftime') and dt.strftime('%Y-%m-%d %H:%M') == '2026-04-20 13:10':
-                print(f"[DBG cdata] {code} dt={dt} lp={lp} last={last} type={type(last)}", file=sys.stderr, flush=True)
         return SimpleNamespace(
             paused=info.paused, last_price=last, day_open=info.day_open,
             high_limit=info.high_limit, low_limit=info.low_limit,
@@ -654,110 +635,43 @@ def attribute_history(security, count, unit="1d", fields=None, skip_paused=True,
 def _live_price(security):
     """取当前 bar 的实时价，回退到持仓价。
 
-    回测桥每根 bar 都会把各标的当前价写入 minute_prices 快照（日线用
+    1 Core：解析顺序在 ``core.pricing.resolve_live_price``（快照→分钟精确取点→
+    持仓价）。回测桥每根 bar 都会把各标的当前价写入 minute_prices 快照（日线用
     close，分钟线用当前价），因此无论日线还是分钟模式都优先取该快照；
     分钟模式下再回退到 manager 精确取点；最后回退到持仓价。
     """
-    snap = _state.get("minute_prices") or {}
-    if security in snap and snap[security]:
-        return snap[security]
-    if _state.get("minute_mode"):
-        mgr = _state.get("manager")
-        ctx = _state.get("ctx")
-        if mgr and ctx and ctx.current_dt is not None:
-            p = mgr.get_minute_price_at(security, ctx.current_dt)
-            if p is not None:
-                if security in ("159363.XSHE", "159381.XSHE"):
-                    import sys
-                    print(f"[DBG price] {security} dt={ctx.current_dt} price={p}", file=sys.stderr, flush=True)
-                return p
-    return _state["ctx"].portfolio.get_position(security).price or 0
+    return resolve_live_price(
+        _state.get("minute_prices"), security,
+        minute_mode=_state.get("minute_mode"), manager=_state.get("manager"),
+        current_dt=_state.get("ctx").current_dt if _state.get("ctx") else None,
+        fallback_price=_state["ctx"].portfolio.get_position(security).price,
+    )
 
 
 def order(security, amount):
     """按股数下单（正买负卖）。
 
+    1 Core：撮合真身在 ``core.execution.execute_order``，此处只做取价+委托。
     交易规则：买入 100 股整手；T+1（当日买入不可卖，卖出量按 closeable 截断）；
     佣金双边 + 卖出印花税（非 ETF）；``_state["no_buy"]/["no_sell"]`` 禁买卖。
     """
     ctx = _state["ctx"]
-    p = ctx.portfolio
-    price = _live_price(security)
-    if price == 0 or amount == 0:
-        return False
-    amount = int(amount)
-    if amount > 0:
-        amount = amount // 100 * 100  # A股/ETF 买入整手（100 股向下取整）
-        if amount <= 0 or security in (_state.get("no_buy") or ()):
-            return False  # 不足一手 / 涨停禁买
-    existing = p.positions.get(security)
-    prev_cost = float(existing.avg_cost or 0.0) if existing else 0.0
-    if amount < 0:
-        if security in (_state.get("no_sell") or ()):
-            return False  # 跌停/停牌禁卖
-        closeable = float(existing.closeable_amount) if existing else 0.0
-        amount = -min(-amount, closeable)  # T+1：卖出不超过可卖量
-        if amount == 0:
-            return False
-    fee = _state["fee"]
-    slip = _state["slippage"]
-    fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
-    # 按最小报价单位取整（共享 tick.round_to_tick：真实成交只落在 tick 上，
-    # 与回测侧 jqcompat._patch_matcher_tick_rounding、Matcher 止损同口径）
-    fill = round_to_tick(fill, security)
-    turnover = abs(amount) * fill
-    # Use separate buy/sell commission rates with minimum
-    fee_cfg = _state.get("fee_config")
-    if fee_cfg:
-        if amount > 0:
-            comm_rate = fee_cfg["open_commission"]
-        else:
-            comm_rate = fee_cfg["close_commission"]
-        min_comm = fee_cfg["min_commission"]
-    else:
-        comm_rate = fee
-        min_comm = 0.0
-    fee_amount = round(max(turnover * comm_rate, min_comm), 2)
-    tax_amount = 0.0
-    if amount > 0:
-        cost = turnover + fee_amount
-        if cost > p.cash:
-            return False
-    else:
-        tax_amount = 0.0 if _is_etf(security) else round(turnover * DEFAULT_STAMP_TAX, 2)
-        cost = -(turnover - fee_amount - tax_amount)
-    pos = p.positions.setdefault(security, Position())
-    if amount > 0:
-        if float(pos.amount or 0.0) <= 0:
-            pos.entry_ts = ctx.current_dt  # 首次建仓记录买入时间
-        total_cost = pos.amount * pos.avg_cost + amount * fill
-        pos.amount += amount
-        pos.avg_cost = total_cost / pos.amount if pos.amount else 0.0
-        pos.today_amount = float(pos.today_amount or 0.0) + amount  # T+1 当日买入冻结
-    else:
-        pos.amount += amount
-        if pos.amount <= 0:
-            pos.amount = 0
-            pos.avg_cost = 0.0
-            p.positions.pop(security, None)
-    pos.price = price
-    p.cash -= cost
-    _state["trades"].append({
-        "dt": ctx.current_dt, "code": security, "side": "buy" if amount > 0 else "sell",
-        "amount": amount, "price": fill, "fee": fee_amount, "tax": tax_amount,
-        "avg_cost": prev_cost,
-    })
-    return True
+    return execute_order(
+        portfolio=ctx.portfolio, position_factory=Position,
+        code=security, amount=amount, price=_live_price(security),
+        current_dt=ctx.current_dt, fee=_state["fee"], slippage=_state["slippage"],
+        fee_config=_state.get("fee_config"),
+        no_buy=_state.get("no_buy"), no_sell=_state.get("no_sell"),
+        trades=_state["trades"],
+    )
 
 
 def order_value(security, value):
-    """按金额下单。"""
-    ctx = _state["ctx"]
+    """按金额下单（1 Core：股数换算走 core，成交走 order）。"""
     price = _live_price(security)
     if price == 0 or value == 0:
         return False
-    amount = int(value // (price * (1 + _state["fee"])))
-    return order(security, amount)
+    return order(security, order_value_amount(value, price, _state["fee"]))
 
 
 def order_target(security, amount):
@@ -777,21 +691,17 @@ def order_target(security, amount):
 
 
 def order_target_percent(security, percent):
-    """调整到目标仓位比例（0~1）。"""
+    """调整到目标仓位比例（0~1；1 Core：差额+买力钳制走 core）。"""
     ctx = _state["ctx"]
     p = ctx.portfolio
     price = _live_price(security)
     if price == 0:
         return False
-    target_value = p.value * percent
-    target_shares = int(target_value // price) if percent > 0 else 0
-    current_amount = p.get_position(security).amount
-    amount = target_shares - current_amount
-    if amount > 0:
-        # 受手续费/滑点影响，买入不能超过可用资金
-        unit_cost = price * (1 + _state["slippage"]) * (1 + _state["fee"])
-        affordable = int(p.cash // unit_cost) if unit_cost > 0 else 0
-        amount = min(amount, affordable)
+    amount = target_percent_amount(
+        portfolio_value=p.value, percent=percent, price=price,
+        current_amount=p.get_position(security).amount, cash=p.cash,
+        slippage=_state["slippage"], fee=_state["fee"],
+    )
     if amount != 0:
         return order(security, amount)
     return True
@@ -1015,15 +925,6 @@ def _jq_names() -> dict[str, str]:
 
 
 def get_security_name(code):
-    if code == "159363.XSHE":
-        ctx = _state.get("ctx")
-        if ctx and ctx.current_dt and hasattr(ctx.current_dt, 'strftime'):
-            dt_str = ctx.current_dt.strftime('%Y-%m-%d %H:%M')
-            if dt_str == '2026-04-20 13:10':
-                import sys
-                cd = get_current_data()
-                lp = cd[code].last_price if code in cd._daily or True else 0
-                print(f"[DBG gsn] {code} dt={ctx.current_dt} cd_last_price={lp}", file=sys.stderr, flush=True)
     names = _state.get("sec_names")
     if names and code in names:
         return names[code]

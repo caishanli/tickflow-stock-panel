@@ -15,6 +15,9 @@ from typing import ClassVar
 import numpy as np
 import pandas as pd
 
+from .core import limit_prices_from_prev_close as _limit_prices_from_prev_close
+from .core import limit_rate as _core_limit_rate
+
 logger = logging.getLogger("ptradecompat")
 
 _DAILY_AT: dict[tuple[int, int], list] = {}   # (hour, minute) -> [func]（同一时刻按注册顺序触发）
@@ -63,23 +66,9 @@ def _is_st_name(code, name=None):
 
 
 def _limit_rate(code, name=None):
-    """按代码分档的涨跌停幅度：沪 68/58 与深 30/159 为 ±20%，ST ±5%，其余 ±10%。"""
+    """按代码分档的涨跌停幅度（1 Core 薄适配：码制归一化 + 本地 ST 名源，公式见 core.limits）。"""
     pure, _, exch = code.partition(".")
-    if exch in ("", "XSHG", "SS") and pure.startswith(("68", "58")):
-        return 0.20
-    if exch in ("", "XSHE", "SZ") and pure.startswith(("30", "159")):
-        return 0.20
-    if _is_st_name(code, name):
-        return 0.05
-    return 0.10
-
-
-def _limit_prices_from_prev_close(close, rate=0.10):
-    """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。"""
-    prev_close = close.shift(1)
-    limit_up = (prev_close * (1 + rate)).round(2)
-    limit_down = (prev_close * (1 - rate)).round(2)
-    return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+    return _core_limit_rate(pure, exch, _is_st_name(code, name))
 
 
 def _close_series(df):
