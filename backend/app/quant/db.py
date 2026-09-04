@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS sim_state (
 CREATE TABLE IF NOT EXISTS sim_equity_snapshots (
     account_id TEXT, dt TEXT, net_value REAL, cash REAL, positions_value REAL,
     pnl REAL, pnl_pct REAL);
+CREATE INDEX IF NOT EXISTS idx_sim_snap_acct_dt ON sim_equity_snapshots(account_id, dt);
 CREATE TABLE IF NOT EXISTS sim_trades (
     account_id TEXT, ts TEXT, code TEXT, name TEXT, action TEXT, price REAL, amount REAL,
     pnl REAL, pnl_pct REAL, commission REAL);
@@ -110,6 +111,11 @@ def init_db(path: str | None = None) -> None:
                          ("pnl", "REAL"), ("commission", "REAL")):
             if col not in cols:
                 conn.execute(f"ALTER TABLE sim_stop_loss ADD COLUMN {col} {ddl}")
+        # 兼容旧库：sim_equity_snapshots 加 (account_id, dt) 索引（同分钟去重
+        # upsert 与列表/曲线查询都走它；旧库建表时无索引，需补）
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sim_snap_acct_dt "
+            "ON sim_equity_snapshots(account_id, dt)")
         conn.commit()
     finally:
         conn.close()
@@ -474,17 +480,22 @@ def list_sim_accounts():
         d["day_pnl_pct"] = None
         nv = d.get("net_value")
         if isinstance(nv, (int, float)) and nv > 0:
-            snaps = c.execute(
-                "SELECT dt, net_value FROM sim_equity_snapshots "
-                "WHERE account_id=? ORDER BY dt DESC LIMIT 600",
+            # 先取最新快照日，再定向查前一日末净值：不限行数，盘中 mark-to-market
+            # 一分钟写多行时 LIMIT N 取最新 N 行可能全是当天（前一日被挤掉，
+            # 当日收益置 None，前端空白——2026-09-04 d092ad90/781c7d63 实锤）。
+            latest = c.execute(
+                "SELECT substr(dt,1,10) AS d FROM sim_equity_snapshots "
+                "WHERE account_id=? ORDER BY dt DESC LIMIT 1",
                 (d["id"],),
-            ).fetchall()
-            if snaps:
-                latest_day = str(snaps[0]["dt"])[:10]
-                prev_nv = next(
-                    (s["net_value"] for s in snaps if str(s["dt"])[:10] != latest_day),
-                    None,
-                )
+            ).fetchone()
+            if latest:
+                prev = c.execute(
+                    "SELECT net_value FROM sim_equity_snapshots "
+                    "WHERE account_id=? AND substr(dt,1,10) < ? "
+                    "ORDER BY dt DESC LIMIT 1",
+                    (d["id"], latest["d"]),
+                ).fetchone()
+                prev_nv = prev["net_value"] if prev else None
                 if isinstance(prev_nv, (int, float)) and prev_nv > 0:
                     d["day_pnl_pct"] = nv / prev_nv - 1
                     d["day_pnl"] = nv - prev_nv
@@ -551,24 +562,54 @@ def read_sim_state(account_id):
     return state
 
 
+def _snapshot_minute(dt) -> str:
+    """快照分钟键：dt 字符串前 16 位（YYYY-MM-DD HH:MM），秒/微秒归一掉。"""
+    return str(dt or "")[:16]
+
+
 def insert_sim_snapshot(account_id, dt, net_value, cash, positions_value, pnl, pnl_pct):
+    """逐笔快照（同分钟去重）：同账户同分钟只保留一行，后写覆盖先写。
+
+    盘中看护巡检 + 策略 mark-to-market 多处写快照，一分钟可触发 2~5 次；
+    不去重一天写出 800+ 行（2026-09-04 d092ad90/781c7d63 实锤），表白膨胀。
+    """
+    minute = _snapshot_minute(dt)
     with get_conn() as c:
-        c.execute(
-            "INSERT INTO sim_equity_snapshots(account_id,dt,net_value,cash,positions_value,pnl,pnl_pct) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (account_id, dt, net_value, cash, positions_value, pnl, pnl_pct),
-        )
+        row = c.execute(
+            "SELECT dt FROM sim_equity_snapshots WHERE account_id=? AND substr(dt,1,16)=? "
+            "ORDER BY dt DESC LIMIT 1",
+            (account_id, minute),
+        ).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO sim_equity_snapshots(account_id,dt,net_value,cash,positions_value,pnl,pnl_pct) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (account_id, dt, net_value, cash, positions_value, pnl, pnl_pct),
+            )
+        else:
+            c.execute(
+                "UPDATE sim_equity_snapshots SET dt=?, net_value=?, cash=?, "
+                "positions_value=?, pnl=?, pnl_pct=? WHERE account_id=? AND dt=?",
+                (dt, net_value, cash, positions_value, pnl, pnl_pct,
+                 account_id, row["dt"]),
+            )
 
 
 def batch_insert_snapshots(rows):
-    """批量写入快照。rows: list of (account_id, dt, net_value, cash, positions_value, pnl, pnl_pct)"""
+    """批量写入快照。rows: list of (account_id, dt, net_value, cash, positions_value, pnl, pnl_pct)。
+
+    批内同账户同分钟多行只保留最后一次（后写覆盖），与逐笔去重同口径。
+    """
     if not rows:
         return
+    deduped = {}
+    for r in rows:
+        deduped[(r[0], _snapshot_minute(r[1]))] = r
     with get_conn() as c:
         c.executemany(
             "INSERT INTO sim_equity_snapshots(account_id,dt,net_value,cash,positions_value,pnl,pnl_pct) "
             "VALUES(?,?,?,?,?,?,?)",
-            rows,
+            list(deduped.values()),
         )
 
 
