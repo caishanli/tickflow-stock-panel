@@ -569,6 +569,42 @@ def order_target_value(security, value, limit_price=None):
     return order_value(security, diff)
 
 
+def order_target_percent(security, percent):
+    """PTrade 按目标市值占比调仓（rqalpha 环境），与引擎侧同式。
+
+    target = 组合总市值 × percent → 目标股数（向下取整，percent≤0 即清仓）；
+    卖出钳制到可卖量（与引擎 order() 内钳制等价，rqalpha 原生可能整单拒绝）。
+    """
+    from rqalpha.environment import Environment
+    env = Environment.get_instance()
+    jq = _to_jq(security)
+    price = float(getattr(env.portfolio, "close_position_prices", {}).get(jq, 0) or 0)
+    if price == 0:
+        return False
+    try:
+        total = float(env.portfolio.total_value)
+    except Exception:  # noqa: BLE001
+        return False
+    percent = float(percent)
+    target_shares = int(total * percent // price) if percent > 0 else 0
+    try:
+        cur = int(get_position(security).amount)
+    except Exception:  # noqa: BLE001
+        cur = 0
+    amount = target_shares - cur
+    if amount == 0:
+        return True
+    if amount < 0:
+        try:
+            can = int(get_position(security).enable_amount)
+        except Exception:  # noqa: BLE001
+            can = abs(amount)
+        amount = -min(abs(amount), can)
+        if amount == 0:
+            return True
+    return order(security, amount)
+
+
 def get_all_trades_days(date=None):
     from rqalpha.environment import Environment
     env = Environment.get_instance()
@@ -668,14 +704,39 @@ def set_benchmark(code):
     _BENCHMARK = code
 
 
+_LAST_COMMISSION = None  # 最近一次 set_commission 记录值（供检查；生效靠实时覆盖）
+_LAST_SLIPPAGE = None
+
+
 def set_commission(commission_ratio=None, min_commission=None, type=None, **kw):
-    """PTrade 佣金（回测经 rqalpha 配置生效，此处存储式 no-op）。"""
-    return None
+    """PTrade 佣金：记录并落到 rqalpha 运行中费率决策器（与 jq set_order_cost 同口径）。
+
+    此前存储式 no-op 导致回测按 params 默认费率、补跑按策略设置收费，两边分叉
+    （quant-core-contract §2；jq 侧同族 bug 已修）。此处复用 jqcompat 的记录+
+    运行时覆盖实现，不再各写一种。全 None 时不触碰（与引擎侧"None 即保持"一致）。
+    """
+    global _LAST_COMMISSION
+    if commission_ratio is None and min_commission is None:
+        return
+    ratio = float(commission_ratio) if commission_ratio is not None else 0.0001
+    minc = float(min_commission) if min_commission is not None else 5
+    _LAST_COMMISSION = {"commission_ratio": ratio, "min_commission": minc}
+    from app.quant.jqcompat import OrderCost as _JqCost
+    from app.quant.jqcompat import set_order_cost as _jq_set_cost
+    _jq_set_cost(_JqCost(open_tax=0, close_tax=0, open_commission=ratio,
+                         close_commission=ratio, close_today_commission=ratio,
+                         min_commission=minc))
 
 
 def set_slippage(slippage=0.0):
-    """PTrade 滑点（回测经 rqalpha 配置生效，此处存储式 no-op）。"""
-    return None
+    """PTrade 滑点：记录并尽力同步到运行中的 matcher（与 jq set_slippage 同口径）。
+
+    此前 no-op 会导致回测/补跑滑点分叉，见 quant-core-contract §1。
+    """
+    global _LAST_SLIPPAGE
+    _LAST_SLIPPAGE = float(slippage)
+    from app.quant.jqcompat import set_slippage as _jq_set_slippage
+    _jq_set_slippage(float(slippage))
 
 
 class _LogProxy:
@@ -751,6 +812,7 @@ def _register_ptrade_apis():
     register_api("get_snapshot", get_snapshot)
     register_api("order_target", order_target)
     register_api("order_target_value", order_target_value)
+    register_api("order_target_percent", order_target_percent)
     register_api("get_all_trades_days", get_all_trades_days)
     register_api("get_trading_day_by_date", get_trading_day_by_date)
     register_api("get_etf_info", get_etf_info)

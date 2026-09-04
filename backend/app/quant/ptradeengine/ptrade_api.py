@@ -20,6 +20,8 @@ from typing import ClassVar
 import numpy as np
 import pandas as pd
 
+from ..jqengine.datasource.manager import DataManager
+from ..tick import round_to_tick
 from .context import PtradeContext, PtradePortfolio, PtradePosition, ptrade_code_conv
 
 DEFAULT_STAMP_TAX = 0.0005  # 卖出印花税（A股 0.05%，ETF 免征）
@@ -50,9 +52,10 @@ to_engine, to_pt = _conv
 
 
 def _is_etf(code):
-    """简单代码前缀判定：沪市 5 开头、深市 15/16 开头为基金（免印花税）。"""
+    """简单代码前缀判定：沪市 5 开头、深市 15/16/18 开头为基金（免印花税，与
+    jqengine/matcher 同口径；成交价取整走 tick.round_to_tick）。"""
     num = (code or "").split(".")[0]
-    return num.startswith(("5", "15", "16"))
+    return num.startswith(("5", "15", "16", "18"))
 
 
 def _norm_freq(freq):
@@ -185,7 +188,8 @@ def order(security, amount):
     fee = _state["fee"]
     slip = _state["slippage"]
     fill = price * (1 + slip) if amount > 0 else price * (1 - slip)
-    fill = round(fill, 3)
+    # 与 jqengine order()/回测撮合同口径（共享 tick 实现，见 quant-core-contract §1）
+    fill = round_to_tick(fill, security)
     turnover = abs(amount) * fill
     fee_cfg = _state.get("fee_config")
     if fee_cfg:
@@ -311,10 +315,21 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
     if len(engine_codes) > 1:
         mem = mgr._daily_mem if freq == "1d" else mgr._minute_mem
         if mem:
+            # 批量守卫与 jqengine 同口径（DataManager.mem_daily_usable 唯一实现，
+            # 见 quant-core-contract §4）：覆盖不足的跳过本循环，由下方逐只路径
+            # 回源（其 fetch 自带覆盖检查）。分钟帧不套用（盘中语义不同）。
+            eff_end = None
+            if freq == "1d" and now is not None:
+                eff_end = now.normalize()
+                if now.hour < 15:
+                    eff_end = eff_end - pd.Timedelta(days=1)
             for pt_code, ec in zip(codes, engine_codes, strict=False):
                 try:
                     raw = mem.get(f"get_daily_{ec}") if freq == "1d" else mem.get(ec)
                     if raw is None or (hasattr(raw, "empty") and raw.empty):
+                        continue
+                    if freq == "1d" and not DataManager.mem_daily_usable(
+                            raw, None, eff_end, count):
                         continue
                     if col not in raw.columns:
                         continue

@@ -1155,6 +1155,26 @@ class DataManager:
             return 1.0
 
     @staticmethod
+    def mem_daily_usable(df, start_ts, end_ts, count) -> bool:
+        """内存日线帧是否覆盖批量查询（jqengine 与 ptradeengine 共用唯一实现）。
+
+        单标的 fetch 路径自带覆盖检查+回源，批量路径必须同口径，否则同一 dm
+        两条路径读出两套历史（2026-09-03 长窗对齐实锤：窄/陈旧帧被长回看直接
+        用，短帧 R²/风控全是垃圾值 → 选票翻转，且静默无告警）。
+        """
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return False
+        idx = getattr(df, "index", None)
+        if not isinstance(idx, pd.DatetimeIndex) or len(idx) == 0:
+            return False
+        norm = idx.normalize()
+        if end_ts is not None and norm.max() < end_ts:
+            return False  # 末端早于请求末端：陈旧帧
+        lo = start_ts if start_ts is not None else norm.min()
+        n = int(((norm >= lo) & (norm <= end_ts)).sum()) if end_ts is not None else len(df)
+        return not (count and n < int(count))  # 起点太晚：窄帧撑不满回看窗口
+
+    @staticmethod
     def _adjust_for_splits(df, events=None):
         """按拆股/合股跳变向前复权：跳变点之前的所有价格乘以 ratio。
 

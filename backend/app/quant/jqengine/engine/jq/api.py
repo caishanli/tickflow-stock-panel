@@ -24,6 +24,7 @@ from pandas.tseries.offsets import CustomBusinessDay
 
 from ....tick import round_to_tick
 from ...datasource.base import DataSourceError
+from ...datasource.manager import DataManager
 from . import jq_names
 from .context import Context, G, Position
 from .portfolio import Portfolio
@@ -264,24 +265,11 @@ def _frame_desc(df):
 
 
 def _mem_daily_usable(df, start_ts, end_ts, count):
-    """内存日线帧是否覆盖本次批量查询（与单标的 fetch 路径的覆盖语义对齐）。
+    """内存日线帧是否覆盖本次批量查询（见 DataManager.mem_daily_usable，唯一实现）。
 
-    2026-09-03 长窗对齐实锤：批量路径曾无条件信任 ``_daily_mem``，早期窄窗口
-    取数（如交易日历计算）先写入的窄/陈旧帧会被长回看（动量 25d+）直接使用——
-    短帧 R²/风控全是垃圾值 → 选票翻转（06-23 562590），且静默无告警。单标的
-    路径有覆盖检查+回源，此处必须同口径，否则同一 dm 两条路径读出两套历史。
+    2026-09-03 长窗对齐实锤：批量路径曾无条件信任 ``_daily_mem``（详见契约 §4）。
     """
-    if df is None or (hasattr(df, "empty") and df.empty):
-        return False
-    idx = getattr(df, "index", None)
-    if not isinstance(idx, pd.DatetimeIndex) or len(idx) == 0:
-        return False
-    norm = idx.normalize()
-    if end_ts is not None and norm.max() < end_ts:
-        return False  # 末端早于请求末端：陈旧帧
-    lo = start_ts if start_ts is not None else norm.min()
-    n = int(((norm >= lo) & (norm <= end_ts)).sum()) if end_ts is not None else len(df)
-    return not (count and n < int(count))  # 起点太晚：窄帧撑不满回看窗口
+    return DataManager.mem_daily_usable(df, start_ts, end_ts, count)
 
 
 def _get_price_batch_daily(security, start_date, end_date, count, fields, panel):
