@@ -32,7 +32,7 @@ def test_taxonomy_consistent_with_universe():
     """
     pytest.importorskip("rqalpha")
     from app.quant import jqcompat
-    from app.quant.simulate.matcher import _is_etf as sim_is_etf
+    from app.quant.core.instruments import is_etf as sim_is_etf
     from app.quant.tick import tick_size
 
     codes = _snapshot_codes()

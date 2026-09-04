@@ -1,7 +1,8 @@
 """1 Core 铁律的机器执法（见 docs/quant-core-contract.md §0）。
 
-一个语义只许有一个实现。允许表（ALLOWLIST）只减不增：
-收敛掉一处重复，就从表里删一处；新增同名语义定义即失败。
+一个语义只许有一个实现，正统位置 ``app/quant/core/``。引擎文件只许做
+翻译（码制/签名/state 形状）+ 薄适配（一行转调、无运算分支）；新增同名
+语义定义、或委托链断裂，即失败。
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import ast
 from pathlib import Path
 
 Q = Path(__file__).resolve().parents[2] / "app" / "quant"
+CORE = "core/"
 
 
 def _defs(name):
@@ -34,67 +36,104 @@ def _func_node(path, name):
     raise AssertionError(f"{path} 缺少 def {name}")
 
 
-# ---- 唯一实现：这些语义只许一处定义，别处只能 import ----
+def _assert_thin_adapter(path, name):
+    """薄适配校验：docstring + 至多一条赋值 + 一行 return，无运算/分支。"""
+    node = _func_node(path, name)
+    body = [n for n in node.body if not isinstance(n, ast.Expr)]
+    assert body and isinstance(body[-1], ast.Return), \
+        f"{path}:{name} 不再是薄转调（末尾不是 return）"
+    assert len(body) <= 2, f"{path}:{name} 超过一行转调 ({len(body)} 句)"
+    banned = (ast.BinOp, ast.Compare, ast.If, ast.For, ast.While, ast.BoolOp)
+    assert not any(isinstance(n, banned) for n in ast.walk(node)), \
+        f"{path}:{name} 适配体内出现运算/分支，违反 1 Core §0.2"
 
-def test_round_to_tick_single_definition():
-    assert _defs("round_to_tick") == {"tick.py": _defs("round_to_tick")["tick.py"]}, \
-        f"round_to_tick 出现第二实现：{_defs('round_to_tick')}"
+
+def _assert_delegates(path, caller, callee):
+    """委托链校验：caller 函数体内必须调用 callee。"""
+    node = _func_node(path, caller)
+    calls = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name):
+                calls.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                calls.add(f.attr)
+    assert callee in calls, f"{path}:{caller} 未调用 {callee}，委托链断裂"
 
 
-def test_tick_size_single_definition():
-    assert set(_defs("tick_size")) == {"tick.py"}, _defs("tick_size")
+# ---- 唯一实现：正统定义点只许在 core/，别处零定义 ----
+
+def test_tick_canonical_in_core():
+    assert set(_defs("round_to_tick")) == {CORE + "tick.py"}, _defs("round_to_tick")
+    assert set(_defs("tick_size")) == {CORE + "tick.py"}, _defs("tick_size")
 
 
-def test_revoke_future_split_factor_single_definition():
+def test_is_etf_converged():
+    """税种判定零本地定义（2026-09 收敛完成；_is_etf_jq_code 系宇宙过滤，另名保留）。"""
+    assert _defs("_is_etf") == {}, _defs("_is_etf")
+    assert set(_defs("is_etf")) == {CORE + "instruments.py"}, _defs("is_etf")
+
+
+def test_classify_fund_converged():
+    assert _defs("_fund_instrument_type") == {}, _defs("_fund_instrument_type")
+    assert set(_defs("classify_fund")) == {CORE + "instruments.py"}
+
+
+def test_limit_prices_converged():
+    assert _defs("_limit_prices_from_prev_close") == {}, \
+        _defs("_limit_prices_from_prev_close")
+
+
+def test_revoke_single_definition():
     assert set(_defs("revoke_future_split_factor")) == \
         {"jqengine/datasource/manager.py"}, _defs("revoke_future_split_factor")
 
 
 def test_mem_daily_usable_single_real_definition():
-    """唯一实现 DataManager.mem_daily_usable；jq api 的同名函数只许是薄转调。"""
     sites = _defs("mem_daily_usable")
     assert "jqengine/datasource/manager.py" in sites, sites
     extra = set(sites) - {"jqengine/datasource/manager.py"}
     assert extra <= {"jqengine/engine/jq/api.py"}, f"新增实现：{sites}"
-    if extra:
-        node = _func_node("jqengine/engine/jq/api.py", "mem_daily_usable")
-        # 薄包装：docstring + 一行 return，不许算术/比较/分支（§0 第2条）
-        body = [n for n in node.body if not isinstance(n, ast.Expr)]
-        assert len(body) == 1 and isinstance(body[0], ast.Return), \
-            "api._mem_daily_usable 不再是薄转调，有人往里加了逻辑"
-        banned = (ast.BinOp, ast.Compare, ast.If, ast.For, ast.While, ast.BoolOp)
-        assert not any(isinstance(n, banned) for n in ast.walk(node)), \
-            "api._mem_daily_usable 包装体内出现运算/分支，违反 1 Core §0.2"
+    for path in extra:
+        _assert_thin_adapter(path, "mem_daily_usable")
 
 
-# ---- 收敛中：允许表只减不增 ----
+def test_stamp_tax_no_local_definition():
+    """DEFAULT_STAMP_TAX 不许赋值定义，只许从 core import 别名。"""
+    for rel in ("jqengine/engine/jq/api.py", "simulate/matcher.py",
+                "ptradeengine/ptrade_api.py"):
+        tree = ast.parse((Q / rel).read_text(encoding="utf-8"))
+        assigns = [n for n in tree.body if isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "DEFAULT_STAMP_TAX" for t in n.targets)]
+        assert not assigns, f"{rel} 仍本地定义税率"
+        imported = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                    and (n.module or "") in ("core", "core.instruments")
+                    and any(a.asname == "DEFAULT_STAMP_TAX" for a in n.names)]
+        assert imported, f"{rel} 的 DEFAULT_STAMP_TAX 未从 core import"
 
-_IS_ETF_ALLOW = {
-    "jqengine/engine/jq/api.py",
-    "simulate/matcher.py",
+
+# ---- 薄适配允许表（只减不增）：码制归一化 + 本地名源，无公式 ----
+
+_LIMIT_RATE_ALLOW = {
+    "jqcompat.py",
+    "ptradecompat.py",
     "ptradeengine/ptrade_api.py",
 }
 
 
-def test_is_etf_no_new_definition():
-    """税种判定 _is_etf 允许表：现存三处，禁止第四处；合一时逐处删表。"""
-    sites = set(_defs("_is_etf"))
-    assert sites <= _IS_ETF_ALLOW, f"新增 _is_etf 实现：{sites - _IS_ETF_ALLOW}"
-    assert sites == _IS_ETF_ALLOW, \
-        f"允许表过期（已收敛？请删表）：缺 { _IS_ETF_ALLOW - sites}"
+def test_limit_rate_adapters_only():
+    sites = set(_defs("_limit_rate"))
+    assert sites <= _LIMIT_RATE_ALLOW | {CORE + "limits.py"}, \
+        f"新增 _limit_rate 实现：{sites - _LIMIT_RATE_ALLOW}"
+    for path in sites - {CORE + "limits.py"}:
+        _assert_thin_adapter(path, "_limit_rate")
 
 
-def test_stamp_tax_all_env_driven():
-    """所有 DEFAULT_STAMP_TAX 定义必须读 QUANT_SIM_STAMP_TAX，禁止硬编码税率。"""
-    for rel in ("jqengine/engine/jq/api.py", "simulate/matcher.py",
-                "ptradeengine/ptrade_api.py"):
-        src = (Q / rel).read_text(encoding="utf-8")
-        node = None
-        tree = ast.parse(src)
-        for n in tree.body:
-            if isinstance(n, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "DEFAULT_STAMP_TAX" for t in n.targets):
-                node = n
-        assert node is not None, f"{rel} 缺少 DEFAULT_STAMP_TAX"
-        assert "QUANT_SIM_STAMP_TAX" in ast.dump(node.value), \
-            f"{rel} 的 DEFAULT_STAMP_TAX 未读 env，硬编码税率违反 1 Core"
+# ---- 委托链：两 order() 必须调 execute_order ----
+
+def test_orders_delegate_to_core():
+    _assert_delegates("jqengine/engine/jq/api.py", "order", "execute_order")
+    _assert_delegates("ptradeengine/ptrade_api.py", "order", "execute_order")
+    assert set(_defs("execute_order")) == {CORE + "execution.py"}, \
+        _defs("execute_order")

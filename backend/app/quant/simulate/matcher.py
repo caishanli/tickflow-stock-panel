@@ -10,22 +10,15 @@
 """
 from __future__ import annotations
 
-import os
-
 from ..config import CONFIG
-from ..tick import round_to_tick
-
-# 印花税率（仅卖出，股票 0.05%）。config 暂无该字段，允许环境变量覆盖
-DEFAULT_STAMP_TAX = float(os.environ.get("QUANT_SIM_STAMP_TAX", "0.0005"))
-
-
-def _is_etf(code: str) -> bool:
-    """简单代码前缀判定：沪市 5 开头、深市 15/16/18 开头为基金（免印花税）。
-
-    18 系（180/181）与宇宙过滤 _is_etf_jq_code 的 ETF 段对齐；沪市无 5 开头
-    股票。只用于税费判定，成交价取整走 tick.round_to_tick（勿混用）。"""
-    num = (code or "").split(".")[0]
-    return num.startswith(("5", "15", "16", "18"))
+from ..core import (
+    STAMP_TAX_RATE as DEFAULT_STAMP_TAX,
+)
+from ..core import (
+    commission,
+    fill_price,
+    stamp_tax_rate,
+)
 
 
 def _resolve_name(code: str) -> str:
@@ -79,13 +72,12 @@ class Matcher:
             if sellable <= 0:
                 continue
             sell_amount = min(amount, sellable)
-            fill = float(price) * (1 - slippage)  # 卖出滑点（主引擎滑点双边口径）
-            # 按最小报价单位取整（共享 tick.round_to_tick，与 jqengine order()、
-            # 回测侧撮合同口径——否则止损成交价与两侧常规成交/回测撮合价漂移半 tick）
-            fill = round_to_tick(fill, code)
-            tax = 0.0 if _is_etf(code) else stamp_tax  # ETF 免印花税
-            commission = max(sell_amount * fill * fee, min_commission)  # 佣金含最低兜底
-            proceeds = sell_amount * fill - commission - sell_amount * fill * tax
+            # 1 Core：卖出滑点+tick 取整+佣金+印花税率走 core.fees（数字与旧内联公式一致）
+            fill = fill_price(price, "sell", slippage, code)
+            tax_rate = stamp_tax_rate(code, stamp_tax)
+            commission_amt = commission(sell_amount * fill, fee, min_commission,
+                                          ndigits=None)
+            proceeds = sell_amount * fill - commission_amt - sell_amount * fill * tax_rate
             cash += proceeds
             log.append({
                 "dt": state.get("dt"),
@@ -105,7 +97,7 @@ class Matcher:
                     "amount": sell_amount,
                     "pnl": round((fill - avg_cost) * sell_amount, 4),
                     "pnl_pct": round(pnl_pct, 4),
-                    "commission": round(commission, 4),
+                    "commission": round(commission_amt, 4),
                 })
             if self.account_id:
                 # M15：止损落库——sim_stop_loss（止损日志）与 sim_trades（成交记录）
@@ -117,11 +109,11 @@ class Matcher:
                 db.insert_sim_stoploss(self.account_id, ts, code, name,
                                        "STOP_LOSS", round(fill, 4), sell_amount,
                                        round(pnl, 4), round(pnl_pct, 4),
-                                       round(commission, 4))
+                                       round(commission_amt, 4))
                 db.insert_sim_trade(self.account_id, ts, code, "STOP_LOSS",
                                     round(fill, 4), sell_amount,
                                     round(pnl, 4), round(pnl_pct, 4),
-                                    round(commission, 4), name)
+                                    round(commission_amt, 4), name)
             if sell_amount < amount:
                 pos["amount"] = amount - sell_amount  # T+1 部分可卖：剩余数量留仓
             else:

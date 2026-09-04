@@ -55,11 +55,10 @@
 深交所：`15*` → ETF，`16*` → LOF，`18*` → ETF；
 其余 → CS（股票；注意深市 `000xxx` 是股票不是指数）。
 
-- 成交取整：`tick.tick_size`（0.001 / 0.01）
-- 回测税种：`jqcompat._fund_instrument_type`（ETF/LOF/CS，决定 rqalpha 是否收印花税）
-- 补跑税种：`simulate.matcher._is_etf` / `jqengine.api._is_etf`（免税判定）
-- **三处互相独立实现，禁止混用；一致性由测试对宇宙全量逐码校验，新前缀出现时测试失败驱动显式分类**（52 系曾漏判致单笔多扣 49.76 元）
-- **收敛方向（§0）：三处 `_is_etf` 税种判定最终合一；`test_one_core.py` 锁死"只许三处、不许第四处"，合一时逐处删表。**
+- 成交取整：`core.tick.tick_size`（0.001 / 0.01）
+- 回测税种：`core.instruments.classify_fund`（ETF/LOF/CS，决定 rqalpha 是否收印花税；`jqcompat` 与 `rqalpha_bridge` 均为其别名——bridge 曾私藏过期副本，误判 52/53/55/18，1 Core 已收敛）
+- 补跑税种：`core.instruments.is_etf`（免税判定；三引擎零本地定义）
+- **一致性由测试对宇宙全量逐码校验 + `test_one_core.py` 锁死零本地定义，新前缀出现时测试失败驱动显式分类**（52 系曾漏判致单笔多扣 49.76 元）
 
 ## 4. 数据窗口与复权
 
@@ -92,3 +91,7 @@
 - 补跑跨日首 bar 快照竞态：修复需动盘中实时核心路径，待交易日实盘验证。
 - vendor（聚宽/通达信）数据点差：逐点不可达，验收只看结构指标（§0）。
 - `open≠close` 佣金在 rqalpha 侧取 close 近似（dust 级，§2）。
+- **策略触发时刻差（1-core 范围外）**：分钟窗下 rqalpha 按 bar 触发策略 intraday 动作
+  （如 589800 04-29 10:06 卖），补跑侧同策略在 13:10 批量流水线才触发——决策层调度
+  /快照 feed 差异，非执行数学差异。1-core A/B 实锤代码中性（新旧码 bt 39/39 同价、
+  新旧码 sim 39/39 同价，旧码 bt 同样 10:06 卖）；验收仍看结构指标（覆盖率/翻转/价比中位）。

@@ -31,6 +31,10 @@ from rqalpha.environment import Environment
 from rqalpha.interface import AbstractMod
 from rqalpha.model.instrument import Instrument
 
+from .core import classify_fund as _fund_instrument_type
+from .core import limit_prices_from_prev_close as _limit_prices_from_prev_close
+from .core import limit_rate as _core_limit_rate
+
 logger = logging.getLogger("jqcompat")
 
 
@@ -2006,38 +2010,9 @@ def _is_st_name(code, name=None):
 
 
 def _limit_rate(code, name=None):
-    """按代码分档的涨跌停幅度（供日线/分钟 recarray 与 rqalpha_bridge 复用）。
-
-    - 沪市 68xxxx（科创板股票）、58xxxx（科创板 ETF/LOF）：±20%
-    - 深市 30xxxx（创业板股票）、159xxx（创业板 ETF）：±20%
-    - ST 股票（名称含 "ST"，取不到名称按非 ST）：±5%
-    - 其余主板股票/ETF：±10%
-    北交所 8xxxxx/4xxxxx 实为 ±30%，但本代码体系（聚宽 XSHG/XSHE 后缀）
-    覆盖不到北交所标的，不做分档，随主板 ±10%。
-    """
+    """按代码分档的涨跌停幅度（1 Core 薄适配：码制归一化 + 本地 ST 名源，公式见 core.limits）。"""
     pure, _, exch = code.partition(".")
-    if exch in ("", "XSHG") and pure.startswith(("68", "58")):
-        return 0.20
-    if exch in ("", "XSHE") and pure.startswith(("30", "159")):
-        return 0.20
-    if _is_st_name(code, name):
-        return 0.05
-    return 0.10
-
-
-def _limit_prices_from_prev_close(close: pd.Series, rate: float = 0.10):
-    """按昨收计算涨跌停价：limit = round(prev_close × (1±rate), 2)。
-
-    交易所口径以昨收为基准（此前用当根 high×1.1/low×0.9，导致
-    last_price >= high_limit 恒 False）。首日无前收 → NaN：不用当日 open
-    估算，避免制造虚假涨跌停触发；NaN 在策略比较中恒 False，行为可预期。
-    rate 按标的分档（见 _limit_rate）：科创/创业 20cm、ST 5%、主板 10%；
-    调用方未给标的时保持主板 10% 兜底。
-    """
-    prev_close = close.shift(1)
-    limit_up = (prev_close * (1 + rate)).round(2)
-    limit_down = (prev_close * (1 - rate)).round(2)
-    return limit_up.to_numpy(dtype=np.float64), limit_down.to_numpy(dtype=np.float64)
+    return _core_limit_rate(pure, exch, _is_st_name(code, name))
 
 
 def _mem_daily_to_recarray(df, code=None):
@@ -2155,34 +2130,6 @@ class _MinuteBarStore:
 
     def get_bars(self, order_book_id):
         return self._bars.get(order_book_id, np.empty(0, dtype=_BAR_DTYPE))
-
-
-def _fund_instrument_type(code):
-    """按代码段判定基金/证券类型。
-
-    上交所(XSHG)：50 → LOF，其余 5 开头（51/52/53/55/56/58，宇宙实证）
-    → ETF；深交所(XSHE)：15 → ETF，16 → LOF，18 → ETF（与宇宙过滤
-    _is_jq_etf_code 的 180/181 ETF 段一致）；其余 → CS。沪市无 5 开头股票，
-    深市 000xxx 是股票（见 mootdx _is_index 注释的反例），故后缀+前缀双判。
-    rqalpha 股票账户支持 ETF/LOF 交易（INST_TYPE_IN_STOCK_ACCOUNT），
-    且 sys_transaction_cost 只对 CS 收卖出印花税 —— ETF/LOF 现实免税，
-    类型必须标对，否则回测多扣 0.05% 印花税（2026-09-03 长窗对齐实锤：
-    520830 被误判 CS，04-08 一笔多扣 49.76 元并滚雪球）。
-    """
-    pure, _, exch = code.partition(".")
-    if exch == "XSHG":
-        if pure.startswith("50"):
-            return "LOF"
-        if pure.startswith("5"):
-            return "ETF"
-    elif exch == "XSHE":
-        if pure.startswith("15"):
-            return "ETF"
-        if pure.startswith("16"):
-            return "LOF"
-        if pure.startswith("18"):
-            return "ETF"
-    return "CS"
 
 
 def _daily_slice_side(dt, include_now):
