@@ -14,6 +14,7 @@ no_buy / no_sell）统一 PTrade 码；仅在与 DataManager（JQ 码 .XSHG/.XSH
 """
 from __future__ import annotations
 
+import os
 import types
 from typing import ClassVar
 
@@ -24,7 +25,8 @@ from ..jqengine.datasource.manager import DataManager
 from ..tick import round_to_tick
 from .context import PtradeContext, PtradePortfolio, PtradePosition, ptrade_code_conv
 
-DEFAULT_STAMP_TAX = 0.0005  # 卖出印花税（A股 0.05%，ETF 免征）
+# 1 Core：与 jqengine.api / simulate.matcher 同源（env 可调），禁止私自定税率。
+DEFAULT_STAMP_TAX = float(os.environ.get("QUANT_SIM_STAMP_TAX", "0.0005"))  # 卖出印花税（A股，ETF 免征）
 
 # 官方 get_history 输出字段（用于单标的列名判定）
 _PT_FIELDS = ("open", "high", "low", "close", "volume", "money", "price",

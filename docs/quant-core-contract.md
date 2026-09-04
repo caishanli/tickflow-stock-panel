@@ -9,6 +9,22 @@
 > 新增 API 面（新平台风格）只许做**翻译**（映射到本契约），不许做解释；
 > 契约没有的东西要么扩展 core（走评审+全矩阵重验），要么显式抛错。
 > Face 对等清单与禁静默 stub 由 `backend/tests/quant/test_core_contract.py` 锁死。
+> **1 Core 铁律**见 §0；收敛进度与允许表由 `backend/tests/quant/test_one_core.py` 锁死。
+
+## 0. 1 Core 铁律（长期有效，优先于一切便利）
+
+**一个语义只许有一个实现。** jq / ptrade 只是两种 API 方言（码制、签名、`_state` 形状），
+翻译层只许做翻译，不许重写语义。凡是影响成交价、费用、税、持仓、取数窗口的逻辑，
+唯一实现只能住在 `backend/app/quant/` 下的共享位置（`tick.py`、`simulate/matcher.py`、
+`jqcompat.py`、`jqengine/datasource/manager.py`，未来收敛到 `core/` 包——目录未建成就近共享，**不许另起第三份**）。
+
+1. **新语义只许进共享实现。** 需求先问"core 里有没有"：有就调，没有就加到共享处 + 两边同调；**禁止在引擎文件里就地写第二份公式**（哪怕"就三行"）。
+2. **别名必须真委托。** 过渡期允许薄包装（如 `api._mem_daily_usable`），但函数体只能是一行转调；测试用 AST 校验：包装函数体内不许出现算术/比较/分支，违者失败。
+3. **允许表只减不增。** 现存重复（`_is_etf` 三处、`DEFAULT_STAMP_TAX` 两处 env+一处硬编码→已收敛为全 env）记在 `test_one_core.py` 的 ALLOWLIST 里；新增任何同名语义定义即测试失败。每次收敛掉一处，就从表里删一处。
+4. **改共享实现 = 改两边。** 动 tick/费率/税/窗口/复权任一共享函数，必须重跑回测 vs 补跑双矩阵（jq 窗 + ptrade 窗）+ 全量 `tests/quant`，指标回到 §0 头验收线才算完。
+5. **码制转换不是语义。** `.SS/.SZ ↔ .XSHG/.XSHE`、`PtradePosition` 字段别名这类翻译永远留在引擎侧，不许反向污染共享实现（共享函数只认 JQ 码）。
+
+违反即视为引入新的静默分叉，按 §7 红线同等处理（打回）。
 
 ## 1. 订单与成交
 
@@ -43,6 +59,7 @@
 - 回测税种：`jqcompat._fund_instrument_type`（ETF/LOF/CS，决定 rqalpha 是否收印花税）
 - 补跑税种：`simulate.matcher._is_etf` / `jqengine.api._is_etf`（免税判定）
 - **三处互相独立实现，禁止混用；一致性由测试对宇宙全量逐码校验，新前缀出现时测试失败驱动显式分类**（52 系曾漏判致单笔多扣 49.76 元）
+- **收敛方向（§0）：三处 `_is_etf` 税种判定最终合一；`test_one_core.py` 锁死"只许三处、不许第四处"，合一时逐处删表。**
 
 ## 4. 数据窗口与复权
 
