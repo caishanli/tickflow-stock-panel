@@ -28,6 +28,9 @@ from ....core import (
     resolve_live_price,
     target_percent_amount,
 )
+from ....core import (
+    limit_rate as _core_limit_rate,
+)
 from ....core.instruments import STAMP_TAX_RATE as DEFAULT_STAMP_TAX  # noqa: F401  # 兼容别名
 from ....core.instruments import is_etf as _is_etf  # noqa: F401  # 兼容别名
 from ...datasource.base import DataSourceError
@@ -102,6 +105,15 @@ def _default_snapshot(code):
     )
 
 
+_LISTING_DATES = None   # {6位代码: listing_date}，get_security_info 惰性加载
+
+
+def _limit_rate(code):
+    """涨跌停幅度（1 Core 薄适配：码制归一化转调 core.limits，jq/pt 域均可）。"""
+    pure, _, exch = str(code).partition(".")
+    return _core_limit_rate(pure, exch)
+
+
 class CurrentDataProxy:
     """current_data 代理。
 
@@ -115,34 +127,53 @@ class CurrentDataProxy:
         self._daily = {}
 
     def _daily_info(self, code):
-        if code in self._daily:
-            return self._daily[code]
-        info = self._default_daily(code)
+        # 按 (code, 日) 缓存：day_open/涨跌停基准随交易日推进而变化，跨日必须
+        # 重算——原实现按 code 永久缓存，补跑中 day_open/涨跌停价冻结在首次
+        # 访问日，开盘低开止损与涨跌停判定全程失真。
         ctx = _state.get("ctx")
         dt = str(ctx.current_dt) if (ctx and ctx.current_dt is not None) else None
+        day_key = str(pd.Timestamp(dt).date()) if dt else ""
+        cache_key = (code, day_key)
+        if cache_key in self._daily:
+            return self._daily[cache_key]
+        info = self._default_daily(code)
         mgr = _state.get("manager")
         if mgr and dt:
             try:
                 start = (pd.Timestamp(dt) - pd.Timedelta(days=10)).strftime("%Y%m%d")
                 df = mgr.fetch("get_daily", code, start, dt)
-                if df is not None and not df.empty:
+                if df is not None and not df.empty and isinstance(df.index, pd.DatetimeIndex):
                     dt_ts = pd.Timestamp(dt)
-                    if isinstance(df.index, pd.DatetimeIndex):
-                        df = df[df.index <= dt_ts]
-                    if df is not None and not df.empty:
-                        row = df.iloc[-1]
-                        prev_close = float(row.get("close", 0))
+                    day0 = dt_ts.normalize()
+                    prev_df = df[df.index < day0]
+                    today_df = df[(df.index >= day0) & (df.index <= dt_ts)]
+                    # 昨收必须取今日**之前**最后一根 bar：原实现 iloc[-1] 在补跑中
+                    # 命中今日 bar（未来数据），high_limit/low_limit 全部错位
+                    prev_close = (float(prev_df.iloc[-1].get("close", 0))
+                                  if len(prev_df) else 0.0)
+                    # day_open：补跑中当日日线已落盘 → 取当日 open；实时盘中当日
+                    # 日线未落盘 → 回退当日首根分钟 bar 的 open（≈集合竞价开盘）
+                    if len(today_df):
+                        day_open = float(today_df.iloc[-1].get("open", 0))
+                        volume = float(today_df.iloc[-1].get("volume", 0))
+                    else:
+                        day_open = float(mgr.get_day_open(code, dt_ts) or 0.0) \
+                            if hasattr(mgr, "get_day_open") else 0.0
+                        volume = (float(prev_df.iloc[-1].get("volume", 0))
+                                  if len(prev_df) else 0.0)
+                    if prev_close > 0:
+                        rate = _limit_rate(code)
                         info = SimpleNamespace(
                             paused=False,
-                            day_open=float(row.get("open", 0)),
-                            high_limit=prev_close * 1.1,
-                            low_limit=prev_close * 0.9,
+                            day_open=day_open,
+                            high_limit=prev_close * (1 + rate),
+                            low_limit=prev_close * (1 - rate),
                             amount=0,
-                            volume=float(row.get("volume", 0)),
+                            volume=volume,
                         )
             except Exception:
                 pass
-        self._daily[code] = info
+        self._daily[cache_key] = info
         return info
 
     def _default_daily(self, code):
@@ -188,6 +219,23 @@ class CurrentDataProxy:
             return self[code]
         except Exception:
             return default or _default_snapshot(code)
+
+    def __contains__(self, code):
+        """支持 ``code in current_data``。
+
+        缺失它时 `in` 退化为老式迭代协议：Python 会以 __getitem__(0)、
+        __getitem__(1)… 无限探测，每个整数码都触发一次日线网络回源失败
+        （实测迭代 227 万次把补跑卡死 1 小时，麒麟策略
+        ``if etf_code in current_data`` 首次暴露）。语义对齐回测侧
+        jqcompat：已知标的返回 True（读取侧自有默认值兜底）。
+        """
+        if not isinstance(code, str):
+            return False
+        try:
+            info = self._daily_info(code)
+            return info is not None
+        except Exception:
+            return False
 
 
 _current_data_proxy = None
@@ -253,10 +301,14 @@ def _mem_daily_usable(df, start_ts, end_ts, count):
     return DataManager.mem_daily_usable(df, start_ts, end_ts, count)
 
 
-def _get_price_batch_daily(security, start_date, end_date, count, fields, panel):
+def _get_price_batch_daily(security, start_date, end_date, count, fields, panel,
+                           fq="qfq"):
     """批量日线查询：直接从 _daily_mem 取，避免逐标的 copy/filter/reset_index。
 
     内存帧未覆盖请求区间时走原 fetch 路径回源（见 _mem_daily_usable）。
+    fq in ("qfq","pre") 时 fetch 请求带 fq → **服务端**（stockdata）应用
+    最新锚定前复权（561980 份额折算假悬崖案例：折算应用收敛在服务端单点
+    实现，回测桥 jqcompat 自有 _apply_qfq_bars 不受影响，模拟盘不重复应用）。
     """
     mgr = _state["manager"]
     ctx = _state.get("ctx")
@@ -281,7 +333,9 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel)
             # （08-21 黄金ETF误换仓根因之一），失败必须留痕告警。
             for attempt in (1, 2):
                 try:
-                    df = mgr.fetch("get_daily", sec, start_date or "20000101", end_date or "20300101")
+                    df = mgr.fetch("get_daily", sec, start_date or "20000101",
+                                   end_date or "20300101",
+                                   **({"fq": fq} if fq in ("qfq", "pre") else {}))
                     break
                 except Exception as e:
                     _logger.warning("批量日线取数失败(第%d次) %s: %s", attempt, sec, e)
@@ -414,7 +468,7 @@ def get_price(security, start_date=None, end_date=None, count=None,
     # 快速批量路径：多标的 + 已预加载
     if len(security) > 10 and mgr._daily_mem and frequency not in ("1m", "minute", "1min"):
         return _get_price_batch_daily(security, start_date, end_date, count,
-                                       fields, panel)
+                                      fields, panel, fq=fq)
     if len(security) > 10 and mgr._minute_mem and frequency in ("1m", "minute", "1min"):
         return _get_price_batch_minute(security, start_date, end_date, count,
                                        fields, panel)
@@ -428,7 +482,8 @@ def get_price(security, start_date=None, end_date=None, count=None,
                 raw = mgr.fetch("get_minute", sec, _dt)
             else:
                 raw = mgr.fetch("get_daily", sec,
-                                start_date or "20000101", end_date or "20300101")
+                                start_date or "20000101", end_date or "20300101",
+                                **({"fq": fq} if fq in ("qfq", "pre") else {}))
             if raw is None or raw.empty:
                 _trace(sec, f"single freq={frequency} RAW_EMPTY")
                 continue
@@ -619,17 +674,37 @@ def _get_etf_nav_df(codes: list[str], end_date) -> pd.DataFrame:
     return result
 
 
-def attribute_history(security, count, unit="1d", fields=None, skip_paused=True, df=True):
+def attribute_history(security, count, unit="1d", fields=None, skip_paused=True, df=True,
+                      fq="pre"):
     freq_map = {"1d": "daily", "1m": "minute"}
     freq = freq_map.get(unit, "daily")
     fields = fields or ["close"]
-    result = get_price(security, count=count, frequency=freq, fields=fields, panel=True)
+    result = get_price(security, count=count, frequency=freq, fields=fields,
+                       panel=True, fq=fq)
     if isinstance(result, pd.DataFrame) and not result.empty:
         result = result.reset_index(drop=True)
         result.index = range(-len(result), 0)
         result.index.name = "date" if unit == "1d" else "datetime"
         return result
     return pd.DataFrame()
+
+
+def get_attribute_history(security, count, unit="1d", fields=None,
+                          skip_paused=True, df=True, fq="pre"):
+    """聚宽 get_attribute_history：与 attribute_history 同参（fq 含其中）。
+
+    差异在索引约定：聚宽返回 **0..count-1 升序整数索引**（策略惯用
+    ``['field'][0]`` 正标签取最旧一行），而本地 attribute_history 返回
+    ``-count..-1`` 负索引。缺这个别名时该调用直接 NameError（麒麟策略
+    capture_morning_prices 首次暴露——同码在聚宽可跑、本地报未定义）。
+    """
+    frame = attribute_history(security, count, unit=unit, fields=fields,
+                              skip_paused=skip_paused, df=df, fq=fq)
+    if isinstance(frame, pd.DataFrame) and not frame.empty:
+        frame = frame.copy()
+        frame.index = range(len(frame))
+        frame.index.name = "date" if unit == "1d" else "datetime"
+    return frame
 
 
 def _live_price(security):
@@ -654,14 +729,36 @@ def order(security, amount):
     1 Core：撮合真身在 ``core.execution.execute_order``，此处只做取价+委托。
     交易规则：买入 100 股整手；T+1（当日买入不可卖，卖出量按 closeable 截断）；
     佣金双边 + 卖出印花税（非 ETF）；``_state["no_buy"]/["no_sell"]`` 禁买卖。
+
+    精简喂价下 no_buy/no_sell 只覆盖持仓+目标清单（喂价广度无关化）：未覆盖
+    码在下单时按现价现算涨跌停——否则当日新目标可在涨停价买入/跌停价卖出
+    （全池喂价时代由驱动方按池价统一判定，精简喂价漏掉当日新目标）。
     """
     ctx = _state["ctx"]
+    no_buy = set(_state.get("no_buy") or set())
+    no_sell = set(_state.get("no_sell") or set())
+    if security not in no_buy and security not in no_sell:
+        px = _live_price(security)
+        if px:
+            try:
+                cd = get_current_data()[security]
+                hl, ll = float(cd.high_limit or 0), float(cd.low_limit or 0)
+                # 容差取 0.01 元下限（A 股最小价差）+2% 相对容差，比 runner
+                # 驱动方判定的 ±0.2% 保守：下单点价已含滑点，误放行代价
+                # （涨停买入/跌停卖出）远大于误拦截。
+                if amount > 0 and hl > 0 and px >= hl - max(0.011, hl * 0.002):
+                    no_buy.add(security)
+                elif amount < 0 and ll > 0 and px <= ll + max(0.011, ll * 0.002):
+                    no_sell.add(security)
+            except Exception as e:
+                # fail-open（涨跌停计算失败放行）但留 debug 痕迹，便于排查
+                _logger.debug("order 涨跌停兜底判定失败 %s: %s", security, e)
     return execute_order(
         portfolio=ctx.portfolio, position_factory=Position,
         code=security, amount=amount, price=_live_price(security),
         current_dt=ctx.current_dt, fee=_state["fee"], slippage=_state["slippage"],
         fee_config=_state.get("fee_config"),
-        no_buy=_state.get("no_buy"), no_sell=_state.get("no_sell"),
+        no_buy=no_buy, no_sell=no_sell,
         trades=_state["trades"],
     )
 
@@ -1051,6 +1148,10 @@ def get_all_securities(types=None, date=None):
     if mgr is None:
         return pd.DataFrame()
     types = types or ["etf"]
+    if isinstance(types, str):
+        # jqcompat 回测引擎对字符串 types 做 [types] 归一化；此处缺失会让
+        # get_all_securities('stock') 按字符迭代（'s','t','o','c','k'）→ 恒空。
+        types = [types]
     # 从网络源获取通达信简称（与聚宽 display_name 一致）
     mootdx_names = {}
     if "network" in mgr.sources:
@@ -1081,6 +1182,11 @@ def get_all_securities(types=None, date=None):
                 continue
             for item in items or []:
                 if isinstance(item, str):
+                    # 北交所整体禁用：本地无 BJ 日线数据，且用户账户未开通
+                    # 北交所（2026-09-05）。4/8/92 号段与 .BJ 后缀一并跳过。
+                    if item.endswith(".BJ") or item[:2] in ("43", "83", "87", "88", "92") \
+                            or item[0] in ("4", "8"):
+                        continue
                     code = _ts_code_to_jq_code(item)
                     pure = code.split(".")[0]
                     name = mootdx_names.get(pure, code)
@@ -1092,6 +1198,9 @@ def get_all_securities(types=None, date=None):
                                     "end_date": "2200-01-01", "type": t})
                 else:
                     ts_code = item.get("ts_code", "")
+                    if ts_code.endswith(".BJ") or ts_code[:2] in ("43", "83", "87", "88", "92") \
+                            or ts_code[0] in ("4", "8"):
+                        continue
                     code = _ts_code_to_jq_code(ts_code)
                     pure = code.split(".")[0]
                     name = mootdx_names.get(pure, item.get("name", code))
@@ -1147,4 +1256,30 @@ def get_security_info(code):
     兜底（如走弱期 etf_names_dict 为空）时买卖日志/通知就显示成 ``代码(代码)``。
     统一走 get_security_name（sec_names/jq名/网络名/etf_list 逐级解析）。
     """
-    return SimpleNamespace(display_name=get_security_name(code))
+    # start_date：策略 filter_new_stock 等会读取；上市日期取自 instruments
+    # 快照（与回测桥 _load_stock_meta 同源口径），缺失退化为 2000-01-01 的
+    # date 对象（不误杀，等价回测引擎「数据不可得退化为全程可交易」）。
+    # 模块级缓存整表，避免逐标的读 parquet（全市场扫描策略每天 5 千+ 次调用）。
+    global _LISTING_DATES
+    if _LISTING_DATES is None:
+        _LISTING_DATES = {}
+        try:
+            import polars as _pl
+
+            from app.quant.config import CONFIG as _QCONFIG
+            _ip = os.path.join(os.path.dirname(_QCONFIG.db_path),
+                               "instruments", "instruments.parquet")
+            if os.path.exists(_ip):
+                _df = _pl.read_parquet(_ip).select(
+                    ["symbol", "listing_date"]).drop_nulls()
+                # 快照 symbol 为 TS 格式（600470.SH），按 6 位码建索引
+                _LISTING_DATES = {
+                    str(r["symbol"])[:6]: r["listing_date"]
+                    for r in _df.iter_rows(named=True)}
+        except Exception:
+            _LISTING_DATES = {}
+    start_date = _LISTING_DATES.get(str(code)[:6])
+    start_date = pd.Timestamp(start_date).date() if start_date is not None         else pd.Timestamp("2000-01-01").date()
+    return SimpleNamespace(display_name=get_security_name(code),
+                           start_date=start_date,
+                           name=get_security_name(code))

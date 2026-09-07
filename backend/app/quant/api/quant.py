@@ -50,6 +50,8 @@ class BacktestIn(BaseModel):
     capital: float = 100000.0
     fee: float = 0.0003
     slippage: float = 0.001
+    # 股票策略宇宙声明（"all_stocks"=全市场 A 股；空串=默认全市场 ETF 宇宙）
+    universe: str = ""
     record: bool = True
 
 

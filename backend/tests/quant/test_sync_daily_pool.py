@@ -17,6 +17,14 @@ class _FakeDailySrc:
                              "amount": [1000.0]},
                             index=pd.DatetimeIndex([ts]))
 
+    def get_minute(self, code, max_bars=40000, since=None):
+        # 历史日回源契约（since 分页）：day < today-5d 时 sync_etf_minute 走本方法
+        idx = pd.DatetimeIndex([pd.Timestamp("2026-08-21 15:00:00")])
+        idx.name = "datetime"
+        return pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0],
+                             "close": [1.0], "volume": [1.0], "amount": [1.0]},
+                            index=idx)
+
     def get_minute_recent(self, code, pages=1):
         # 真实 get_minute_recent 契约：index.name == "datetime"
         idx = pd.DatetimeIndex([pd.Timestamp("2026-08-21 15:00:00")])

@@ -21,6 +21,7 @@ from app.config import settings
 
 from .. import db
 from ..config import CONFIG
+from ..core import limit_rate as _core_limit_rate
 from ..datasource.manager import QuantDataProvider
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
@@ -30,10 +31,33 @@ from .protocol import is_paused, read_state, save_state
 
 log = logging.getLogger("app.quant.simulate.runner")
 
+# get_all_securities('stock') / ("stock") 调用形态（全市场选股策略标记）
+_GET_ALL_SECURITIES_STOCK_RE = re.compile(
+    r"get_all_securities\s*\(\s*['\"]stock['\"]")
+
+
+def _proc_rss_mb() -> float:
+    """当前进程 RSS（MB），补跑性能统计用；读取失败返回 0。"""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
+
 POLL_INTERVAL = 60  # 看护模式巡检间隔（秒）：分钟级止损，同时避免猛打数据源
 IDLE_INTERVAL = 30  # 非交易时段空转间隔（秒）
-LIMIT_DOWN_PCT = -0.098  # 跌停判定阈值（主板 10% 留容差；科创/创业 20% 简化不细分）
-LIMIT_UP_PCT = 0.098     # 涨停判定阈值（禁买，与跌停同口径）
+# 涨跌停判定容差（0.2%）：20% 板块按 core.limit_rate 分档后仍留同样容差
+_LIMIT_TOL = 0.002
+
+
+def _limit_rate_of(code):
+    """涨跌停幅度（1 Core 薄适配：pt/jq 码统一转调 core.limits 公式）。"""
+    pure, _, exch = str(code).partition(".")
+    return _core_limit_rate(pure, exch)
 TICK_OFFSET = settings.sim_tick_offset  # 交易时段每分钟第 N 秒后触发(SIM_TICK_OFFSET, 等快照跨分钟边界)
 SESSION_END_GRACE = datetime.time(15, 2)  # 15:00 收市 bar 的处理宽限（之后进收盘钩子）
 MARK_INTERVAL = 10          # 盘中实时打标间隔（秒）
@@ -112,7 +136,7 @@ def _step_once(account_id: str, provider: QuantDataProvider, matcher: Matcher,
             continue
         prices[c] = _last_price(df)
         prev = _prev_close(provider, c, today)
-        if prev and prices[c] <= prev * (1 + LIMIT_DOWN_PCT):
+        if prev and prices[c] <= prev * (1 - _limit_rate_of(c) + _LIMIT_TOL):
             no_sell.add(c)  # 跌停禁止卖出，止损顺延（主引擎 sell_limit_down 口径）
     state["dt"] = str(datetime.datetime.now())
     matcher.step(state, prices, no_sell=no_sell)
@@ -320,6 +344,13 @@ def _make_dm():
     dm = get_data_manager()
     dm._use_real_minute = True
     dm._offline = False
+    # 进程级日线统一前复权：模拟盘内所有 _daily_mem 日线帧必须是同一口径
+    # （最新锚定前复权，服务端折算）。缓存 _covers 不校验 start，任何一条
+    # 裸（原始价）取数路径都会污染该标的后续全部历史请求——561980 份额
+    # 折算（06-26 4.147→0.842）假悬崖曾借此漏进 S1 乖离率抄底，2026-09-06
+    # kirin 补跑回归 +5.25%（对齐应为 +20.38%）的根因。回测桥独立进程、
+    # 不经 _make_dm，保持原始价 + 自有 _apply_qfq_bars，不受影响。
+    dm._default_fq = "pre"
     # 盘中分钟取数诊断：SIM_MINUTE_DIAG=1 时记录每次取数 bar 数/缺失/回源，
     # 用于排查"当日分钟缺失被误判临时停牌"（08-13 159768 案例）。默认关闭。
     dm._diag_minute = os.getenv("SIM_MINUTE_DIAG", "") == "1"
@@ -520,23 +551,6 @@ def _daily_due(task_time: str, bar_dt) -> bool:
     return t >= hhmm if hhmm else False
 
 
-def _daily_pending(bundle, bar_dt, fired, force_all: bool = False) -> bool:
-    """本 bar 是否会触发某个尚未执行的 run_daily 任务（every_bar 不算）。
-
-    与 :func:`_fire_session` 的触发判定保持同一口径（同一 ``fired`` 集合、
-    同一 :func:`_daily_due`），供补跑取价范围决策使用。
-    """
-    for func, t in getattr(bundle, "daily", ()) or ():
-        ts = str(t)
-        if ts in ("before_open", "after_close", "every_bar"):
-            continue
-        if force_all:
-            return True
-        if (id(func), ts) not in fired and _daily_due(ts, bar_dt):
-            return True
-    return False
-
-
 def _replay_feed_codes(ctx, bundle, aux, bar_dt):
     """补跑取价范围决策：返回"只取这些标的"的列表，``None`` 表示取全池。
 
@@ -547,16 +561,26 @@ def _replay_feed_codes(ctx, bundle, aux, bar_dt):
     current_dt 的最后一分钟收盘，功能等价。
 
     以下情况必须取全池，否则会丢判定：
-    - 会触发调仓/决策类 run_daily 的 bar：涨跌停禁买判定需要候选池现价
     - 注册了 handle_data / run_minute 的每 bar 回调：可能读任意标的价
     - 日频账户（force_all）：所有 run_daily 挤在同一 tick 触发
+
+    其余情况（含决策类 run_daily）：只喂 持仓 + g.target_list（09:30 买单的
+    no_buy 判定需要）+ 心跳 510300。此前任何决策 bar 都全池喂价（连板策略
+    池 ~1000 只 × 换页级命中成本 40ms ≈ 40s/次，11 个任务 bar/天 = 7 分钟/天，
+    补跑大头）；候选池现价由 CurrentDataProxy 惰性回看提供，功能等价——
+    no_sell 只关乎持仓（必然在喂价内），no_buy 只关乎本 bar 可能下的买单
+    （target_list 覆盖）。
     """
     if getattr(bundle, "handle_data", None) or getattr(bundle, "minute", None):
         return None
-    if _daily_pending(bundle, bar_dt, aux.get("fired") or set(),
-                      force_all=aux.get("frequency") == "daily"):
-        return None
-    return list(ctx.portfolio.positions.keys()) or None
+    hold = list(ctx.portfolio.positions.keys())
+    g = getattr(ctx, "g", None)
+    if g is not None:
+        for _attr in ("target_list", "buy_list", "buy_stocks", "targets"):
+            tl = getattr(g, _attr, None)
+            if isinstance(tl, (list, tuple, set)) and tl:
+                hold.extend(tl)
+    return list(dict.fromkeys(hold)) or ["510300.XSHG"]
 
 
 def _safe_call(account_id: str, func, ctx, tag: str) -> None:
@@ -614,6 +638,15 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
         dm = aux.get("dm")
         if dm is not None and hasattr(dm, "_minute_empty"):
             dm._minute_empty.clear()
+            # 内存护栏：淘汰覆盖末尾早于 7 天前的分钟帧，钉窗补跑不再无限增长
+            ev = getattr(dm, "evict_minute_frames", None)
+            if ev is not None:
+                try:
+                    keep = set(getattr(ctx, "universe", None) or [])
+                    keep |= set(ctx.portfolio.positions.keys())
+                    ev(pd.Timestamp(now) - pd.Timedelta(days=7), keep=keep)
+                except Exception:
+                    pass
     jq_api.on_new_day()
     try:
         days = jq_api.get_trade_days(end_date=str(now.date()), count=5)
@@ -632,6 +665,28 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now, aux: dict
         _safe_call(account_id, bundle.before_trading_start, ctx, "before_trading_start")
     # 盘前回调可能更新 g.* 池子，重新注入 universe（每日刷新）
     _seed_universe(ctx)
+    # 补跑加速：把当日宇宙新增标的的分钟数据一次性批量预取（一次服务端批量
+    # scan），替代逐 bar 逐标的滑窗加载。全市场选股类策略每日轮动 ~百只新码，
+    # 每码要拼 ~40 个分钟分区，惰性加载是补跑 2-3 分钟/天的主因。
+    if aux is not None and aux.get("replay_mode") and dm is not None:
+        pre = getattr(dm, "preload_minute_for_pool", None)
+        uni = list(getattr(ctx, "universe", None) or [])
+        if pre is not None and uni:
+            # 分块预取：整批 800+ 只 × 40 天窗口一次调用会超过客户端 120s
+            # 超时 → 静默失败 → 回退逐 bar 逐码惰性加载（851 只 × ~60ms/码
+            # = 每根 bar 45-67s，即"卡在 8 月 5 日"的真相）。80 只/批可控。
+            _day_end = datetime.datetime.combine(
+                ctx.current_dt.date() if ctx and ctx.current_dt
+                else datetime.date.today(), datetime.time(15, 0))
+            chunk, ok = 80, 0
+            try:
+                for i in range(0, len(uni), chunk):
+                    pre(uni[i:i + chunk], _day_end, span_days=2)
+                    ok += len(uni[i:i + chunk])
+            except Exception as e:
+                log.warning("[replay] 每日分钟预取分块失败（回退滑窗加载）: %s", e)
+            _emit_log(account_id, "info",
+                      f"盘前分钟预取: {ok}/{len(uni)} 只（{chunk} 只/批）")
 
 
 def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
@@ -924,7 +979,7 @@ def _pin_replay_minute_window(dm, ctx, start, end) -> None:
     preload = getattr(dm, "preload_minute_for_pool", None)
     if preload is not None and codes:
         try:
-            preload(codes, pd.Timestamp(end))
+            preload(codes, pd.Timestamp(start), span_days=2)
         except Exception as e:
             log.warning("[replay] 分钟池批量预取失败（补跑将逐日回源）: %s", e)
 
@@ -942,7 +997,8 @@ def _unset_replay_minute_window(dm) -> None:
 
 
 def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
-                    state: dict, aux: dict, start_date: str) -> None:
+                    state: dict, aux: dict, start_date: str,
+                    strategy_code: str = "") -> None:
     """从 start_date 起按历史分钟补跑至今日（今天仅补跑到当前已走完的 bar），
     随后由主循环无缝接入实时，避免当天收盘后才启动/重置账户时日内行情丢失。"""
     _replay_active_ids.add(account_id)
@@ -975,19 +1031,49 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
         # 总耗时约 50%，是补跑最慢的根因。
         if dm is not None:
             dm._replay_mode = True
+        # 全市场选股类策略（get_all_securities('stock')）：补跑前预载全市场日线，
+        # 让引擎 get_price 的批量路径生效。否则落逐只网络取数（4400 只/次，
+        # 慢且异常被吞 → 曾出现「41 天零成交 40 秒跑完」的假补跑）。
+        # 正则匹配调用形态（'stock'/"stock" 均可，注释里提到 stock 不触发）。
+        try:
+            if dm is not None and _GET_ALL_SECURITIES_STOCK_RE.search(strategy_code or ""):
+                dm.preload_daily(fq="pre")
+                _emit_log(account_id, "info", "全市场日线预载完成（批量 get_price 路径）")
+        except Exception as e:
+            _emit_log(account_id, "error", f"全市场日线预载失败: {e}")
+        # 指数无本地分钟数据：预先标进 _minute_empty（与 _seed_universe 注入的
+        # 走弱期判定指数同一组），避免补跑首个 bar 对指数码触发分钟回源慢
+        # 尝试把 bar 流拖死（bar 有效性由 watch 行情价决定）。指数只被日线级
+        # 逻辑使用，不参与分钟定价，负缓存对实时模式同样正确。
+        try:
+            if dm is not None:
+                _me = getattr(dm, "_minute_empty", None)
+                if _me is not None:
+                    _me.update(["000300.XSHG", "399101.XSHE",
+                                "399006.XSHE", "000510.XSHG"])
+        except Exception:
+            pass
         for day in full_days:
             if is_paused(account_id):
                 break
+            _day_t0 = datetime.datetime.now()
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
                         datetime.datetime.combine(day, datetime.time(9, 25)), aux)
+            _day_ticks = 0
             for bar in _session_minutes(day):
                 if aux.get("frequency") == "daily" and bar.time() != datetime.time(9, 31):
                     continue
                 _strategy_tick(account_id, bundle, ctx, dm, _hist_feed, matcher, state, aux, bar)
+                _day_ticks += 1
             _eod(account_id, bundle, ctx, dm, state, aux,
                  datetime.datetime.combine(day, datetime.time(15, 5)))
             _emit_log(account_id, "info", f"补跑 {day} 完成，净值 {state.get('net_value', 0):.2f}",
                       ts=str(datetime.datetime.combine(day, datetime.time(15, 5))))
+            # 补跑性能统计：每交易日墙钟耗时 + tick 数（独立进程无 logging 配置，
+            # INFO 会被丢弃 → 直接 print 走 stdout 日志）
+            print(f"[replay-perf] day={day} "
+                  f"wall={(datetime.datetime.now() - _day_t0).total_seconds():.1f}s "
+                  f"ticks={_day_ticks} rss={_proc_rss_mb():.0f}MB", flush=True)
         # 今天若已是交易日，把已走过（<= 当前时间）的 bar 也回补进来；
         # 今天不跑 _eod，剩余 bar / 收盘由主循环实时接管（last_bar 已推进避免重复触发）
         # 今日分区可能尚未落盘、且会被 15:35 同步修订 → 恢复在线新鲜度回源。
@@ -1088,6 +1174,11 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     watch = list(dict.fromkeys(
         list(getattr(ctx, "universe", None) or [])
         + list(ctx.portfolio.positions.keys())))
+    # 空宇宙策略（全市场选股、不声明 g.* 池，如连板打板类）：补跑/实时 bar 的
+    # 有效性由 watch 行情价决定，watch 为空会令 bar_dt=None、所有 run_daily
+    # 回调静默不触发（表现为零成交假补跑）。用基准 ETF 做心跳定价源撑起 bar 流。
+    if not watch:
+        watch = ["510300.XSHG"]
     # 数据层用引擎码（JQ），feed 前转换；ptrade 策略域为 .SS/.SZ
     watch_codes = [_to_engine(c) for c in watch]
     prices, bar_dt, price_ts = None, None, {}
@@ -1101,10 +1192,19 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
                 dm, [_to_engine(c) for c in hold], now, aux["fresh_frames"])
     if not prices:
         prices, bar_dt, price_ts = feed(dm, watch_codes, now, aux["fresh_frames"])
+        if not prices and watch_codes and "510300.XSHG" not in watch_codes:
+            # watch 码全部无分钟价（如宇宙只有指数码的空池策略）→ 心跳 ETF 兜底，
+            # 否则 bar_dt 恒 None、run_daily 回调永不触发（静默零成交假补跑）。
+            prices, bar_dt, price_ts = feed(dm, ["510300.XSHG"], now,
+                                            aux["fresh_frames"])
     if prices:
         prices = {_to_pt(c): v for c, v in prices.items()}
         price_ts = {_to_pt(c): v for c, v in (price_ts or {}).items()}
     if bar_dt is None:
+        # [tick-debug] SIM_TICK_DEBUG=1 时打印跳过原因（诊断空宇宙策略补跑用）
+        if os.getenv("SIM_TICK_DEBUG") == "1":
+            print(f"[tick-debug] bar_dt=None now={now} watch_n={len(watch_codes)} "
+                  f"watch_head={watch_codes[:2]}", flush=True)
         # 收盘宽限期内无实时数据属正常，不报警
         t = pd.Timestamp(now).time()
         if t <= SESSION_END_GRACE:
@@ -1136,14 +1236,31 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
                 pc_cache[cache_key] = prev
         if not prev:
             continue
-        if px <= prev * (1 + LIMIT_DOWN_PCT):
+        rate = _limit_rate_of(code)
+        if px <= prev * (1 - rate + _LIMIT_TOL):
             no_sell.add(code)
-        elif px >= prev * (1 + LIMIT_UP_PCT):
+        elif px >= prev * (1 + rate - _LIMIT_TOL):
             no_buy.add(code)
     jq_api._state["no_sell"] = no_sell
     jq_api._state["no_buy"] = no_buy
     _fire_session(account_id, bundle, ctx, bar_ts, aux["fired"], jq_api,
                   force_all=aux.get("frequency") == "daily")
+    # 晨选后增量预热：选股回调（09:25/09:30）重建 g.pool 后，当日新入池码未在
+    # 盘前预热覆盖内，后续决策 bar 会逐码 60ms 懒加载重付。回调一结束就对
+    # （可能已变的）universe 做分块增量预热，todo 过滤跳过已缓存码，只补新码。
+    if (aux.get("replay_mode") and dm is not None
+            and datetime.time(9, 25) <= bar_ts.time() <= datetime.time(9, 31)):
+        _seed_universe(ctx)  # 选股回调重建了 g.pool，先重播种 universe 再预热
+        _pre = getattr(dm, "preload_minute_for_pool", None)
+        _uni = list(dict.fromkeys(
+            list(getattr(ctx, "universe", None) or [])
+            + list(ctx.portfolio.positions.keys())))
+        if _pre is not None and _uni:
+            try:
+                for _i in range(0, len(_uni), 80):
+                    _pre(_uni[_i:_i + 80], bar_ts, span_days=2)
+            except Exception:
+                pass
     # 止损巡检（matcher 在 state 口径上工作，结果回写 portfolio）
     _state_from_portfolio(ctx, state)
     state["dt"] = str(bar_ts)
@@ -1265,8 +1382,10 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     elif start_date and start_date < today_str:
         replay_from = start_date
     if replay_from:
-        _replay_history(account_id, bundle, ctx, dm, matcher, state, aux, replay_from)
+        _replay_history(account_id, bundle, ctx, dm, matcher, state, aux, replay_from,
+                        strategy_code=code)
     elif replay_partial:
+        assert saved_ts is not None  # replay_partial=True 蕴含 saved_ts 有效
         _replay_partial_day(account_id, bundle, ctx, dm, matcher, state, aux, saved_ts)
     hooks_done: dict[str, str | None] = {"pre": None, "eod": None}
     trading_day: tuple[str, bool] | None = None  # (today_str, bool) 每日缓存一次

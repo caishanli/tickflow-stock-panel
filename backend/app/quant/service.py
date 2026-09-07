@@ -197,12 +197,20 @@ def account_start(aid: str) -> None:
             aid, status="running", started_at=datetime.datetime.now().isoformat()
         )
         os.makedirs(CONFIG.runtime_dir, exist_ok=True)
-        proc = subprocess.Popen(
-            [sys.executable, _script("run_quant_sim.py"), aid],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        # runner stdout/stderr 落每账户日志文件：策略 print/异常栈可回查，
+        # 不再静默吞掉（补跑零成交类问题此前完全不可见）。
+        # 父进程 spawn 后立即 close 自己这份 fd——子进程持有 dup，父进程不关
+        # 每次 start 都泄漏一个 fd（长期运行的后端进程会累积）。
+        sim_log = open(os.path.join(CONFIG.runtime_dir, f"{aid}.log"), "ab")  # noqa: SIM115  # fd 交给子进程/句柄注册，父进程按需关闭
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, _script("run_quant_sim.py"), aid],
+                stdout=sim_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            sim_log.close()
         # M5：pid 落库，reset/终止时按 pid 杀进程组
         pid = getattr(proc, "pid", None)
         if pid:
@@ -240,17 +248,21 @@ def account_ensure_running(aid: str) -> None:
             return
         os.makedirs(CONFIG.runtime_dir, exist_ok=True)
         db.update_sim_account(aid, started_at=datetime.datetime.now().isoformat())
+        # 与 account_start 同口径：stdout 落每账户日志（append），父进程即关 fd
+        sim_log = open(os.path.join(CONFIG.runtime_dir, f"{aid}.log"), "ab")  # noqa: SIM115  # fd 交给子进程/句柄注册，父进程按需关闭
         try:
             proc = subprocess.Popen(
                 [sys.executable, _script("run_quant_sim.py"), aid],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=sim_log,
+                stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         except Exception as e:
             db.insert_sim_log(aid, str(datetime.datetime.now()), "error",
                               f"守护自动重启失败: {e}")
             return
+        finally:
+            sim_log.close()
         db.update_sim_account(aid, pid=getattr(proc, "pid", None))
         db.insert_sim_log(aid, str(datetime.datetime.now()), "warn",
                           "检测到进程退出，自动重启")

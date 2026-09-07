@@ -525,6 +525,25 @@ def attribute_history(security, count, unit="1d", fields=None, skip_paused=True,
     return df[list(fields)]
 
 
+def get_attribute_history(security, count, unit="1d", fields=None,
+                          skip_paused=True, df=True, fq="pre"):
+    """聚宽 get_attribute_history：与 attribute_history 同参。
+
+    差异在索引约定：聚宽返回 **0..count-1 升序整数索引**（策略惯用
+    ``['field'][0]`` 正标签取最旧一行），本地 attribute_history 返回
+    时间索引帧。缺该别名时聚宽移植策略直接 NameError（麒麟策略
+    capture_morning_prices 首次暴露——同码在聚宽可跑、本地报未定义）。
+    """
+    frame = attribute_history(security, count, unit=unit, fields=fields,
+                              skip_paused=skip_paused, df=df, fq=fq)
+    if frame is None or (hasattr(frame, "empty") and frame.empty):
+        return pd.DataFrame()
+    frame = frame.copy()
+    frame.index = range(len(frame))
+    frame.index.name = "date" if unit == "1d" else "datetime"
+    return frame
+
+
 def is_temporarily_suspended(security, context=None, minute_count=10):
     try:
         minute_data = get_price(
@@ -1080,12 +1099,15 @@ LIVE_SINK = None
 class _Log:
     def _sink(self, level, a):
         msg = " ".join(str(x) for x in a)
-        try:
-            with open("/tmp/wufu_dbg.log", "a", encoding="utf-8") as _f:
-                _f.write(f"[{level}] {msg}\n")
-                _f.flush()
-        except Exception:
-            pass
+        # /tmp/wufu_dbg.log 留痕仅诊断开关启用时（SIM_LOG_DEBUG=1）：
+        # 回测热路径每条日志 open+write 纯属浪费，且硬编码 /tmp 不可移植。
+        if os.getenv("SIM_LOG_DEBUG") == "1":
+            try:
+                with open("/tmp/wufu_dbg.log", "a", encoding="utf-8") as _f:
+                    _f.write(f"[{level}] {msg}\n")
+                    _f.flush()
+            except Exception:
+                pass
         if LIVE_SINK is not None:
             try:
                 LIVE_SINK(level, msg)
@@ -1094,9 +1116,11 @@ class _Log:
 
     def info(self, *a, **k):
         self._sink("INFO", a)
+        logger.info(*a)
 
     def warn(self, *a, **k):
         self._sink("WARNING", a)
+        logger.warning(*a)
 
     warning = warn
 
@@ -2899,6 +2923,13 @@ def _register_jq_apis():
         # sys.modules["jqdata"]，因此必须强制覆盖（不能用 setdefault）。
         _JQDATA_MOD = types.ModuleType("jqdata")
         sys.modules["jqdata"] = _JQDATA_MOD
+        # finance 子模块占位：聚宽金融数据库（FUND_SHARE_DAILY 等）本地无数据，
+        # 提供 `from jqdata import finance` 可导入；run_query 返回 None，策略
+        # 侧自有 try/except 降级（如麒麟策略的 LOF 份额退市判定）。
+        _finance = types.ModuleType("jqdata.finance")
+        _finance.FUND_SHARE_DAILY = None
+        _finance.run_query = lambda *a, **k: None
+        _JQDATA_MOD.finance = _finance
 
     _shims = [
         ("g", _GLOBAL_G),
@@ -2910,6 +2941,7 @@ def _register_jq_apis():
         ("get_security_name", get_security_name),
         ("get_security_info", get_security_info),
         ("attribute_history", attribute_history),
+        ("get_attribute_history", get_attribute_history),
         ("is_temporarily_suspended", is_temporarily_suspended),
         ("get_trade_days", get_trade_days),
         ("get_all_trade_days", get_all_trade_days),

@@ -134,9 +134,10 @@ def test_realtime_snapshot_serves_from_memory(src, monkeypatch):
         {"symbol": "512670.SH", "datetime": f"{day} 09:31:00", "open": 1.0,
          "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1000, "amount": 1000.0},
     ])
-    # 非交易时段：只读内存库，不触网
+    # 非交易时段：只读内存库，不触网。as_of 传当日末（bar 时刻 09:31 可能晚于
+    # 跑测试的墙钟，asof 过滤会把 bar 滤掉——时间敏感 flaky）
     monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
-    df = src.get_realtime_snapshot(["512670.XSHG"])
+    df = src.get_realtime_snapshot(["512670.XSHG"], as_of=f"{day} 23:59:59")
     assert not df.is_empty()
     assert df["close"].to_list() == [1.0]
 
@@ -184,7 +185,7 @@ def test_realtime_snapshot_mixed_ns_us_datetime(src, monkeypatch):
     assert ns_df.schema["datetime"] == pl.Datetime("ns")
     src.minute_store.update(day, ns_df)
     monkeypatch.setattr("app.services.stockdata.sources._in_trading", lambda *a, **k: False)
-    df = src.get_realtime_snapshot(["512670.XSHG"])
+    df = src.get_realtime_snapshot(["512670.XSHG"], as_of=f"{day} 23:59:59")
     assert not df.is_empty()
     # 分区 09:31 与内存 10:00 两条都应在（unique keep="last" 只去同秒重复）
     assert len(df) == 2

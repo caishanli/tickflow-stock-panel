@@ -18,9 +18,24 @@ from app.quant.simulate.runner import run_loop
 
 
 def main():
+    # 卡死诊断：SIGUSR1 触发全线程栈转储（无需 ptrace 权限）。
+    # 转储文件按账户分文件落 runtime 目录，与 sim 日志同处、多账户互不覆盖。
+    import faulthandler
+    import signal as _sig
+    try:
+        import os as _os
+
+        from app.quant.config import CONFIG
+        _os.makedirs(CONFIG.runtime_dir, exist_ok=True)
+        _aid = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "unknown"
+        _fh_file = open(_os.path.join(CONFIG.runtime_dir, f"{_aid}.stack_dump.txt"), "w")  # noqa: SIM115  # fd 交给子进程/句柄注册，父进程按需关闭
+        faulthandler.register(_sig.SIGUSR1, file=_fh_file, all_threads=True)
+    except Exception:
+        pass
     args = sys.argv[1:]
     if args and args[0] == "--create":
         import argparse
+
         from app.quant import service
 
         p = argparse.ArgumentParser(prog="run_quant_sim.py --create")
@@ -40,6 +55,7 @@ def main():
                        help="创建后立即经内存门禁拉起子进程")
         a = p.parse_args(args[1:])
         import uuid
+
         from app.quant import db
         if a.clone_from:
             src = db.get_sim_account(a.clone_from)

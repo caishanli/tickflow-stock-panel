@@ -40,8 +40,13 @@ def h_get_price(p, s: DataSources):
     freq = p.get("frequency", "daily")
     start = p.get("start_date")
     end = p.get("end_date")
+    fq = p.get("fq")
     if freq == "daily":
         df = s.get_daily(codes, start or "2000-01-01", end or _dt.date.today().isoformat())
+        # fq="pre"/"qfq"：最新锚定前复权（聚宽 get_price fq 默认语义）。
+        # 不传或传 none/raw 保持原始价（回测桥自有折算层，不受影响）。
+        if fq in ("pre", "qfq"):
+            df = s.apply_qfq_daily(df)
         return "parquet", df
     # 分钟：区间内（或当日）1m
     if not start or not end:
@@ -54,7 +59,10 @@ def h_get_price(p, s: DataSources):
 def h_preload_daily(p, s: DataSources):
     lookback = int(p.get("lookback_days", 400))
     asof = p.get("asof")
+    fq = p.get("fq")
     df = s.preload_daily(lookback, _dt.date.fromisoformat(asof) if asof else None)
+    if fq in ("pre", "qfq"):
+        df = s.apply_qfq_daily(df)
     return "parquet", df
 
 

@@ -352,7 +352,7 @@ def _replay_dm_cls(days):
         def unset_minute_window(self):
             self.unset_seen = True
 
-        def preload_minute_for_pool(self, codes, as_of=None):
+        def preload_minute_for_pool(self, codes, as_of=None, span_days=None):
             self.pool_seen = list(codes) if codes else []
 
         def fetch(self, method, *a, **k):

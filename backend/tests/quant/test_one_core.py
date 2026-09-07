@@ -119,6 +119,10 @@ _LIMIT_RATE_ALLOW = {
     "jqcompat.py",
     "ptradecompat.py",
     "ptradeengine/ptrade_api.py",
+    # jqengine 引擎适配（与 ptradeengine 对位）：CurrentDataProxy 涨跌停兜底用
+    "jqengine/engine/jq/api.py",
+    # 模拟盘 runner 涨跌停禁买卖判定（pt/jq 码归一）
+    "simulate/runner.py",
 }
 
 

@@ -49,7 +49,7 @@ class _FakeClient:
     def __init__(self, daily):
         self._daily = daily  # {jq_code: DatetimeIndex 日线帧}
 
-    def preload_daily(self, lookback_days=400, asof=None):
+    def preload_daily(self, lookback_days=400, asof=None, fq=None):
         return self._daily
 
     def get_adj_factors(self):

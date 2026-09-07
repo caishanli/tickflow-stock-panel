@@ -20,12 +20,12 @@ class FakeClient:
     def __init__(self):
         self.calls = []
 
-    def preload_daily(self, lookback_days=400, asof=None):
+    def preload_daily(self, lookback_days=400, asof=None, fq=None):
         self.calls.append("preload_daily")
         return {"512670.XSHG": _df("512670.XSHG", [1.0, 1.1])}
 
     def get_price(self, security, start_date=None, end_date=None,
-                  frequency="daily", fields=None):
+                  frequency="daily", fields=None, fq=None):
         self.calls.append(("get_price", frequency, security))
         codes = security if isinstance(security, list) else [security]
         return {c: _df(c, [1.0, 1.1]) for c in codes}

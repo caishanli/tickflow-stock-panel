@@ -278,7 +278,14 @@ def test_sync_etf_minute_retry_round(monkeypatch):
     calls = {"n": 0}
 
     class _Src:
+        def get_minute(self, jq, max_bars=40000, since=None):
+            # 历史日回源契约（since 分页）：day < today-5d 时走本方法而非 recent
+            return self._get_minute_recent_impl(jq)
+
         def get_minute_recent(self, jq, pages=2):
+            return self._get_minute_recent_impl(jq)
+
+        def _get_minute_recent_impl(self, jq):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise TimeoutError("down")

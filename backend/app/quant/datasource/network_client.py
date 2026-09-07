@@ -110,10 +110,19 @@ class StockDataClient:
         df = pl.read_parquet(io.BytesIO(raw))
         if df.is_empty():
             return {}
-        pdf = df.to_pandas()
-        has_date = "date" in pdf.columns
+        has_date = "date" in df.columns
         ts_col = "date" if has_date else "datetime"
-        pdf = pdf.set_index(pd.to_datetime(pdf[ts_col]))
+        # 时间列在 polars 侧向量化解析：pandas 逐元素 to_datetime(str) 是
+        # get_minute_price_at 重载路径的实测热点（分钟窗 ~2 万行/次重载）。
+        # strict=False 解析失败产 NaT → drop（NaT 索引行会让 searchsorted/
+        # normalize 产出垃圾，宁缺毋滥）。
+        if df.schema.get(ts_col) == pl.Utf8:
+            df = df.with_columns(pl.col(ts_col).str.to_datetime(strict=False))
+        elif df.schema.get(ts_col) == pl.Date:
+            df = df.with_columns(pl.col(ts_col).cast(pl.Datetime("us")))
+        df = df.drop_nulls(subset=[ts_col])
+        pdf = df.to_pandas()
+        pdf = pdf.set_index(ts_col)
         pdf.index.name = None
         drop = ["symbol", ts_col]
         out: dict[str, pd.DataFrame] = {}
@@ -130,11 +139,12 @@ class StockDataClient:
 
     # ---- 行情 ----
     def get_price(self, security, start_date=None, end_date=None, frequency="daily",
-                  fields=None) -> dict[str, pd.DataFrame]:
+                  fields=None, fq: str | None = None) -> dict[str, pd.DataFrame]:
         resp = self._request("get_price", {
             "security": security, "start_date": str(start_date) if start_date else None,
             "end_date": str(end_date) if end_date else None,
-            "frequency": frequency, "fields": fields})
+            "frequency": frequency, "fields": fields,
+            "fq": fq})
         return self._parquet_to_dict(resp)
 
     def get_minute_pool(self, codes, lo_ts, hi_ts) -> dict[str, pd.DataFrame]:
@@ -150,10 +160,12 @@ class StockDataClient:
             "as_of": str(as_of) if as_of is not None else None})
         return self._parquet_to_dict(resp)
 
-    def preload_daily(self, lookback_days: int = 400, asof=None) -> dict[str, pd.DataFrame]:
+    def preload_daily(self, lookback_days: int = 400, asof=None,
+                      fq: str | None = None) -> dict[str, pd.DataFrame]:
         resp = self._request("preload_daily", {
             "lookback_days": lookback_days,
-            "asof": str(asof) if asof is not None else None})
+            "asof": str(asof) if asof is not None else None,
+            "fq": fq})
         return self._parquet_to_dict(resp)
 
     def get_adj_factors(self) -> pd.DataFrame:

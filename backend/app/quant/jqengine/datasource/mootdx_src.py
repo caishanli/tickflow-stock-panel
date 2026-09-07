@@ -149,9 +149,11 @@ class MootdxSource(DataSource):
         顺序：1) 显式指定/固定服务器 → 2) rank_servers() 实测延迟排名序探测
         （排名为空时回退裸 _TDX_SERVERS 列表）→ 3) 裸 factory 兜底。
         返回 StdQuotes 实例（client.client 已替换为 pytdx.TdxHq_API）。
+
+        Quotes 用模块级名字（顶部 import）：函数内局部 `from mootdx.quotes
+        import Quotes` 会绕开测试对 msrc.Quotes 的 monkeypatch。
         """
         import pytdx.hq as _pytdx_hq
-        from mootdx.quotes import Quotes
 
         def _patch(quotes_client, ip, port):
             """用 pytdx 替换 mootdx 内部的 tdxpy client，修复 bars/quotes 返回空。"""

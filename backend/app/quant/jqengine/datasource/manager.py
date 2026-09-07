@@ -200,6 +200,11 @@ class DataManager:
     def __init__(self, token=None, cache=None, minute_mem_cap=None, **kwargs):
         self.cache = cache or DataCache()
         self.client = kwargs.pop("client", None)
+        # 进程级日线默认复权（None=原始价）。模拟盘设 "pre"：该进程内 _daily_mem
+        # 所有日线帧统一按最新锚定前复权（服务端折算），保证 get_price/attribute_history/
+        # current_data 各路径读到同一口径。回测桥保持 None——其 jqcompat 层自带
+        # _apply_qfq_bars，这里若默认复权会双重折算污染回测。
+        self._default_fq: str | None = kwargs.pop("default_fq", None)
         if self.client is None:
             from app.quant.datasource.network_client import StockDataClient
             self.client = StockDataClient()
@@ -224,6 +229,11 @@ class DataManager:
             cap=minute_mem_cap,
             on_evict=lambda k, _v: self._minute_cov.pop(k, None))
         self._minute_empty = set()  # 已知无分钟数据的标的，避免重复网络请求
+        # {code: (帧末时间, 负缓存写入时刻)}，历史日期有界负缓存。
+        # 带写入时刻：超过 _MINUTE_NDA_TTL 后条目失效重查（数据回填/复牌自愈），
+        # 否则补跑中复牌标的会永久取到"无数据"。
+        self._minute_no_data_after: dict[str, tuple] = {}
+        self._MINUTE_NDA_TTL = pd.Timedelta(minutes=30)
         self._daily_mem = {}
         self._daily_preloaded = False  # preload_daily 幂等标志（分区数据已载入）
         self._daily_preloaded_asof = None  # 上次 preload 的 asof（新交易日据此重载）
@@ -331,7 +341,12 @@ class DataManager:
             events = [e for e in events if e[0] <= cutoff]
             if not events:
                 return pdf
-        dates = pd.to_datetime(pdf["trade_dt"]).values
+        if "trade_dt" in pdf.columns:
+            dates = pd.DatetimeIndex(pd.to_datetime(pdf["trade_dt"])).normalize()
+        elif isinstance(pdf.index, pd.DatetimeIndex):
+            dates = pdf.index.normalize()
+        else:
+            return pdf
         factors = np.ones(len(dates), dtype=float)
         for ex_dt, f in events:
             mask = dates < ex_dt
@@ -487,7 +502,14 @@ class DataManager:
                 continue
         print(f"[preload] 分钟线: {count}/{len(codes)} 只")
 
-    def preload_daily(self, force: bool = False):
+    def preload_daily(self, force: bool = False, fq: str | None = None):
+        """fq="pre"：预载帧按最新锚定前复权（服务端应用）。
+
+        默认 None=原始价——**回测桥也走本方法**，其 jqcompat 层自带
+        _apply_qfq_bars 折算，预载若默认复权会双重折算污染回测；仅模拟盘
+        （``_default_fq="pre"``，见 _make_dm）调用点显式传或走进程级默认。
+        """
+        fq = fq or getattr(self, "_default_fq", None)
         # 按 asof 判幂等：asof = 今日-1（最新已完成交易日）。模拟盘补跑当日重启
         # （asof=前一日）进入实时后，次日盘前 preload 必须重新预载，否则 _daily_mem
         # 停留在上次 asof，策略"全市场ETF总成交额"最新交易日只有被零星刷新的子集
@@ -500,7 +522,7 @@ class DataManager:
         try:
             from_part = self.client.preload_daily(
                 lookback_days=self._DAILY_LOOKBACK_DAYS,
-                asof=asof)
+                asof=asof, fq=fq)
             if from_part:
                 for jq, df in from_part.items():
                     df = _ensure_money_yuan(df, "network")
@@ -683,6 +705,17 @@ class DataManager:
                                   ).strftime("%Y-%m-%d")
                         _fetch_args += [_start, _dt.datetime.now().strftime("%Y-%m-%d")]
                         _fetch_args = _fetch_args[:3]
+                    # 进程级默认复权：模拟盘 _default_fq="pre"（见
+                    # simulate/runner._make_dm）时，所有未显式带 fq 的日线取数
+                    # 统一按最新锚定前复权回源——否则任一条裸取数路径（如
+                    # current_data 的 10 日窄窗）会把原始价帧写进 _daily_mem，
+                    # 而 _covers 不校验 start，此后同标的全部 fq 请求都会命中
+                    # 该原始帧（份额折算假悬崖 → S1 假信号，2026-09-06 kirin
+                    # 回放回归根因）。显式传 fq 时以调用方为准。
+                    # getattr：测试可用 __new__ 构造最小实例（无 __init__）。
+                    if (getattr(self, "_default_fq", None)
+                            and "fq" not in kwargs):
+                        kwargs["fq"] = self._default_fq
                     df = getattr(self.sources["network"], method)(*_fetch_args, **kwargs)
                     if df is None or (hasattr(df, "empty") and df.empty):
                         raise DataSourceError(f"network 空数据")
@@ -937,6 +970,12 @@ class DataManager:
             # 上界记帧真实末 bar：覆盖校验按实际数据（非请求 hi_eff）判定命中，
             # 补跑/盘中当日分区未落盘时不会把当日算进覆盖区间（回归 513030）
             self._minute_cov[code] = (lo_ts, df.index.max())
+            # 历史日期下帧末到不了 as_of 当日（停牌/退市/分区缺口）：帧是
+            # 不可变分区的全量，后续 as_of 只会更晚 → 记负缓存上界，避免
+            # 每个 bar 都重载整段窗口（08-06 补跑卡顿根因之一）。
+            if (not is_today
+                    and pd.Timestamp(df.index.max()).normalize() < as_of_ts.normalize()):
+                self._minute_no_data_after[code] = (df.index.max(), pd.Timestamp.now())
             if is_today and getattr(self, "_diag_minute", False):
                 logger.info("[minute-diag] %s 盘中加载成功 bars=%d 末bar=%s as_of=%s",
                             code, len(df), df.index.max(), as_of_ts)
@@ -958,6 +997,24 @@ class DataManager:
                                "lo=%s hi=%s as_of=%s", code, lo_ts, hi_eff, as_of_ts)
         return df
 
+    def get_day_open(self, code, dt):
+        """当日开盘价（当日日线分区未落盘的实时盘中兜底）。
+
+        取当日首根分钟 bar 的 open（≈集合竞价成交价）；无当日分钟数据返回 0.0，
+        调用方据此跳过依赖 day_open 的判定（如开盘低开止损）。
+        """
+        dt_ts = pd.Timestamp(dt).normalize()
+        df = self._ensure_minute_windowed(code, dt_ts + pd.Timedelta(hours=9, minutes=31))
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return 0.0
+        day_df = df[df.index.normalize() == dt_ts]
+        if day_df.empty:
+            return 0.0
+        try:
+            return float(day_df["open"].iloc[0])
+        except Exception:
+            return 0.0
+
     def _load_minute_pool_from_partitions(self, codes, lo_ts, hi_ts):
         if not codes:
             return {}
@@ -967,7 +1024,7 @@ class DataManager:
             logger.warning("[DataManager] 分钟池网络取数失败: %s", e)
             return {}
 
-    def preload_minute_for_pool(self, codes, as_of=None):
+    def preload_minute_for_pool(self, codes, as_of=None, span_days=None):
         """批量预热分钟线缓存：把 codes 中所有标的的分钟数据加载到 _minute_mem。
 
         在策略构建好合并池后调用（如 `midday_routine` 后），使后续
@@ -991,7 +1048,15 @@ class DataManager:
         # 实时/模拟盘（无 _minute_win）保持滑窗语义，帧随 as_of 前移由
         # _ensure_minute_windowed 覆盖校验自愈。
         full = bool(getattr(self, "_minute_win", None))
-        lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=full)
+        if span_days is not None:
+            # 短窗预热（补跑内存护栏）：帧只含最近 span_days 天，工作集
+            # 从 ~300MB（钉住全区间）降到 ~30MB，决策 bar 的缓存命中不再被
+            # 换页拖到 40-130ms/只（08-14 补跑 1 bar/分钟根因）。
+            # 分钟帧只服务"截至 dt 的最后一价"查询，无长回看需求，2 天足够。
+            lo_ts = as_of_ts.normalize() - pd.Timedelta(days=span_days)
+            hi_ts = as_of_ts.normalize()
+        else:
+            lo_ts, hi_ts = self._minute_window(as_of=as_of_ts, full=full)
         hi_eff = self._hi_eff(hi_ts)
         loaded = 0
         # 过滤已知无分钟的标的 + 已覆盖标点（同日重复预热直接跳过，只批新入池）
@@ -1063,6 +1128,28 @@ class DataManager:
         logger.info("[DataManager] 分钟线预热完成: 成功 %d/%d，已缓存 %d 只",
                     loaded, len(codes), len(self._minute_mem))
 
+    def evict_minute_frames(self, before_ts, keep=None):
+        """淘汰覆盖末尾早于 ``before_ts`` 的分钟缓存帧（补跑内存护栏）。
+
+        钉窗补跑会把整个区间的帧常驻 ``_minute_mem``，全市场轮动策略跑一个
+        月即累计 ~GB 级，系统 swap 打满后所有命中路径被换页拖慢 50-100 倍
+        （08-14 补跑 1 bar/分钟的根因之一）。按日淘汰 7 天前的陈旧帧：
+        被再次访问时按需重载（正确性不变，仅一次网络回源）。
+        """
+        keep = set(keep or ())
+        dropped = 0
+        for code in list(self._minute_cov.keys()):
+            if code in keep:
+                continue
+            cov = self._minute_cov.get(code)
+            if cov is not None and cov[1] < before_ts:
+                self._minute_mem.pop(code, None)
+                self._minute_cov.pop(code, None)
+                self._minute_split_events.pop(code, None)
+                self._minute_no_data_after.pop(code, None)
+                dropped += 1
+        return dropped
+
     def get_minute_price_at(self, code, dt):
         """取某标的截至 ``dt`` 的最后一分钟收盘价（供实时价/下单价，O(1) 切片）。
 
@@ -1071,11 +1158,39 @@ class DataManager:
         返回 ``float``；无数据返回 ``None``。
         """
         dt_ts = pd.Timestamp(dt)
+        # 历史 bar 的有界负缓存：补跑中某码分钟帧上界到不了 dt（停牌/退市/
+        # 数据提前结束），且刚重载过仍如此 → 该码在窗口内更晚的 dt 也必然无
+        # 数据，直接返回 None。不做这个缓存，大池日每根决策 bar 都会对停牌码
+        # 重复整段加载（实测每次卡死 8 月 6 日的根因）。仅历史日期生效——
+        # 当日实时数据可能稍后落盘，不做此假设（见 08-13 159768 案例）。
+        # TTL 自愈：条目过期后失效重查——数据回填/复牌后恢复取数，不再永久
+        # "无数据"（负缓存只有写入时刻、无失效机制会变成永久黑名单）。
+        nda = self._minute_no_data_after.get(code)
+        if nda is not None:
+            nda_end, nda_at = nda
+            if pd.Timestamp.now() - nda_at > self._MINUTE_NDA_TTL:
+                self._minute_no_data_after.pop(code, None)
+                nda = None
+        if (nda is not None and dt_ts.normalize() > nda_end
+                and dt_ts.date() < pd.Timestamp.today().date()):
+            return None
         df = self._minute_mem.get(code)
         cov = self._minute_cov.get(code)
         # H6c：dt 越出缓存帧覆盖区间（无论早晚）都重新按滑窗加载
         if (df is None or (hasattr(df, "empty") and df.empty) or cov is None
                 or dt_ts > cov[1] or dt_ts < cov[0]):
+            if getattr(self, "_diag_minute", False):
+                n = getattr(self, "_diag_reload_n", 0) + 1
+                self._diag_reload_n = n
+                if n % 50 == 1:
+                    _nda = self._minute_no_data_after.get(code)
+                    logger.warning("[minute-diag] reload#%d code=%s dt=%s "
+                                   "cov=%s mem=%s empty=%s nda=%s",
+                                   n, code, dt_ts,
+                                   (cov[0], cov[1]) if cov else None,
+                                   df is not None,
+                                   code in self._minute_empty,
+                                   _nda[0] if _nda else None)
             df = self._ensure_minute_windowed(code, dt_ts)
         if df is None or (hasattr(df, "empty") and df.empty):
             return None
@@ -1083,6 +1198,11 @@ class DataManager:
         # 返回 None，绝不把前一交易日收盘价当成当日价（补跑撞上当日分区未落盘
         # 时 513030 以 08-14 收盘 1.940 买入，真实 08-17 13:10 为 1.985 的回归）。
         if pd.Timestamp(df.index.max()).normalize() < dt_ts.normalize():
+            # 帧末仍早于目标日（历史日期）：记录数据上界，供有界负缓存秒回。
+            # 本函数没有 as_of 参数，以 dt_ts 是否为当日判定——当日实时数据
+            # 可能稍后落盘，不做负缓存（见 08-13 159768 案例）。
+            if dt_ts.date() < pd.Timestamp.today().date():
+                self._minute_no_data_after[code] = (df.index.max(), pd.Timestamp.now())
             return None
         try:
             pos = df.index.searchsorted(dt_ts, side="right") - 1
@@ -1459,7 +1579,12 @@ class DataManager:
                 start = (_dt.datetime.now()
                          - _dt.timedelta(days=_DAILY_FETCH_LOOKBACK_DAYS)
                          ).strftime("%Y-%m-%d")
-                out = batch_fn(list(missing), start, end)
+                _fq_kw: dict = {}
+                if getattr(self, "_default_fq", None):
+                    # 与 fetch 同口径：成交额补数回源也不得把原始价帧写进
+                    # _daily_mem（帧末=今天会"覆盖"一切回放期请求）
+                    _fq_kw["fq"] = self._default_fq
+                out = batch_fn(list(missing), start, end, **_fq_kw)
                 if isinstance(out, dict):
                     got = {c: df for c, df in out.items()
                            if df is not None and not (hasattr(df, "empty") and df.empty)}

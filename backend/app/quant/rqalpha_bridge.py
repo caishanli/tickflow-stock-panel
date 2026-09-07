@@ -1423,7 +1423,8 @@ def run_jq_backtest(strategy_path: str, params: dict,
     try:
         return _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end,
                                       db_path, max_universe=max_universe,
-                                      strategy_path=strategy_path)
+                                      strategy_path=strategy_path,
+                                      universe=universe or params.get("universe"))
     finally:
         # dm 是进程级单例：恢复 offline 开关，避免污染同进程后续调用方
         # （如实盘/策略侧需要联网回源的路径）。
@@ -1557,8 +1558,43 @@ def _pt_account_stop_source(stop_loss: float) -> str:
     )
 
 
+def _load_all_stock_universe():
+    """全市场 A 股宇宙（jq 码格式，如 '600470.SH'），来自本地 instruments 快照。
+
+    剔除北交所（mootdx/本地日线均无 BJ 数据，混入会在选股阶段逐只回源失败）。
+    """
+    import polars as pl
+
+    from .config import CONFIG
+    # instruments 快照与 quant.db 同在仓库 data/ 目录下
+    path = os.path.join(os.path.dirname(CONFIG.db_path), "instruments", "instruments.parquet")
+    df = pl.read_parquet(path)
+    syms = df.filter(~pl.col("symbol").str.ends_with(".BJ"))["symbol"].to_list()
+    # 快照 symbol 是 TS 格式（600470.SH），dm 日线缓存键是聚宽格式
+    # （600470.XSHG），必须转换，否则股票宇宙查不到任何行情。
+    return [_ts_to_jq(s) for s in syms if len(s) == 9 and s[:6].isdigit()]
+
+
+def _load_stock_meta(codes):
+    """返回 ({code: name}, {code: (list_date, delist_date)})，来自 instruments 快照。"""
+    import polars as pl
+
+    from .config import CONFIG
+    # instruments 快照与 quant.db 同在仓库 data/ 目录下
+    path = os.path.join(os.path.dirname(CONFIG.db_path), "instruments", "instruments.parquet")
+    df = pl.read_parquet(path)
+    sub = df.filter(pl.col("symbol").is_in(list(codes)))
+    names, dates = {}, {}
+    for row in sub.iter_rows(named=True):
+        code = _ts_to_jq(row["symbol"])
+        names[code] = row.get("name") or code
+        ld = row.get("listing_date")
+        dates[code] = (str(ld) if ld is not None else "2000-01-01", "2999-12-31")
+    return names, dates
+
+
 def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
-                           max_universe=None, strategy_path=""):
+                           max_universe=None, strategy_path="", universe=None):
     """run_jq_backtest 主体（独立成函数，便于上层用 try/finally 恢复 dm._offline）。"""
     from .jqcompat import JqDataSource, install_jqcompat
 
@@ -1595,13 +1631,26 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     print("[universe] 全市场 ETF 池: {} 只".format(len(etf_universe)))
     _log_progress(params.get("run_id"), f"全市场 ETF 池: {len(etf_universe)} 只，构建数据源…")
 
+    # 股票宇宙：universe="all_stocks" → 本地 instruments 快照全市场 A 股（剔除
+    # 北交所，mootdx/本地日线无 BJ 数据）；传 code list 则原样使用。名称与上市
+    # 日期同样取自快照，供 get_all_securities(date) / filter_new_stock 使用，
+    # 避免股票策略（如连板打板）因宇宙只有 ETF 而无股可选。
+    stock_universe = list(universe) if universe and not isinstance(universe, str) else []
+    if isinstance(universe, str) and universe == "all_stocks":
+        stock_universe = _load_all_stock_universe()
+    if stock_universe:
+        s_names, s_dates = _load_stock_meta(stock_universe)
+        etf_names = {**(etf_names or {}), **s_names}
+        etf_list_dates = {**(etf_list_dates or {}), **s_dates}
+        _log_progress(params.get("run_id"), f"股票宇宙: {len(stock_universe)} 只（替代 ETF 池）")
+
     fixed_pools = _extract_fixed_pools(strategy_text)
 
-    # 数据源宇宙需覆盖：全市场动态池(etf_universe) + 策略源码固定池(fixed_pools，
+    # 数据源宇宙需覆盖：全市场动态池(ETF 池或股票宇宙) + 策略源码固定池(fixed_pools，
     # 含 LOF 等不在 ETF 名录中的标的) + 指数/基准/防御 ETF。
     # 固定池标的会被策略直接下单，必须建 instrument，否则 RQInvalidArgument。
     ds_universe = list(dict.fromkeys(
-        list(etf_universe) + list(fixed_pools) + _EXTRA_INDEX_CODES
+        list(stock_universe or etf_universe) + list(fixed_pools) + _EXTRA_INDEX_CODES
         + [benchmark, "511880.XSHG"]
     ))
 

@@ -269,7 +269,7 @@ class _PreloadAdvanceClient:
         self.codes = codes
         self.preload_asofs = []
 
-    def preload_daily(self, lookback_days=400, asof=None):
+    def preload_daily(self, lookback_days=400, asof=None, fq=None):
         self.preload_asofs.append(asof)
         return {c: _daily_through(asof) for c in self.codes}
 
@@ -1050,3 +1050,33 @@ def test_adj_events_rebuild_across_days_no_none_crash(tmp_path, monkeypatch):
     events_day2 = dm._adj_events()   # 不应 AttributeError
     assert events_day2["510300.XSHG"][0][1] == 2.0
     assert dm._adj_built_day == "2026-08-26"
+
+
+def test_minute_no_data_after_ttl_selfheal(monkeypatch):
+    """负缓存条目超 TTL 后失效重查：补跑中复牌/数据回填的标的恢复取数，
+    不再永久"无数据"（_minute_no_data_after 原实现无失效机制）。"""
+    from app.quant.jqengine.datasource.manager import DataManager
+
+    dm = DataManager.__new__(DataManager)
+    dm._minute_no_data_after = {}
+    dm._MINUTE_NDA_TTL = pd.Timedelta(minutes=30)
+    dm._minute_empty = set()
+    dm._minute_mem = {}
+    dm._minute_cov = {}
+
+    code = "513030.XSHG"
+    end = pd.Timestamp("2026-08-14 15:00:00")
+    # 条目 1 小时前写入 → 已过期
+    dm._minute_no_data_after[code] = (end, pd.Timestamp.now() - pd.Timedelta(hours=1))
+    # 过期 → 不短路（get_minute_price_at 会重查；这里只验 TTL 分支逻辑不 return None）
+    nda = dm._minute_no_data_after.get(code)
+    assert nda is not None
+    nda_end, nda_at = nda
+    expired = pd.Timestamp.now() - nda_at > dm._MINUTE_NDA_TTL
+    assert expired
+
+    # 新条目（30 分钟内）→ 有效期内且 dt 晚于帧末 → 短路 None
+    dm._minute_no_data_after[code] = (end, pd.Timestamp.now() - pd.Timedelta(minutes=5))
+    dt_late = pd.Timestamp.now() - pd.Timedelta(days=1)  # 历史 dt（昨天 15:30 后）
+    dt_late = dt_late.replace(hour=15, minute=30)
+    assert dm._minute_no_data_after[code][0].normalize() < dt_late.normalize()

@@ -13,6 +13,13 @@ _jqdata = types.ModuleType("jqdata")
 _jqdata.__all__ = []
 sys.modules.setdefault("jqdata", _jqdata)
 
+# finance 子模块占位：聚宽金融数据库本地无数据，run_query 返回 None，
+# 策略侧自有 try/except 降级（如麒麟策略 LOF 份额退市判定）。
+_finance = types.ModuleType("jqdata.finance")
+_finance.FUND_SHARE_DAILY = None
+_finance.run_query = lambda *a, **k: None
+_jqdata.finance = _finance
+
 # Fake jqfactor module so "from jqfactor import *" in strategies doesn't crash
 _jqfactor = types.ModuleType("jqfactor")
 _jqfactor.__all__ = []
@@ -76,6 +83,7 @@ def load_strategy(code, manager, fee, slippage, cash):
         "get_trade_days": api.get_trade_days,
         "get_extras": api.get_extras,
         "attribute_history": api.attribute_history,
+        "get_attribute_history": api.get_attribute_history,
         "is_temporarily_suspended": api.is_temporarily_suspended,
         "PriceRelatedSlippage": api.PriceRelatedSlippage,
         "OrderCost": api.OrderCost,

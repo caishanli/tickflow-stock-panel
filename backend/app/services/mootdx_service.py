@@ -192,7 +192,13 @@ def _etf_universe() -> list[str]:
             logger.warning("ETF 快照读取失败，回退分区标的: %s", e)
     lf = pl.scan_parquet(str(ETF_MINUTE_ROOT / "**" / "*.parquet"),
                          hive_partitioning=True)
-    syms = lf.select("symbol").unique().collect()["symbol"].to_list()
+    try:
+        syms = lf.select("symbol").unique().collect()["symbol"].to_list()
+    except Exception as e:
+        # 分区目录缺失/glob 展开为空（测试进程 DATA_ROOT 被 reload 钉到已删
+        # tmp 的场景）：返回空宇宙，调用方跳过该段回源
+        logger.warning("mootdx_service: ETF 分区扫描失败，返回空宇宙: %s", e)
+        return []
     out = []
     for s in syms:
         pure, mkt = s.split(".")
@@ -1178,28 +1184,105 @@ def _symbol_factor_frame(jq: str, closes: pd.Series,
     })
 
 
+def _merge_cliff_factors(jq: str, closes: pd.Series,
+                         base_fr: pl.DataFrame | None,
+                         threshold: float = 0.2) -> pl.DataFrame | None:
+    """根修：在 xdxr 因子之上检测残余价格悬崖，合成份额折算/分拆合并因子。
+
+    xdxr 事件只覆盖分红/送转/缩股，**不含 ETF 份额折算类事件**（561980 案例：
+    06-26 份额折算 4.147→0.842 假悬崖直入 20 日乖离率 -58.6%，触发假超跌抄底，
+    模拟盘与回测从首日起路径分叉）。ETF 隔夜涨跌幅受交易所限价约束（最大
+    ±20%，20cm 品种恰好 ±20% 属合法涨跌、以严格大于排除）——残余 |Δ|>20%
+    必为折算或坏数据，按当日/前日比值合成除权事件折叠历史价，与
+    _apply_qfq 的 ``dates < ex_dt × f`` 语义一致。幂等：调整后序列平滑时
+    原样返回 base_fr。
+    """
+    closes = closes.dropna()
+    if len(closes) < 2:
+        return base_fr
+    factors = pd.Series(1.0, index=closes.index)
+    if base_fr is not None and not base_fr.is_empty():
+        fmap = dict(zip(base_fr["trade_date"].to_list(),
+                        base_fr["ex_factor"].to_list(), strict=False))
+        factors = pd.Series([float(fmap.get(d.isoformat(), 1.0))
+                             for d in closes.index], index=closes.index)
+    adj = closes * factors
+    ret = adj.pct_change().dropna()
+    cliffs = ret[ret.abs() > threshold]
+    if cliffs.empty:
+        return base_fr
+    logger.warning(
+        "mootdx_service: %s 合成份额折算因子 %d 个悬崖: %s",
+        jq, len(cliffs),
+        [(str(d.date()), f"{r:+.1%}") for d, r in cliffs.items()][:5])
+    pos = {d: i for i, d in enumerate(closes.index)}
+    extra = pd.Series(1.0, index=closes.index)
+    for dt, r in cliffs.items():
+        f = float(r) + 1.0
+        extra.iloc[: pos[dt]] *= f
+    total = factors * extra
+    return pl.DataFrame({
+        "symbol": jq,
+        "trade_date": [d.isoformat() for d in closes.index.date],
+        "ex_factor": total.values,
+    })
+
+
+def _sentinel_row(queried_at: _date) -> dict:
+    """无事件标的的哨兵行（category=-1，year/month/day 编码查询日期）。
+
+    `_symbol_factor_frame` 对 cat ∉ (1, 11) 的行直接跳过，哨兵不产生因子；
+    携带查询日期使哨兵老化后可重查（新分红事件在哨兵写入后发生 → 超期重查
+    补采）。"""
+    return {"category": -1, "year": queried_at.year, "month": queried_at.month,
+            "day": queried_at.day, "suogu": 0.0, "fenhong": 0.0,
+            "songzhuangu": 0.0, "peigu": 0.0, "peigujia": 0.0}
+
+
+def _sentinel_is_fresh(row: dict, max_age_days: int = 90) -> bool:
+    """哨兵行是否仍在有效期内（未过期 → 不必重查 xdxr）。"""
+    try:
+        q = _date(int(row["year"]), int(row["month"]), int(row["day"]))
+        return (_date.today() - q).days <= max_age_days
+    except Exception:
+        return False
+
+
 def sync_adj_factor() -> dict:
-    """增量更新 ETF 前复权因子表(mootdx xdxr 事件重建, 三层加固). 
+    """增量更新 ETF+股票 前复权因子表(mootdx xdxr 事件重建, 三层加固).
     对宇宙内每只有除权事件的标的，用 xdxr 记录 + 日线 close 重建逐日
     ex_factor 序列，覆盖该标的在 ``all.parquet`` 中的行（全量重算该标的，
     幂等). xdxr 原始事件落本地 ``xdxr_events.parquet``(查询失败沿用本地
-    事件); 写表后跑断点审计(调整后序列仍含 >20% 单日跳变即缺口), 
-    查询失败 ∪ 审计缺口用新 MootdxSource 实例重试一轮, 仍有缺口 WARNING. 
-    返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}. 
+    事件); 写表后跑断点审计(调整后序列仍含 >20% 单日跳变即缺口),
+    查询失败 ∪ 审计缺口用新 MootdxSource 实例重试一轮, 仍有缺口 WARNING.
+
+    宇宙 = ETF 全量逐只查 xdxr（现状）+ 全市场 A 股（增量：事件表已有新鲜
+    记录——事件行或 90 天内哨兵——的 sym6 不再逐日重查，只本地重建因子帧；
+    首次接入 ~5200 只一次性补查，之后每日只有新上市/哨兵过期的少量增量）。
+    股票因子修复模拟盘 fq="pre" 股票日线无复权口径的问题（服务端
+    apply_qfq_daily 与回测桥 _adj_events 共用本表）。
+
+    返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}.
     """
     src = MootdxSource()
     dm = DataManager()
     daily = dm._load_daily_from_partitions(asof=None)
     codes = _etf_universe()
-    if not codes:
+    stock_codes = [c for c in _stock_universe() if not c.endswith(".BJ")]
+    if not codes and not stock_codes:
         return {"written_symbols": 0, "rows": 0, "total_symbols": 0,
                 "query_failed": [], "audit_uncovered": []}
-    # 只保留宇宙内的标的
-    daily = {k: v for k, v in daily.items() if k in set(codes)}
-    # 第2层: xdxr 原始事件落本地. 查询失败(None)沿用本地已有事件, 
-    # 因子重建纯本地计算--socket 只影响"发现新事件", 不影响既有因子. 
+    # 只保留宇宙内的标的（ETF + 股票；daily 两类分区都载入）。
+    # daily 的 key 是 jq 码；股票宇宙是 .SH/.SZ，按 6 位纯码对齐。
+    etf_set = set(codes)
+    stock_set = {s.split(".")[0] for s in stock_codes}
+    daily = {k: v for k, v in daily.items()
+             if k in etf_set or k.split(".")[0] in stock_set}
+    # 第2层: xdxr 原始事件落本地. 查询失败(None)沿用本地已有事件,
+    # 因子重建纯本地计算--socket 只影响"发现新事件", 不影响既有因子.
     events_path = ADJ_FACTOR_PATH.parent / "xdxr_events.parquet"
     events_map = _load_xdxr_events(events_path)
+    today = _date.today()
     query_failed = []
     frames = []
     for jq, pdf in daily.items():
@@ -1207,14 +1290,37 @@ def sync_adj_factor() -> dict:
         if closes.empty:
             continue
         sym6 = jq.split(".")[0]
-        rows = src._xdxr_rows(sym6)
+        is_etf = jq in etf_set
+        # 本地事件记录决策：
+        # - ETF：每日全量重查（数量 ~1660 只可承受；ETF 份额折算不走 xdxr、
+        #   靠悬崖检测兜底，漏事件代价高）。
+        # - 股票：事件表已有事件行，或 90 天内哨兵行（查过、无事件）→ 不触网，
+        #   只本地重建因子帧。首次接入 ~5200 只一次性补查，之后每日只有
+        #   新上市/哨兵过期的少量增量（否则全市场逐日重查不可行）。
+        rows = None
+        if not is_etf:
+            local_rows = events_map.get(sym6)
+            if local_rows:
+                has_event = any(r["category"] != -1 for r in local_rows)
+                sent = next((r for r in local_rows if r["category"] == -1), None)
+                if has_event or (sent is not None and _sentinel_is_fresh(sent)):
+                    rows = local_rows
         if rows is None:
-            if sym6 not in query_failed:
-                query_failed.append(sym6)
-            logger.warning("mootdx_service: %s xdxr 查询失败, 沿用本地事件", sym6)
-        else:
-            events_map[sym6] = _normalize_xdxr_rows(rows)
+            rows = src._xdxr_rows(sym6)
+            if rows is None:
+                if sym6 not in query_failed:
+                    query_failed.append(sym6)
+                logger.warning("mootdx_service: %s xdxr 查询失败, 沿用本地事件", sym6)
+            else:
+                if rows:
+                    events_map[sym6] = _normalize_xdxr_rows(rows)
+                elif not is_etf:
+                    # 无事件（股票）：写新鲜哨兵，之后 90 天内不再重查
+                    events_map[sym6] = [_sentinel_row(today)]
+                else:
+                    events_map[sym6] = []
         fr = _symbol_factor_frame(jq, closes, events_map.get(sym6))
+        fr = _merge_cliff_factors(jq, closes, fr)
         if fr is not None:
             frames.append(fr)
     _save_xdxr_events(events_path, events_map)
@@ -1266,6 +1372,7 @@ def sync_adj_factor() -> dict:
                     continue
                 fr = _symbol_factor_frame(jq, closes,
                                           events_map.get(jq.split(".")[0]))
+                fr = _merge_cliff_factors(jq, closes, fr)
                 if fr is not None:
                     frames.append(fr)
             out = _merge_write(frames)
@@ -1275,7 +1382,7 @@ def sync_adj_factor() -> dict:
         logger.warning("mootdx_service: 因子断点审计未覆盖 %d 只: %s",
                        len(audit_uncovered), audit_uncovered[:10])
     return {"written_symbols": len(frames), "rows": out.height,
-            "total_symbols": len(codes),
+            "total_symbols": len(codes) + len(stock_codes),
             "query_failed": query_failed, "audit_uncovered": audit_uncovered}
 
 
@@ -1655,7 +1762,12 @@ def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
 
 
 def _stock_universe() -> list[str]:
-    """返回全市场 A 股 symbol 列表（.SH/.SZ，优先 instruments parquet）。"""
+    """返回全市场 A 股 symbol 列表（.SH/.SZ，优先 instruments parquet）。
+
+    instruments 缺失时回退扫描日线分区；分区目录不存在/glob 展开为空
+    （polars ComputeError）容忍返回空表——测试进程里 DATA_ROOT 可能被
+    reload 钉到已删的 tmp，空宇宙只意味着跳过对应回源段，不应崩溃。
+    """
     inst_path = DATA_ROOT / "instruments" / "instruments.parquet"
     if inst_path.exists():
         try:
@@ -1665,10 +1777,14 @@ def _stock_universe() -> list[str]:
                 return sorted(syms)
         except Exception as e:
             logger.warning("mootdx_service: instruments 读取失败: %s", e)
-    # 兜底：从已有日线分区收集
-    lf = pl.scan_parquet(str(STOCK_DAILY_ROOT / "**" / "*.parquet"),
-                         hive_partitioning=True)
-    return sorted(lf.select("symbol").unique().collect()["symbol"].to_list())
+    # 兜底：从已有日线分区收集（目录缺失/空 glob 时返回空）
+    try:
+        lf = pl.scan_parquet(str(STOCK_DAILY_ROOT / "**" / "*.parquet"),
+                             hive_partitioning=True)
+        return sorted(lf.select("symbol").unique().collect()["symbol"].to_list())
+    except Exception as e:
+        logger.warning("mootdx_service: 股票宇宙分区扫描失败，返回空宇宙: %s", e)
+        return []
 
 
 def _jq_to_tf_symbol(sym: str) -> str:
@@ -2000,6 +2116,38 @@ def _partition_symbol_sets(root: Path, lookback: int) -> list[tuple[Path, set]]:
     return out
 
 
+_LISTED_DATES_CACHE: dict[str, _date] | None = None
+
+
+def _listed_dates() -> dict[str, _date]:
+    """{symbol: listing_date}（instruments parquet，失败返回空表，结果缓存）。"""
+    global _LISTED_DATES_CACHE
+    if _LISTED_DATES_CACHE is None:
+        out: dict[str, _date] = {}
+        inst_path = DATA_ROOT / "instruments" / "instruments.parquet"
+        if inst_path.exists():
+            try:
+                df = pl.read_parquet(inst_path, columns=["symbol", "listing_date"])
+                for sym, ld in zip(df["symbol"].to_list(),
+                                   df["listing_date"].to_list(), strict=False):
+                    if ld is None:
+                        continue
+                    if isinstance(ld, _date):
+                        out[str(sym)] = ld
+                    elif isinstance(ld, _dt.datetime):
+                        out[str(sym)] = ld.date()
+                    else:
+                        try:
+                            out[str(sym)] = _date.fromisoformat(str(ld)[:10])
+                        except ValueError:
+                            continue
+            except Exception:
+                logger.warning("mootdx_service: instruments 上市日期读取失败",
+                               exc_info=True)
+        _LISTED_DATES_CACHE = out
+    return _LISTED_DATES_CACHE
+
+
 def _shortfall_days(
     root: Path,
     lookback: int = _INDEX_SHORTFALL_LOOKBACK,
@@ -2011,6 +2159,11 @@ def _shortfall_days(
     - 基线取窗口内最大集（退市/停牌类正常波动 ≤5% 由 ratio 容忍）；
     - 当日盘中不判（半程数据不可作依据，与既有守卫同口径）；
     - 分区 <3 个时无基线可比，返回空。
+    - 缺失清单只统计「当日已上市且非北交所」的标的：北交所 mootdx 永远无
+      数据、上市日晚于该日的新股当日缺席是正确口径——否则基线检测把它们
+      当缺口，服务每次启动都对同一历史日全量重拉（08-28 案例：343 只假
+      缺口 = 330 北交所 + 3 只 9 月新股 → 每次重启白轰 ~4 分钟 mootdx，
+      期间所有取数客户端被拖慢 50-100 倍，模拟盘补跑同步卡顿）。
     """
     if not root.is_dir():
         return {}
@@ -2020,6 +2173,7 @@ def _shortfall_days(
     base_syms = max((s for _, s in sets_), key=len)
     if not base_syms:
         return {}
+    listed = _listed_dates() if str(root).startswith(str(DATA_ROOT)) else {}
     today = _date.today()
     out: dict[_date, list[str]] = {}
     for d, syms in sets_:
@@ -2027,6 +2181,10 @@ def _shortfall_days(
         if day == today and not _market_closed():
             continue
         missing = sorted(base_syms - syms)
+        if listed:
+            missing = [s for s in missing
+                       if not str(s).endswith(".BJ")
+                       and listed.get(s, _date.min) <= day]
         if missing and len(syms) < len(base_syms) * ratio:
             out[day] = missing
     return out

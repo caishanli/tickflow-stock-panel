@@ -5,7 +5,7 @@ import { toast } from '@/components/Toast'
 import { DatePicker } from '@/components/DatePicker'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History, Save, ChevronDown,
+  Plus, ArrowLeft, Play, Download, Trash2, FileCode2, Activity, Settings2, History, Save, ChevronDown, EyeOff,
 } from 'lucide-react'
 import * as api from '../api'
 import { openBacktestStream } from '../stream'
@@ -93,11 +93,30 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
   const [delIds, setDelIds] = useState<string[] | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [selectMode, setSelectMode] = useState(false)
+  // 测试策略 = ID 非 8 位随机十六进制（UI 新建为 uuid4().hex[:8]，脚本/导入常用自定义 ID 如 dual_v54）
+  const [hideTest, setHideTest] = useState(() => localStorage.getItem('quant_hide_test_strategies') !== '0')
   const PAGE_SIZE = 15
 
-  const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE))
+  const isTestId = (id: string) => !/^[0-9a-f]{8}$/i.test(id)
+  const filtered = useMemo(
+    () => (hideTest ? list.filter(s => !isTestId(s.id)) : list),
+    [list, hideTest])
+  const hiddenCount = list.length - filtered.length
+
+  const toggleHideTest = () => {
+    setHideTest(v => {
+      const next = !v
+      localStorage.setItem('quant_hide_test_strategies', next ? '1' : '0')
+      return next
+    })
+  }
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const safePage = Math.min(page, totalPages)
-  const pageItems = list.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+  const pageItems = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+  const emptyMsg = list.length > 0 && filtered.length === 0
+    ? '全部为测试策略，已被隐藏（可点上方开关查看）'
+    : '暂无策略，点击左上角新建'
   const pageIds = pageItems.map(s => s.id)
   const allPageSelected = pageIds.length > 0 && pageIds.every(id => selected.has(id))
 
@@ -158,6 +177,11 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             className={`inline-flex items-center px-3 h-9 rounded-lg border text-xs transition-colors ${selectMode ? 'border-accent/50 text-accent bg-accent/10' : 'border-border text-secondary hover:text-foreground'}`}>
             {selectMode ? '退出管理' : '批量管理'}
           </button>
+          <button onClick={toggleHideTest} title="ID 非 8 位随机字符的策略（脚本/导入的对照策略）"
+            className={`inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border text-xs transition-colors ${hideTest ? 'border-accent/50 text-accent bg-accent/10' : 'border-border text-secondary hover:text-foreground'}`}>
+            <EyeOff size={14} />
+            {hideTest ? `已隐藏测试策略(${hiddenCount})` : '隐藏测试策略'}
+          </button>
         </div>
         <div className="hidden md:block rounded-card border border-border bg-surface overflow-hidden">
             <table className="w-full text-xs">
@@ -182,7 +206,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
             </thead>
             <tbody className="text-foreground">
               {pageItems.length === 0 && (
-                <tr><td colSpan={selectMode ? 10 : 9} className="px-3 py-10 text-center text-muted">暂无策略，点击左上角新建</td></tr>
+                <tr><td colSpan={selectMode ? 10 : 9} className="px-3 py-10 text-center text-muted">{emptyMsg}</td></tr>
               )}
               {pageItems.map((s, i) => {
                 const m = pickMetrics(s.latest?.metrics_json)
@@ -244,7 +268,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
         <div className="md:hidden space-y-2">
           {pageItems.length === 0 && (
             <div className="rounded-card border border-border bg-surface px-3 py-10 text-center text-muted text-xs">
-              暂无策略，点击左上角新建
+              {emptyMsg}
             </div>
           )}
           {pageItems.map((s) => {
@@ -310,7 +334,7 @@ function StrategyList({ onNew, onOpen }: { onNew: () => void; onOpen: (id: strin
 
         {totalPages > 1 && (
           <div className="flex items-center justify-between mt-3 text-xs text-muted">
-            <span>共 {list.length} 条 · 第 {safePage}/{totalPages} 页</span>
+            <span>共 {filtered.length} 条{hideTest && hiddenCount > 0 ? ` · 已隐藏 ${hiddenCount} 条测试策略` : ''} · 第 {safePage}/{totalPages} 页</span>
             <div className="flex items-center gap-1">
               <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={safePage <= 1}
                 className="px-2.5 py-1 rounded-btn border border-border text-secondary hover:text-foreground disabled:opacity-40 transition-colors">上一页</button>

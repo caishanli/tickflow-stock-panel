@@ -8,7 +8,8 @@ from app.quant.jqengine.engine.jq import jq_names
 
 
 def test_jq_names_skips_stale_snapshot(tmp_path, monkeypatch):
-    """快照过期（>30天）时 jq_names 返回空（回退 tdx）。"""
+    """快照过期（>30天）时 jq_names 降级沿用旧名（2026-08-30 行为变更：
+    名称是纯展示元数据，旧名优于落代码兜底；过期打 WARNING 提示刷新）。"""
     old = (_dt.datetime.now() - _dt.timedelta(days=31)).isoformat()
     snap = tmp_path / "etf_universe_snapshot.json"
     snap.write_text(json.dumps({
@@ -21,7 +22,7 @@ def test_jq_names_skips_stale_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(jq_names, "MAX_AGE", _dt.timedelta(days=30))
     jq_names._CACHE = None
     try:
-        assert jq_names.load_jq_names() == {}
+        assert jq_names.load_jq_names() == {"511880.XSHG": "货币ETF-A"}
     finally:
         jq_names._CACHE = None
 

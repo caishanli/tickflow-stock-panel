@@ -64,7 +64,11 @@ def test_get_price_minute_multi(server_and_client):
 
 def test_current_snapshot(server_and_client):
     cli, _ = server_and_client
-    snap = cli.current_snapshot(["512670.XSHG", "159919.XSHE"])
+    # as_of 传当日末：bar 时刻 10:00 可能晚于跑测试的墙钟，asof 过滤会滤掉
+    # （时间敏感 flaky）
+    day = _dt.date.today().isoformat()
+    snap = cli.current_snapshot(["512670.XSHG", "159919.XSHE"],
+                                as_of=f"{day} 23:59:59")
     assert "512670.XSHG" in snap
     assert snap["512670.XSHG"]["close"].iloc[-1] == 1.05
 

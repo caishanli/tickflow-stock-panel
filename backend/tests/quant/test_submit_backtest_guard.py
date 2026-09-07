@@ -214,7 +214,7 @@ def test_batch_daily_refetches_uncovered_mem_frame():
             self._daily_mem = {}
             self.fetch_calls = []
 
-        def fetch(self, method, sec, start=None, end=None):
+        def fetch(self, method, sec, start=None, end=None, **kwargs):
             self.fetch_calls.append(sec)
             df = _df(full_idx)
             self._daily_mem[f"{method}_{sec}"] = df

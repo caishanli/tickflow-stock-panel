@@ -34,7 +34,10 @@ class _FakeTdxApi:
 class _FakeQuotes:
     @staticmethod
     def factory(market="std", server=None):
-        return object()
+        # 模拟 StdQuotes：可写 .client 属性（_patch 会把 pytdx 实例塞进来）
+        class _Std:
+            client = None
+        return _Std()
 
 
 def test_patch_sets_socket_read_timeout(monkeypatch):
