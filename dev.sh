@@ -209,7 +209,11 @@ echo
   # 比 --frozen 更彻底: 不校验 lockfile, 避免镜像源 403/网络抖动导致后端起不来。
   # python -m uvicorn: 强制用 venv 的解释器和 uvicorn 模块, 防止 PATH 里
   # 其他 Python(如 /usr/local/bin/uvicorn) 抢先, 导致用错误版本启动后端。
-  uv run --no-sync python -m uvicorn app.main:app ${UVICORN_ENV_ARGS[@]+"${UVICORN_ENV_ARGS[@]}"} --reload \
+  #
+  # run_backend_reloader: uvicorn --reload 的防挂死包装。裸 --reload 在代码变更
+  # 触发 reload 时, watcher 无超时 join 老 child —— lifespan shutdown 或非 daemon
+  # 线程卡住即端口永久挂死（每次必现）。包装层给 join 加超时 + SIGKILL 兜底。
+  uv run --no-sync python scripts/run_backend_reloader.py app.main:app ${UVICORN_ENV_ARGS[@]+"${UVICORN_ENV_ARGS[@]}"} --reload \
     --host "$BACKEND_HOST" --port "$BACKEND_PORT" 2>&1 \
     | prefix_awk "$(printf "${BLUE}[backend ]${NC} ")"
 ) &

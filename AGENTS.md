@@ -11,7 +11,7 @@ A 股「选股 + 监控 + 回测」量化工作台。后端 FastAPI + Polars/Duc
 - 后台运行：**一律用 `setsid` 脱离**——在 agent/bash 会话里后台拉起（裸 `nohup ... &` 或 `&` 会让工具/父 shell 等待 dev.sh 的 stdout 管道直到超时）：
   `setsid ./dev.sh > /tmp/tickflow-dev.log 2>&1 </dev/null & disown`
   启动后**另起一个命令**验证端口（`ss -tlnp | grep -E ":3018|:3011|:3322"`），不要在同一个调用里 `sleep`/轮询（会连带超时）。确认存活后再操作。
-- 若后端 `:3018` 卡死不响应：多为 uvicorn `--reload`（改代码触发）与 stockdata guardian 重拉子进程的竞态，kill 掉 3018/3011/3322 端口的进程后用上面 setsid 命令重启即可。
+- 后端 reload 防挂死：dev.sh 经 `backend/scripts/run_backend_reloader.py` 包装 uvicorn `--reload`。裸 `--reload` 的 watcher 在代码变更触发 reload 时对老 child `terminate()+join()`（无超时）——child 优雅停机被非 daemon 线程（polars 线程池等）拖住即端口永久挂死（2026-09-07 定位，每次必现）。包装层给 join 加 8s 超时（`BACKEND_RELOAD_KILL_AFTER` 可调）+ SIGKILL 兜底，child 僵死也能在 ~10s 内自动恢复。诊断：`kill -USR1 <child_pid>` 全线程栈转储到 `data/backend_fault_dump.txt`。
 - 首次启动需 `cp .env.example .env`（留空 `TICKFLOW_API_KEY` = None/Free 模式，仅历史日 K）。`AUTH_PASSWORD` 仅首次初始化生效，改密码用页面 UI。
 - 模拟盘交易时段触发偏移：根 `.env` 设 `SIM_TICK_OFFSET=N`（默认 8，每分钟第 N 秒后触发，等快照跨分钟边界）；设 3 可提速（实测 13:10:03~05 完成 vs 原 13:10:10~11）。**改值需重启 main backend**（uvicorn 启动时读一次）。stockdata 服务不受影响。
 
