@@ -748,8 +748,17 @@ def order(security, amount):
                 # （涨停买入/跌停卖出）远大于误拦截。
                 if amount > 0 and hl > 0 and px >= hl - max(0.011, hl * 0.002):
                     no_buy.add(security)
+                    _logger.warning(
+                        "[ORDER] 涨停禁买 %s: 现价%.3f >= 涨停价%.3f-容差 "
+                        "(一字板/封板买入无法成交) dt=%s",
+                        security, px, hl, ctx.current_dt,
+                    )
                 elif amount < 0 and ll > 0 and px <= ll + max(0.011, ll * 0.002):
                     no_sell.add(security)
+                    _logger.warning(
+                        "[ORDER] 跌停禁卖 %s: 现价%.3f <= 跌停价%.3f+容差 dt=%s",
+                        security, px, ll, ctx.current_dt,
+                    )
             except Exception as e:
                 # fail-open（涨跌停计算失败放行）但留 debug 痕迹，便于排查
                 _logger.debug("order 涨跌停兜底判定失败 %s: %s", security, e)

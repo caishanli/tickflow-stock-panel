@@ -210,10 +210,11 @@ echo
   # python -m uvicorn: 强制用 venv 的解释器和 uvicorn 模块, 防止 PATH 里
   # 其他 Python(如 /usr/local/bin/uvicorn) 抢先, 导致用错误版本启动后端。
   #
-  # run_backend_reloader: uvicorn --reload 的防挂死包装。裸 --reload 在代码变更
-  # 触发 reload 时, watcher 无超时 join 老 child —— lifespan shutdown 或非 daemon
-  # 线程卡住即端口永久挂死（每次必现）。包装层给 join 加超时 + SIGKILL 兜底。
-  uv run --no-sync python scripts/run_backend_reloader.py app.main:app ${UVICORN_ENV_ARGS[@]+"${UVICORN_ENV_ARGS[@]}"} --reload \
+  # 不开 --reload：实盘/模拟盘运行时后端必须稳定，代码改动后手动重启。
+  # 他人/脚本在 backend/ 下频繁写 .py（如策略迭代实验）会触发 watchfiles
+  # reload 风暴 → 后端反复重启 → stockdata 行情服务跟着冷重启（2026-09-07
+  # 实测每1~3分钟一次）。需要热重载时手动加 --reload。
+  uv run --no-sync python -m uvicorn app.main:app ${UVICORN_ENV_ARGS[@]+"${UVICORN_ENV_ARGS[@]}"} \
     --host "$BACKEND_HOST" --port "$BACKEND_PORT" 2>&1 \
     | prefix_awk "$(printf "${BLUE}[backend ]${NC} ")"
 ) &

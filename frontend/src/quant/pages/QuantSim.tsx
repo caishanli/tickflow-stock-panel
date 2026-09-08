@@ -901,7 +901,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
       <div className="rounded-card border border-border bg-surface overflow-hidden shrink-0">
         <div className="px-4 pt-3 pb-2 text-xs text-foreground font-medium">持仓 ({posEntries.length})</div>
         {posEntries.length > 0 ? (
-          <div className="overflow-auto">
+          <>
+          <div className="hidden md:block overflow-auto">
             <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
@@ -968,6 +969,62 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </tbody>
             </table>
           </div>
+          {/* 移动端卡片：单列堆叠，精简核心字段，点击弹分时 */}
+          <div className="md:hidden px-3 pb-3 space-y-2">
+            {posEntries.map(([sym, p]: any) => {
+              const value = (Number(p.amount) || 0) * (Number(p.price) || 0)
+              const zeroPos = Number(p.amount) === 0
+              const pnlPct = zeroPos
+                ? (typeof p.realized_pnl_pct === 'number' ? p.realized_pnl_pct : null)
+                : (Number(p.avg_cost) > 0 ? Number(p.price) / Number(p.avg_cost) - 1 : null)
+              const pnlAmt = zeroPos
+                ? (typeof p.realized_pnl === 'number' ? p.realized_pnl : null)
+                : (pnlPct != null ? pnlPct * Number(p.amount) * Number(p.avg_cost) : null)
+              const tsLabel = fmtPriceTs(p.price_ts, today)
+              const entryTs = splitTs(p.entry_ts)
+              return (
+                <div key={sym}
+                  onClick={() => {
+                    setPreview({
+                      symbol: sym,
+                      name: p.name ?? '',
+                      date: today,
+                      markers: buildSymbolMarkers(sortedTrades, sym),
+                    })
+                  }}
+                  className="rounded-lg border border-border bg-elevated/40 p-3 cursor-pointer active:bg-elevated transition-colors">
+                  <div className="flex items-baseline gap-1.5 min-w-0">
+                    <span className="truncate text-sm font-medium text-foreground">{p.name ?? ''}</span>
+                    <span className="shrink-0 font-mono text-[11px] text-muted">{sym}</span>
+                    <span className={`ml-auto shrink-0 text-sm num font-medium ${pnlPct == null ? 'text-muted' : pnlPct >= 0 ? 'text-bull' : 'text-bear'}`}>
+                      {fmtPct(pnlPct)}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-muted">
+                    {p.entry_ts ? `买入 ${entryTs.d}${entryTs.t ? ` ${entryTs.t}` : ''}` : '买入 —'}
+                    {' · '}{p.amount}股 · 成本 {fmtNum(p.avg_cost, 3)}
+                  </div>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    <div>
+                      <div className="text-[10px] text-muted">现价{tsLabel ? `(${tsLabel})` : ''}</div>
+                      <div className="text-xs num font-medium">{fmtNum(p.price, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-muted">市值</div>
+                      <div className="text-xs num font-medium">{fmtNum(value)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-muted">盈亏</div>
+                      <div className={`text-xs num font-medium ${pnlAmt == null ? 'text-muted' : pnlAmt >= 0 ? 'text-bull' : 'text-bear'}`}>
+                        {pnlAmt == null ? '—' : fmtNum(pnlAmt)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+          </>
         ) : (
           <div className="px-4 pb-4 text-xs text-muted">暂无持仓</div>
         )}
@@ -988,7 +1045,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         </div>
         {tab === 'trades' && (
           tradeList.length > 0 ? (
-            <div className="flex-1 min-h-[12rem] max-md:min-h-0 overflow-auto">
+            <>
+            <div className="hidden md:block flex-1 min-h-[12rem] overflow-auto">
               <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
@@ -1063,11 +1121,70 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </tbody>
               </table>
             </div>
+            {/* 移动端卡片：单列堆叠，精简核心字段，点击弹分时 */}
+            <div className="md:hidden flex-1 overflow-auto p-3 space-y-2">
+              {[...sortedTrades].reverse().map((t: any, i: number) => {
+                const h = holdOf(sortedTrades.length - 1 - i)
+                const ts = splitTs(t.ts)
+                const holdDays = t.action === 'BUY'
+                  ? (h?.open
+                      ? (h?.hold == null ? null : h.hold === 0 ? '<1天' : `${h.hold}个交易日`)
+                      : null)
+                  : h?.hold == null ? null : h.hold === 0 ? '<1天' : `${h.hold}个交易日`
+                const holding = t.action === 'BUY' && !!h?.open
+                const holdLabel = holding ? (holdDays ? `${holdDays}（持仓中）` : '持仓中') : holdDays
+                const dirLabel = t.action === 'BUY' ? '买入' : t.action === 'STOP_LOSS' ? '止损' : '卖出'
+                return (
+                  <div key={i}
+                    onClick={() => {
+                      setPreview({
+                        symbol: t.code ?? '',
+                        name: t.name ?? '',
+                        date: String(t.ts ?? '').slice(0, 10),
+                        markers: buildSymbolMarkers(sortedTrades, t.code ?? ''),
+                      })
+                    }}
+                    className="rounded-lg border border-border bg-elevated/40 p-3 cursor-pointer active:bg-elevated transition-colors">
+                    <div className="flex items-baseline gap-1.5 min-w-0">
+                      <span className="truncate text-sm font-medium text-foreground">{t.name ?? ''}</span>
+                      <span className="shrink-0 font-mono text-[11px] text-muted">{t.code ?? ''}</span>
+                      <span className={`ml-auto shrink-0 text-xs font-medium ${t.action === 'BUY' ? 'text-bull' : 'text-bear'}`}>{dirLabel}</span>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted" title={ts.full}>
+                      {ts.d}{ts.t ? ` ${ts.t}` : ''}{holdLabel ? ` · ${holdLabel}` : ''}
+                    </div>
+                    <div className="mt-2 grid grid-cols-3 gap-2">
+                      <div>
+                        <div className="text-[10px] text-muted">价格</div>
+                        <div className="text-xs num font-medium">{fmtNum(t.price, 3)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-muted">盈亏</div>
+                        <div className={`text-xs num font-medium ${typeof t.pnl === 'number' && t.pnl !== 0 ? (t.pnl >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                          {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-muted">收益率</div>
+                        <div className={`text-xs num font-medium ${t.action !== 'BUY' && typeof t.pnl_pct === 'number' ? (t.pnl_pct >= 0 ? 'text-bull' : 'text-bear') : 'text-muted'}`}>
+                          {t.action === 'BUY' ? '—' : fmtPct(t.pnl_pct)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted">
+                      {t.amount}股 · 金额 {fmtNum(Number(t.price) * Number(t.amount))} · 手续费 {fmtNum(t.commission, 2)}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            </>
           ) : <div className="flex-1 px-4 py-4 text-xs text-muted">暂无成交</div>
         )}
         {tab === 'stoploss' && (
           stoplossRows.length > 0 ? (
-            <div className="flex-1 min-h-[12rem] max-md:min-h-0 overflow-auto">
+            <>
+            <div className="hidden md:block flex-1 min-h-[12rem] overflow-auto">
               <table className="w-full text-xs">
                 <thead className="text-muted">
                   <tr className="text-left">
@@ -1084,7 +1201,16 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </thead>
                 <tbody className="text-foreground">
                   {[...stoplossRows].reverse().map((t: any, i: number) => (
-                    <tr key={i} className="group border-t border-border/60 hover:bg-elevated/60 transition-colors">
+                    <tr key={i}
+                      onClick={() => {
+                        setPreview({
+                          symbol: t.code ?? '',
+                          name: t.name ?? '',
+                          date: String(t.ts ?? '').slice(0, 10),
+                          markers: buildSymbolMarkers(sortedTrades, t.code ?? ''),
+                        })
+                      }}
+                      className="group border-t border-border/60 cursor-pointer hover:bg-elevated/60 transition-colors">
                       <td className="max-md:sticky max-md:left-0 max-md:z-20 max-md:bg-surface w-20 min-w-[5rem] leading-tight max-md:group-hover:bg-elevated px-3 py-1.5" title={splitTs(t.ts).full}>
                         <div className="num">{splitTs(t.ts).d}</div>
                         {splitTs(t.ts).t && <div className="num">{splitTs(t.ts).t}</div>}
@@ -1106,6 +1232,55 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
                 </tbody>
               </table>
             </div>
+            {/* 移动端卡片：单列堆叠，精简核心字段，点击弹分时 */}
+            <div className="md:hidden flex-1 overflow-auto p-3 space-y-2">
+              {[...stoplossRows].reverse().map((t: any, i: number) => {
+                const ts = splitTs(t.ts)
+                return (
+                  <div key={i}
+                    onClick={() => {
+                      setPreview({
+                        symbol: t.code ?? '',
+                        name: t.name ?? '',
+                        date: String(t.ts ?? '').slice(0, 10),
+                        markers: buildSymbolMarkers(sortedTrades, t.code ?? ''),
+                      })
+                    }}
+                    className="rounded-lg border border-border bg-elevated/40 p-3 cursor-pointer active:bg-elevated transition-colors">
+                    <div className="flex items-baseline gap-1.5 min-w-0">
+                      <span className="truncate text-sm font-medium text-foreground">{t.name ?? ''}</span>
+                      <span className="shrink-0 font-mono text-[11px] text-muted">{t.code ?? ''}</span>
+                      <span className="ml-auto shrink-0 text-xs font-medium text-bear">止损</span>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted" title={ts.full}>
+                      {ts.d}{ts.t ? ` ${ts.t}` : ''}
+                    </div>
+                    <div className="mt-2 grid grid-cols-3 gap-2">
+                      <div>
+                        <div className="text-[10px] text-muted">价格</div>
+                        <div className="text-xs num font-medium">{fmtNum(t.price, 3)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-muted">盈亏</div>
+                        <div className={`text-xs num font-medium ${typeof t.pnl === 'number' && t.pnl !== 0 ? 'text-bear' : 'text-muted'}`}>
+                          {typeof t.pnl === 'number' && t.pnl !== 0 ? fmtNum(t.pnl) : '—'}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-muted">收益率</div>
+                        <div className={`text-xs num font-medium ${typeof t.pnl_pct === 'number' ? 'text-bear' : 'text-muted'}`}>
+                          {fmtPct(t.pnl_pct)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted">
+                      {t.amount}股 · 手续费 {fmtNum(t.commission, 2)}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            </>
           ) : <div className="flex-1 px-4 py-4 text-xs text-muted">暂无止损</div>
         )}
         {tab === 'logs' && (

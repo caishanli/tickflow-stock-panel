@@ -16,30 +16,98 @@ jq ``order`` 与 ptrade ``order`` 在此之前是两份逐行镜像的代码（�
 """
 from __future__ import annotations
 
+import logging
+
 from .fees import commission, fill_price, resolve_commission, stamp_tax
 from .lots import affordable_shares, round_buy_lot
+
+_logger = logging.getLogger("quant.execution")
+
+
+def _emit_reject_sink(code: str, msg: str) -> None:
+    """拒单日志外送（``_state["log_sink"]``，模拟盘注入后前端 sim_logs 可见）。
+
+    纯 Python logging 只进进程 stderr（模拟盘 stdout/stderr 常为 /dev/null），
+    前端/排查走不到；此处尽力向 log_sink 复制一份。只在 jqengine api 模块
+    已初始化 ``_state`` 时生效（回测/裸用 core 时静默跳过）。
+    """
+    try:
+        from ..jqengine.engine.jq import api as _jq_api
+
+        state = getattr(_jq_api, "_state", None)
+        sink = state.get("log_sink") if state else None
+        if sink:
+            sink("warn", f"{msg} [execution:{code}]")
+    except Exception:
+        pass
+
+
+def _reject(code: str, amount: int, price: float, current_dt, reason: str,
+            detail: str = "") -> bool:
+    """拒单统一出口：详细 warning（logging + log_sink 双通道）+ 返回 False。
+
+    此前所有拒单路径全部静默 return False，策略层还无条件打 'buy ...' 意图
+    日志，事后完全无法区分「下了没成交」与「根本没下」（2026-09-07
+    lb_v2opt_sim 605577 一字板买入被涨停禁买拦截即无任何痕迹）。
+    """
+    side = "BUY" if amount > 0 else "SELL"
+    extra = f" ({detail})" if detail else ""
+    msg = (
+        f"[REJECT] {side} {code} {abs(amount)}股 @"
+        f"{(price or 0.0):.3f} dt={current_dt} 原因={reason}{extra}"
+    )
+    _logger.warning(msg)
+    _emit_reject_sink(code, msg)
+    return False
 
 
 def execute_order(*, portfolio, position_factory, code, amount, price,
                   current_dt, fee, slippage, fee_config=None,
                   no_buy=(), no_sell=(), trades=None) -> bool:
     """按股数下单（正买负卖）。返回是否成交。"""
-    if price == 0 or amount == 0:
-        return False
+    if price == 0:
+        return _reject(code, amount, price, current_dt, "无有效价格(price=0)")
+    if amount == 0:
+        return _reject(code, amount, price, current_dt, "下单量为0")
     amount = int(amount)
     if amount > 0:
-        amount = round_buy_lot(amount)
-        if amount <= 0 or code in (no_buy or ()):
-            return False  # 不足一手 / 涨停禁买
+        lot_amount = round_buy_lot(amount)
+        if lot_amount <= 0:
+            value = amount * price
+            return _reject(
+                code, amount, price, current_dt, "不足一手",
+                f"计算股数{amount}股(约{value:.0f}元)折整手后为0"
+            )
+        amount = lot_amount
+        if code in (no_buy or ()):
+            return _reject(
+                code, amount, price, current_dt, "涨停禁买",
+                f"现价{price:.3f}已达/接近涨停价，或被驱动方列入no_buy名单"
+            )
     existing = portfolio.positions.get(code)
     prev_cost = float(existing.avg_cost or 0.0) if existing else 0.0
     if amount < 0:
         if code in (no_sell or ()):
-            return False  # 跌停/停牌禁卖
+            return _reject(
+                code, amount, price, current_dt, "跌停禁卖/停牌",
+                f"现价{price:.3f}已达/接近跌停价，或被驱动方列入no_sell名单"
+            )
         closeable = float(existing.closeable_amount) if existing else 0.0
-        amount = -min(-amount, closeable)  # T+1：卖出不超过可卖量
+        if closeable <= 0:
+            return _reject(
+                code, amount, price, current_dt, "无可卖数量",
+                f"持仓{float(existing.amount) if existing else 0:.0f}股, "
+                f"T+1可卖0股(当日买入或无持仓)"
+            )
+        clipped = -min(-amount, closeable)
+        if clipped != amount:
+            _logger.warning(
+                "[CLIP] SELL %s 委托%d股 > T+1可卖%d股, 截断为%d股 dt=%s",
+                code, -amount, int(closeable), -clipped, current_dt,
+            )
+        amount = clipped
         if amount == 0:
-            return False
+            return _reject(code, amount, price, current_dt, "卖出截断后为0")
     side = "buy" if amount > 0 else "sell"
     fill = fill_price(price, side, slippage, code)
     turnover = abs(amount) * fill
@@ -49,7 +117,11 @@ def execute_order(*, portfolio, position_factory, code, amount, price,
     if amount > 0:
         cost = turnover + fee_amount
         if cost > portfolio.cash:
-            return False
+            return _reject(
+                code, amount, price, current_dt, "资金不足",
+                f"需{cost:.2f}元(含佣金{fee_amount:.2f}) > 可用现金"
+                f"{portfolio.cash:.2f}元"
+            )
     else:
         tax_amount = stamp_tax(turnover, code)
         cost = -(turnover - fee_amount - tax_amount)
