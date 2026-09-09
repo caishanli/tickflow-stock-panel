@@ -23,6 +23,7 @@ from .. import db
 from ..config import CONFIG
 from ..core import limit_rate as _core_limit_rate
 from ..datasource.manager import QuantDataProvider
+from ..jqengine.datasource.manager import is_halted_by_volume
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
 from . import live_feed, names
@@ -1241,6 +1242,42 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
             no_sell.add(code)
         elif px >= prev * (1 + rate - _LIMIT_TOL):
             no_buy.add(code)
+    # 停牌禁买卖（2026-09-09 龙版传媒：停牌日分区照出昨收平线+零量占位，
+    # 陈旧价流入撮合，以陈旧价成交）。日线 paused（全部 priced 码，按日缓存）
+    # + 分钟窗（持仓码，覆盖盘中停牌）：进 no_sell（止损巡检跳过）与 no_buy。
+    # 无数据一律放行（08-25 误判教训：瞬态缺数≠停牌）。
+    try:
+        _halt_day_cache = aux.setdefault("_halt_day_cache", {})
+        if _halt_day_cache.get("_day") != today:
+            _halt_day_cache.clear()
+            _halt_day_cache["_day"] = today
+        for _code in prices:
+            _ec = _to_engine(_code)
+            _hk = (_ec, today)
+            _h = _halt_day_cache.get(_hk)
+            if _h is None:
+                _h = False
+                try:
+                    _h = bool(jq_api.get_current_data()[_ec].paused)
+                except Exception:
+                    _h = False
+                _halt_day_cache[_hk] = _h
+            if _h:
+                no_sell.add(_code)
+                no_buy.add(_code)
+        try:
+            _pos_codes = list(ctx.portfolio.positions.keys())
+        except Exception:
+            _pos_codes = []
+        for _pcode in _pos_codes:
+            try:
+                if bool(is_halted_by_volume(dm, _to_engine(_pcode), asof=bar_ts)):
+                    no_sell.add(_pcode)
+                    no_buy.add(_pcode)
+            except Exception:
+                continue
+    except Exception:
+        pass
     jq_api._state["no_sell"] = no_sell
     jq_api._state["no_buy"] = no_buy
     _fire_session(account_id, bundle, ctx, bar_ts, aux["fired"], jq_api,

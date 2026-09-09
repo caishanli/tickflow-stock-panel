@@ -34,7 +34,7 @@ from ....core import (
 from ....core.instruments import STAMP_TAX_RATE as DEFAULT_STAMP_TAX  # noqa: F401  # 兼容别名
 from ....core.instruments import is_etf as _is_etf  # noqa: F401  # 兼容别名
 from ...datasource.base import DataSourceError
-from ...datasource.manager import DataManager
+from ...datasource.manager import DataManager, daily_fetch_window, is_halted_by_volume
 from . import jq_names
 from .context import Context, G, Position
 from .portfolio import Portfolio
@@ -153,9 +153,22 @@ class CurrentDataProxy:
                                   if len(prev_df) else 0.0)
                     # day_open：补跑中当日日线已落盘 → 取当日 open；实时盘中当日
                     # 日线未落盘 → 回退当日首根分钟 bar 的 open（≈集合竞价开盘）
+                    paused = False
                     if len(today_df):
                         day_open = float(today_df.iloc[-1].get("open", 0))
                         volume = float(today_df.iloc[-1].get("volume", 0))
+                        # 当日平线无量占位 → 停牌（一字无量同理禁交易）：
+                        # 停牌日分区照出 bar（OHLC 为昨收、volume 为 2**-127
+                        # ≈ 0 哨兵），paused 此前恒 False 导致停牌股以陈旧价
+                        # 成交（2026-09-09 龙版传媒）。未知（无当日 bar）保持
+                        # False，不误伤瞬态缺数（08-25 教训）。
+                        try:
+                            _tvol = float(pd.to_numeric(
+                                today_df["volume"], errors="coerce").fillna(0.0).sum())
+                        except Exception:
+                            _tvol = None
+                        if _tvol is not None and _tvol < 1.0:
+                            paused = True
                     else:
                         day_open = float(mgr.get_day_open(code, dt_ts) or 0.0) \
                             if hasattr(mgr, "get_day_open") else 0.0
@@ -164,7 +177,7 @@ class CurrentDataProxy:
                     if prev_close > 0:
                         rate = _limit_rate(code)
                         info = SimpleNamespace(
-                            paused=False,
+                            paused=paused,
                             day_open=day_open,
                             high_limit=prev_close * (1 + rate),
                             low_limit=prev_close * (1 - rate),
@@ -301,6 +314,57 @@ def _mem_daily_usable(df, start_ts, end_ts, count):
     return DataManager.mem_daily_usable(df, start_ts, end_ts, count)
 
 
+def _refetch_missing_daily_batch(mgr, missing, start_date, end_date, count,
+                                   fq="qfq"):
+    """缺口标的日线回源：一次 ``get_daily_batch``（窄窗口），失败/不支持降级逐只。
+
+    背景（2026-09-09 d00506e8 盘前风暴）：全市场 4400 只曾逐只
+    ``"20000101"~"20300101"`` 全历史回源，单次盘前 6 小时、stockdata 2 核
+    打满。缺口统一走 :func:`daily_fetch_window` 窄窗口 + 单次批量（服务端日
+    文件只扫一遍）；批量结果按 fetch 同口径回填 ``_daily_mem``（经
+    ``_put_daily_mem_protected``，不盖掉已有更广缓存）；源不支持批量/批量
+    失败/批量无数据的标的，降级逐只（同样窄窗口，保留原 2 次重试 + 警告语义，
+    缺席留痕不断：08-21 黄金ETF误换仓教训）。
+    """
+    fstart, fend = daily_fetch_window(start_date, end_date, count)
+    fq_kw = {"fq": fq} if fq in ("qfq", "pre") else {}
+    still_missing = list(missing)
+    sources = getattr(mgr, "sources", None) or {}
+    network = sources.get("network") if hasattr(sources, "get") else None
+    batch_fn = getattr(network, "get_daily_batch", None)
+    if batch_fn is not None:
+        try:
+            out = batch_fn(list(missing), fstart, fend, **fq_kw)
+        except Exception as e:
+            _logger.warning("批量日线回源失败，降级逐只 (%d 只): %s", len(missing), e)
+            out = None
+        if isinstance(out, dict):
+            put = getattr(mgr, "_put_daily_mem_protected", None)
+            got = set()
+            for code, df in out.items():
+                if df is None or (hasattr(df, "empty") and df.empty):
+                    continue
+                if put is not None:
+                    put(f"get_daily_{code}", df)
+                else:
+                    mgr._daily_mem[f"get_daily_{code}"] = df
+                got.add(code)
+            still_missing = [c for c in missing if c not in got]
+    # 兜底逐只：走原 fetch 路径（触发加载并缓存到 _daily_mem）。
+    # 重试一次：回源瞬时失败曾导致单标的整体缺席动量计算
+    # （08-21 黄金ETF误换仓根因之一），失败必须留痕告警。
+    for sec in still_missing:
+        for attempt in (1, 2):
+            try:
+                df = mgr.fetch("get_daily", sec, fstart, fend, **fq_kw)
+                break
+            except Exception as e:
+                _logger.warning("批量日线取数失败(第%d次) %s: %s", attempt, sec, e)
+                df = None
+        if df is None or (hasattr(df, "empty") and df.empty):
+            _logger.warning("批量日线取数最终失败，标的缺席本次历史数据: %s", sec)
+
+
 def _get_price_batch_daily(security, start_date, end_date, count, fields, panel,
                            fq="qfq"):
     """批量日线查询：直接从 _daily_mem 取，避免逐标的 copy/filter/reset_index。
@@ -320,7 +384,9 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel,
     else:
         cutoff = end_ts + pd.Timedelta(days=1) if end_ts else None
 
-    frames = []
+    # 第一遍：内存命中与缺口分离。缺口集中一次批量回源（函数内回填
+    # _daily_mem），再统一走下方的掩膜/tail 逻辑。
+    memhit = set()
     for sec in security:
         df = mgr._daily_mem.get(f"get_daily_{sec}")
         # tracing 关闭时不算帧描述（热路径零开销；_trace 内部会再查一次开关）
@@ -328,26 +394,26 @@ def _get_price_batch_daily(security, start_date, end_date, count, fields, panel,
         if not _mem_daily_usable(df, start_ts, end_ts, count):
             _trace(sec, f"batch end={end_ts.date() if end_ts else None} count={count} "
                         f"mem={_mem_state} verdict=REFETCH")
-            # 兜底：走原 fetch 路径（触发加载并缓存到 _daily_mem）。
-            # 重试一次：回源瞬时失败曾导致单标的整体缺席动量计算
-            # （08-21 黄金ETF误换仓根因之一），失败必须留痕告警。
-            for attempt in (1, 2):
-                try:
-                    df = mgr.fetch("get_daily", sec, start_date or "20000101",
-                                   end_date or "20300101",
-                                   **({"fq": fq} if fq in ("qfq", "pre") else {}))
-                    break
-                except Exception as e:
-                    _logger.warning("批量日线取数失败(第%d次) %s: %s", attempt, sec, e)
-                    df = None
-            if df is None or (hasattr(df, "empty") and df.empty):
-                _logger.warning("批量日线取数最终失败，标的缺席本次历史数据: %s", sec)
-                _trace(sec, "fetch FAILED skip")
-                continue
-            _trace(sec, f"fetched frame={_frame_desc(df)}")
         else:
             _trace(sec, f"batch end={end_ts.date() if end_ts else None} count={count} "
                         f"mem={_mem_state} verdict=MEMHIT")
+            memhit.add(sec)
+    missing = [sec for sec in security if sec not in memhit]
+    if missing:
+        # 窗口按回放时钟锚定：end 缺省取 cutoff（即 ctx.current_dt）而非墙钟
+        # 今天，否则补跑期回源窗口与下方掩膜错位、取到空帧致策略静默缺数。
+        asof = end_date
+        if asof is None and cutoff is not None:
+            asof = cutoff.date().isoformat()
+        _refetch_missing_daily_batch(mgr, missing, start_date, asof, count, fq=fq)
+    frames = []
+    for sec in security:
+        df = mgr._daily_mem.get(f"get_daily_{sec}")
+        if df is None or (hasattr(df, "empty") and df.empty):
+            if sec in memhit:
+                continue  # 命中时非空（usable 已校验），防御性分支
+            _trace(sec, "fetch FAILED skip")
+            continue
         idx = df.index
         if not isinstance(idx, pd.DatetimeIndex):
             continue
@@ -481,8 +547,17 @@ def get_price(security, start_date=None, end_date=None, count=None,
                     _ctx.current_dt if _ctx and _ctx.current_dt else "")
                 raw = mgr.fetch("get_minute", sec, _dt)
             else:
-                raw = mgr.fetch("get_daily", sec,
-                                start_date or "20000101", end_date or "20300101",
+                # 窄窗口回源：缺起日时 count 换算窗口，禁止 20000101 全历史兜底
+                # （2026-09-09 盘前风暴同根因；attribute_history 等逐只调用同样中招）。
+                # 窗口按回放时钟锚定（end 缺省取 ctx.current_dt 而非墙钟今天），
+                # 否则补跑期窗口与掩膜错位取到空帧。
+                _sctx = _state.get("ctx")
+                _asof = end_date
+                if (_asof is None and _sctx is not None
+                        and getattr(_sctx, "current_dt", None) is not None):
+                    _asof = pd.Timestamp(_sctx.current_dt).date().isoformat()
+                _fstart, _fend = daily_fetch_window(start_date, _asof, count)
+                raw = mgr.fetch("get_daily", sec, _fstart, _fend,
                                 **({"fq": fq} if fq in ("qfq", "pre") else {}))
             if raw is None or raw.empty:
                 _trace(sec, f"single freq={frequency} RAW_EMPTY")
@@ -723,6 +798,26 @@ def _live_price(security):
     )
 
 
+def _halted_for_order(code) -> bool:
+    """下单前停牌检查（2026-09-09 龙版传媒：全天停牌以陈旧价 18.67 卖出）。
+
+    两路正证据任一命中即拦截：current_data paused（日线当日 bar 存在且
+    无量）或分钟窗（当日/近 30 根无量走平）；无数据一律放行（08-25 误判教训）。
+    """
+    try:
+        mgr = _state.get("manager")
+        ctx = _state.get("ctx")
+        asof = getattr(ctx, "current_dt", None) if ctx else None
+        try:
+            if bool(get_current_data()[code].paused):
+                return True
+        except Exception:
+            pass
+        return bool(is_halted_by_volume(mgr, code, asof=asof))
+    except Exception:
+        return False
+
+
 def order(security, amount):
     """按股数下单（正买负卖）。
 
@@ -737,6 +832,12 @@ def order(security, amount):
     ctx = _state["ctx"]
     no_buy = set(_state.get("no_buy") or set())
     no_sell = set(_state.get("no_sell") or set())
+    if _halted_for_order(security):
+        _logger.warning(
+            "[ORDER] 停牌禁交易 %s: 当日/近端无量走平，拒绝 %s dt=%s",
+            security, "卖出" if amount < 0 else "买入", ctx.current_dt,
+        )
+        return False
     if security not in no_buy and security not in no_sell:
         px = _live_price(security)
         if px:

@@ -14,6 +14,7 @@ no_buy / no_sell）统一 PTrade 码；仅在与 DataManager（JQ 码 .XSHG/.XSH
 """
 from __future__ import annotations
 
+import logging
 import types
 from typing import ClassVar
 
@@ -33,8 +34,10 @@ from ..core import (
 )
 from ..core.instruments import STAMP_TAX_RATE as DEFAULT_STAMP_TAX  # noqa: F401  # 兼容别名
 from ..core.instruments import is_etf as _is_etf  # noqa: F401  # 兼容别名
-from ..jqengine.datasource.manager import DataManager
+from ..jqengine.datasource.manager import DataManager, daily_fetch_window, is_halted_by_volume
 from .context import PtradeContext, PtradePortfolio, PtradePosition, ptrade_code_conv
+
+_logger = logging.getLogger("ptradeengine.api")
 
 # 官方 get_history 输出字段（用于单标的列名判定）
 _PT_FIELDS = ("open", "high", "low", "close", "volume", "money", "price",
@@ -153,8 +156,21 @@ def order(security, amount):
     """按股数下单（正买负卖）。PTrade 域：security 直接用 .SS/.SZ。
 
     1 Core：撮合真身在 ``core.execution.execute_order``，此处只做取价+委托。
+    停牌禁交易（2026-09-09 龙版传媒同根因）：分钟窗无量走平即拒绝，
+    无数据放行（08-25 误判教训）。
     """
     ctx = _state["ctx"]
+    try:
+        _mgr = _state.get("manager")
+        _asof = getattr(ctx, "current_dt", None) if ctx else None
+        if bool(is_halted_by_volume(_mgr, to_engine(security), asof=_asof)):
+            _logger.warning(
+                "[ORDER] 停牌禁交易 %s: 近端无量走平，拒绝 %s dt=%s",
+                security, "卖出" if amount < 0 else "买入", _asof,
+            )
+            return False
+    except Exception:
+        pass
     return execute_order(
         portfolio=ctx.portfolio, position_factory=PtradePosition,
         code=security, amount=amount, price=_live_price(security),
@@ -294,7 +310,11 @@ def get_history(count, frequency, field, security_list=None, include=True, fq="p
                 if raw is None or (hasattr(raw, "empty") and raw.empty):
                     raw = mgr.get_minute(ec, str(now.date())[:10] if now is not None else None, None)
             else:
-                raw = mgr.fetch("get_daily", ec, "20000101", "20300101")
+                # 窄窗口回源：count 换算窗口，禁止 20000101 全历史兜底
+                # （2026-09-09 jq 盘前风暴同根因；服务端全区间扫分区 CPU 风暴）。
+                _fstart, _fend = daily_fetch_window(
+                    None, str(now.date()) if now is not None else None, count)
+                raw = mgr.fetch("get_daily", ec, _fstart, _fend)
             if raw is None or (hasattr(raw, "empty") and raw.empty):
                 continue
             sub = raw

@@ -250,6 +250,126 @@ def test_batch_daily_refetches_uncovered_mem_frame():
         jq_api._state["ctx"] = None
 
 
+def test_batch_daily_missing_uses_narrow_window_single_batch():
+    """盘前风暴回归（2026-09-09 d00506e8）：count=2 无起日曾逐只
+    "20000101"~"20300101" 全历史回源，全市场 4400 只扇出即 6 小时。
+
+    缺口必须合并为一次 get_daily_batch，且窗口收窄到 count 附近（禁止全历史）。
+    """
+    from app.quant.jqengine.datasource.manager import daily_fetch_window
+    from app.quant.jqengine.engine.jq import api as jq_api
+
+    # 窗口换算口径
+    assert daily_fetch_window(None, "2026-09-08", 2) == ("2026-05-11", "2026-09-08")
+    assert daily_fetch_window("2026-09-01", "2026-09-08", 2) == ("2026-09-01", "2026-09-08")
+    assert daily_fetch_window(None, "2026-09-08", 250)[0] == "2025-03-27"
+    s, _ = daily_fetch_window(None, None, None)
+    assert (pd.Timestamp.now() - pd.Timestamp(s)).days >= 399
+    # 无 count 的 end-only 查询不截断到 120 天：走 400 天回看（长均线不断裂）
+    s2, e2 = daily_fetch_window(None, "2026-09-08", None)
+    assert e2 == "2026-09-08"
+    assert (pd.Timestamp(e2) - pd.Timestamp(s2)).days == 400
+
+    full_idx = pd.DatetimeIndex(pd.bdate_range("2026-01-01", "2026-09-08"))
+    narrow = full_idx[-100:]
+
+    def _df(idx):
+        n = len(idx)
+        return pd.DataFrame({"close": [1.0] * n, "money": [1e7] * n}, index=idx)
+
+    class _BatchMgr:
+        def __init__(self):
+            self._daily_mem = {}
+            self.batch_calls = []
+            self.fetch_calls = []
+            self.sources = {"network": self}
+            self.fail_batch = False
+
+        def get_daily_batch(self, codes, start, end, **kwargs):
+            self.batch_calls.append((list(codes), start, end))
+            if self.fail_batch:
+                raise RuntimeError("boom")
+            return {c: _df(narrow) for c in codes}
+
+        def fetch(self, method, sec, start=None, end=None, **kwargs):
+            self.fetch_calls.append((sec, start, end))
+            df = _df(narrow)
+            self._daily_mem[f"{method}_{sec}"] = df
+            return df
+
+    mgr = _BatchMgr()
+    jq_api._state["manager"] = mgr
+    jq_api._state["ctx"] = None
+    try:
+        out = jq_api._get_price_batch_daily(
+            ["AAA.XSHG", "BBB.XSHG"], None, "2026-09-08", 2, ["close"], False)
+        # 一次批量、窗口收窄（120 天下限），无逐只 fetch
+        assert len(mgr.batch_calls) == 1
+        codes, start, end = mgr.batch_calls[0]
+        assert sorted(codes) == ["AAA.XSHG", "BBB.XSHG"]
+        assert (pd.Timestamp("2026-09-08") - pd.Timestamp(start)).days == 120
+        assert end == "2026-09-08"
+        assert mgr.fetch_calls == []
+        assert len(out) == 4  # 2 只 × count=2
+        # 批量结果回填内存：下次同口径直接命中，不再触网
+        out = jq_api._get_price_batch_daily(
+            ["AAA.XSHG", "BBB.XSHG"], None, "2026-09-08", 2, ["close"], False)
+        assert len(mgr.batch_calls) == 1
+        assert len(out) == 4
+        # 批量失败 → 降级逐只（同样窄窗口，语义不断）
+        mgr2 = _BatchMgr()
+        mgr2.fail_batch = True
+        jq_api._state["manager"] = mgr2
+        out = jq_api._get_price_batch_daily(
+            ["CCC.XSHG"], None, "2026-09-08", 2, ["close"], False)
+        assert len(mgr2.batch_calls) == 1
+        assert [c[0] for c in mgr2.fetch_calls] == ["CCC.XSHG"]
+        assert mgr2.fetch_calls[0][1] != "20000101"
+        assert len(out) == 2
+    finally:
+        jq_api._state["manager"] = None
+        jq_api._state["ctx"] = None
+
+
+def test_batch_daily_replay_anchors_window_at_current_dt():
+    """补跑锚定回归：无 end_date 的 count 查询在回放期必须按 current_dt
+    回源，否则窗口（墙钟今天附近）与掩膜（回放时刻）错位取到空帧，策略静默缺数。
+    """
+    from types import SimpleNamespace
+
+    from app.quant.jqengine.engine.jq import api as jq_api
+
+    full_idx = pd.DatetimeIndex(pd.bdate_range("2026-01-01", "2026-09-08"))
+
+    def _df(idx):
+        n = len(idx)
+        return pd.DataFrame({"close": [1.0] * n, "money": [1e7] * n}, index=idx)
+
+    class _BatchMgr:
+        def __init__(self):
+            self._daily_mem = {}
+            self.batch_calls = []
+            self.sources = {"network": self}
+
+        def get_daily_batch(self, codes, start, end, **kwargs):
+            self.batch_calls.append((list(codes), start, end))
+            return {c: _df(full_idx[full_idx <= pd.Timestamp(end)]) for c in codes}
+
+    mgr = _BatchMgr()
+    jq_api._state["manager"] = mgr
+    jq_api._state["ctx"] = SimpleNamespace(current_dt=pd.Timestamp("2026-06-23 10:00"))
+    try:
+        out = jq_api._get_price_batch_daily(
+            ["AAA.XSHG"], None, None, 2, ["close"], False)
+        assert len(mgr.batch_calls) == 1
+        assert mgr.batch_calls[0][2] == "2026-06-23"  # 锚在回放日，不在今天
+        assert len(out) == 2
+        assert out["time"].max().date().isoformat() == "2026-06-23"
+    finally:
+        jq_api._state["manager"] = None
+        jq_api._state["ctx"] = None
+
+
 def test_fund_instrument_type_covers_all_universe_prefixes():
     """_fund_instrument_type 必须覆盖宇宙实证的全部基金前缀（2026-09-03 教训：
     52/53/55 被误判 CS，回测对 ETF 收 0.05% 印花税，520830 一笔多扣 49.76）。

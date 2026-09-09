@@ -46,6 +46,106 @@ def _is_recent_history_end(req_end) -> bool:
     except Exception:
         return True
 
+
+def daily_fetch_window(start_date=None, end_date=None, count=None) -> tuple[str, str]:
+    """``count``/缺省日期 → 窄回源窗口 ``(start, end)``（ISO 日期串）。
+
+    背景（2026-09-09 d00506e8 盘前风暴）：策略常只传 ``count=N`` 不传起日
+    （如涨停扫描 ``count=2``），调用方曾兜底 ``20000101~20300101`` 全历史——
+    服务端 ``get_daily`` 按日分区全扫（约 800 文件×3 目录/请求），全市场
+    4400 只逐只扇出即单次盘前 6 小时、stockdata 2 核打满。``count`` 只需末
+    N 个交易日，窄窗口在客户端按原口径掩膜后结果一致（多出的是被 ``tail``
+    丢掉的行）。
+
+    口径：有 ``count`` 时 N 个交易日 ≈ ``N×2+30`` 个日历日（周末 + 约 1 月
+    停牌缓冲），下限 120 天（连板计数等依赖停牌前数据的场景不断裂）；无
+    ``count``（含 ``count=0`` 这类"全要"语义）→ 400 天回看（与
+    ``_DAILY_FETCH_LOOKBACK_DAYS`` 同口径，不静默截断长均线类需求；要更长
+    须显式传起日）；``end`` 缺省取墙钟今天——调用方在补跑/回放场景须先把
+    ``end`` 解析为回放时钟（``ctx.current_dt``）再传入，否则窗口与掩膜错位
+    取到空帧。返回端恒为具体日期（无未来哨兵，服务端钳制到现有分区）。
+    """
+    end_s = str(pd.Timestamp(end_date).date()) if end_date else "20300101"
+    if start_date:
+        return str(pd.Timestamp(start_date).date()), end_s
+    try:
+        n = int(count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    anchor = pd.Timestamp(end_s) if end_date else pd.Timestamp.now()
+    days = max(n * 2 + 30, 120) if n > 0 else _DAILY_FETCH_LOOKBACK_DAYS
+    start = (anchor - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    return start, end_s if end_date else anchor.strftime("%Y-%m-%d")
+
+
+_HALT_VOL_EPS = 1.0  # 无量阈值（股/手）：累计成交低于此视为无量
+_HALT_RECENT_BARS = 30  # 近端窗口（根）
+
+
+def is_halted_by_volume(dm, code, asof=None) -> bool:
+    """量停牌判定：只有正证据才拦截（避免 08-25 误判重演）。
+
+    背景（2026-09-09 龙版传媒 605577 全天停牌，两模拟盘以陈旧价 18.67
+    卖出）：停牌日分钟分区照出 bar（OHLC 为昨收平线、volume 为 2**-127
+    ≈ 0 占位），live_feed 旧帧兜底 + 盘中日期守卫全部放行，陈旧价一路流入
+    下单撮合。本函数是分钟侧统一判据（引擎码入参）：
+    - 全天规则：asof 当日已发布 bar 存在、累计量 < 1 且走平 → 全天停牌；
+    - 近端规则：截至 asof 近 30 根同日 bar 存在、累计量 < 1 且走平
+      → 盘中停牌；
+    - 无 bar / 无量列 / 异常 → 未知，放行（fail-open，行为与修复前一致；
+      无数据≠停牌）。
+
+    价走平用 close 去重（占位 bar OHLC 恒等）；阈值 1.0（股/手）：任何真实
+    成交累计都远大于此。分钟内存缺失时的全天规则由 current_data paused
+    覆盖（日线当日量，见 jq api CurrentDataProxy）。
+    """
+    try:
+        return _is_halted_by_volume(dm, code, asof=asof)
+    except Exception:
+        return False
+
+
+def _is_halted_by_volume(dm, code, asof=None) -> bool:
+    now_ts = pd.Timestamp(asof) if asof is not None else pd.Timestamp.now()
+    day = now_ts.date()
+    mm = getattr(dm, "_minute_mem", None)
+    df = None
+    if mm is not None:
+        try:
+            get = getattr(mm, "get", None)
+            df = get(code) if callable(get) else None
+        except Exception:
+            df = None
+    if df is not None and not (hasattr(df, "empty") and df.empty) \
+            and "volume" in getattr(df, "columns", []):
+        try:
+            idx = pd.DatetimeIndex(pd.to_datetime(df.index))
+        except Exception:
+            idx = None
+        if idx is not None and len(idx):
+            mask = (idx.normalize() == pd.Timestamp(day)) & (idx <= now_ts)
+            if bool(mask.any()):
+                sub = df.loc[mask]
+                vol = pd.to_numeric(sub["volume"], errors="coerce").fillna(0.0)
+                if float(vol.sum()) < _HALT_VOL_EPS and _is_flat(sub):
+                    return True
+                tail = sub.iloc[-_HALT_RECENT_BARS:]
+                tvol = pd.to_numeric(tail["volume"], errors="coerce").fillna(0.0)
+                if float(tvol.sum()) < _HALT_VOL_EPS and _is_flat(tail):
+                    return True
+    return False
+
+
+def _is_flat(df) -> bool:
+    """占位平线判定：close 无变动（停牌/无量一字 bar OHLC 恒等）。"""
+    try:
+        if "close" not in getattr(df, "columns", []):
+            return False
+        closes = pd.to_numeric(df["close"], errors="coerce").dropna()
+        return len(closes) > 0 and bool((closes == closes.iloc[0]).all())
+    except Exception:
+        return False
+
 # --- DataManager 单例：确保策略与 JqDataSource 共享同一缓存实例 ---
 _data_manager_instance = None
 
