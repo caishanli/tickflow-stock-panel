@@ -733,21 +733,22 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
               silent: true,
               symbol: 'pin',
               symbolSize: 38,
-              label: { fontSize: 10, color: '#fff' },
+              label: { fontSize: 10 },
               data: [
                 {
                   xAxis: dd.peakIdx,
                   yAxis: stratWin[dd.peakIdx],
                   name: `${ddLabel}起点`,
                   itemStyle: { color: '#3b82f6' },
-                  label: { formatter: `${ddLabel}起点` },
+                  // 文字放 pin 上方外部：pin 内 38px 塞不下 6 个汉字
+                  label: { formatter: `${ddLabel}起点`, position: 'top', distance: 4, color: '#3b82f6' },
                 },
                 {
                   xAxis: dd.troughIdx,
                   yAxis: stratWin[dd.troughIdx],
                   name: ddText,
                   itemStyle: { color: '#22c55e' },
-                  label: { formatter: `${(dd.drawdown * 100).toFixed(2)}%` },
+                  label: { formatter: `${(dd.drawdown * 100).toFixed(2)}%`, position: 'top', distance: 4, color: '#22c55e' },
                 },
               ],
             },
