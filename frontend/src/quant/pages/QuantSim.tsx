@@ -6,7 +6,7 @@ import { toast } from '@/components/Toast'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Plus, Play, Square, RotateCcw, Bell, Trash2 } from 'lucide-react'
 import * as api from '../api'
-import { computeSimMetrics } from '../metrics'
+import { computeSimMetrics, findMaxDrawdown } from '../metrics'
 import { openSimStream } from '../stream'
 import { AccountDialog, type AccountForm } from './AccountDialog'
 import { DingtalkConfigDialog } from './DingtalkConfigDialog'
@@ -651,6 +651,10 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     const benchDaily = benchPct.map((v, i) =>
       i === 0 ? 0 : Number((((1 + v / 100) / (1 + benchPct[i - 1] / 100) - 1) * 100).toFixed(2)))
     const xLabels = data.map((d) => String(d.dt ?? '').slice(0, 10))
+    // 当前窗口内的最大回撤：峰值（起点）与谷值（终点）下标，用于曲线标记
+    const dd = findMaxDrawdown(data.map((d) => Number(d.net_value ?? 0)))
+    const ddLabel = rangeDays == null ? '最大回撤' : '区间最大回撤'
+    const ddText = dd ? `${ddLabel} ${(dd.drawdown * 100).toFixed(2)}%` : ''
     return {
       animation: false,
       grid: { left: 64, right: 16, top: 30, bottom: 46 },
@@ -674,6 +678,11 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           const bDay = benchDaily[idx] ?? 0
           const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
           const color = (v: number) => v >= 0 ? '#ef4444' : '#22c55e'
+          const tag = dd && idx === dd.troughIdx
+            ? `<div style="font-size:10px;margin-top:4px;color:#22c55e">${ddText} · ${xLabels[dd.peakIdx] ?? ''} → ${day}</div>`
+            : dd && idx === dd.peakIdx
+              ? `<div style="font-size:10px;margin-top:4px;opacity:0.6">${ddLabel}起点</div>`
+              : ''
           return `<div style="font-size:11px;margin-bottom:4px;opacity:0.7">${day}</div>` +
             `<div style="display:grid;grid-template-columns:auto auto auto;gap:2px 12px;font-size:12px">` +
             `<span style="color:${accent}">策略</span>` +
@@ -683,7 +692,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
             `<span style="color:${color(bCum)}">${fmt(bCum)}</span>` +
             `<span style="color:${color(bDay)};opacity:0.6">${fmt(bDay)}</span>` +
             `</div>` +
-            `<div style="font-size:10px;margin-top:4px;opacity:0.4">累计 / 当日</div>`
+            `<div style="font-size:10px;margin-top:4px;opacity:0.4">累计 / 当日</div>` +
+            tag
         },
       },
       xAxis: {
@@ -716,6 +726,32 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
               colorStops: [{ offset: 0, color: accent + '26' }, { offset: 1, color: accent + '03' }],
             },
           },
+          ...(dd ? {
+            // 最大回撤两点标记：峰值（起点，蓝）与谷值（终点，绿）
+            // 用类目序号定位，即使同日多点导致横轴日期重复也不会错位
+            markPoint: {
+              silent: true,
+              symbol: 'pin',
+              symbolSize: 38,
+              label: { fontSize: 10, color: '#fff' },
+              data: [
+                {
+                  xAxis: dd.peakIdx,
+                  yAxis: stratWin[dd.peakIdx],
+                  name: `${ddLabel}起点`,
+                  itemStyle: { color: '#3b82f6' },
+                  label: { formatter: `${ddLabel}起点` },
+                },
+                {
+                  xAxis: dd.troughIdx,
+                  yAxis: stratWin[dd.troughIdx],
+                  name: ddText,
+                  itemStyle: { color: '#22c55e' },
+                  label: { formatter: `${(dd.drawdown * 100).toFixed(2)}%` },
+                },
+              ],
+            },
+          } : {}),
         },
         {
           name: '沪深300(累计)',
@@ -726,7 +762,7 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         },
       ],
     } as any
-  }, [windowed, baseNV])
+  }, [windowed, baseNV, rangeDays])
 
   const tradeList: any[] = Array.isArray(tr) ? tr : []
 

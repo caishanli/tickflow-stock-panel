@@ -139,7 +139,7 @@ function computeSharpe(equity: any[]): number | null {
   return (mean / std) * Math.sqrt(252)
 }
 
-/** 全程最大回撤（从净值序列） */
+/** 全程最大回撤（从净值序列，按天取最后一个点，与曲线口径一致） */
 function computeMaxDrawdown(equity: any[]): number | null {
   const dayLast = new Map<string, number>()
   for (const e of equity) {
@@ -148,15 +148,33 @@ function computeMaxDrawdown(equity: any[]): number | null {
     const nv = Number(e.net_value ?? e.value ?? 0)
     if (nv > 0) dayLast.set(day, nv)
   }
-  const values = Array.from(dayLast.values())
-  if (values.length < 2) return null
+  const dd = findMaxDrawdown(Array.from(dayLast.values()))
+  return dd ? dd.drawdown : null
+}
 
-  let peak = values[0]
-  let maxDd = 0
-  for (const v of values) {
-    if (v > peak) peak = v
-    const dd = (v - peak) / peak
-    if (dd < maxDd) maxDd = dd
+/** 在净值序列上定位最大回撤的起点（峰值）与终点（谷值），无回撤时返回 null */
+export function findMaxDrawdown(values: number[]): {
+  peakIdx: number
+  troughIdx: number
+  drawdown: number
+} | null {
+  if (!Array.isArray(values) || values.length < 2) return null
+  let peakIdx = 0
+  let peakVal = values[0]
+  if (!Number.isFinite(peakVal) || peakVal <= 0) return null
+  let best: { peakIdx: number; troughIdx: number; drawdown: number } | null = null
+  for (let i = 1; i < values.length; i++) {
+    const v = values[i]
+    if (!Number.isFinite(v) || v <= 0) continue
+    if (v > peakVal) {
+      peakVal = v
+      peakIdx = i
+      continue
+    }
+    const dd = v / peakVal - 1
+    if (dd < 0 && (!best || dd < best.drawdown)) {
+      best = { peakIdx, troughIdx: i, drawdown: dd }
+    }
   }
-  return maxDd === 0 ? null : maxDd
+  return best
 }
