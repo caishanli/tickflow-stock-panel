@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import ReactECharts from 'echarts-for-react'
 
-import { fmtNum } from '../metrics'
+import { findMaxDrawdown, fmtNum } from '../metrics'
 
 /** 读取 CSS 设计令牌变量，echarts 无法直接消费 var()，需解析为实际颜色 */
 function cssVar(name: string, fallback: string) {
@@ -59,6 +59,9 @@ export function BacktestResult({ status, equity, trades, logs }: Props) {
     const values = data.map((d) => Number(d.value ?? d.equity ?? d.nav ?? 0))
     const first = values[0]
     const nav = first ? values.map((v) => (v / first) * 1) : values
+    // 全程最大回撤两点：峰值（起点）与谷值（终点），无回撤时不标记
+    const dd = findMaxDrawdown(values)
+    const ddText = dd ? `最大回撤 ${(dd.drawdown * 100).toFixed(2)}%` : ''
 
     return {
       animation: false,
@@ -99,6 +102,31 @@ export function BacktestResult({ status, equity, trades, logs }: Props) {
               ],
             },
           },
+          ...(dd ? {
+            // 最大回撤两点标记：峰值（起点，蓝）与谷值（终点，绿），用类目序号定位
+            markPoint: {
+              silent: true,
+              symbol: 'pin',
+              symbolSize: 38,
+              label: { fontSize: 10, color: '#fff' },
+              data: [
+                {
+                  xAxis: dd.peakIdx,
+                  yAxis: nav[dd.peakIdx],
+                  name: '最大回撤起点',
+                  itemStyle: { color: '#3b82f6' },
+                  label: { formatter: '最大回撤起点' },
+                },
+                {
+                  xAxis: dd.troughIdx,
+                  yAxis: nav[dd.troughIdx],
+                  name: ddText,
+                  itemStyle: { color: '#22c55e' },
+                  label: { formatter: `${(dd.drawdown * 100).toFixed(2)}%` },
+                },
+              ],
+            },
+          } : {}),
         },
       ],
     } as any

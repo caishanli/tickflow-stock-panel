@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { useChartTheme } from '@/lib/theme'
+import { findMaxDrawdown } from '../metrics'
 
 export function EquityChart({ equity }: { equity: any[] }) {
   const ct = useChartTheme()
@@ -16,6 +17,9 @@ export function EquityChart({ equity }: { equity: any[] }) {
     }
     const s = toReturn(strat)
     const b = toReturn(bench)
+    // 全程最大回撤两点：峰值（起点）与谷值（终点），无回撤时不标记
+    const dd = findMaxDrawdown(strat)
+    const ddText = dd ? `最大回撤 ${(dd.drawdown * 100).toFixed(2)}%` : ''
     return {
       animation: false,
       grid: { left: 56, right: 16, top: 28, bottom: 32 },
@@ -60,6 +64,31 @@ export function EquityChart({ equity }: { equity: any[] }) {
             data: [{ yAxis: 0 }],
             label: { show: false },
           },
+          ...(dd ? {
+            // 最大回撤两点标记：峰值（起点，蓝）与谷值（终点，绿），用类目序号定位
+            markPoint: {
+              silent: true,
+              symbol: 'pin',
+              symbolSize: 38,
+              label: { fontSize: 10, color: '#fff' },
+              data: [
+                {
+                  xAxis: dd.peakIdx,
+                  yAxis: s[dd.peakIdx],
+                  name: '最大回撤起点',
+                  itemStyle: { color: '#3b82f6' },
+                  label: { formatter: '最大回撤起点' },
+                },
+                {
+                  xAxis: dd.troughIdx,
+                  yAxis: s[dd.troughIdx],
+                  name: ddText,
+                  itemStyle: { color: '#22c55e' },
+                  label: { formatter: `${(dd.drawdown * 100).toFixed(2)}%` },
+                },
+              ],
+            },
+          } : {}),
         },
         {
           name: '基准', type: 'line', data: b, symbol: 'none',
