@@ -1408,6 +1408,39 @@ def _partition_dates(root: Path) -> list[str]:
                   if d.is_dir() and d.name.startswith("date="))
 
 
+def _local_000300_trade_days(start: _date, end: _date) -> list[_date]:
+    """本地指数日线推导交易日（mootdx 日历不可用时的 fallback）。
+
+    读 ``kline_index_daily`` 分区中有 ``000300.SH`` bar 的日期。本地数据
+    只含真实交易过的 bar，天然排除节假日（2026-09-11 事故：工作日近似把
+    端午休市 06-19 误判为交易日，导致全市场空跑）。无本地数据时返回 []，
+    调用方继续退回工作日近似。
+    """
+    days: set[_date] = set()
+    try:
+        if not INDEX_DAILY_ROOT.is_dir():
+            return []
+        for ds in _partition_dates(INDEX_DAILY_ROOT):
+            try:
+                d = _date.fromisoformat(ds)
+            except ValueError:
+                continue
+            if not (start <= d <= end):
+                continue
+            part = INDEX_DAILY_ROOT / f"date={ds}" / "part.parquet"
+            if not part.exists():
+                continue
+            try:
+                syms = set(pl.read_parquet(part, columns=["symbol"])["symbol"].to_list())
+            except Exception:
+                continue
+            if "000300.SH" in syms or "000300.XSHG" in syms:
+                days.add(d)
+    except Exception:
+        return []
+    return sorted(days)
+
+
 def _trade_days_up_to(end: _date) -> list[_date]:
     """返回 (end-回看窗口, end] 内 A 股交易日（从沪深300 日线索引推导）。"""
     src = MootdxSource()
@@ -1425,6 +1458,9 @@ def _trade_days_up_to(end: _date) -> list[_date]:
             return [d for d in days if start <= d <= end]
     except Exception as e:
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
+    local = _local_000300_trade_days(start, end)
+    if local:
+        return local
     # 兜底：工作日近似
     days = []
     d = start
@@ -1448,9 +1484,12 @@ def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
         if df is not None and not df.empty:
             # mootdx get_daily 忽略 start 参数返回全历史，需显式过滤下界
             return sorted(d.date() for d in df.index
-                          if start <= d.date() <= end)
+                            if start <= d.date() <= end)
     except Exception as e:
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
+    local = _local_000300_trade_days(start, end)
+    if local:
+        return local
     days = []
     d = start
     while d <= end:

@@ -117,6 +117,49 @@ def test_fill_gaps_policy(monkeypatch):
     assert called == [[D10]]
 
 
+def test_fill_gaps_force_bypasses_closed_breaker(monkeypatch):
+    """新进程熔断闭合时默认 no-op；force=True 显式绕过（运维手动补跑用）。"""
+    import app.services.mootdx_service as ms
+    from app.quant.jqengine.datasource import mootdx_breaker as mbr
+    called = []
+    monkeypatch.setattr(ad, "sync_etf_daily_alt",
+                        lambda days: called.append(days) or {"total": 1})
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [D10])
+    monkeypatch.setattr(mbr, "kline_allowed", lambda: True)  # 新进程：熔断闭合
+    assert ad.fill_recent_gaps_daily("etf") is None
+    assert called == []
+    assert ad.fill_recent_gaps_daily("etf", force=True) == {"total": 1}
+    assert called == [[D10]]
+
+
+def test_fetch_error_summary_logged(monkeypatch, caplog):
+    """备用源被 WAF 拦时不再静默：backfill_days 打一条聚合 warning。"""
+    import logging
+
+    import requests
+
+    class _FailResp:
+        status_code = 501
+
+    class _FailSession:
+        def get(self, *a, **k):
+            e = requests.HTTPError("501 Server Error")
+            e.response = _FailResp()
+            raise e
+
+    monkeypatch.setattr(ad.requests, "Session", lambda: _FailSession())
+    with caplog.at_level(logging.WARNING, logger="app.services.alt_daily"):
+        res = ad.backfill_days([("600000.SH", 100.0), ("000001.SZ", 100.0)],
+                               [D10], progress="备用日线回源")
+    assert res["ok_symbols"] == []
+    assert res["frames"][D10] == []
+    assert sorted(res["uncovered"]) == ["000001.SZ", "600000.SH"]
+    summary = [r.message for r in caplog.records
+               if "备用源请求失败" in r.message]
+    assert summary, "expected one aggregated failure summary"
+    assert "501" in summary[0]
+
+
 def test_only_missing_never_overwrites(monkeypatch):
     import app.services.mootdx_service as ms
     monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.SH", "000001.SZ"])

@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as _date
 
@@ -43,6 +44,27 @@ _SINA_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.
 _HTTP_TIMEOUT = 15.0
 _MAX_RETRIES = 3
 _BACKOFF = (2.0, 5.0, 10.0)
+
+#: 备用源请求失败明细（(源, 明细)）：``_get_json`` 追加，``backfill_days``
+#: 起止重置/汇总打一条聚合 warning（2026-09-11 教训：腾讯 501/新浪 456
+#: 被静默吞掉，全市场 0 行却零诊断）。跨线程共享故配锁；并发多轮
+#: backfill_days 会混计（调度侧串行调用，无此问题）。
+_FETCH_ERR_LOCK = threading.Lock()
+_FETCH_ERRORS: list[tuple[str, str]] = []
+
+
+def _note_fetch_error(source: str, detail: str) -> None:
+    with _FETCH_ERR_LOCK:
+        _FETCH_ERRORS.append((source, detail))
+
+
+def _drain_fetch_errors() -> list[tuple[str, str]]:
+    """取走并清空失败明细（backfill_days 起止各调一次，避免跨轮混计）。"""
+    with _FETCH_ERR_LOCK:
+        errs = _FETCH_ERRORS.copy()
+        _FETCH_ERRORS.clear()
+        return errs
+
 
 _DAY_SCHEMA = {
     "symbol": pl.String, "date": pl.Date,
@@ -79,20 +101,28 @@ def tf_to_vendor(symbol: str) -> str | None:
     return None
 
 
-def _get_json(session: requests.Session, url: str, headers: dict) -> dict | None:
+def _get_json(session: requests.Session, url: str, headers: dict,
+              source: str = "") -> dict | None:
     try:
         resp = session.get(url, headers=headers, timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
         payload = resp.json()
         return payload if isinstance(payload, dict) else None
-    except Exception:
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is not None:
+            _note_fetch_error(source or "http", f"HTTP {status}")
+        else:
+            _note_fetch_error(source or "http",
+                              f"{type(e).__name__}:{str(e)[:60]}")
         return None
 
 
 def fetch_tencent_day(session: requests.Session, vendor: str, count: int = 10) -> list | None:
     """腾讯前复权日线（近 count 根）。None=失败；[] = 无数据。"""
     payload = _get_json(
-        session, f"{_TENCENT_DAY_URL}{vendor},day,,,{count},qfq", _TENCENT_HEADERS)
+        session, f"{_TENCENT_DAY_URL}{vendor},day,,,{count},qfq", _TENCENT_HEADERS,
+        source="tencent")
     try:
         node = ((payload or {}).get("data") or {}).get(vendor) or {}
         return list(node.get("qfqday") or [])
@@ -105,7 +135,7 @@ def fetch_sina_day(session: requests.Session, vendor: str, count: int = 10) -> l
     payload = _get_json(
         session,
         f"{_SINA_KLINE_URL}?symbol={vendor}&scale=240&ma=no&datalen={count}",
-        _SINA_HEADERS)
+        _SINA_HEADERS, source="sina")
     try:
         return list(((payload or {}).get("result") or {}).get("data") or [])
     except Exception:
@@ -233,6 +263,7 @@ def backfill_days(symbols: list[tuple[str, float]], days: list[_date],
     ok_symbols: list[str] = []
     uncovered: list[str] = []
     local = threading.local()
+    _drain_fetch_errors()  # 起点重置：上轮残留不计入本轮汇总
 
     def _session() -> requests.Session:
         s = getattr(local, "s", None)
@@ -271,6 +302,13 @@ def backfill_days(symbols: list[tuple[str, float]], days: list[_date],
                 sub = frame.filter(pl.col("date") == d)
                 if not sub.is_empty():
                     frames_by_day[d].append(sub)
+    errs = _drain_fetch_errors()
+    if errs:
+        counts = Counter(errs)
+        detail = ", ".join(f"{src} {msg} ×{n}"
+                           for (src, msg), n in counts.most_common(8))
+        logger.warning("%s: 备用源请求失败汇总: %s（共 %d 次，未覆盖 %d/%d 只）",
+                       progress, detail, len(errs), len(uncovered), total)
     return {"frames": frames_by_day, "ok_symbols": ok_symbols,
             "uncovered": uncovered}
 
@@ -401,12 +439,14 @@ def sync_index_daily_alt(days: list[_date], symbols: list[str] | None = None,
                        prefer=prefer, overwrite=overwrite)
 
 
-def fill_recent_gaps_daily(kind: str = "stock", lookback: int = 5) -> dict | None:
+def fill_recent_gaps_daily(kind: str = "stock", lookback: int = 5,
+                           force: bool = False) -> dict | None:
     """近期日线缺口的备用链兜底（调度侧唯一入口；健康时零开销 no-op）。
 
     缺口 = 分区缺失的已收盘交易日；同时满足才回补：
     1. 近 ``lookback`` 天内有缺口；
     2. K 线熔断开路（mootdx/TickFlow 当轮已确认不可用）。
+    ``force=True`` 跳过条件 2（运维手动补跑用，默认关闭）。
     """
     from app.quant.jqengine.datasource.mootdx_breaker import kline_allowed
     from app.services import mootdx_service as ms
@@ -417,12 +457,13 @@ def fill_recent_gaps_daily(kind: str = "stock", lookback: int = 5) -> dict | Non
     missing = [d for d in ms._missing_daily_days(root)][-lookback:]
     if not missing:
         return None
-    if kline_allowed():
+    if kline_allowed() and not force:
         logger.debug("alt_daily: %s日线缺口 %s 但熔断关闭，主源自行处理",
                      kind, [d.isoformat() for d in missing])
         return None
-    logger.warning("alt_daily: %s日线缺口 %s 且熔断开路，切备用链回补",
-                   kind, [d.isoformat() for d in missing])
+    logger.warning("alt_daily: %s日线缺口 %s 且%s，切备用链回补",
+                   kind, [d.isoformat() for d in missing],
+                   "force 绕过熔断状态" if force else "熔断开路")
     if kind == "etf":
         return sync_etf_daily_alt(missing)
     if kind == "index":
