@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 
@@ -87,6 +89,22 @@ def _normalize_daily(df_in, default_symbol: str | None = None) -> pl.DataFrame:
     return df.select(keep)
 
 
+_RETRY_WAIT_RE = re.compile(r"请\s*(\d+)\s*ms\s*后重试")
+_RETRY_WAIT_CAP_MS = 60_000
+_RETRY_FALLBACK_MS = (5_000, 15_000)
+
+
+def _parse_retry_wait_ms(message: str, attempt: int = 0) -> int:
+    """从限流错误里解析服务端建议等待（毫秒），上限 60s；解析不到按 attempt 指数退避。"""
+    m = _RETRY_WAIT_RE.search(message or "")
+    if m:
+        try:
+            return max(0, min(int(m.group(1)), _RETRY_WAIT_CAP_MS))
+        except ValueError:
+            pass
+    return _RETRY_FALLBACK_MS[min(attempt, len(_RETRY_FALLBACK_MS) - 1)]
+
+
 def sync_daily_batch(symbols: list[str],
                      count: int | None = None,
                      batch_size: int | None = None,
@@ -110,22 +128,36 @@ def sync_daily_batch(symbols: list[str],
 
     for i, chunk in enumerate(chunks):
         sleep_between_batches(i, rpm)
-        try:
-            if start_time and end_time:
-                raw = tf.klines.batch(
-                    chunk, period="1d", adjust="none",
-                    start_time=_datetime_to_ms(start_time),
-                    end_time=_datetime_to_ms(end_time),
-                    count=10000,
-                    as_dataframe=True, show_progress=False,
-                )
-            else:
-                raw = tf.klines.batch(chunk, period="1d", count=count or 250, adjust="none",
-                                      as_dataframe=True, show_progress=False)
-        except Exception as e:
-            logger.warning("batch fetch failed for %d symbols (chunk %d/%d): %s",
-                           len(chunk), i + 1, len(chunks), e)
-            failed_syms.extend(chunk)
+        # 429 退避重试：服务端会在 message 里给"请 Xms 后重试"（免费 60/min），
+        # 按它说的等（上限 60s）；解析不到则指数退避。3 次耗尽才记失败——
+        # 之前失败整 chunk 直接丢（09-11 曾一次丢 462 只）。
+        raw = None
+        for attempt in range(3):
+            try:
+                if start_time and end_time:
+                    raw = tf.klines.batch(
+                        chunk, period="1d", adjust="none",
+                        start_time=_datetime_to_ms(start_time),
+                        end_time=_datetime_to_ms(end_time),
+                        count=10000,
+                        as_dataframe=True, show_progress=False,
+                    )
+                else:
+                    raw = tf.klines.batch(chunk, period="1d", count=count or 250, adjust="none",
+                                          as_dataframe=True, show_progress=False)
+                break
+            except Exception as e:
+                if attempt >= 2:
+                    logger.warning("batch fetch failed for %d symbols (chunk %d/%d): %s",
+                                   len(chunk), i + 1, len(chunks), e)
+                    failed_syms.extend(chunk)
+                    raw = None
+                    break
+                wait = _parse_retry_wait_ms(str(e), attempt)
+                logger.warning("batch chunk %d/%d 限流, %dms 后重试(%d/3): %s",
+                               i + 1, len(chunks), wait, attempt + 1, e)
+                time.sleep(wait / 1000.0)
+        if raw is None:
             continue
 
         # 兼容两种形态:dict[sym → df] 和扁平 df

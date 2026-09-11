@@ -104,6 +104,15 @@ def _backfill_loop():
             _scheduler_state["last_backfill"] = str(_dt.datetime.now())
             _scheduler_state["backfill_result"] = res
         logger.info("stockdata startup backfill done: %s", res)
+        # mootdx 熔断期备用史源（同 _run_sync 注释）：启动时即有缺口且开路
+        # 则直接腾讯回补，不等收盘 cron
+        from app.services import tencent_minute as tm
+        tm.fill_recent_gaps("stock")
+        tm.fill_recent_gaps("etf")
+        from app.services import alt_daily as ad
+        ad.fill_recent_gaps_daily("stock")
+        ad.fill_recent_gaps_daily("etf")
+        ad.fill_recent_gaps_daily("index")
         # 季频财务（gpcw）幂等回源：已有分区秒级跳过，新季度才下载
         from app.services import tdx_financials
         fin = tdx_financials.sync_financials()
@@ -146,6 +155,16 @@ def _run_sync(full_stock_minute: bool = False):
                     limit=mootdx_service.STOCK_MINUTE_BATCH_LIMIT)
                 from app.services import etf_nav_service
                 nav = etf_nav_service.sync_etf_nav()
+            # mootdx 熔断期备用史源：近几日分钟缺口仍在且熔断开路时，用腾讯
+            # m1 回补（健康时零开销 no-op；只补缺口 symbol，不覆盖已有 bar）
+            from app.services import tencent_minute as tm
+            tm.fill_recent_gaps("stock")
+            tm.fill_recent_gaps("etf")
+            # 日线备用链（腾讯fqkline→新浪→mootdx）：收盘后缺口仍在且开路时回补
+            from app.services import alt_daily as ad
+            ad.fill_recent_gaps_daily("stock")
+            ad.fill_recent_gaps_daily("etf")
+            ad.fill_recent_gaps_daily("index")
             with _lock:
                 _scheduler_state["last_sync"] = str(_dt.datetime.now())
                 _scheduler_state["sync_result"] = {

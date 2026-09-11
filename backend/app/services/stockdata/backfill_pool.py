@@ -70,6 +70,20 @@ class BackfillPool:
         "ok" 恒为空列表，成功数看 "ok_count"；调用方经 on_batch_done 消费。
         """
         symbols = list(symbols)
+        # mootdx 真源路径（默认 None 或 MootdxSource；测试假源不拦截）：
+        # 熔断开路期整批跳过（不触网），缺口由下轮定时任务补回——避免
+        # 全市场 5000+ 只逐只空转 + 日志风暴。
+        from app.quant.jqengine.datasource.mootdx_src import MootdxSource
+        if self._factory is None or self._factory is MootdxSource:
+            from app.quant.jqengine.datasource.mootdx_breaker import (
+                BREAKER_OPEN_MSG,
+                kline_allowed,
+            )
+            if not kline_allowed():
+                logger.warning("backfill pool 跳过：%s（%d 只，缺口下轮补回）",
+                               BREAKER_OPEN_MSG, len(symbols))
+                return {"ok": [], "ok_count": 0,
+                        "failed": {s: BREAKER_OPEN_MSG for s in symbols}}
         workers = self.effective_workers(len(symbols))
         results: list = []
         ok_count = 0

@@ -424,7 +424,11 @@ def _pull_recent_guarded(src, code: str, timeout: float = 30.0):
         logger.warning("[sources] %s 实时回源超时(%ss)，将重建数据源", code, timeout)
         raise TimeoutError(f"mootdx realtime pull timeout: {code}")
     if "err" in box:
-        logger.warning("[sources] %s 实时回源失败: %s", code, box["err"])
+        err = box["err"]
+        from app.quant.jqengine.datasource.mootdx_breaker import BREAKER_OPEN_MSG
+        if BREAKER_OPEN_MSG in str(err):
+            return None  # 熔断开路：快速失败已由熔断器统一日志，逐只不再刷屏
+        logger.warning("[sources] %s 实时回源失败: %s", code, err)
         return None
     df = box.get("df")
     if df is None or df.empty:

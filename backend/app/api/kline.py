@@ -108,6 +108,23 @@ def _stockdata_minute(symbol: str, trade_date: date):
         return pl.DataFrame()
 
 
+def _stockdata_intraday_fresh(sd_df, tol_min: int = 15) -> bool:
+    """stockdata 今天部分 bar 是否足够新（末根距今 ≤tol_min 分钟）。
+
+    内存库服务重启/故障后只有近期累积 bar，凑不够 90% 门禁；但末根新鲜时
+    仍应直接返回——TickFlow 免费版无实时分钟，后续路径只会回退到空。
+    sd_df["datetime"] 为 UTC naive（见 _stockdata_minute）。
+    """
+    try:
+        if sd_df is None or sd_df.is_empty() or "datetime" not in sd_df.columns:
+            return False
+        latest = sd_df["datetime"].max()
+        now_utc = cn_now().replace(tzinfo=None) - timedelta(hours=8)
+        return (now_utc - latest).total_seconds() <= tol_min * 60
+    except Exception:
+        return False
+
+
 def _stockdata_daily(symbol: str, start: date, end: date, is_stock: bool = True):
     """本地 stockdata 服务取原始日K (无复权/无指标)。股票 volume 股→手 与 enriched 口径一致。失败返回空 df。"""
     import polars as pl
@@ -998,6 +1015,15 @@ def get_minute(
         sd_df = _stockdata_minute(symbol, trade_date)
         # 历史交易日要求 ≥90% 完整度, 不足走本地/TickFlow 补齐; 盘中今天按实际(实时累积)
         if not sd_df.is_empty() and (trade_date != date.today() or len(sd_df) >= expected * 0.9):
+            return {
+                "symbol": symbol, "name": stock_name, "stock_info": stock_info,
+                "date": str(trade_date), "rows": sd_df.to_dicts(),
+                "source": "stockdata", "price_limit": price_limit,
+            }
+        if trade_date == date.today() and _stockdata_intraday_fresh(sd_df):
+            # 盘中新鲜度兜底：只有部分实时 bar（服务重启/故障后内存库仅累积
+            # 近期）但末根足够新时直接返回；TickFlow 免费版无实时分钟，
+            # 走后续路径只会回退到空（source=none）。
             return {
                 "symbol": symbol, "name": stock_name, "stock_info": stock_info,
                 "date": str(trade_date), "rows": sd_df.to_dicts(),

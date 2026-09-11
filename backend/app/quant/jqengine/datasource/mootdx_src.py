@@ -11,6 +11,12 @@ from mootdx.quotes import Quotes
 from mootdx.utils import get_stock_market
 
 from .base import DataSource, DataSourceError
+from .mootdx_breaker import (
+    BREAKER_OPEN_MSG,
+    kline_allowed,
+    kline_record_fail,
+    kline_record_ok,
+)
 
 # pytdx 已停止维护，其 block_reader.py:128 的 `if code is not ''` 在 Python 3.12+
 # 触发 SyntaxWarning（'' 为 interned 单例，`is not` 与 `!=` 行为等价，无实际影响）。
@@ -70,6 +76,10 @@ _TDX_SOCKET_READ_TIMEOUT = 10.0
 # 外层守护超时需覆盖内层整轮服务器轮换的最坏耗时（_TDX_SERVERS 各一次 + 兜底），
 # 否则会在轮换中途被掐断、永远到不了可用服务器（08-19 长跑回源每只 30s 超时根因）。
 _TDX_FETCH_GUARD_TIMEOUT = len(_TDX_SERVERS) * _TDX_SOCKET_READ_TIMEOUT + 30.0
+# 轮换早停：连续空响应（跨服务器全局无数据，如 2026-09-10 起全市场 K 线
+# 返回空）或连续未成功达此数即结束本轮——单只烧满 17 台是空转。
+_RETRY_ABORT_EMPTY = 5
+_RETRY_ABORT_FAILS = 8
 
 
 def _weekday_days(since, today):
@@ -251,16 +261,24 @@ class MootdxSource(DataSource):
             self._client = None
         return True
 
-    def _with_server_retry(self, fn, empty_ok=False):
+    def _with_server_retry(self, fn, empty_ok=False, count_breaker=True):
         """执行取数 ``fn``，超时/返回空时按 _TDX_SERVERS 轮询换服务器重试。
 
         - fn 内阻塞超过 15s 视为超时（线程守护，超时即换服务器）；
         - 返回 None/空 且 ``empty_ok=False`` 也触发换服务器；
-        - 列表用尽后回退到 bestip/factory 兜底客户端（_api 重建）。
+        - 连续 5 次空响应（跨服务器全局无数据，轮换无意义）或连续 8 次
+          未成功即提前结束轮换——全市场 K 线返回空时单只烧 17 轮是空转；
+        - ``count_breaker``：K 线（bars）调用参与全局熔断计数；xdxr 等
+          非 K 线接口传 False（不污染不断路）；
+        - 熔断开路期入口快速失败（不触网），调用方直走腾讯/新浪。
         返回 (df, err)：成功 df 非 None，失败二者皆 None/err 说明。
         """
         import threading
+        if count_breaker and not kline_allowed():
+            return None, (BREAKER_OPEN_MSG + "（K线连续失败，冷却等待恢复）")
         attempts = len(_TDX_SERVERS) + 1  # 显式列表各一次 + 末次 bestip/factory 兜底
+        fails = 0       # 本次调用连续未成功次数（超时/异常/空）
+        empty_streak = 0  # 本次调用连续空响应次数
         for attempt in range(attempts):
             c = self._api()
             box = {}
@@ -274,15 +292,31 @@ class MootdxSource(DataSource):
             t.join(10)
             if t.is_alive():
                 self._rotate_server()
+                fails += 1
+                empty_streak = 0
+                if fails >= _RETRY_ABORT_FAILS:
+                    break
                 continue
             if "err" in box:
                 self._rotate_server()
+                fails += 1
+                empty_streak = 0
+                if fails >= _RETRY_ABORT_FAILS:
+                    break
                 continue
             df = box.get("df")
             if df is None or (not empty_ok and (hasattr(df, "empty") and df.empty)):
                 self._rotate_server(to_bestip=(attempt == attempts - 1))
+                fails += 1
+                empty_streak += 1
+                if empty_streak >= _RETRY_ABORT_EMPTY or fails >= _RETRY_ABORT_FAILS:
+                    break
                 continue
+            if count_breaker:
+                kline_record_ok()
             return df, None
+        if count_breaker:
+            kline_record_fail()
         return None, "mootdx 所有服务器均超时/无数据"
 
     def get_daily(self, code, start, end):
@@ -334,7 +368,7 @@ class MootdxSource(DataSource):
         try:
             rows, _err = self._with_server_retry(
                 lambda c: c.client.get_xdxr_info(int(get_stock_market(sym)), sym),
-                empty_ok=True)
+                empty_ok=True, count_breaker=False)
         except Exception:
             rows = None
         if rows is None:

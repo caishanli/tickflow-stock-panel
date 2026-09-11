@@ -25,6 +25,7 @@ import pandas as pd
 import polars as pl
 
 from app.quant.jqengine.datasource.manager import DataManager
+from app.quant.jqengine.datasource.mootdx_breaker import BREAKER_OPEN_MSG
 from app.quant.jqengine.datasource.mootdx_src import MootdxSource
 from app.services.stockdata.backfill_pool import BackfillPool
 
@@ -230,7 +231,8 @@ def sync_etf_minute(day: _date | None = None) -> dict:
             else:
                 df = src.get_minute_recent(jq, pages=2)
         except Exception as e:
-            logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
+            if BREAKER_OPEN_MSG not in str(e):
+                logger.warning("mootdx_service: %s 分钟拉取失败: %s", jq, e)
             return None
         if df is None or df.empty:
             return None
@@ -635,7 +637,8 @@ def sync_stock_minute(limit: int | None = None) -> dict:
             _append_failure(sym, "timeout")
             raise
         except Exception as e:
-            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            if BREAKER_OPEN_MSG not in str(e):
+                logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
             return None
         if df is None or df.empty:
@@ -752,7 +755,8 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
             _append_failure(sym, "timeout")
             raise
         except Exception as e:
-            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            if BREAKER_OPEN_MSG not in str(e):
+                logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
             return None
         if df is None or df.empty:
@@ -838,7 +842,8 @@ def sync_stock_minute_range(days: list[_date]) -> int:
             _append_failure(sym, "timeout")
             raise
         except Exception as e:
-            logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
+            if BREAKER_OPEN_MSG not in str(e):
+                logger.warning("mootdx_service: %s 分钟拉取失败: %s", sym, e)
             _append_failure(sym, f"exception:{str(e)[:60]}")
             return None
         if df is None or df.empty:
