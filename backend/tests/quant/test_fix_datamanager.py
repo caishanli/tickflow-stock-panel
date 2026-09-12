@@ -1067,16 +1067,19 @@ def test_minute_no_data_after_ttl_selfheal(monkeypatch):
     code = "513030.XSHG"
     end = pd.Timestamp("2026-08-14 15:00:00")
     # 条目 1 小时前写入 → 已过期
-    dm._minute_no_data_after[code] = (end, pd.Timestamp.now() - pd.Timedelta(hours=1))
+    through = pd.Timestamp('2026-08-17 15:00')
+    dm._minute_no_data_after[code] = (end, through, pd.Timestamp.now() - pd.Timedelta(hours=1))
     # 过期 → 不短路（get_minute_price_at 会重查；这里只验 TTL 分支逻辑不 return None）
     nda = dm._minute_no_data_after.get(code)
     assert nda is not None
-    nda_end, nda_at = nda
+    nda_end, nda_through, nda_at = nda
+    assert nda_end == end and nda_through == through
     expired = pd.Timestamp.now() - nda_at > dm._MINUTE_NDA_TTL
     assert expired
 
-    # 新条目（30 分钟内）→ 有效期内且 dt 晚于帧末 → 短路 None
-    dm._minute_no_data_after[code] = (end, pd.Timestamp.now() - pd.Timedelta(minutes=5))
+    # 新条目只覆盖已查询窗口，不能把缺数结果外推到其后的历史日期。
+    dm._minute_no_data_after[code] = (end, through, pd.Timestamp.now() - pd.Timedelta(minutes=5))
     dt_late = pd.Timestamp.now() - pd.Timedelta(days=1)  # 历史 dt（昨天 15:30 后）
     dt_late = dt_late.replace(hour=15, minute=30)
     assert dm._minute_no_data_after[code][0].normalize() < dt_late.normalize()
+    assert dm._minute_no_data_after[code][1] < dt_late

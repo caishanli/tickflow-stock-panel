@@ -105,6 +105,66 @@ run_daily(afternoon, "13:10")
 '''
 
 
+@pytest.mark.parametrize('heartbeat_price', [3., None])
+def test_halted_replay_uses_clock_feed_without_changing_orders(tmp_quant, monkeypatch, heartbeat_price):
+    from app.quant.jqengine.engine.jq import api
+    from app.quant.jqengine.engine.jq.context import Position
+    from app.quant.jqengine.engine.jq.loader import load_strategy
+
+    halted, target, heartbeat = '605577.XSHG', '600000.XSHG', '510300.XSHG'
+    noise = [f'000{i:03}.XSHE' for i in range(100, 200)]
+    source = '''
+def init(context):
+    g.calls = 0
+def scheduled(context):
+    g.calls += 1
+    order("605577.XSHG", -1000)
+    order("600000.XSHG", 100)
+run_daily(scheduled, "10:30")
+'''
+    monkeypatch.setattr(runner, '_prev_close_dm', lambda *a, **kw: None)
+    monkeypatch.setattr(runner.names, 'resolve_name', lambda code: code)
+
+    def execute(full):
+        queries = []
+        dm = _StubDM()
+
+        def price(code, when):
+            queries.append(code)
+            return None if code == halted else heartbeat_price if code == heartbeat else 20.
+
+        dm.get_minute_price_at = price
+        bundle = load_strategy(source, dm, .0003, .001, 100000.)
+        ctx = bundle.ctx
+        bundle.init_fn(ctx)
+        ctx.universe = [halted, target, *noise]
+        ctx.portfolio.positions[halted] = Position(amount=1000, avg_cost=18.67, price=18.67)
+        aid = service.account_create('full' if full else 'reduced', 118670., .06, 'fixture')
+        state = dict(cash=100000., start_cash=118670., positions={}, stop_loss_log=[])
+        aux = dict(jq_api=api, start_cash=118670., fired=set(), fresh_frames={},
+                   replay_mode=True, frequency='minute', dm=dm)
+        with monkeypatch.context() as patch:
+            if full:
+                patch.setattr(runner, '_replay_feed_codes', lambda *a: None)
+            for when in pd.date_range('2026-09-11 10:30', periods=3, freq='min'):
+                runner._strategy_tick(aid, bundle, ctx, dm, runner._hist_feed,
+                                      Matcher(.06), state, aux, when)
+        runner._flush_replay_batch(aid, aux)
+        assert ctx.g.calls == 1
+        assert ctx.portfolio.positions[halted].amount == 1000
+        fields = ('ts', 'code', 'action', 'amount', 'price', 'commission')
+        trades = [tuple(row[f] for f in fields) for row in db.get_sim_trades(aid)]
+        assert len(trades) == 1 and trades[0][1] == target
+        snapshots = [(row['dt'], row['net_value']) for row in db.get_sim_snapshots(aid)]
+        return trades, snapshots, queries
+
+    full, reduced = execute(True), execute(False)
+    assert full[:2] == reduced[:2]
+    if heartbeat_price is not None:
+        assert not set(noise) & set(reduced[2])
+        assert len(reduced[2]) < len(full[2]) / 10
+
+
 def _today_bar(hour=10, minute=30):
     """今日盘中某时刻的 bar（与测试运行时刻无关，保证 'open'/'HH:MM' 调度确定触发）。"""
     return pd.Timestamp.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -532,6 +592,71 @@ def test_replay_partial_day_does_not_refire_daily_pipeline(tmp_quant, monkeypatc
     from app.quant.jqengine.engine.jq import api
     # 13:10 流水线在补跑起点（13:56）前已执行过，重放不得再次触发
     assert api._state["ctx"].g.afternoon_n == 0
+
+
+@pytest.mark.parametrize('flavor', ['jq', 'ptrade'])
+@pytest.mark.parametrize(('saved_at', 'now_at', 'expected_buy_days', 'expected_pre'), [
+    ('2026-09-09 15:05:00', '2026-09-10 10:00:00', ['2026-09-10'], 1),
+    ('2026-09-09 13:56:00', '2026-09-10 10:00:00', ['2026-09-10'], 2),
+    ('2026-09-10 13:56:00', '2026-09-10 14:20:00', [], 1),
+    ('2026-09-11 15:05:00', '2026-09-12 10:00:00', [], 0),
+    ('2026-09-10 17:28:00', '2026-09-10 17:30:00', [], 0),
+    ('2026-09-09 15:05:00', '2026-09-10 08:15:00', [], 0),
+    ('2026-09-10 09:00:00', '2026-09-10 09:10:00', [], 0),
+])
+def test_resume_never_replays_completed_orders_or_releases_same_day_stock(
+        tmp_quant, monkeypatch, saved_at, now_at, expected_buy_days, expected_pre, flavor):
+    """Use real matching, restored T+1 positions and DB writes through the main loop."""
+    real_datetime = datetime.datetime
+    now = real_datetime.fromisoformat(now_at)
+
+    class FixedNow(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(runner, 'datetime', SimpleNamespace(**(vars(datetime) | {'datetime': FixedNow})))
+    days = [datetime.date(2026, 9, 9), datetime.date(2026, 9, 10)]
+    symbol = '600000.XSHG' if flavor == 'jq' else '600000.SS'
+    register = ("run_daily(morning, '09:30')\n    run_daily(afternoon, '14:10')"
+                if flavor == 'jq' else
+                "run_daily(context, morning, time='09:30')\n    run_daily(context, afternoon, time='14:10')")
+    code = f'''
+def initialize(context):
+    context.universe = ['{symbol}']
+    {register}
+
+def morning(context):
+    order('{symbol}', 100)
+
+def afternoon(context):
+    order_target('{symbol}', 0)
+
+def before_trading_start(context, data=None):
+    log.info('resume-test-pre-market')
+'''
+    save_strategy('resume_stock', 'resume', code)
+    aid = service.account_create('resume', 100000, .06, 'resume_stock', str(days[0]))
+    protocol.save_state(aid, dict(cash=99000., start_cash=100000., net_value=100000., pnl=0.,
+        positions={symbol: dict(amount=100., avg_cost=10., price=10., today_amount=100.)},
+        stop_loss_log=[], dt=saved_at))
+    checks = iter([False] * 8 + [True])
+    monkeypatch.setattr(runner, 'is_paused', lambda aid: next(checks))
+    monkeypatch.setattr(runner, 'in_trading', lambda now=None: False)
+    monkeypatch.setattr(runner, '_is_trading_day', lambda dm, day: day in days)
+    monkeypatch.setattr(runner, '_prev_close_dm', lambda *a, **k: None)
+    monkeypatch.setattr(runner.time, 'sleep', lambda s: None)
+    runner.run_loop(aid, dm=_replay_dm_cls(days)(), feed=_feed_factory(10., now),
+                    matcher=Matcher(.06))
+    trades = db.get_sim_trades(aid)
+    assert [(row['action'], row['ts'][:10]) for row in trades] == [
+        ('BUY', day) for day in expected_buy_days]
+    assert all(row['dt'] > saved_at for row in db.get_sim_snapshots(aid))
+    state = protocol.read_state(aid)
+    assert state['positions'][symbol]['amount'] == 100 * (1 + len(expected_buy_days))
+    assert state['positions'][symbol]['today_amount'] == 100
+    pre = [row for row in db.get_sim_logs(aid) if row['message'] == 'resume-test-pre-market']
+    assert len(pre) == expected_pre
 
 
 STRATEGY_REPLAY_LOG = '''

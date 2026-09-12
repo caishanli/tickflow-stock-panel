@@ -329,7 +329,7 @@ class DataManager:
             cap=minute_mem_cap,
             on_evict=lambda k, _v: self._minute_cov.pop(k, None))
         self._minute_empty = set()  # 已知无分钟数据的标的，避免重复网络请求
-        # {code: (帧末时间, 负缓存写入时刻)}，历史日期有界负缓存。
+        # {code: (帧末时间, 已查询上界, 写入时刻)}，历史日期有界负缓存。
         # 带写入时刻：超过 _MINUTE_NDA_TTL 后条目失效重查（数据回填/复牌自愈），
         # 否则补跑中复牌标的会永久取到"无数据"。
         self._minute_no_data_after: dict[str, tuple] = {}
@@ -510,6 +510,7 @@ class DataManager:
         # clear() 而非重新赋值：保持 _minute_mem 对象身份（LRU 实例）不变
         self._minute_mem.clear()
         self._minute_cov.clear()
+        self._minute_no_data_after.clear()
 
     def unset_minute_window(self) -> None:
         """复位分钟线窗口（补跑结束后调用）：回到实时/模拟盘的滑窗语义。
@@ -1070,12 +1071,11 @@ class DataManager:
             # 上界记帧真实末 bar：覆盖校验按实际数据（非请求 hi_eff）判定命中，
             # 补跑/盘中当日分区未落盘时不会把当日算进覆盖区间（回归 513030）
             self._minute_cov[code] = (lo_ts, df.index.max())
-            # 历史日期下帧末到不了 as_of 当日（停牌/退市/分区缺口）：帧是
-            # 不可变分区的全量，后续 as_of 只会更晚 → 记负缓存上界，避免
-            # 每个 bar 都重载整段窗口（08-06 补跑卡顿根因之一）。
+            # 缺数结论只覆盖已请求到的 hi_eff，不能外推至复牌后的日期。
+            # 同一天的重复 bar 仍可复用，避免逐分钟重载整个窗口。
             if (not is_today
                     and pd.Timestamp(df.index.max()).normalize() < as_of_ts.normalize()):
-                self._minute_no_data_after[code] = (df.index.max(), pd.Timestamp.now())
+                self._minute_no_data_after[code] = (df.index.max(), hi_eff, pd.Timestamp.now())
             if is_today and getattr(self, "_diag_minute", False):
                 logger.info("[minute-diag] %s 盘中加载成功 bars=%d 末bar=%s as_of=%s",
                             code, len(df), df.index.max(), as_of_ts)
@@ -1258,17 +1258,21 @@ class DataManager:
         返回 ``float``；无数据返回 ``None``。
         """
         dt_ts = pd.Timestamp(dt)
-        # 历史 bar 的有界负缓存：补跑中某码分钟帧上界到不了 dt（停牌/退市/
-        # 数据提前结束），且刚重载过仍如此 → 该码在窗口内更晚的 dt 也必然无
-        # 数据，直接返回 None。不做这个缓存，大池日每根决策 bar 都会对停牌码
+        # 历史 bar 的有界负缓存：只在实际请求过的范围内复用缺数结果。
+        # 不能把停牌日缺数据外推到所有未来日期，令复牌股等待墙钟TTL才恢复。
+        # 不做这个缓存，大池日每根决策 bar 都会对停牌码
         # 重复整段加载（实测每次卡死 8 月 6 日的根因）。仅历史日期生效——
         # 当日实时数据可能稍后落盘，不做此假设（见 08-13 159768 案例）。
         # TTL 自愈：条目过期后失效重查——数据回填/复牌后恢复取数，不再永久
         # "无数据"（负缓存只有写入时刻、无失效机制会变成永久黑名单）。
         nda = self._minute_no_data_after.get(code)
         if nda is not None:
-            nda_end, nda_at = nda
-            if pd.Timestamp.now() - nda_at > self._MINUTE_NDA_TTL:
+            nda_end, nda_through, nda_at = nda
+            frame = self._minute_mem.get(code)
+            refreshed = (frame is not None and not frame.empty
+                         and frame.index.max() > nda_end)
+            if (pd.Timestamp.now() - nda_at > self._MINUTE_NDA_TTL
+                    or dt_ts > nda_through or refreshed):
                 self._minute_no_data_after.pop(code, None)
                 nda = None
         if (nda is not None and dt_ts.normalize() > nda_end
@@ -1302,11 +1306,16 @@ class DataManager:
             # 本函数没有 as_of 参数，以 dt_ts 是否为当日判定——当日实时数据
             # 可能稍后落盘，不做负缓存（见 08-13 159768 案例）。
             if dt_ts.date() < pd.Timestamp.today().date():
-                self._minute_no_data_after[code] = (df.index.max(), pd.Timestamp.now())
+                self._minute_no_data_after[code] = (
+                    df.index.max(), dt_ts.normalize() + pd.Timedelta(hours=15), pd.Timestamp.now())
             return None
         try:
             pos = df.index.searchsorted(dt_ts, side="right") - 1
             if pos < 0:
+                return None
+            # 缓存可能包含缺失日之后的 bar；检查实际选中的行，不能只看帧上界。
+            # 同样禁止开盘首根分钟线到来前用昨日收盘冒充今日报价。
+            if pd.Timestamp(df.index[pos]).normalize() != dt_ts.normalize():
                 return None
             px = float(df["close"].iloc[pos])
             # as-of 早于拆股事件时撤销前复权（与 jqcompat 分钟侧同语义）

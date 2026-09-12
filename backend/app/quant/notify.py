@@ -45,13 +45,22 @@ def send_dingtalk(webhook_url: str, secret: str, title: str, text: str) -> bool:
         "msgtype": "markdown",
         "markdown": {"title": title, "text": text},
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=_TIMEOUT)
-        data = resp.json()
-        if isinstance(data, dict) and data.get("errcode") == 0:
-            return True
-        log.warning("钉钉推送失败: %s", data)
-        return False
-    except Exception as e:
-        log.warning("钉钉推送异常: %s", e)
-        return False
+    # 传输层异常重试 1 次（间隔 2s）：实测到 oapi.dingtalk.com 的 TLS 握手偶发
+    # SSLEOFError（约 1/3 概率），新连接重试即可恢复；errcode != 0 属服务端
+    # 确定性拒绝，不重试。成功路径仍只发一次（test_send_dingtalk_plain_text
+    # 断言单次调用）。
+    last_err: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(url, json=payload, timeout=_TIMEOUT)
+            data = resp.json()
+            if isinstance(data, dict) and data.get("errcode") == 0:
+                return True
+            log.warning("钉钉推送失败: %s", data)
+            return False
+        except Exception as e:
+            last_err = e
+            if attempt == 1:
+                time.sleep(2)
+    log.warning("钉钉推送异常: %s", last_err)
+    return False

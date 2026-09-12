@@ -211,8 +211,11 @@ class CurrentDataProxy:
         if ctx and ctx.current_dt is not None:
             try:
                 df = get_price(code, count=1, frequency="1m")
-                if df is not None and not df.empty:
-                    return float(df["close"].iloc[-1])
+                if df is not None and not df.empty and isinstance(df.index, pd.DatetimeIndex):
+                    quote_dt = df.index[-1]
+                    asof = pd.Timestamp(ctx.current_dt)
+                    if quote_dt.normalize() == asof.normalize() and quote_dt <= asof:
+                        return float(df["close"].iloc[-1])
             except Exception:
                 pass
         return None
@@ -783,12 +786,12 @@ def get_attribute_history(security, count, unit="1d", fields=None,
 
 
 def _live_price(security):
-    """取当前 bar 的实时价，回退到持仓价。
+    """取当前 bar 的成交价；分钟模式缺行情时返回 0。
 
     1 Core：解析顺序在 ``core.pricing.resolve_live_price``（快照→分钟精确取点→
-    持仓价）。回测桥每根 bar 都会把各标的当前价写入 minute_prices 快照（日线用
+    日线模式持仓价）。回测桥每根 bar 都会把各标的当前价写入 minute_prices 快照（日线用
     close，分钟线用当前价），因此无论日线还是分钟模式都优先取该快照；
-    分钟模式下再回退到 manager 精确取点；最后回退到持仓价。
+    分钟模式下再向 manager 精确取点，缺失则拒绝委托。
     """
     return resolve_live_price(
         _state.get("minute_prices"), security,
@@ -982,8 +985,9 @@ def record(**kw):
 
 def _reset(manager, fee, slippage, cash):
     """回测前重置运行期状态，返回新建的 context。"""
-    global _current_data_proxy
+    global _current_data_proxy, _A_SHARE_CALENDAR
     _current_data_proxy = None
+    _A_SHARE_CALENDAR = None
     ctx = Context()
     ctx.portfolio = Portfolio(cash)
     _state.update(ctx=ctx, manager=manager, fee=fee, slippage=slippage,
@@ -994,7 +998,11 @@ def _reset(manager, fee, slippage, cash):
 
 
 def on_new_day():
-    """新交易日钩子：清零 T+1 当日买入冻结量，并清 current_data 静态日线缓存。"""
+    """新交易日钩子：释放 T+1，刷新日历和 current_data 静态日线缓存。"""
+    global _A_SHARE_CALENDAR
+    # 日历由已落盘指数日线推导；长驻模拟盘须在盘前重取新完成的交易日。
+    # 否则周末启动的进程到周二仍把上周五当 previous_date，选股日期滞后。
+    _A_SHARE_CALENDAR = None
     ctx = _state.get("ctx")
     if ctx is not None and ctx.portfolio is not None:
         for pos in ctx.portfolio.positions.values():

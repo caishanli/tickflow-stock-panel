@@ -3,7 +3,7 @@
 顺序（jq / ptrade 两 API 面相同，差异仅码制转换钩子）：
 1. ``snapshot``（回测桥/runner 每 bar 写入的分钟价快照，调用方域代码）；
 2. 分钟模式下 ``manager.get_minute_price_at`` 精确取点（拆股 as-of 撤销在内）；
-3. 回退持仓价（由调用方传入，无行情即 0 → 调用方按无行情处理）。
+3. 分钟模式无行情返回 0；仅日线模式保留持仓价回退。
 """
 from __future__ import annotations
 
@@ -24,4 +24,8 @@ def resolve_live_price(snapshot, code, *, minute_mode=False, manager=None,
         p = manager.get_minute_price_at(q, current_dt)
         if p is not None:
             return p
+    # 持仓价是估值标记，不能证明当前可成交。连续停牌第二日起可能连占位
+    # bar 都没有，此时量能停牌守卫无法确认停牌，也必须按无行情拒绝委托。
+    if minute_mode:
+        return 0
     return fallback_price or 0
