@@ -1,6 +1,8 @@
 import threading
 import time
 
+import pytest
+
 from app.services.stockdata.single_flight import DedupCache, SingleFlight, TTLCache
 
 
@@ -20,12 +22,15 @@ def test_single_flight_only_fetches_once():
     def worker():
         results.append(sf.run("k", loader))
 
-    ts = [threading.Thread(target=worker) for _ in range(5)]
-    for t in ts: t.start()
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(5)]
+    for t in ts:
+        t.start()
     assert entered.wait(5)  # leader 已到达 loader
     time.sleep(0.05)  # 留时间让其余 4 个并发请求到达 single-flight 的等待点
     release.set()
-    for t in ts: t.join()
+    for t in ts:
+        t.join(timeout=5)
+    assert all(not t.is_alive() for t in ts)
     assert results == [42] * 5
     assert len(calls) == 1  # 只回源一次
 
@@ -35,11 +40,8 @@ def test_single_flight_releases_on_error():
     def bad():
         raise RuntimeError("boom")
     for _ in range(2):
-        try:
+        with pytest.raises(RuntimeError, match="boom"):
             sf.run("k", bad)
-            assert False
-        except RuntimeError:
-            pass
 
 
 def test_ttl_cache_hit():
@@ -49,6 +51,40 @@ def test_ttl_cache_hit():
         c.get_or_fetch("k", ttl=10, loader=lambda: calls.append(1) or "v")
     assert len(calls) == 1
     assert c.get_or_fetch("k", ttl=10, loader=lambda: "x") == "v"
+
+
+def test_delayed_cache_miss_rechecks_after_leader_finished(monkeypatch):
+    cache = DedupCache()
+    missed = threading.Event()
+    resume = threading.Event()
+    original_get = cache._cache.get
+    calls = []
+    results = []
+
+    def get(key):
+        result = original_get(key)
+        if threading.current_thread().name == "delayed-miss" and not missed.is_set():
+            missed.set()
+            assert resume.wait(5)
+        return result
+
+    monkeypatch.setattr(cache._cache, "get", get)
+
+    def fetch():
+        return cache.get_or_fetch("k", 60, lambda: calls.append(1) or "frame")
+
+    thread = threading.Thread(target=lambda: results.append(fetch()),
+                              name="delayed-miss", daemon=True)
+    thread.start()
+    try:
+        assert missed.wait(5)
+        assert fetch() == "frame"
+    finally:
+        resume.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert results == ["frame"]
+    assert calls == [1]
 
 
 def test_ttl_cache_expires():

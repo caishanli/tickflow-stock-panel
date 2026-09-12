@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, TypeVar
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -30,6 +31,11 @@ logger = logging.getLogger("app.services.stockdata.sources")
 _HIST_TTL = 60.0  # 历史日线/分钟短 TTL（仅突发去重，不驻留）
 
 _T = TypeVar("_T")
+
+
+def _now() -> _dt.datetime:
+    """服务端行情时钟统一为北京时间，与分钟分区的无时区时间戳一致。"""
+    return _dt.datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
 
 
 def _tf_symbol(code: str) -> str:
@@ -63,7 +69,7 @@ def _is_index(code: str) -> bool:
 
 def _in_trading(now: _dt.datetime | None = None) -> bool:
     """交易时段判定（口径同 quant.simulate.runner.in_trading）。"""
-    now = now or _dt.datetime.now()
+    now = now or _now()
     t = now.time()
     return (now.weekday() < 5
             and (_dt.time(9, 30) <= t <= _dt.time(11, 30)
@@ -126,7 +132,7 @@ class MinuteMemoryStore:
     def ensure_day(self, day: _dt.date) -> None:
         """换日 lazy 清空：内存库只保留 `day` 当天的数据。"""
         with self._lock:
-            if self._day != day:
+            if self._day is None or self._day < day:
                 self._frames.clear()
                 self._day = day
 
@@ -141,17 +147,22 @@ class MinuteMemoryStore:
             frames = [frames]
         if not frames:
             return
+        target_day = _dt.date.fromisoformat(day[:10])
+        frames = [_as_datetime(df) for df in frames if not df.is_empty()]
         with self._lock:
-            self._day = _dt.datetime.fromisoformat(day).date()
+            # 跨日回源可能晚到，不能把新一天的内存库倒退或混入上一日数据。
+            if self._day is not None and target_day < self._day:
+                return
+            if self._day != target_day:
+                self._frames.clear()
+                self._day = target_day
             for df in frames:
-                if df.is_empty():
-                    continue
-                df = _as_datetime(df)
+                df = df.filter(pl.col("datetime").dt.date() == target_day)
                 syms = set(df["symbol"].to_list())
                 for sym in syms:
                     sub = df.filter(pl.col("symbol") == sym)
                     old = self._frames.get(sym)
-                    merged = pl.concat([old, sub]).unique(
+                    merged = pl.concat([old, sub], how="vertical_relaxed").unique(
                         subset=["datetime"], keep="last").sort("datetime") if old is not None \
                         else sub
                     self._frames[sym] = merged
@@ -160,11 +171,11 @@ class MinuteMemoryStore:
         """取内存库中指定标的在 [lo_ts, hi_ts] 的当日分钟（空帧当无数据）。"""
         with self._lock:
             parts = [self._frames[s] for s in symbols if s in self._frames]
-            if not parts:
-                return pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
-            df = pl.concat(parts).filter(
-                (pl.col("datetime") >= pd_to_ts(lo_ts)) & (pl.col("datetime") <= pd_to_ts(hi_ts)))
-            return df
+        if not parts:
+            return pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
+        # 帧以新对象替换；锁外过滤快照，避免历史大窗口阻塞实时写入。
+        return pl.concat(parts, how="vertical_relaxed").filter(
+            (pl.col("datetime") >= pd_to_ts(lo_ts)) & (pl.col("datetime") <= pd_to_ts(hi_ts)))
 
 
 class DayFileCache:
@@ -174,12 +185,15 @@ class DayFileCache:
     其他标的的后续请求直接命中。后台清扫线程每 10s 卸载超时（默认 60s）未
     访问的文件，并执行容量上限（默认 60 文件）淘汰。不预载、不驻留 400 天
     全市场整帧（spec 2026-08-21-stockdata-daily-dayfile-lru-design）。
+    fingerprint 提供目标日文件版本；访问时校验，落盘修复后不继续返回热旧帧。
     """
 
-    def __init__(self, ttl: float = 60.0, cap: int = 60) -> None:
+    def __init__(self, ttl: float = 60.0, cap: int = 60,
+                 fingerprint: Callable[[str, str], object] | None = None) -> None:
         self._ttl = ttl
         self._cap = cap
-        self._items: dict[tuple[str, str], tuple[float, pl.DataFrame]] = {}
+        self._fingerprint = fingerprint
+        self._items: dict[tuple[str, str], tuple[float, object, pl.DataFrame]] = {}
         self._lock = threading.Lock()
         self._single = SingleFlight()
 
@@ -189,12 +203,16 @@ class DayFileCache:
 
     def get(self, subdir: str, date: str) -> pl.DataFrame | None:
         """命中返回帧并刷新该文件最后访问时间；未命中返回 None（不加载）。"""
+        version = self._fingerprint(subdir, date) if self._fingerprint else None
         with self._lock:
             item = self._items.get((subdir, date))
             if item is None:
                 return None
-            _ts, frame = item
-            self._items[(subdir, date)] = (time.monotonic(), frame)
+            _ts, loaded_version, frame = item
+            if version != loaded_version:
+                del self._items[(subdir, date)]
+                return None
+            self._items[(subdir, date)] = (time.monotonic(), version, frame)
             return frame
 
     def get_or_load(self, subdir: str, date: str,
@@ -203,26 +221,30 @@ class DayFileCache:
         hit = self.get(subdir, date)
         if hit is not None:
             return hit
-        return self._single.run(
-            f"{subdir}:{date}",
-            lambda: self._insert(subdir, date, loader()))
+        def load_if_missing():
+            cached = self.get(subdir, date)
+            if cached is not None:
+                return cached
+            # 必须在读帧之前记录版本；读盘期间发生替换，下次访问仍能检测到。
+            version = self._fingerprint(subdir, date) if self._fingerprint else None
+            frame = loader()
+            if frame is None or frame.is_empty():
+                return None
+            self._insert(subdir, date, version, frame)
+            return frame
 
-    def _insert(self, subdir: str, date: str,
-                frame: pl.DataFrame | None) -> pl.DataFrame | None:
-        if frame is None or frame.is_empty():
-            return None
+        return self._single.run(f"{subdir}:{date}", load_if_missing)
+
+    def _insert(self, subdir: str, date: str, version: object, frame: pl.DataFrame) -> None:
         with self._lock:
-            # double-check：single-flight 期间可能已有其他线程载入
-            if (subdir, date) not in self._items:
-                self._items[(subdir, date)] = (time.monotonic(), frame)
-        return frame
+            self._items[(subdir, date)] = (time.monotonic(), version, frame)
 
     def sweep(self) -> int:
         """卸载超时未访问文件；仍超容量上限时按最后访问时间从旧到新踢。返回卸载数。"""
         now = time.monotonic()
         evicted = 0
         with self._lock:
-            for k in [k for k, (ts, _f) in self._items.items() if now - ts > self._ttl]:
+            for k in [k for k, (ts, _v, _f) in self._items.items() if now - ts > self._ttl]:
                 del self._items[k]
                 evicted += 1
             if len(self._items) > self._cap:
@@ -275,15 +297,6 @@ class NetworkPuller:
         """交易时段冷启动自举判定：当日既无合成记录也无结果缓存。"""
         if not _in_trading():
             return False
-        today = _dt.date.today()
-        if self._bootstrap_day != today:
-            self._bootstrap_day = today
-            self._bootstrapped.clear()
-            # 跨日残留会让 has_record 误判「当日已有记录」：_result_cache key 永不淘汰，
-            # synth 快照戳原要到收到新快照（晚于本判定）才重置——不清则自举退化为
-            # 每进程一次，次日早间分钟历史整天缺失
-            self._result_cache.clear()
-            self.synth.reset_if_new_day(today)
         has_record = (code_tf in self._bootstrapped
                       or code_tf in self._result_cache
                       or self.synth.last_quote_time(code_tf) is not None)
@@ -305,14 +318,17 @@ class NetworkPuller:
             if c not in pdf.columns:
                 pdf[c] = None
         frame = _as_datetime(pl.from_pandas(pdf[_MINUTE_COLS]))
+        frame = frame.filter(pl.col("datetime").dt.date() == _now().date())
         return frame if not frame.is_empty() else None
 
     def _seed_synth_from_frame(self, tf: str, frame: pl.DataFrame) -> None:
         """自举帧末行播种合成器：半程真实 bar + 累计量额基线（防首拍零量覆盖）。
 
-        mootdx 分钟量纲=股，与合成器一致；累计基线=全帧 volume/amount 求和。
+        mootdx 最近一页可能跨多个交易日；累计基线只累加今日量额。
         """
         try:
+            frame = _as_datetime(frame).filter(
+                (pl.col("symbol") == tf) & (pl.col("datetime").dt.date() == _now().date()))
             rows = frame.sort("datetime").tail(1).to_dicts()
             if not rows:
                 return
@@ -328,6 +344,13 @@ class NetworkPuller:
 
     def fetch_many(self, codes: list[str]) -> list[pl.DataFrame]:
         with self._chain_lock:
+            today = _now().date()
+            if self._bootstrap_day != today:
+                self._bootstrap_day = today
+                self._bootstrapped.clear()
+                # 在 TTL 查询之前换日，避免昨日结果命中而绕过自举/合成器重置。
+                self._result_cache.clear()
+                self.synth.reset_if_new_day(today)
             tf_codes = [_tf_symbol(c) for c in codes]
             out: dict[str, pl.DataFrame] = {}
             todo: list[str] = []
@@ -369,7 +392,7 @@ class NetworkPuller:
                     quotes.update(self.sina.fetch(missing))
                 emitted: set[str] = set()
                 if quotes:
-                    self.synth.reset_if_new_day(_dt.date.today())
+                    self.synth.reset_if_new_day(today)
                     for df in self.synth.update(quotes):
                         for sym in df["symbol"].unique().to_list():
                             sub = df.filter(pl.col("symbol") == sym)
@@ -452,7 +475,7 @@ class DataSources:
                 fetch_workers = 16
         self.dedup = DedupCache()
         self.minute_store = MinuteMemoryStore()
-        self.dayfile_cache = DayFileCache()
+        self.dayfile_cache = DayFileCache(fingerprint=self._day_file_version)
         self.puller = NetworkPuller(factory=mootdx_factory, workers=fetch_workers)
         self._names_map: dict[str, str] | None = None
         self._names_cache_file = os.path.join(self.data_root, ".stock_names_cache.json")
@@ -463,6 +486,24 @@ class DataSources:
         return self.dedup.get_or_fetch(key, ttl, loader)
 
     # ---- 分区扫描 ----
+    def _day_file_version(self, subdir: str, date: str) -> tuple:
+        """只 stat 目标日文件；回源原子替换/增删分片后热缓存立即失效。"""
+        root = os.path.join(self.data_root, subdir, f"date={date}")
+        try:
+            with os.scandir(root) as entries:
+                versions = []
+                for entry in entries:
+                    if entry.name.endswith(".parquet"):
+                        try:
+                            st = entry.stat()
+                        except FileNotFoundError:
+                            continue
+                        versions.append((entry.name, st.st_ino, st.st_size,
+                                         st.st_mtime_ns, st.st_ctime_ns))
+                return tuple(sorted(versions))
+        except FileNotFoundError:
+            return ()
+
     def _scan_partitions(self, subdir: str, day_lo: str | None, day_hi: str | None,
                          symbols: set[str] | None, cols: list[str]) -> pl.DataFrame:
         root = os.path.join(self.data_root, subdir)
@@ -631,96 +672,110 @@ class DataSources:
         return self.get_or_fetch(key, _HIST_TTL, _load)
 
     def get_minute(self, codes: list[str], lo_ts, hi_ts) -> pl.DataFrame:
-        """历史分钟读分区；若请求范围包含今日，叠加当日分钟内存库（网络数据）。"""
+        """历史分区短 TTL 去重；实时内存每次叠加，刷新后立即对回测/模拟盘可见。"""
+        if not codes:
+            return pl.DataFrame()
+        lo_d = str(pd_to_date(lo_ts)) if lo_ts is not None else None
+        hi_d = str(pd_to_date(hi_ts)) if hi_ts is not None else None
+        syms = {_tf_symbol(c) for c in codes}
+
         def _load():
-            lo_d = str(pd_to_date(lo_ts)) if lo_ts is not None else None
-            hi_d = str(pd_to_date(hi_ts)) if hi_ts is not None else None
-            syms = {_tf_symbol(c) for c in codes}
             parts = []
             for subdir in ("kline_etf_minute", "kline_minute"):
                 df = self._scan_partitions(subdir, lo_d, hi_d, syms, _MINUTE_COLS)
                 if not df.is_empty():
                     parts.append(df)
-            today = _dt.date.today()
-            if (lo_d is None or lo_d <= today.isoformat()) and (hi_d is None or hi_d >= today.isoformat()):
-                mem = self.minute_store.get_slice(syms, str(lo_ts or today), str(hi_ts or f"{today} 15:00:00"))
-                if not mem.is_empty():
-                    parts.append(mem)
             if not parts:
                 return pl.DataFrame()
-            out = pl.concat(parts).unique(subset=["symbol", "datetime"], keep="last")
+            out = pl.concat(parts, how="vertical_relaxed")
             if lo_ts is not None:
                 out = out.filter(pl.col("datetime") >= pd_to_ts(lo_ts))
             if hi_ts is not None:
                 out = out.filter(pl.col("datetime") <= pd_to_ts(hi_ts))
-            return out
+            return out.unique(subset=["symbol", "datetime"], keep="last")
 
-        # 短 TTL 仅突发去重；10s 保证当日内存库叠加层不过期
-        key = f"min:{','.join(sorted(codes))}:{lo_ts}:{hi_ts}"
-        return self.get_or_fetch(key, 10.0, _load)
+        key = f"min:{','.join(sorted(syms))}:{lo_ts}:{hi_ts}"
+        persisted = self.get_or_fetch(key, 10.0, _load)
+        today = _now().date()
+        if (lo_d is None or lo_d <= today.isoformat()) and (hi_d is None or hi_d >= today.isoformat()):
+            mem = self.minute_store.get_slice(
+                syms, str(lo_ts or today), str(hi_ts or f"{today} 15:00:00"))
+            if not mem.is_empty():
+                parts = [persisted, mem] if not persisted.is_empty() else [mem]
+                return pl.concat(parts, how="vertical_relaxed").unique(
+                    subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
+        # 纯历史缓存命中不重复拼帧/去重，保持回测大窗口的常数时间返回路径。
+        return persisted
 
     def get_realtime_snapshot(self, codes: list[str], as_of=None) -> pl.DataFrame:
-        """当日分钟内存库 + 未覆盖标的共享拉取池按需补实时（per-symbol 去重）。
+        """按 as-of 返回股票/ETF 当日分钟；只有真实今日的交易时段允许实时回源。
 
-        实时回源只在交易时段执行；非交易时段只读内存库 + 当日分区（不触网）。
-        指数标的（仅用日线）不参与实时回源。
+        历史补跑只读分区，不改变实时库日期。回源帧限定目标日，未来 bar 在
+        新鲜度判定之前过滤，避免收盘分区的未来行掩盖当前分钟缺口。
         """
-        asof_ts = pd_to_ts(as_of) if as_of is not None else _dt.datetime.now()
-        today = asof_ts.date()
+        now = _now()
+        asof_ts = pd_to_ts(as_of) if as_of is not None else now
+        day = asof_ts.date()
+        day_start = _dt.datetime.combine(day, _dt.time())
         tf_syms = {_tf_symbol(c) for c in codes}
-        self.minute_store.ensure_day(today)
+        empty = pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
+        if not tf_syms:
+            return empty
+        is_today = day == now.date()
+        if is_today:
+            self.minute_store.ensure_day(day)
 
-        # 基础帧：当日分区（收盘同步/重启场景，经日期文件 LRU 缓存避免逐请求重扫）
-        # + 内存库（网络实时）。spec 2026-08-21-stockdata-realtime-cache-design。
+        def window(frame):
+            return _as_datetime(frame).filter(
+                pl.col("symbol").is_in(tf_syms)
+                & (pl.col("datetime") >= day_start)
+                & (pl.col("datetime") <= asof_ts))
+
         base_parts = []
-        part = self.dayfile_cache.get_or_load(
-            "kline_etf_minute", today.isoformat(),
-            lambda: self._read_day_file("kline_etf_minute", today.isoformat(), _MINUTE_COLS))
-        if part is not None and not part.is_empty():
-            base_parts.append(part.filter(pl.col("symbol").is_in(tf_syms)))
-        mem = self.minute_store.get_slice(tf_syms, f"{today} 00:00:00", str(asof_ts))
-        if not mem.is_empty():
-            base_parts.append(mem)
-        base = pl.concat(base_parts).unique(subset=["symbol", "datetime"], keep="last") \
-            if base_parts else pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
+        for subdir in ("kline_etf_minute", "kline_minute"):
+            part = self.dayfile_cache.get_or_load(
+                subdir, day.isoformat(),
+                functools.partial(self._read_day_file, subdir, day.isoformat(), _MINUTE_COLS))
+            if part is not None and not part.is_empty():
+                sub = window(part)
+                if not sub.is_empty():
+                    base_parts.append(sub)
+        if is_today:
+            mem = self.minute_store.get_slice(tf_syms, str(day_start), str(asof_ts))
+            if not mem.is_empty():
+                base_parts.append(mem)
+        base = pl.concat(base_parts, how="vertical_relaxed").unique(
+            subset=["symbol", "datetime"], keep="last") if base_parts else empty
 
-        # 未覆盖：内存缺失，或内存最新 bar < asof（过期）。指数跳过。非交易时段不拉。
-        # 陈旧阈值可调（STOCKDATA_RT_STALE_SEC，默认 10s）；合成器快照新鲜可豁免
-        # （bar 时间旧但刚收到实时快照 → 合成 bar 已足够新，不重复回源）。
         try:
             stale_sec = float(os.getenv("STOCKDATA_RT_STALE_SEC", "") or 10.0)
         except ValueError:
             stale_sec = 10.0
 
-        def _is_stale(sym: str, last_dt) -> bool:
+        def is_stale(sym, last_dt):
             qt = self.puller.synth.last_quote_time(sym)
-            eff = max(last_dt, qt) if qt is not None else last_dt
+            # 另一个客户端可能已请求更晚时点，未来快照不能豁免本次 as-of 缺口。
+            eff = max(last_dt, qt) if qt is not None and qt <= asof_ts else last_dt
             return eff < asof_ts - _dt.timedelta(seconds=stale_sec)
 
-        latest_by_sym = {}
-        for sym, mx in base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows():
-            latest_by_sym[sym] = mx
-        todo = [c for c in codes
-                if _in_trading(asof_ts) and not _is_index(c)
+        latest_by_sym = dict(base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows())
+        todo = [c for c in dict.fromkeys(codes)
+                if is_today and _in_trading(now) and _in_trading(asof_ts) and not _is_index(c)
                 and (_tf_symbol(c) not in latest_by_sym
-                     or _is_stale(_tf_symbol(c), latest_by_sym[_tf_symbol(c)]))]
-        fills: list[pl.DataFrame] = []
+                     or is_stale(_tf_symbol(c), latest_by_sym[_tf_symbol(c)]))]
         if todo:
-            pulls = self.puller.fetch_many(todo)
-            for df in pulls:
-                if not df.is_empty():
-                    fills.append(df)
-            # 更新当日分钟内存库（网络数据才驻留）
-            if fills:
-                self.minute_store.update(today.isoformat(), fills)
-
-        if not (base_parts or fills):
-            # 无基础帧也无实时填充：返回空帧、跳过过滤（空帧 datetime 为 Utf8，
-            # 不能与 datetime 字面量比较 → InvalidOperationError）
-            return pl.DataFrame(schema={c: pl.Utf8 for c in _MINUTE_COLS})
-        out = pl.concat(base_parts + fills).unique(subset=["symbol", "datetime"], keep="last")
-        out = out.filter(pl.col("datetime") <= asof_ts)
-        return out.sort(["symbol", "datetime"])
+            for frame in self.puller.fetch_many(todo):
+                if frame.is_empty():
+                    continue
+                frame = window(frame)
+                if frame.is_empty():
+                    continue
+                self.minute_store.update(day.isoformat(), frame)
+                base_parts.append(frame)
+        if not base_parts:
+            return empty
+        return pl.concat(base_parts, how="vertical_relaxed").unique(
+            subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
 
     # ---- 元数据 ----
     def get_trade_days(self, start_date: str, end_date: str) -> list[str]:

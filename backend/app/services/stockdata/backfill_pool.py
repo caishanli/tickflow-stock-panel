@@ -9,7 +9,7 @@ import datetime as _dt
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 logger = logging.getLogger("app.services.stockdata.backfill_pool")
 
@@ -68,6 +68,7 @@ class BackfillPool:
         ``keep_frames=False``：池不驻留结果帧（分钟级大帧 × 全市场会推高
         RSS 至 OOM——旧串行实现每批 flush 即弃，本参数保持该峰值形态），
         "ok" 恒为空列表，成功数看 "ok_count"；调用方经 on_batch_done 消费。
+        最多保留 2×workers 个在途任务；回调按完成顺序消费，返回 ok 保持输入顺序。
         """
         symbols = list(symbols)
         # mootdx 真源路径（默认 None 或 MootdxSource；测试假源不拦截）：
@@ -85,7 +86,7 @@ class BackfillPool:
                 return {"ok": [], "ok_count": 0,
                         "failed": {s: BREAKER_OPEN_MSG for s in symbols}}
         workers = self.effective_workers(len(symbols))
-        results: list = []
+        results: dict = {}
         ok_count = 0
         failed: dict[str, str] = {}
         batch: list = []
@@ -101,25 +102,39 @@ class BackfillPool:
 
         with ThreadPoolExecutor(max_workers=workers,
                                 thread_name_prefix="backfill") as ex:
-            futures = [ex.submit(_one, s) for s in symbols]
-            for fut in futures:
-                sym, out, err = fut.result()
-                if err is not None:
-                    failed[sym] = str(err)[:120]
-                    continue
-                if out is not None:
-                    if keep_frames:
-                        results.append(out)
-                    ok_count += 1
-                    # 仅在确有回调时攒批：否则 keep_frames=False 下 batch
-                    # 会全程驻留帧（潜在 OOM 脚枪，评审复审指出）
-                    if on_batch_done is not None:
-                        batch.append(out)
-                if on_batch_done is not None and len(batch) >= batch_size:
-                    on_batch_done(batch)
-                    batch = []
+            # Future 也持有结果帧：全量 submit + 保存 futures 会使已落盘数据
+            # 仍驻留至整批结束。限制待完成窗口，并在消费后释放 Future/帧引用。
+            remaining = iter(enumerate(symbols))
+            pending = {}
+            for index, sym in remaining:
+                pending[ex.submit(_one, sym)] = index
+                if len(pending) >= workers * 2:
+                    break
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                while done:
+                    fut = done.pop()
+                    index = pending.pop(fut)
+                    sym, out, err = fut.result()
+                    if err is not None:
+                        failed[sym] = str(err)[:120]
+                    elif out is not None:
+                        if keep_frames:
+                            results[index] = out
+                        ok_count += 1
+                        if on_batch_done is not None:
+                            batch.append(out)
+                    if on_batch_done is not None and len(batch) >= batch_size:
+                        on_batch_done(batch)
+                        batch = []
+                    del fut, out, err
+                    item = next(remaining, None)
+                    if item is not None:
+                        index, sym = item
+                        pending[ex.submit(_one, sym)] = index
         if on_batch_done is not None and batch:
             on_batch_done(batch)
         logger.info("backfill pool done: ok=%d failed=%d workers=%d",
                     ok_count, len(failed), workers)
-        return {"ok": results, "ok_count": ok_count, "failed": failed}
+        return {"ok": [results[i] for i in sorted(results)],
+                "ok_count": ok_count, "failed": failed}

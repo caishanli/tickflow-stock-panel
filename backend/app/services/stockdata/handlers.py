@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 
-from .sources import DataSources, _to_jq
+from .sources import DataSources, _now, _to_jq, pd_to_ts
 
 logger = logging.getLogger("app.services.stockdata.handlers")
 
@@ -49,10 +49,13 @@ def h_get_price(p, s: DataSources):
             df = s.apply_qfq_daily(df)
         return "parquet", df
     # 分钟：区间内（或当日）1m
-    if not start or not end:
-        today = _dt.date.today().isoformat()
-        start, end = start or today, end or today
-    df = s.get_minute(codes, start + " 00:00:00", end + " 15:00:00")
+    today = _now().date().isoformat()
+    start, end = start or today, end or today
+    lo_ts, hi_ts = pd_to_ts(start), pd_to_ts(end)
+    # 日期上界包含收盘；带时分秒的上界必须原样保留，不能拼出两个时间段。
+    if len(str(end)) in (8, 10):
+        hi_ts = hi_ts.replace(hour=15)
+    df = s.get_minute(codes, str(lo_ts), str(hi_ts))
     return "parquet", df
 
 

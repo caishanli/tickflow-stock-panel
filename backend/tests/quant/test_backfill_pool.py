@@ -68,3 +68,57 @@ def test_keep_frames_false_does_not_retain():
     assert res["ok"] == []            # 池未驻留
     assert res["ok_count"] == 3
     assert len(held) == 3             # 帧仍经批回调全量送达
+
+
+def test_flushed_frames_are_released_before_map_finishes():
+    """Future 自身也持有结果；仅返回 ok=[] 不能证明批量落盘后内存释放。"""
+    import weakref
+
+    class Frame:
+        pass
+
+    first_batch = []
+    retained_at_flush = []
+
+    def flush(batch):
+        if not first_batch:
+            first_batch.extend(weakref.ref(frame) for frame in batch)
+        else:
+            retained_at_flush.append(sum(ref() is not None for ref in first_batch))
+
+    pool = BackfillPool(workers=2, source_factory=object)
+    result = pool.map(lambda _src, _sym: Frame(), range(30), batch_size=2,
+                      on_batch_done=flush, keep_frames=False)
+    assert result["ok_count"] == 30
+    assert retained_at_flush == [0] * 14
+
+
+def test_completed_symbols_flush_while_first_symbol_is_slow():
+    import threading
+
+    release = threading.Event()
+    flushed = threading.Event()
+    result = []
+
+    def fetch(_src, symbol):
+        if symbol == "slow":
+            assert release.wait(5)
+        return symbol
+
+    def flush(batch):
+        if "fast" in batch:
+            flushed.set()
+
+    pool = BackfillPool(workers=2, source_factory=object)
+    thread = threading.Thread(target=lambda: result.append(pool.map(
+        fetch, ["slow", "fast"], batch_size=1, on_batch_done=flush
+    )), daemon=True)
+    thread.start()
+    try:
+        assert flushed.wait(2), "已完成数据不应等待队首慢标的才落盘"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    # 返回结果保留调用方输入顺序，落盘回调按完成顺序流式消费。
+    assert result[0]["ok"] == ["slow", "fast"]

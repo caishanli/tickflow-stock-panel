@@ -12,7 +12,7 @@ from typing import Any
 
 
 class _Flight:
-    __slots__ = ("ev", "started", "result", "error")
+    __slots__ = ("error", "ev", "result", "started")
 
     def __init__(self) -> None:
         self.ev = threading.Event()
@@ -119,9 +119,15 @@ class DedupCache:
         hit = self._cache.get(key)
         if hit is not None:
             return hit
-        # 双检：并发时 single-flight 保证 loader 只执行一次
-        return self._single.run(
-            key, lambda: self._cache.set(key, loader(), ttl))
+        def load_if_missing():
+            # 首次 miss 后线程可能被挂起，恢复时上一轮 flight 已结束并填好缓存。
+            # 双检必须在新 leader 内执行，否则会重复回源并覆盖刚写入的结果。
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached
+            return self._cache.set(key, loader(), ttl)
+
+        return self._single.run(key, load_if_missing)
 
     def purge_expired(self) -> int:
         return self._cache.purge_expired()

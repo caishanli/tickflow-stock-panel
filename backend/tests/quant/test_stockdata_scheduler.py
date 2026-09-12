@@ -2,7 +2,19 @@
 import datetime as _dt
 import threading
 
+import pytest
+
 from app.services.stockdata import scheduler as sch
+
+
+@pytest.fixture(autouse=True)
+def isolate_external_sync(monkeypatch):
+    """调度单测只验证编排，禁止真实净值/备用源回源和用户分区写入。"""
+    from app.services import alt_daily, etf_nav_service, tencent_minute
+
+    monkeypatch.setattr(etf_nav_service, "sync_etf_nav", lambda: 0)
+    monkeypatch.setattr(tencent_minute, "fill_recent_gaps", lambda *_a, **_k: {})
+    monkeypatch.setattr(alt_daily, "fill_recent_gaps_daily", lambda *_a, **_k: {})
 
 
 class _FakeLock:
@@ -146,6 +158,7 @@ def test_run_sync_incremental_keeps_limit(monkeypatch):
 def test_run_check_day_runs_repair(monkeypatch):
     """check_day 后台执行体：解析日期并调 mootdx_service.check_and_repair_day。"""
     from datetime import date as _d
+
     from app.services import mootdx_service
     calls = []
     monkeypatch.setattr(sch, "_sync_lock", lambda: _FakeLock())
@@ -193,7 +206,9 @@ def test_dayfile_sweep_loop_evicts_expired(monkeypatch):
     """清扫线程循环：每 interval 秒 sweep 一次，过期文件被卸载。"""
     import threading as _th
     import time as _t
+
     import polars as pl
+
     from app.services.stockdata import scheduler as sch
     from app.services.stockdata.sources import DayFileCache
 
