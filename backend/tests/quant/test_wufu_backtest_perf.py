@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from app.quant.config import CONFIG
 from app.quant.jqengine.datasource.manager import DataManager
 
 pytestmark = pytest.mark.integration
@@ -21,11 +22,25 @@ PERF_BUDGET_S = 120
     not os.path.isdir(os.path.join(DataManager._partition_root(), "kline_daily")),
     reason="需要真实 data/ 分区",
 )
-def test_wufu_backtest_within_120s():
+def test_wufu_backtest_within_120s(tmp_path, monkeypatch, record_property):
+    import pandas as pd
+
     from app.quant.rqalpha_bridge import run_jq_backtest
+
+    monkeypatch.setattr(CONFIG, "db_path", str(tmp_path / "quant.db"))
     t0 = time.monotonic()
-    run_jq_backtest(STRATEGY, {"start": START, "end": END,
-                               "benchmark": "510300.XSHG", "minute_cache_cap": 800},
-                    db_path="data/quant.db")
+    result = run_jq_backtest(
+        STRATEGY, {"start": START, "end": END, "out_dir": str(tmp_path),
+                   "benchmark": "510300.XSHG", "minute_cache_cap": 800},
+        db_path=CONFIG.db_path)
     elapsed = time.monotonic() - t0
+    record_property("elapsed_s", elapsed)
+    # 快速返回错误或零成交不能通过性能门禁，也不能写入相对路径的遗留业务库。
+    assert "error" not in result, result
+    assert result.get("n_trades", 0) > 0, result
+    equity = pd.read_csv(tmp_path / "equity.csv")
+    assert equity["date"].iloc[0] == START
+    assert equity["date"].iloc[-1] == END
+    assert len(equity) == 72
+    assert equity["date"].is_unique
     assert elapsed <= PERF_BUDGET_S, f"回测耗时 {elapsed:.1f}s 超过 {PERF_BUDGET_S}s 预算"

@@ -167,7 +167,8 @@ def test_xdxr_failure_not_cached(monkeypatch):
     src._xdxr_cache = {}
     calls = {"n": 0}
 
-    def fake_retry(fn, empty_ok=False):
+    def fake_retry(fn, empty_ok=False, count_breaker=True):
+        assert count_breaker is False
         calls["n"] += 1
         return (None, "down") if calls["n"] == 1 else ([], None)
 

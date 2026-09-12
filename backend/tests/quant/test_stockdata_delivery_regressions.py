@@ -201,3 +201,84 @@ def test_snapshot_cache_sees_repair_and_partition_removal(delivery, tmp_path):
     assert src.get_realtime_snapshot(["600000.SH"], now)["close"].to_list() == [2.0]
     (tmp_path / "kline_minute" / f"date={day}" / "part.parquet").unlink()
     assert src.get_realtime_snapshot(["600000.SH"], now).is_empty()
+
+
+@pytest.fixture
+def manager_delivery(delivery, tmp_path):
+    """保留真实 handler/协议/客户端转换，避免宽松替身掩盖分钟上界契约。"""
+    import msgpack
+
+    from app.quant.datasource.network_client import StockDataClient
+    from app.quant.jqengine.datasource.cache import DataCache
+    from app.quant.jqengine.datasource.manager import DataManager
+    from app.services.stockdata.protocol import encode_response
+
+    src, now, _fetch = delivery
+
+    class InProcessClient(StockDataClient):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def _request(self, method, params, retry=3):
+            self.requests.append((method, params))
+            kind, data = handle(method, params, src)
+            return msgpack.unpackb(encode_response(1, True, kind, data)[4:], raw=False)
+
+    dm = DataManager(token="", cache=DataCache(root=str(tmp_path / "client-cache")))
+    dm.client = InProcessClient()
+    day = (now - dt.timedelta(days=1)).date()
+    dm.set_minute_window(str(day), str(day))
+    return dm, day
+
+
+@pytest.mark.parametrize("subdir,symbol,code", [
+    ("kline_minute", "600000.SH", "600000.XSHG"),
+    ("kline_etf_minute", "512670.SH", "512670.XSHG"),
+])
+def test_sim_feed_single_symbol_reload_includes_target_day(
+    manager_delivery, tmp_path, subdir, symbol, code,
+):
+    from app.quant.simulate.runner import _hist_feed
+
+    dm, day = manager_delivery
+    opening = dt.datetime.combine(day, dt.time(9, 31))
+    close = opening.replace(hour=15, minute=0)
+    write_partition(tmp_path, subdir, day, pl.concat([
+        minute(symbol, opening, 2.0), minute(symbol, close, 3.0),
+    ]))
+    # 缓存未覆盖历史日：走单标的 get_price，不能把午夜上界传给精确时间接口。
+    prices, bar_dt, _ = _hist_feed(dm, [code], opening, {})
+    assert prices == {code: 2.0}
+    assert bar_dt == opening
+    assert dm.get_minute_price_at(code, close) == 3.0
+    # 新客户端明确发送收盘上界，不依赖服务端对旧版午夜请求的兼容。
+    assert any(method == "get_price" and params["end_date"] == str(close)
+               for method, params in dm.client.requests)
+
+
+def test_manager_minute_feed_preserves_explicit_intraday_end(manager_delivery, tmp_path):
+    dm, day = manager_delivery
+    end = dt.datetime.combine(day, dt.time(13, 10))
+    write_partition(tmp_path, "kline_etf_minute", day, pl.concat([
+        minute("512670.SH", end, 2.0),
+        minute("512670.SH", end + dt.timedelta(minutes=1), 3.0),
+    ]))
+    frame = dm.get_minute_feed("512670.XSHG", end, end)
+    assert frame is not None
+    assert frame["close"].to_list() == [2.0]
+
+
+@pytest.mark.parametrize("time_suffix", ["", " 00:00:00", "T00:00:00"])
+def test_minute_get_price_accepts_legacy_whole_day_upper_bound(delivery, tmp_path, time_suffix):
+    src, now, _fetch = delivery
+    close = now.replace(hour=15, minute=0, second=0)
+    write_partition(tmp_path, "kline_etf_minute", now.date(), pl.concat([
+        minute("512670.SH", now, 2.0), minute("512670.SH", close, 3.0),
+    ]))
+    kind, frame = handle("get_price", {
+        "security": "512670.XSHG", "frequency": "1m",
+        "start_date": str(now.date()), "end_date": str(now.date()) + time_suffix,
+    }, src)
+    assert kind == "parquet"
+    assert frame.sort("datetime")["close"].to_list() == [2.0, 3.0]

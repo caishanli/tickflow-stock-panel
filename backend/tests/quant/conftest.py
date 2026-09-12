@@ -7,6 +7,15 @@ import pytest
 
 
 @pytest.fixture
+def sync_dingtalk_executor(monkeypatch):
+    """通知断言同步执行，避免 submit 返回后后台线程尚未触发 mock 的竞态。"""
+    from app.quant.simulate import runner
+
+    monkeypatch.setattr(runner, "_DINGTALK_EXECUTOR", types.SimpleNamespace(
+        submit=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+
+@pytest.fixture
 def mem_ok(monkeypatch):
     """内存守卫隔离: 无活模拟盘进程 + 内存充裕(守卫恒放行)。
 

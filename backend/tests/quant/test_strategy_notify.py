@@ -20,7 +20,7 @@ def _fresh_db():
     return path
 
 
-def test_strategy_notify_writes_log_and_triggers_dingtalk():
+def test_strategy_notify_writes_log_and_triggers_dingtalk(sync_dingtalk_executor):
     """log.notify() 写入 sim_logs 并触发钉钉异步发送。"""
     p = _fresh_db()
     db.insert_sim_account("a1", "acc", 10000.0, 0.03, "created")

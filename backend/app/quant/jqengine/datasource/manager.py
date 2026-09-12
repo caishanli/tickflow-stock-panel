@@ -1445,7 +1445,9 @@ class DataManager:
 
         layers = []
         if use_real:
-            real = self._load_real_minute(code, lo_ts, hi_ts, all_min)
+            # 单标的路径与批量预热使用同一有效上界。网络接口保留精确时间，
+            # 原样传归一后的午夜会排除目标日，令历史模拟盘整日无价、零成交。
+            real = self._load_real_minute(code, lo_ts, hi_eff, all_min)
             if real is not None and not real.empty:
                 # H6b：real_ 本地帧可延伸到窗口之外（缓存随"今天"推移增长），
                 # 先裁到 [lo, hi] 再并入，避免越界/未来数据进入合并结果。

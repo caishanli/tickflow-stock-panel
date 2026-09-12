@@ -17,7 +17,7 @@ def _fresh_db():
     return path
 
 
-def test_notify_level_triggers_dingtalk_when_enabled():
+def test_notify_level_triggers_dingtalk_when_enabled(sync_dingtalk_executor):
     """账户开启钉钉 + 配了 webhook 时，notify level 触发异步发送。"""
     p = _fresh_db()
     db.insert_sim_account("a1", "acc", 10000.0, 0.03, "created")

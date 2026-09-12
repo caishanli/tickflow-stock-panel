@@ -52,8 +52,9 @@ def h_get_price(p, s: DataSources):
     today = _now().date().isoformat()
     start, end = start or today, end or today
     lo_ts, hi_ts = pd_to_ts(start), pd_to_ts(end)
-    # 日期上界包含收盘；带时分秒的上界必须原样保留，不能拼出两个时间段。
-    if len(str(end)) in (8, 10):
+    # 旧版 DataManager 把日期序列化成午夜；兼容已运行客户端的整日语义，
+    # 避免只重启 stockdata 后历史模拟盘整日无价。盘中上界仍原样保留。
+    if hi_ts == hi_ts.normalize():
         hi_ts = hi_ts.replace(hour=15)
     df = s.get_minute(codes, str(lo_ts), str(hi_ts))
     return "parquet", df
