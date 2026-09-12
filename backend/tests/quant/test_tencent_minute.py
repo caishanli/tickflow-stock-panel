@@ -3,7 +3,11 @@
 背景：mootdx K 线全局返回空时（2026-09-10 起），分钟批量回源整批失败；
 本模块用腾讯 mkline 回补近期缺口。口径已实锤：行格式 [时间, 开, 收, 高,
 低, 量(手), {}, 换手率基点]（600000 全天 rollup vs 快照 OHLCV 对齐，量差 1 手）。
+
+09-10 残缺案例驱动的新语义：have 判定按「当日最后 bar 是否到收盘段」，
+对未覆盖 symbol 只追加其既有最后 bar 之后的行（symbol 出现 ≠ 当日完整）。
 """
+import datetime as _dt
 from datetime import date
 
 import polars as pl
@@ -88,7 +92,9 @@ def _mk_payload(rows):
 def test_fetch_m1_ok_and_shapes():
     s = _FakeSession([_mk_payload(ROWS)])
     assert tm.fetch_m1(s, "sh600000") == ROWS
-    assert "sh600000,m1,,320" in s.calls[0]
+    # 800 根：320 只够 1.3 个交易日，09-10 案例里 T-2 缺口补不到（>800 上限封顶）
+    assert "sh600000,m1,,800" in s.calls[0]
+    assert tm._bars() == 800
     # 空 m1（停牌/限流）→ 重试后返回空帧（每次均空，非网络失败）
     assert tm._fetch_symbol(
         _FakeSession([_mk_payload([])] * 3), "600000.SH", {D11}).is_empty()
@@ -101,7 +107,6 @@ def test_fetch_symbol_retry_then_ok(monkeypatch):
     df = tm._fetch_symbol(_FakeSession([_mk_payload([])]),
                           "600000.SH", {D11}, )
     assert df.is_empty()
-    import requests as _rq
     calls = []
     orig = tm.fetch_m1
 
@@ -119,17 +124,56 @@ def test_fetch_symbol_retry_then_ok(monkeypatch):
     assert len(calls) == 3 and len(s.calls) == 1
 
 
+def _write_minute_part(root, day, sym_ts: list[tuple[str, _dt.datetime]]):
+    pdir = root / f"date={day.isoformat()}"
+    pdir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": [s for s, _ in sym_ts],
+        "datetime": [t for _, t in sym_ts],
+    }, schema_overrides={"datetime": pl.Datetime("us")}).write_parquet(pdir / "part.parquet")
+
+
+def test_partition_keys_counts_and_completeness(tmp_path):
+    """「当日完整」按 bar 数判定：symbol 存在但 bar 数量级短缺 → 不完整。"""
+    root = tmp_path / "kline_minute"
+    _write_minute_part(root, D10, [
+        ("600000.SH", _dt.datetime(2026, 9, 10, 13, 42)),
+        ("600000.SH", _dt.datetime(2026, 9, 10, 15, 0)),   # 尾段残缺（09-10 案例）
+        ("000001.SZ", _dt.datetime(2026, 9, 10, 9, 31)),
+        ("000001.SZ", _dt.datetime(2026, 9, 10, 15, 0)),
+    ])
+    keys = tm._partition_keys(root, D10)
+    assert keys is not None and keys.height == 4
+    counts = tm._bar_counts(keys)
+    assert counts == {"600000.SH": 2, "000001.SZ": 2}
+    assert not tm._day_complete(counts, "600000.SH")   # 2 根 << 200
+    assert not tm._day_complete(counts, "缺 partition.SH")
+    # 完整日（241 根）才判完整
+    full = dict.fromkeys(["600000.SH"], 241)
+    assert tm._day_complete(full, "600000.SH")
+    assert tm._partition_keys(root, D11) is None  # 缺分区 → None
+
+
 def test_fill_recent_gaps_policy(monkeypatch):
     import app.services.mootdx_service as ms
     from app.quant.jqengine.datasource import mootdx_breaker as mbr
     called = []
     monkeypatch.setattr(tm, "sync_stock_minute_tencent",
                         lambda days, **k: called.append(days) or {"total": 1})
+    monkeypatch.setattr(ms, "_short_bar_minute_days", lambda root, **k: [])
     # 无缺口 → 不触发
     monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda: [])
     assert tm.fill_recent_gaps("stock") is None
     assert called == []
+    # 分区齐全但 bar 数量级残缺（09-10 案例：symbol 覆盖 99.8%，每只仅 79 根）
+    # → 同样视为缺口触发回补
+    monkeypatch.setattr(ms, "_short_bar_minute_days", lambda root, **k: [D10])
+    monkeypatch.setattr(mbr, "kline_allowed", lambda: False)
+    assert tm.fill_recent_gaps("stock") == {"total": 1}
+    assert called == [[D10]]
+    called.clear()
     # 有缺口但熔断关闭 → 不触发（mootdx 自行处理）
+    monkeypatch.setattr(ms, "_short_bar_minute_days", lambda root, **k: [])
     monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda: [D10])
     monkeypatch.setattr(mbr, "kline_allowed", lambda: True)
     assert tm.fill_recent_gaps("stock") is None
@@ -140,15 +184,53 @@ def test_fill_recent_gaps_policy(monkeypatch):
     assert called == [[D10]]
 
 
-def test_only_missing_never_overwrites(monkeypatch):
+def test_only_missing_fills_holes_never_overwrites(monkeypatch, tmp_path):
+    """缺口按 (symbol,datetime) 反连接填充：洞在上午/尾段都能补，已有 bar 不动。"""
     import app.services.mootdx_service as ms
-    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.SH", "000001.SZ"])
+    monkeypatch.setattr(ms, "_stock_universe",
+                        lambda: ["600001.SH", "600000.SH", "000001.SZ"])
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
-    # 600000 两天分区里都有 → 整批跳过；000001 两天都没有 → 全拉
-    monkeypatch.setattr(tm, "_partition_symbols",
-                        lambda root, d: {"600000.SH"})
+    # 分区现状（模拟 09-10 残缺形态：尾段已有、上午缺失）：
+    # - 600001.SH 两天都完整（241 根）→ 整批跳过，连网都不碰
+    # - 600000.SH D10 只有尾段 2 根、D11 完整 → 拉取后只补 D10 缺失时间戳
+    # - 000001.SZ 两天分区都没有 → 全量补
+    root = tmp_path / "sm"
+    _write_minute_part(root, D10, [
+        ("600001.SH", _dt.datetime(2026, 9, 10, 9, 31)),
+        ("600001.SH", _dt.datetime(2026, 9, 10, 15, 0)),
+        ("600000.SH", _dt.datetime(2026, 9, 10, 13, 42)),   # 尾段残缺
+        ("600000.SH", _dt.datetime(2026, 9, 10, 15, 0)),
+    ])
+    # 600001 补足 241 根（bar 数 ≥200 判完整）
+    pdir = root / f"date={D10.isoformat()}"
+    df = pl.read_parquet(pdir / "part.parquet")
+    extra = pl.DataFrame({
+        "symbol": ["600001.SH"] * 239,
+        "datetime": [_dt.datetime(2026, 9, 10, 9, 32) + _dt.timedelta(minutes=i)
+                     for i in range(239)],
+    }, schema_overrides={"datetime": pl.Datetime("us")})
+    pl.concat([df, extra]).write_parquet(pdir / "part.parquet")
+    _write_minute_part(root, D11, [
+        ("600001.SH", _dt.datetime(2026, 9, 11, 15, 0)),
+        ("600000.SH", _dt.datetime(2026, 9, 11, 15, 0)),
+        ("600000.SH", _dt.datetime(2026, 9, 11, 9, 31)),
+    ])
+    pdir11 = root / f"date={D11.isoformat()}"
+    df11 = pl.read_parquet(pdir11 / "part.parquet")
+    extra11 = pl.DataFrame({
+        "symbol": ["600001.SH"] * 240,
+        "datetime": [_dt.datetime(2026, 9, 11, 9, 31) + _dt.timedelta(minutes=i)
+                     for i in range(240)],
+    }, schema_overrides={"datetime": pl.Datetime("us")})
+    pl.concat([df11, extra11]).write_parquet(pdir11 / "part.parquet")
+    monkeypatch.setattr(ms, "STOCK_MINUTE_ROOT", root)
     fetched = []
-    frames_600 = tm.parse_m1_rows("600000.SH", ROWS, {D10, D11})
+    frames_600 = tm.parse_m1_rows("600000.SH", [
+        ["202609100931", "9.3", "9.3", "9.3", "9.3", "100", {}, "0"],   # 缺 → 补
+        ["202609101342", "9.3", "9.3", "9.3", "9.3", "100", {}, "0"],   # 已有 → 反连接剔除
+        ["202609101500", "9.3", "9.3", "9.3", "9.3", "100", {}, "0"],   # 已有 → 反连接剔除
+        ["202609111500", "9.3", "9.3", "9.3", "9.3", "100", {}, "0"],   # D11 已有 → 剔除
+    ], {D10, D11})
     frames_001 = tm.parse_m1_rows("000001.SZ", ROWS, {D10, D11})
 
     def _fake_backfill(syms, days, progress=""):
@@ -168,8 +250,16 @@ def test_only_missing_never_overwrites(monkeypatch):
     flushed = []
     monkeypatch.setattr(ms, "_flush_stock_minute_chunk", flushed.extend)
     res = tm.sync_stock_minute_tencent([D10, D11])
-    assert fetched == ["000001.SZ"]  # 600000 两天都有，连网都不碰
-    # D10/D11: 仅000001（各1行/2行，600000被过滤，mootdx bar 保留）
-    assert res["total"] == 3
-    assert res["rows"] == {D10.isoformat(): 1, D11.isoformat(): 2}
-    assert {f["symbol"][0] for f in flushed} == {"000001.SZ"}
+    assert fetched == ["600000.SH", "000001.SZ"]  # 600001 两天完整，连网都不碰
+    # D10: 600000 仅补缺失的 09:31 一根 + 000001 一根全补（ROWS 中 D10 仅 15:00）
+    # D11: 600000 的 15:00 已有 → 反连接后为空，只剩 000001 两根
+    assert res["rows"] == {D10.isoformat(): 2, D11.isoformat(): 2}
+    assert res["total"] == 4
+    by_day: dict = {}
+    for f in flushed:
+        # 反连接后的 combined 帧是多 symbol 的，须逐行统计
+        for sym, t in zip(f["symbol"].to_list(), f["datetime"].to_list(),
+                          strict=True):
+            by_day.setdefault(sym, []).append(t)
+    assert by_day["600000.SH"] == [_dt.datetime(2026, 9, 10, 9, 31)]
+    assert set(by_day["000001.SZ"]) == set(frames_001["datetime"].to_list())

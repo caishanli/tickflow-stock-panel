@@ -4,9 +4,12 @@
 疑似出口 IP 被限），此时分钟/日线批量回源整批失败。腾讯 ``mkline``
 （``ifzq.gtimg.cn``）零鉴权、HTTP、可做近期分钟回补。
 
-接口实测（2026-09-11）：
-- ``.../mkline?param={sh|sz}{code},m1,,320``：最近 ~320 根 1m（约 1.3 个
-  交易日；周末不 sliding，死线为下周一 11:00 左右）；
+接口实测（2026-09-11/12）：
+- ``.../mkline?param={sh|sz}{code},m1,,800``：最近 ~800 根 1m（约 3.3 个
+  交易日；320 根只够 1.3 日——09-10 熔断案例 9.11 收盘回补时 9.10 只剩
+  尾段 13:42~15:00 共 79 根，整段上午缺失且此后无人能补；800 根可覆盖
+  T-2/T-3 缺口）；每交易日 241 根（09:30~11:30 + 13:01~15:00，无 13:00
+  bar，与 mootdx 口径一致）；
 - 行格式 ``[时间, 开, 收, 高, 低, 量(手), {}, 换手率(基点)]``——注意第 2
   列是**收**不是高（已用 600000 全天 rollup vs 快照 OHLCV 逐项对齐验证，
   量合计 653274 vs 653273 手）；
@@ -47,6 +50,17 @@ _MAX_RETRIES = 3
 _BACKOFF = (2.0, 5.0, 10.0)
 _THROTTLE_STREAK = 30   # 全局连续空响应达此数 → 休眠 60s（腾讯限流，可恢复）
 _THROTTLE_SLEEP = 60.0
+# 单请求拉取根数：mkline 实测上限 800（>800 仍返回 800）。320≈1.3 个交易日
+# 不够回补 T-2 缺口（09-10 案例：9.11 收盘回补时 9.10 只够到 10:49），
+# 800≈3.3 个交易日。env 可调，上限 800。
+_BARS_CAP = 800
+
+
+def _bars() -> int:
+    try:
+        return min(_BARS_CAP, max(1, int(os.getenv("TENCENT_MINUTE_BARS", "") or _BARS_CAP)))
+    except ValueError:
+        return _BARS_CAP
 
 _throttle_lock = threading.Lock()
 _throttle_streak = 0
@@ -101,11 +115,11 @@ def _note_ok() -> None:
 
 
 def fetch_m1(session: requests.Session, vendor: str) -> list | None:
-    """拉单标的 m1（~320 根）。None=网络/HTTP 失败；[] = 无数据（限流或停牌）。
+    """拉单标的 m1（~800 根）。None=网络/HTTP 失败；[] = 无数据（限流或停牌）。
 
     停牌股返回 ``{"code":0,...,"data":{vendor: {"qt":..., "m1":[]}}}`` 或缺 m1。
     """
-    url = f"{_MKLINE_URL}{vendor},m1,,320"
+    url = f"{_MKLINE_URL}{vendor},m1,,{_bars()}"
     try:
         resp = session.get(url, headers=_HEADERS, timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
@@ -238,22 +252,49 @@ def _wanted_days(candidates: list[_date]) -> list[_date]:
     return [d for d in candidates if d <= today]
 
 
-def _partition_symbols(root, day: _date) -> set[str]:
-    """读某日分钟分区已落盘 symbol 集（仅 symbol 列；缺失返回空集）。"""
-    part = root / f"date={day}" / "part.parquet"
+def _partition_keys(root, day: _date) -> pl.DataFrame | None:
+    """读某日分钟分区的 (symbol, datetime) 键集（缺分区/坏文件/空表返回 None）。
+
+    用于缺口填充的两件事：① per-symbol bar 数判定「当日完整」（09-10 案例：
+    分区含全部 symbol 但每只仅尾段 79 根——symbol 出现 ≠ 完整）；② 反连接
+    过滤，只保留分区缺失的 (symbol, datetime) 行，任意位置的洞（上午/尾段/
+    中段）都能补且绝不覆盖既有 bar。
+    """
+    part = root / f"date={day.isoformat()}" / "part.parquet"
     if not part.exists():
-        return set()
+        return None
     try:
-        return set(pl.read_parquet(part, columns=["symbol"])["symbol"].to_list())
+        df = pl.read_parquet(part, columns=["symbol", "datetime"])
     except Exception:
-        return set()
+        return None
+    return None if df.is_empty() else df
+
+
+def _bar_counts(keys: pl.DataFrame) -> dict[str, int]:
+    """(symbol, datetime) 键集 → 每 symbol bar 数。"""
+    cnt = keys.group_by("symbol").len()
+    return dict(zip(cnt["symbol"].to_list(), cnt["len"].to_list(), strict=True))
+
+
+# 「当日完整」的 bar 数下限：正常完整日每 symbol 241 根（09:30~15:00），
+# 停牌/一字板合法短缺 ≤~24 根（09-11 实测全市场最短 217），阈值 200 与
+# mootdx 侧 _short_bar_minute_days 同口径。低于它的 symbol 每轮重拉（反连接
+# 下多为 no-op），高于它的绝不重复回补。
+_DAY_COMPLETE_MIN_BARS = max(1, int(os.getenv("TENCENT_MINUTE_DAY_MIN_BARS", "") or 200))
+
+
+def _day_complete(counts: dict[str, int], sym: str) -> bool:
+    return counts.get(sym, 0) >= _DAY_COMPLETE_MIN_BARS
 
 
 def sync_stock_minute_tencent(days: list[_date], only_missing: bool = True) -> dict:
     """腾讯回补股票分钟到 ``kline_minute`` 分区（merge 写入）。
 
-    复用 mootdx 的宇宙/上市过滤/落盘函数。``only_missing`` 为真时跳过
-    当日分区已有的 symbol（纯缺口填充，永不覆盖 mootdx 已有 bar）。
+    复用 mootdx 的宇宙/上市过滤/落盘函数。``only_missing`` 为真时按「当日
+    bar 数」判定已覆盖（≥ ``_DAY_COMPLETE_MIN_BARS``）：各目标日都完整的
+    symbol 整批跳过（连网都不碰）。对未覆盖 symbol，按 (symbol, datetime)
+    与分区键集**反连接**，只补缺失时间戳——洞在上午/尾段/中段都能填，
+    且绝不覆盖任何已落盘 bar（09-10 案例即为「尾段已有、整段上午缺失」）。
     返回 {"rows": {day: n}, "total": int, "uncovered": [...],
     "source": "tencent"}。
     """
@@ -276,18 +317,19 @@ def sync_stock_minute_tencent(days: list[_date], only_missing: bool = True) -> d
         return ld is None or ld <= earliest
 
     stocks = [s for s in stocks if _listed(s)]
+    per_day_keys: dict[_date, pl.DataFrame | None] = {}
+    per_day_counts: dict[_date, dict[str, int]] = {}
+    complete: set[str] = set()
     if only_missing:
-        # 纯缺口填充：各目标日都已有的 symbol 整批跳过（连网都不碰）；
-        # 剩下按日过滤，保证 mootdx 已有 bar 永不被覆盖。
-        per_day_have = {d: _partition_symbols(ms.STOCK_MINUTE_ROOT, d)
-                        for d in days}
-        have_all = set.intersection(*per_day_have.values()) if per_day_have else set()
-        skipped = [s for s in stocks if s in have_all]
-        stocks = [s for s in stocks if s not in have_all]
+        per_day_keys = {d: _partition_keys(ms.STOCK_MINUTE_ROOT, d) for d in days}
+        per_day_counts = {d: (_bar_counts(k) if k is not None else {})
+                          for d, k in per_day_keys.items()}
+        complete = {s for s in stocks
+                    if all(_day_complete(per_day_counts[d], s) for d in days)}
+        skipped = [s for s in stocks if s in complete]
+        stocks = [s for s in stocks if s not in complete]
         if skipped:
-            logger.info("tencent_minute: 股票 %d 只各目标日均有数据，跳过", len(skipped))
-    else:
-        per_day_have = {}
+            logger.info("tencent_minute: 股票 %d 只各目标日均完整，跳过", len(skipped))
     if not stocks:
         return {"rows": {d.isoformat(): 0 for d in days}, "total": 0,
                 "uncovered": [], "source": "tencent"}
@@ -297,18 +339,19 @@ def sync_stock_minute_tencent(days: list[_date], only_missing: bool = True) -> d
     for d in days:
         frames = res["frames"][d]
         if only_missing:
-            have = per_day_have[d]
-            frames = [f for f in frames if f["symbol"][0] not in have]
+            keys = per_day_keys[d]
+            if keys is not None and frames:
+                combined = pl.concat(frames).join(
+                    keys, on=["symbol", "datetime"], how="anti")
+                frames = [combined] if not combined.is_empty() else []
         if not frames:
             rows[d.isoformat()] = 0
             continue
-        before = len(frames)
         ms._flush_stock_minute_chunk(frames)
         n = sum(f.height for f in frames)
         rows[d.isoformat()] = n
         total += n
-        logger.info("tencent_minute: 股票分钟 %s 落盘 %d 行（%d 只）",
-                    d.isoformat(), n, before)
+        logger.info("tencent_minute: 股票分钟 %s 补洞 %d 行", d.isoformat(), n)
     logger.warning("tencent_minute: 股票分钟回补完成 %d 行，未覆盖 %d 只",
                    total, len(res["uncovered"]))
     return {"rows": rows, "total": total, "uncovered": res["uncovered"],
@@ -318,7 +361,8 @@ def sync_stock_minute_tencent(days: list[_date], only_missing: bool = True) -> d
 def sync_etf_minute_tencent(days: list[_date], only_missing: bool = True) -> dict:
     """腾讯回补 ETF 分钟到 ``kline_etf_minute`` 分区（merge 写入）。
 
-    ``only_missing`` 语义同股票侧：纯缺口填充，不覆盖已有 bar。
+    ``only_missing`` 语义同股票侧：按「当日 bar 数」判定已覆盖，未覆盖
+    symbol 按 (symbol, datetime) 反连接只补缺失时间戳，不覆盖已有 bar。
     """
     from app.services import mootdx_service as ms
     days = _wanted_days(days)
@@ -335,16 +379,19 @@ def sync_etf_minute_tencent(days: list[_date], only_missing: bool = True) -> dic
     if not tf_syms:
         logger.warning("tencent_minute: ETF 宇宙为空，跳过")
         return {"rows": {}, "total": 0, "uncovered": [], "source": "tencent"}
+    per_day_keys: dict[_date, pl.DataFrame | None] = {}
+    per_day_counts: dict[_date, dict[str, int]] = {}
+    complete: set[str] = set()
     if only_missing:
-        per_day_have = {d: _partition_symbols(ms.ETF_MINUTE_ROOT, d)
-                        for d in days}
-        have_all = set.intersection(*per_day_have.values()) if per_day_have else set()
-        skipped = [s for s in tf_syms if s in have_all]
-        tf_syms = [s for s in tf_syms if s not in have_all]
+        per_day_keys = {d: _partition_keys(ms.ETF_MINUTE_ROOT, d) for d in days}
+        per_day_counts = {d: (_bar_counts(k) if k is not None else {})
+                          for d, k in per_day_keys.items()}
+        complete = {s for s in tf_syms
+                    if all(_day_complete(per_day_counts[d], s) for d in days)}
+        skipped = [s for s in tf_syms if s in complete]
+        tf_syms = [s for s in tf_syms if s not in complete]
         if skipped:
-            logger.info("tencent_minute: ETF %d 只各目标日均有数据，跳过", len(skipped))
-    else:
-        per_day_have = {}
+            logger.info("tencent_minute: ETF %d 只各目标日均完整，跳过", len(skipped))
     if not tf_syms:
         return {"rows": {d.isoformat(): 0 for d in days}, "total": 0,
                 "uncovered": [], "source": "tencent"}
@@ -354,8 +401,11 @@ def sync_etf_minute_tencent(days: list[_date], only_missing: bool = True) -> dic
     for d in days:
         frames = res["frames"][d]
         if only_missing:
-            have = per_day_have[d]
-            frames = [f for f in frames if f["symbol"][0] not in have]
+            keys = per_day_keys[d]
+            if keys is not None and frames:
+                combined = pl.concat(frames).join(
+                    keys, on=["symbol", "datetime"], how="anti")
+                frames = [combined] if not combined.is_empty() else []
         if not frames:
             rows[d.isoformat()] = 0
             continue
@@ -373,10 +423,16 @@ def sync_etf_minute_tencent(days: list[_date], only_missing: bool = True) -> dic
 def fill_recent_gaps(kind: str = "stock", lookback: int = 5) -> dict | None:
     """近期分钟缺口的腾讯兜底（调度侧唯一入口；健康时零开销 no-op）。
 
-    缺口 = mootdx 分区缺失的已收盘交易日（盘中今天除外，见
-    ``_missing_*_minute_days``——半程不落盘）。同时满足才回补：
-    1. 近 ``lookback`` 天内有缺口；
-    2. K 线熔断开路（mootdx 已确认不可用，而非偶发抖动）。
+    缺口两类（都限定近 ``lookback`` 个交易日窗口）：
+    1. mootdx 分区缺失的已收盘交易日（盘中今天除外，见
+       ``_missing_*_minute_days``——半程不落盘）；
+    2. 分区存在但 **bar 数量级残缺** 的交易日（``_short_bar_minute_days``：
+       symbol 覆盖齐但每只 bar 数远低于全天，如 09-10 熔断截断日——symbol
+       覆盖率类检测对此盲，若不补检该类缺口会永久搁浅）。
+    同时满足才回补：
+    1. 窗口内有上述任一缺口；
+    2. K 线熔断开路（mootdx 已确认不可用，而非偶发抖动；mootdx 健康时
+       启动巡检会用自家数据 range 重写残缺日，见 mootdx_service 巡检段）。
     不触发返回 None（调用方只记 debug）；触发返回回补结果。
     """
     from app.quant.jqengine.datasource.mootdx_breaker import kline_allowed
@@ -384,17 +440,20 @@ def fill_recent_gaps(kind: str = "stock", lookback: int = 5) -> dict | None:
     if kind not in ("stock", "etf"):
         raise ValueError(f"未知 kind: {kind}")
     if kind == "etf":
-        missing = [d for d in ms._missing_minute_days()][-lookback:]
+        missing = set(ms._missing_minute_days()[-lookback:])
+        short = ms._short_bar_minute_days(ms.ETF_MINUTE_ROOT, lookback=lookback)
     else:
-        missing = [d for d in ms._missing_stock_minute_days()][-lookback:]
-    if not missing:
+        missing = set(ms._missing_stock_minute_days()[-lookback:])
+        short = ms._short_bar_minute_days(ms.STOCK_MINUTE_ROOT, lookback=lookback)
+    days = sorted(missing | set(short))
+    if not days:
         return None
     if kline_allowed():
         logger.debug("tencent_minute: %s分钟缺口 %s 但熔断关闭，mootdx 自行处理",
-                     kind, [d.isoformat() for d in missing])
+                     kind, [d.isoformat() for d in days])
         return None
     logger.warning("tencent_minute: %s分钟缺口 %s 且熔断开路，切腾讯回补",
-                   kind, [d.isoformat() for d in missing])
+                   kind, [d.isoformat() for d in days])
     if kind == "etf":
-        return sync_etf_minute_tencent(missing)
-    return sync_stock_minute_tencent(missing)
+        return sync_etf_minute_tencent(days)
+    return sync_stock_minute_tencent(days)

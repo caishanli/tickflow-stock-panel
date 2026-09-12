@@ -1515,6 +1515,8 @@ def scan_missing_partitions(start: _date | None = None,
     内容级校验与分区缺口并集：5 类数据（ETF日线/股票日线/指数日线/ETF分钟/
     股票分钟）统一跑 ``_incomplete_*_days()``，把"目录存在但内容残缺"（如只剩
     1 只）的日子也归为缺失，触发重写，防残帧永久污染（见各函数 docstring）。
+    分钟两类另跑 ``_short_bar_minute_days()``：symbol 覆盖齐但每只 bar 数量级
+    短缺的截断日（09-10 熔断案例）对覆盖率检测不可见。
 
     额外返回 ``etf_universe_segments``（list[str]）：ETF 宇宙快照缺失的
     权威代码段（如 501/161）。分区覆盖率 vs 残缺宇宙永远测不出"快照缺段"，
@@ -1547,8 +1549,10 @@ def scan_missing_partitions(start: _date | None = None,
     missing_etf_minute |= set(_incomplete_etf_minute_days(recent=content))
     for _d in _shortfall_days(ETF_MINUTE_ROOT):
         missing_etf_minute.add(_d)
+    missing_etf_minute |= set(_short_bar_minute_days(ETF_MINUTE_ROOT))
     missing_stock_minute = set(_missing_days_in(calendar, STOCK_MINUTE_ROOT))
     missing_stock_minute |= set(_incomplete_stock_minute_days(recent=content))
+    missing_stock_minute |= set(_short_bar_minute_days(STOCK_MINUTE_ROOT))
     seg_missing = _safe_universe_segment_missing()
     if seg_missing:
         logger.warning("mootdx_service: ETF 宇宙快照缺代码段 %s，"
@@ -1803,6 +1807,64 @@ def _incomplete_stock_minute_days(recent: int | None = None) -> list[_date]:
     return _incomplete_partition_days(
         STOCK_MINUTE_ROOT, set(codes),
         recent, _STOCK_MINUTE_MIN_COVERAGE)
+
+
+# 「bar 数量级残缺」检测参数：正常完整日每 symbol ~241 根（09:30~15:00），
+# 停牌/一字板合法短缺 ≤~24 根（09-11 实测全市场最短 217）。回源中断残缺日
+# （09-10 案例：mootdx 13:42 熔断，腾讯 320 根回补也只够到 13:42）分区
+# 含全部 symbol 但每只仅 ~79 根——symbol 覆盖率类检测
+# （_incomplete_partition_days/_shortfall_days）对此盲，覆盖率 99.8% 照样过。
+# 占比阈值取 5%：ETF 正常日也有 ~1% 停牌/半日标的（17/1658），1% 会误报
+# （误报会让健康日被反复全量重写）；真实截断是全市场事件（>99%），5% 两侧
+# 余量都足够。
+_MINUTE_SHORT_BAR_MIN = int(os.getenv("MINUTE_SHORT_BAR_MIN", "200"))
+_MINUTE_SHORT_BAR_FRACTION = float(os.getenv("MINUTE_SHORT_BAR_FRACTION", "0.05"))
+_MINUTE_SHORT_BAR_LOOKBACK = int(os.getenv("MINUTE_SHORT_BAR_LOOKBACK", "10"))
+
+
+def _short_bar_minute_days(root: Path, lookback: int | None = None,
+                           bar_min: int | None = None,
+                           fraction: float | None = None) -> list[_date]:
+    """最近窗口内「symbol 覆盖齐但每只 bar 数量级短缺」的分钟残缺日。
+
+    判定：某交易日 bar 数 < ``bar_min`` 的 symbol 占比 > ``fraction``。
+    只扫最近 ``lookback`` 个分区（每分区仅读 symbol+datetime 两列，~1s）；
+    盘中跳过当日（半程数据必然全市场「短缺」，与既有守卫同口径）。分区
+    文件缺失/损坏/空的日子不在此判（归 ``_missing_*_minute_days`` 管）。
+    """
+    lookback = _MINUTE_SHORT_BAR_LOOKBACK if lookback is None else lookback
+    bar_min = _MINUTE_SHORT_BAR_MIN if bar_min is None else bar_min
+    fraction = _MINUTE_SHORT_BAR_FRACTION if fraction is None else fraction
+    existing = _partition_dates(root)
+    if not existing:
+        return []
+    today = _date.today()
+    out: list[_date] = []
+    for ds in existing[-lookback:]:
+        d = _dt.date.fromisoformat(ds)
+        if d == today and not _market_closed():
+            continue
+        parts = sorted((root / f"date={ds}").glob("*.parquet"))
+        if not parts:
+            continue
+        try:
+            df = pl.read_parquet([str(p) for p in parts],
+                                 columns=["symbol", "datetime"],
+                                 hive_partitioning=False)
+        except Exception:
+            continue
+        if df.is_empty():
+            continue
+        cnt = df.group_by("symbol").len()
+        short = cnt.filter(pl.col("len") < bar_min).height
+        if short / cnt.height > fraction:
+            out.append(d)
+    if out:
+        logger.warning("mootdx_service: %s 检出 bar 数量级残缺日 %s "
+                       "(bar<%d 的 symbol 占比 >%.0f%%)",
+                       root.name, [d.isoformat() for d in out],
+                       bar_min, fraction * 100)
+    return out
 
 
 def _stock_universe() -> list[str]:
@@ -2467,11 +2529,16 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     incomplete_index_daily = set(_incomplete_index_daily_days(recent=content))
     incomplete_stock_minute = set(_incomplete_stock_minute_days(recent=content))
     missing_stock_minute_days = set(_missing_stock_minute_days())
+    # bar 数量级残缺日（symbol 覆盖齐但每只 bar 远低于全天，09-10 熔断截断
+    # 案例）：symbol 覆盖率检测盲区，单独扫描最近窗口
+    short_etf_minute = set(_short_bar_minute_days(ETF_MINUTE_ROOT))
+    short_stock_minute = set(_short_bar_minute_days(STOCK_MINUTE_ROOT))
 
     result["missing"] = {
         "kline_etf_minute":   {"latest": etf_minute_days[-1] if etf_minute_days else None,
                                "empty": not etf_minute_days,
-                               "missing": bool(_missing_minute_days() or incomplete_etf_minute)},
+                               "missing": bool(_missing_minute_days() or incomplete_etf_minute
+                                               or short_etf_minute)},
         "kline_daily":        {"latest": stocks_daily[-1] if stocks_daily else None,
                                "empty": not stocks_daily, "missing": bool(_missing_daily_days(STOCK_DAILY_ROOT))},
         "kline_etf_daily":    {"latest": etf_daily_days[-1] if etf_daily_days else None,
@@ -2484,18 +2551,19 @@ def _backfill_to_now_locked() -> dict[str, Any]:
                                "missing": bool(_missing_index_daily_days() or incomplete_index_daily)},
         "kline_minute":       {"latest": stock_minute_days[-1] if stock_minute_days else None,
                                "empty": not stock_minute_days,
-                               "missing": bool(missing_stock_minute_days or incomplete_stock_minute)},
+                               "missing": bool(missing_stock_minute_days or incomplete_stock_minute
+                                               or short_stock_minute)},
         "adj_factor_etf":     {"latest": adj_factor_latest, "empty": not ADJ_FACTOR_PATH.exists(),
                                "missing": _adj_factor_stale()},
         "etf_nav":            {"latest": etf_nav_days[-1] if etf_nav_days else None,
                                "empty": not etf_nav_days, "missing": bool(missing_nav_days)},
     }
 
-    # 1. ETF 分钟（含相对基线残缺日）
+    # 1. ETF 分钟（含相对基线残缺日 / bar 数量级残缺日）
     etf_minute_shortfall = (set(_shortfall_days(ETF_MINUTE_ROOT))
                             if shortfall_ok else set())
     for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute
-                      | etf_minute_shortfall):
+                      | etf_minute_shortfall | short_etf_minute):
         try:
             res = sync_etf_minute(day)
             result["minute_days"].append(str(day))
@@ -2567,9 +2635,11 @@ def _backfill_to_now_locked() -> dict[str, Any]:
             logger.warning("mootdx_service: 因子表回源失败: %s", e)
             result["errors"].append(f"adj_factor: {e}")
 
-    # 3. 股票分钟：先修复内容残缺分区（range 全量，走所有缺失日前的分支），
+    # 3. 股票分钟：先修复内容残缺分区（range 全量，走所有缺失日前的分支；
+    #    含 bar 数量级残缺日——symbol 覆盖率检测盲区，见 _short_bar_minute_days），
     #    再跑增量慢跑（每次一批，resume 跳过已覆盖，多轮自动补齐）
-    incomplete_minute = incomplete_stock_minute | missing_stock_minute_days
+    incomplete_minute = (incomplete_stock_minute | missing_stock_minute_days
+                         | short_stock_minute)
     if incomplete_minute:
         try:
             min_days = sorted(incomplete_minute)
