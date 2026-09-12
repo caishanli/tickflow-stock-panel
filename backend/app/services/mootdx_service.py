@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import date as _date
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
 import polars as pl
@@ -152,11 +152,11 @@ def _mk_progress_logger(total: int, label: str):
     返回 ``tick(done_now, current="")``；内部按首次调用计时。速率/ETA 基于
     首次 tick 以来的平均值，供长回源全程可观测。
     """
-    state = {"t0": None, "last": None, "n": 0}
+    state: dict[str, float] = {"t0": 0.0, "last": 0.0, "n": 0}
 
     def tick(done_now: int, current: str = "") -> None:
         now = time.time()
-        if state["t0"] is None:
+        if not state["t0"]:  # 0.0 = 未初始化（time.time() 恒 > 0）
             state["t0"] = now
             state["last"] = now
             state["n"] = done_now
@@ -886,7 +886,19 @@ def sync_stock_minute_range(days: list[_date]) -> int:
     return total
 
 
-def backfill_missing_partitions(missing: dict[str, list[_date]]) -> dict:
+class _MissingPartitions(TypedDict, total=False):
+    """``scan_missing_partitions`` 的返回结构：日期键 + 一个非日期键。"""
+
+    kline_daily: list[_date]
+    kline_etf_daily: list[_date]
+    kline_index_daily: list[_date]
+    kline_etf_minute: list[_date]
+    kline_minute: list[_date]
+    etf_nav: list[_date]
+    etf_universe_segments: list[str]
+
+
+def backfill_missing_partitions(missing: _MissingPartitions) -> dict:
     """逐缺失日复用现有 sync 函数补全，单日失败记 errors 不阻断。
 
     ``missing`` 键名与 ``scan_missing_partitions`` 一致：
@@ -945,7 +957,7 @@ def scan_and_backfill_full(content_recent: int | None = None) -> dict:
     """
     missing = scan_missing_partitions(content_recent=content_recent)
     backfilled = backfill_missing_partitions(missing)
-    total = sum(len(v) for v in missing.values())
+    total = sum(len(v) for v in missing.values() if isinstance(v, list))
     msg = "mootdx_service: 全量扫描 %d 缺失日, 补全 %s, errors=%s"
     args = (total, {k: len(v) for k, v in backfilled.items()},
             len(backfilled["errors"]))
@@ -1444,9 +1456,7 @@ def _local_000300_trade_days(start: _date, end: _date) -> list[_date]:
 def _trade_days_up_to(end: _date) -> list[_date]:
     """返回 (end-回看窗口, end] 内 A 股交易日（从沪深300 日线索引推导）。"""
     src = MootdxSource()
-    start = end - _date(1970, 1, 1)  # placeholder, overwritten below
-    from datetime import timedelta as _td
-    start = end - _td(days=_DAILY_BACKFILL_LIMIT_DAYS)
+    start = end - _dt.timedelta(days=_DAILY_BACKFILL_LIMIT_DAYS)
     try:
         df = src.get_daily("000300.XSHG", start.strftime("%Y%m%d"),
                            end.strftime("%Y%m%d"))
@@ -1467,7 +1477,7 @@ def _trade_days_up_to(end: _date) -> list[_date]:
     while d <= end:
         if d.weekday() < 5:
             days.append(d)
-        d += _td(days=1)
+        d += _dt.timedelta(days=1)
     return days
 
 
@@ -1506,7 +1516,7 @@ def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
 
 
 def scan_missing_partitions(start: _date | None = None,
-                            content_recent: int | None = None) -> dict[str, list[_date]]:
+                            content_recent: int | None = None) -> _MissingPartitions:
     """分区级缺失扫描：4/1（或 start）至今，6 类数据按交易日历逐日比对。
 
     检测「交易日历上有、但分区目录无 date= 分区」的日期，含中间洞。
@@ -1729,6 +1739,45 @@ def _incomplete_partition_days(root: Path, target: set[str], recent: int,
     return out
 
 
+def _neighbor_drop_partition_days(root: Path, recent: int,
+                                  drop_ratio: float = 0.95) -> list[_date]:
+    """日 symbol 数低于邻居中位数 ``drop_ratio`` 的分区（绝对覆盖率的盲区）。
+
+    动机（2026-09-12 全库审计）：北交所段缺失日 5549/5550≈93.8% 覆盖，
+    ``CONTENT_CHECK_MIN_COVERAGE=0.5`` 与 0.95 都测不出；而 ETF/股票宇宙
+    持续扩容（ETF 每日 +3~4 只新上市），**绝对阈值**会把 2025-09 起的历史
+    扩容日全误判（180 天），故与邻居比而非与当前宇宙比。只比对分区内行
+    数，不读宇宙。盘中当日跳过（半程必然偏少）。
+    """
+    existing = _partition_dates(root)
+    if len(existing) < 2:
+        return []
+    today = _date.today()
+    out: list[_date] = []
+    rows: dict[str, int] = {}
+    scan = existing[-recent:] if recent and recent < len(existing) else existing
+    for ds in scan:
+        part = root / f"date={ds}" / "part.parquet"
+        try:
+            rows[ds] = pl.read_parquet(part, columns=["symbol"]).height \
+                if part.exists() else 0
+        except Exception:
+            continue
+    dss = sorted(rows)
+    for i, ds in enumerate(dss):
+        d = _dt.date.fromisoformat(ds)
+        if d == today and not _market_closed():
+            continue
+        neigh = [rows[x] for x in dss[max(0, i - 3):i] + dss[i + 1:i + 4]]
+        med = sorted(neigh)[len(neigh) // 2] if neigh else 0
+        if med > 0 and rows[ds] < med * drop_ratio:
+            out.append(d)
+    if out:
+        logger.warning("mootdx_service: 邻居比对 %s 检出缺口日 %s（<%.0f%% 邻居中位）",
+                       root.name, [d.isoformat() for d in out], drop_ratio * 100)
+    return out
+
+
 def _incomplete_stock_daily_days(recent: int | None = None) -> list[_date]:
     """股票日线内容残缺分区（symbol 覆盖率 << 股票宇宙）。"""
     try:
@@ -1737,9 +1786,12 @@ def _incomplete_stock_daily_days(recent: int | None = None) -> list[_date]:
         logger.warning("mootdx_service: 股票宇宙读取失败，跳过股票日线内容校验",
                        exc_info=True)
         return []
-    return _incomplete_partition_days(
+    days = set(_incomplete_partition_days(
         STOCK_DAILY_ROOT, set(codes),
-        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE))
+    days |= set(_neighbor_drop_partition_days(
+        STOCK_DAILY_ROOT, recent or _CONTENT_CHECK_RECENT_DAYS))
+    return sorted(days)
 
 
 def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
@@ -1753,9 +1805,12 @@ def _incomplete_etf_daily_days(recent: int | None = None) -> list[_date]:
     if not codes:
         return []
     target = set(_to_tf_symbol(c) for c in codes)
-    return _incomplete_partition_days(
+    days = set(_incomplete_partition_days(
         ETF_DAILY_ROOT, target,
-        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE))
+    days |= set(_neighbor_drop_partition_days(
+        ETF_DAILY_ROOT, recent or _CONTENT_CHECK_RECENT_DAYS))
+    return sorted(days)
 
 
 def _incomplete_index_daily_days(recent: int | None = None) -> list[_date]:
@@ -1772,9 +1827,12 @@ def _incomplete_index_daily_days(recent: int | None = None) -> list[_date]:
         return []
     if not codes:
         return []
-    return _incomplete_partition_days(
+    days = set(_incomplete_partition_days(
         INDEX_DAILY_ROOT, set(codes),
-        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE)
+        recent or _CONTENT_CHECK_RECENT_DAYS, _CONTENT_CHECK_MIN_COVERAGE))
+    days |= set(_neighbor_drop_partition_days(
+        INDEX_DAILY_ROOT, recent or _CONTENT_CHECK_RECENT_DAYS))
+    return sorted(days)
 
 
 def _incomplete_etf_minute_days(recent: int | None = None) -> list[_date]:
