@@ -198,6 +198,14 @@ def test_last_trading_day():
     assert tc.last_trading_day([], "2026-09-10") is None
 
 
+def test_refresh_calendar_path_failure_never_raises(monkeypatch):
+    def _boom():
+        raise RuntimeError("CONFIG exploded")
+    monkeypatch.setattr(tc, "calendar_path", _boom)
+    out = tc.refresh_calendar()
+    assert out == {"ok": False, "reason": "CONFIG exploded", "path": "", "count": 0}
+
+
 def test_push_stale_alert_no_config(tmp_path, monkeypatch):
     p = tmp_path / "cal.json"
     _write_cal(p, ["2026-09-10"])

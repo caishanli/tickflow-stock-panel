@@ -301,8 +301,9 @@ def _fresh_result(path: str, today: date, max_age_days: int) -> dict | None:
 
 def refresh_calendar(force: bool = False, max_age_days: int = 7) -> dict:
     """刷新日历文件，永不抛异常；返回 {"ok","reason","path","count"}。"""
-    path = calendar_path()
+    path = ""
     try:
+        path = calendar_path()
         today = date.today()
         if not force:
             hit = _fresh_result(path, today, max_age_days)
