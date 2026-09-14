@@ -1453,6 +1453,25 @@ def _local_000300_trade_days(start: _date, end: _date) -> list[_date]:
     return sorted(days)
 
 
+def _authoritative_trade_days(start: _date, end: _date) -> list[_date]:
+    """从权威日历文件（新浪口径）取 [start, end] 内交易日；不可用返回 []。
+
+    与 ``_local_000300_trade_days`` 的关键区别：**不是自指的**。后者读
+    ``kline_index_daily`` 分区，而该分区的缺失正是本函数要修的缺口——用它
+    判断"今天是不是交易日"会形成循环：缺 index 分区 → 日历末端停在上一交易日
+    → 今天被判为非交易日 → 缺口检测为空 → 备用链被挡 → index 分区永不补齐
+    （2026-09-14 事故：mootdx 全天故障时 15:35 备用链全线失效）。
+    """
+    try:
+        from app.services.trade_calendar import load_authoritative_dates
+        dates, _origin = load_authoritative_dates()
+    except Exception as e:
+        logger.warning("mootdx_service: 权威交易日历不可用: %s", e)
+        return []
+    lo, hi = start.isoformat(), end.isoformat()
+    return [_date.fromisoformat(d) for d in dates if lo <= d <= hi]
+
+
 def _trade_days_up_to(end: _date) -> list[_date]:
     """返回 (end-回看窗口, end] 内 A 股交易日（从沪深300 日线索引推导）。"""
     src = MootdxSource()
@@ -1468,6 +1487,10 @@ def _trade_days_up_to(end: _date) -> list[_date]:
             return [d for d in days if start <= d <= end]
     except Exception as e:
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
+    # 权威日历优先于本地 index 分区：本地分区恰是待修缺口，拿它做日历会自指
+    authority = _authoritative_trade_days(start, end)
+    if authority:
+        return authority
     local = _local_000300_trade_days(start, end)
     if local:
         return local
@@ -1497,6 +1520,10 @@ def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
                             if start <= d.date() <= end)
     except Exception as e:
         logger.warning("mootdx_service: 交易日历获取失败: %s", e)
+    # 同 _trade_days_up_to：权威日历优先于自指的本地 index 分区
+    authority = _authoritative_trade_days(start, end)
+    if authority:
+        return authority
     local = _local_000300_trade_days(start, end)
     if local:
         return local
