@@ -240,3 +240,15 @@ def test_push_stale_alert_sends_and_marks(tmp_path, monkeypatch):
     assert tc.push_stale_alert("stale text") is True
     assert len(sent) == 1 and sent[0][3] == "stale text"
     assert json.loads(p.read_text())["meta"] == {"last_stale_push": date.today().isoformat()}
+
+
+# --- Task 4: 引擎接线（_CalendarStore.extend，零网络） ---
+
+
+def test_calendar_store_extend():
+    import pandas as pd
+
+    from app.quant.jqcompat import _CalendarStore
+    s = _CalendarStore([pd.Timestamp("2026-09-09").date()])
+    assert s.extend(["2026-09-10", "2026-09-09"]) == 1
+    assert s.get_trading_calendar()[-1].date().isoformat() == "2026-09-10"

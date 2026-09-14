@@ -31,6 +31,8 @@ from rqalpha.environment import Environment
 from rqalpha.interface import AbstractMod
 from rqalpha.model.instrument import Instrument
 
+from app.services.trade_calendar import load_authoritative_dates
+
 from .core import classify_fund as _fund_instrument_type
 from .core import limit_prices_from_prev_close as _limit_prices_from_prev_close
 from .core import limit_rate as _core_limit_rate
@@ -1989,6 +1991,30 @@ class _CalendarStore:
     def get_trading_calendar(self):
         return self._calendar
 
+    def extend(self, dates) -> int:
+        """合并新交易日（去重保序，只延长不回缩），返回新增数量。"""
+        before = len(self._calendar)
+        if not dates:
+            return 0
+        extra = set(pd.DatetimeIndex(pd.to_datetime(list(dates))).date)
+        merged = sorted(set(self._calendar.date) | extra)
+        self._calendar = pd.DatetimeIndex(merged)
+        return len(self._calendar) - before
+
+
+def extend_engine_calendar(dates) -> int:
+    """进程内延长引擎日历（CN_STOCK store）；找不到 store 返回 0 不抛异常。"""
+    try:
+        env = Environment.get_instance()
+        stores = getattr(getattr(env, "data_proxy", None), "_calendar_stores", None) or {}
+        store = stores.get(TRADING_CALENDAR_TYPE.CN_STOCK)
+        if store is None or not hasattr(store, "extend"):
+            return 0
+        return int(store.extend(dates))
+    except Exception as e:
+        logger.warning("进程内延长引擎日历失败: %s", e)
+        return 0
+
 
 def _normalize_daily(df):
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -2201,6 +2227,14 @@ class JqDataSource:
         self._instruments = {}
         all_dates = set()
 
+        # 交易日历优先权威文件（新浪口径，文件→seed）；缺失才回退日期并集 + warn。
+        try:
+            _auth_dates, _cal_origin = load_authoritative_dates()
+            all_dates = {pd.Timestamp(d).date() for d in _auth_dates}
+        except LookupError as e:
+            logger.warning("权威交易日历不可用，回退日期并集构建: %s", e)
+            _cal_origin = "fallback"
+
         # 全量日线内存缓存（一次性取出，供日历并集与日线预加载复用，避免回测中
         # 逐标的 fetch 触发 SQLite 查询；聚宽同类数据常驻内存，这是本地慢的主因）。
         try:
@@ -2211,30 +2245,31 @@ class JqDataSource:
         # 交易日历来源：直接用缓存里所有日线数据的日期并集（不依赖单个标的
         # fetch，避免 offline 模式下缓存未命中即 raise 导致日历为空、回测报
         # "区间内无数据"）。
-        for _k, _df in _all_daily.items():
-            if _df is None or getattr(_df, "empty", True):
-                continue
-            _col = "date" if "date" in _df.columns else (
-                "trade_date" if "trade_date" in _df.columns else None)
-            if _col is None:
-                continue
-            # 批量转 datetime.date（T17：原逐行 pd.Timestamp(...).date() 对
-            # 全市场日线（1667 标的 × ~250 交易日 ≈ 40 万行索引）是纯 Python 逐
-            # 行开销，all_dates 仅用于日历并集，直接向量化 set 更新更快）
-            all_dates.update(
-                pd.DatetimeIndex(pd.to_datetime(_df[_col].to_numpy())).date
-            )
-        # 分区优先后 cache.get_all 可能为空（数据已迁到按日分区 Parquet，
-        # 旧 SQLite/文件缓存未再回填），此时以 preload_daily 灌入的
-        # _daily_mem（全市场分区日线，DatetimeIndex）为日历来源，否则
-        # rqalpha 在账户初始化 get_previous_trading_date 会拿到空日历报
-        # "index 0 is out of bounds"。
-        if not all_dates:
-            for _mem_k, _df in (getattr(dm, "_daily_mem", None) or {}).items():
+        if _cal_origin == "fallback":
+            for _k, _df in _all_daily.items():
                 if _df is None or getattr(_df, "empty", True):
                     continue
-                if _df.index is not None and len(_df.index):
-                    all_dates.update(pd.DatetimeIndex(_df.index).date)
+                _col = "date" if "date" in _df.columns else (
+                    "trade_date" if "trade_date" in _df.columns else None)
+                if _col is None:
+                    continue
+                # 批量转 datetime.date（T17：原逐行 pd.Timestamp(...).date() 对
+                # 全市场日线（1667 标的 × ~250 交易日 ≈ 40 万行索引）是纯 Python 逐
+                # 行开销，all_dates 仅用于日历并集，直接向量化 set 更新更快）
+                all_dates.update(
+                    pd.DatetimeIndex(pd.to_datetime(_df[_col].to_numpy())).date
+                )
+            # 分区优先后 cache.get_all 可能为空（数据已迁到按日分区 Parquet，
+            # 旧 SQLite/文件缓存未再回填），此时以 preload_daily 灌入的
+            # _daily_mem（全市场分区日线，DatetimeIndex）为日历来源，否则
+            # rqalpha 在账户初始化 get_previous_trading_date 会拿到空日历报
+            # "index 0 is out of bounds"。
+            if not all_dates:
+                for _mem_k, _df in (getattr(dm, "_daily_mem", None) or {}).items():
+                    if _df is None or getattr(_df, "empty", True):
+                        continue
+                    if _df.index is not None and len(_df.index):
+                        all_dates.update(pd.DatetimeIndex(_df.index).date)
 
         # 日线预加载：把内存缓存直接铺进 _DayBarStore._bars，回测期间 get_price
         # / history 全部命中内存，零 SQLite、零重复 _normalize_daily。
@@ -2272,6 +2307,7 @@ class JqDataSource:
                 pass
 
         self._trading_dates = sorted(all_dates)
+        logger.info("交易日历来源=%s, %d天", _cal_origin, len(self._trading_dates))
 
         self._day_bar_stores = {}
         self._minute_bar_stores = {}
