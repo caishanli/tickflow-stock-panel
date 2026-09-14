@@ -262,4 +262,10 @@ def test_refresh_never_raises(monkeypatch):
     monkeypatch.setattr(m, "fetch_sina_payload", lambda: (_ for _ in ()).throw(ConnectionError("down")))
     out = m.refresh_calendar(force=True)
     assert out["ok"] is False and "down" in out["reason"]
-###TASK5-HOOK-PLACEHOLDER###
+
+
+def test_scheduler_hooks_calendar():
+    import inspect
+
+    from app.services.stockdata import scheduler
+    assert "refresh_calendar" in inspect.getsource(scheduler._run_sync)

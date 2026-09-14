@@ -165,6 +165,11 @@ def _run_sync(full_stock_minute: bool = False):
             ad.fill_recent_gaps_daily("stock")
             ad.fill_recent_gaps_daily("etf")
             ad.fill_recent_gaps_daily("index")
+            try:
+                from app.services.trade_calendar import refresh_calendar
+                refresh_calendar()
+            except Exception:
+                logger.exception("trade calendar refresh failed (non-blocking)")
             with _lock:
                 _scheduler_state["last_sync"] = str(_dt.datetime.now())
                 _scheduler_state["sync_result"] = {
