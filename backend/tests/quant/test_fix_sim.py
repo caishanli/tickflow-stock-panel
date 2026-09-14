@@ -394,6 +394,32 @@ def test_sim_equity_benchmark_falls_back_to_datetime_index(tmp_quant, api_client
     assert bm["2026-07-10"] == pytest.approx(1.0)
 
 
+def test_sim_equity_benchmark_missing_day_is_null_not_zero(tmp_quant, api_client, monkeypatch):
+    """当日沪深300 未落盘 → benchmark_pct 必须是 null，不能冒充 0。
+
+    回归（2026-09-14 事故）：指数日线当日缺失时旧实现填 0，前端把"累计值归零"
+    反推成当日涨跌 → 沪深300 显示假 +8.12%。0 是"当日涨跌为 0"的合法值，
+    不能用来表示"无数据"。
+    """
+    from app.quant.jqengine.datasource import manager as dm_mgr
+
+    class _GapDM:
+        """只到 07-10，07-13 无数据（模拟当日日线尚未落盘）。"""
+
+        def fetch(self, method, *a, **k):
+            return pd.DataFrame({"close": [100.0, 101.0],
+                                 "trade_dt": ["2026-07-09", "2026-07-10"]})
+
+    monkeypatch.setattr(dm_mgr, "get_data_manager", lambda *a, **k: _GapDM())
+    db.insert_sim_account("a_gap", "a", 100000.0, 0.03, "created")
+    for dt, nv in (("2026-07-10 09:31:00", 100000.0), ("2026-07-13 09:31:00", 101000.0)):
+        db.insert_sim_snapshot("a_gap", dt, nv, nv, 0.0, 0.0, 0.0)
+    r = api_client.get("/api/quant/sim/accounts/a_gap/equity")
+    bm = {s["dt"][:10]: s.get("benchmark_pct") for s in r.json()["data"]}
+    assert bm["2026-07-10"] == pytest.approx(1.0)
+    assert bm["2026-07-13"] is None, "缺失日必须为 null，0 会被前端放大成假暴涨"
+
+
 # ---- 补跑期间状态卡片不更新：status 事件只在状态切换时推送 ----
 async def test_sim_stream_emits_status_when_state_changes(tmp_quant, monkeypatch):
     """补跑时 account.status 恒为 running，但 sim_state 每 bar 更新。
@@ -430,7 +456,6 @@ async def test_sim_stream_trade_event_includes_name(tmp_quant):
     """SSE trade 事件透传 sim_trades.name。"""
     from app.quant.api import quant as quant_api
     import asyncio
-
     db.insert_sim_account("a_nm", "s", 100000.0, 0.03, "running")
     db.upsert_sim_state("a_nm", 100000.0, "{}", 100000.0, 0.0, 100000.0, "[]",
                         "2024-01-02 09:31:00")
@@ -446,6 +471,38 @@ async def test_sim_stream_trade_event_includes_name(tmp_quant):
     assert "event: trade" in second
     assert '"name": "豆粕ETF华夏"' in second
     await agen.aclose()
+
+
+async def test_sim_stream_equity_benchmark_gap_is_null(tmp_quant, monkeypatch):
+    """SSE equity 事件对缺失基准日发 null（与 REST 同契约，前端两路共用口径）。"""
+    from app.quant.api import quant as quant_api
+    from app.quant.jqengine.datasource import manager as dm_mgr
+    import asyncio
+
+    class _GapDM:
+        def fetch(self, method, *a, **k):
+            return pd.DataFrame({"close": [100.0, 101.0],
+                                 "trade_dt": ["2026-07-09", "2026-07-10"]})
+
+    monkeypatch.setattr(dm_mgr, "get_data_manager", lambda *a, **k: _GapDM())
+    db.insert_sim_account("a_ssgap", "s", 100000.0, 0.03, "running")
+    # 07-10 有指数数据；07-11 为周六（无 bar）→ 必须发 null
+    db.insert_sim_snapshot("a_ssgap", "2026-07-10 09:31:00", 100000.0, 100000.0, 0.0, 0.0, 0.0)
+    db.insert_sim_snapshot("a_ssgap", "2026-07-11 09:31:00", 100100.0, 100000.0, 100.0, 100.0, 0.001)
+    resp = quant_api.sim_stream("a_ssgap", since_id=0)
+    agen = resp.body_iterator  # type: ignore[attr-defined]
+    chunks = []
+    try:
+        for _ in range(3):
+            chunks.append(await asyncio.wait_for(anext(agen), timeout=1.0))
+    except (StopAsyncIteration, asyncio.TimeoutError):
+        pass
+    await agen.aclose()
+    eq = [c for c in chunks if "event: equity" in c]
+    assert eq, f"未收到 equity 事件: {chunks}"
+    joined = "".join(eq)
+    assert '"benchmark_pct": null' in joined, joined
+    assert '"benchmark_pct": 0' not in joined, joined
 
 
 # ---- M12 + #8：SSE 断点续推与终态关流 ----

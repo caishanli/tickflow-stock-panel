@@ -641,15 +641,27 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
     const data: any[] = windowed
     // 策略收益率(%)：相对初始资金累计（首日即反映当天盈亏）
     const stratPct = data.map((d) => Number((((Number(d.net_value ?? 0) / (baseNV ?? 1)) - 1) * 100).toFixed(2)))
-    const benchPct = data.map((d) => Number(d.benchmark_pct ?? 0))
+    // 基准累计收益(%)：后端对"该日尚无沪深300 数据"发 null，必须原样保留为
+    // null——冒充 0 会被下面的当日涨跌反推放大成假暴涨（09-14 事故：指数日线
+    // 未落盘 → bench 由 -7.51 突变为 0 → 假 +8.12%）。null 让 ECharts 断线，
+    // 缺口在图上直接可见。
+    const benchPct = data.map((d) => {
+      const v = d.benchmark_pct
+      return v == null || v === '' ? null : Number(v)
+    })
     // 直接显示实际累计收益：策略相对初始资金，基准用后端原始累计值（不归一到 0）
     const stratWin = stratPct
     const benchWin = benchPct
-    // 当日涨跌幅(%)：从累计收益率反推，(1+r_n)/(1+r_{n-1})-1
+    // 当日涨跌幅(%)：从累计收益率反推，(1+r_n)/(1+r_{n-1})-1。
+    // 任一端缺失即 null（不可跨缺口外推——那正是假 +8.12% 的来源）。
     const stratDaily = stratPct.map((v, i) =>
       i === 0 ? 0 : Number((((1 + v / 100) / (1 + stratPct[i - 1] / 100) - 1) * 100).toFixed(2)))
-    const benchDaily = benchPct.map((v, i) =>
-      i === 0 ? 0 : Number((((1 + v / 100) / (1 + benchPct[i - 1] / 100) - 1) * 100).toFixed(2)))
+    const benchDaily: (number | null)[] = benchPct.map((v, i) => {
+      if (v == null) return null
+      const prev = benchPct[i - 1]
+      if (i === 0 || prev == null) return null
+      return Number((((1 + v / 100) / (1 + prev / 100) - 1) * 100).toFixed(2))
+    })
     const xLabels = data.map((d) => String(d.dt ?? '').slice(0, 10))
     // 当前窗口内的最大回撤：峰值（起点）与谷值（终点）下标，用于曲线标记
     const dd = findMaxDrawdown(data.map((d) => Number(d.net_value ?? 0)))
@@ -673,26 +685,32 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
           const idx = params[0].dataIndex
           const day = xLabels[idx] ?? ''
           const sCum = stratWin[idx] ?? 0
-          const bCum = benchWin[idx] ?? 0
+          const bCum = benchWin[idx]
           const sDay = stratDaily[idx] ?? 0
-          const bDay = benchDaily[idx] ?? 0
+          const bDay = benchDaily[idx]
           const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
           const color = (v: number) => v >= 0 ? '#ef4444' : '#22c55e'
+          const muted = cssVar('--muted', '#94a3b8')
           const tag = dd && idx === dd.troughIdx
             ? `<div style="font-size:10px;margin-top:4px;color:#22c55e">${ddText} · ${xLabels[dd.peakIdx] ?? ''} → ${day}</div>`
             : dd && idx === dd.peakIdx
               ? `<div style="font-size:10px;margin-top:4px;opacity:0.6">${ddLabel}起点</div>`
               : ''
+          // 基准缺口显式说明，避免"没有数字"被当成 0 或漏渲染
+          const gapNote = bCum == null
+            ? `<div style="font-size:10px;margin-top:4px;color:${benchColor}">沪深300 当日数据缺失</div>`
+            : ''
           return `<div style="font-size:11px;margin-bottom:4px;opacity:0.7">${day}</div>` +
             `<div style="display:grid;grid-template-columns:auto auto auto;gap:2px 12px;font-size:12px">` +
             `<span style="color:${accent}">策略</span>` +
             `<span style="color:${color(sCum)}">${fmt(sCum)}</span>` +
             `<span style="color:${color(sDay)};opacity:0.6">${fmt(sDay)}</span>` +
             `<span style="color:${benchColor}">沪深300</span>` +
-            `<span style="color:${color(bCum)}">${fmt(bCum)}</span>` +
-            `<span style="color:${color(bDay)};opacity:0.6">${fmt(bDay)}</span>` +
+            `<span style="color:${bCum == null ? muted : color(bCum)}">${bCum == null ? '—' : fmt(bCum)}</span>` +
+            `<span style="color:${bDay == null ? muted : color(bDay)};opacity:0.6">${bDay == null ? '—' : fmt(bDay)}</span>` +
             `</div>` +
             `<div style="font-size:10px;margin-top:4px;opacity:0.4">累计 / 当日</div>` +
+            gapNote +
             tag
         },
       },
@@ -757,7 +775,8 @@ function SimDetail({ aid, strategyName, onBack, startMut, pauseMut, resetMut, de
         {
           name: '沪深300(累计)',
           type: 'line',
-          data: benchWin,
+          data: benchWin,          // null 处断线：缺口可见，不跨过去连成假趋势
+          connectNulls: false,
           symbol: 'none',
           lineStyle: { color: benchColor, width: 1.5, type: 'dashed' },
         },

@@ -486,7 +486,8 @@ def sim_stream(aid: str, since_id: int | None = None):
         off_log = db.get_max_sim_log_id(aid) if start is None else start
         off_trade = db.get_max_sim_trade_id(aid) if start is None else start
         off_eq = db.get_max_sim_snapshot_id(aid) if start is None else start
-        # 连接期取一次基准映射，增量 equity 行也附 benchmark_pct（否则当天末点掉回 0）
+        # 连接期取一次基准映射，增量 equity 行也附 benchmark_pct（缺失日为 None，
+        # 前端据此断线而非当成 0）
         _bench = {}
         try:
             _snaps = db.get_sim_snapshots(aid)
@@ -526,7 +527,10 @@ def sim_stream(aid: str, since_id: int | None = None):
                     off_eq = row["rowid"]
                     d = {k: row[k] for k in ("dt", "net_value", "cash", "positions_value", "pnl", "pnl_pct")}
                     day = str(row["dt"]).replace("-", "")[:8]
-                    d["benchmark_pct"] = _bench.get(day, 0)
+                    # 缺失日为 None（不是 0）：0 是"当日涨跌为 0"的合法值，用它
+                    # 顶替"无数据"会让前端把归零反推成暴涨（09-14 沪深300 显示
+                    # +8.12% 的成因）。
+                    d["benchmark_pct"] = _bench.get(day)
                     yield f"event: equity\ndata: {_json.dumps(d, ensure_ascii=False)}\n\n"
                 for row in db.get_sim_trades_after(aid, off_trade):
                     off_trade = row["rowid"]
@@ -566,7 +570,8 @@ def sim_equity(aid: str):
             out.append(rows[-1])
     for s in out:
         day = str(s.get("dt", ""))[:10].replace("-", "")
-        s["benchmark_pct"] = bench.get(day, 0)
+        # 见 sim_stream：缺失基准日为 None，不得用 0 冒充（0=当日涨跌为 0）
+        s["benchmark_pct"] = bench.get(day)
     return {"data": out}
 
 
