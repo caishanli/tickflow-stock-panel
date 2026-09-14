@@ -252,3 +252,14 @@ def test_calendar_store_extend():
     s = _CalendarStore([pd.Timestamp("2026-09-09").date()])
     assert s.extend(["2026-09-10", "2026-09-09"]) == 1
     assert s.get_trading_calendar()[-1].date().isoformat() == "2026-09-10"
+
+
+# --- Task 5: runner 守卫 + 调度刷新钩子 ---
+
+
+def test_refresh_never_raises(monkeypatch):
+    import app.services.trade_calendar as m
+    monkeypatch.setattr(m, "fetch_sina_payload", lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    out = m.refresh_calendar(force=True)
+    assert out["ok"] is False and "down" in out["reason"]
+###TASK5-HOOK-PLACEHOLDER###

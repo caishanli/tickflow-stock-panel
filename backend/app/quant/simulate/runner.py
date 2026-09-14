@@ -657,12 +657,36 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
     if not resume_same_day:
         jq_api.on_new_day()
     try:
-        days = jq_api.get_trade_days(end_date=str(now.date()), count=5)
-        prev = [d for d in days if pd.Timestamp(d).date() < now.date()]
-        if prev:
-            ctx.previous_date = pd.Timestamp(prev[-1]).date()
-    except Exception:
-        pass
+        import os as _os
+
+        from app.services import trade_calendar as tcal
+        cal_file = tcal.calendar_path()
+        try:
+            mtime = _os.path.getmtime(cal_file)
+        except OSError:
+            mtime = 0.0
+        if aux is not None and mtime > aux.get("cal_mtime", 0.0):
+            data = tcal.load_calendar_file(cal_file)
+            from app.quant import jqcompat as _jq
+            added = _jq.extend_engine_calendar(data["dates"])
+            aux["cal_mtime"] = mtime
+            if added:
+                _emit_log(account_id, "info", f"交易日历已延长{added}天")
+        eng_days = jq_api.get_trade_days()
+        eng_end = str(pd.Timestamp(eng_days[-1]).date()) if len(eng_days) else None
+        fdata = tcal.load_calendar_file(cal_file)
+        file_end = tcal.last_trading_day(fdata["dates"], str(now.date()))
+        probe_end = tcal.probe_recent_anchor()
+        res = tcal.check_drift(eng_end, file_end, probe_end)
+        if not res["ok"] or res["level"] != "ok":
+            _emit_log(account_id, "error", f"🚨【日历漂移】{res['reason']}")
+            # 仅引擎真正落后权威才分页告警；probe-only 差异（腾讯抖动）与
+            # replay 补跑只记 error 日志，避免告警疲劳。
+            replay = aux.get("replay_mode") if aux is not None else False
+            if not replay and not res["ok"] and eng_end != file_end:
+                _send_dingtalk_async(account_id, f"🚨【日历漂移】{res['reason']}")
+    except Exception as e:
+        log.warning("[runner] 日历守卫异常（不阻断）: %s", e)
     # 盘前日线新鲜度由按需取数保证（get_price/get_history 走网络批量读最新分区，
     # 服务端 LRU 命中），不再整体预载全市场日线（见 _make_dm 注释）。
     # 保留重启时重建盘前缓存的既有契约（例如 PTrade 的流动性阈值）。
