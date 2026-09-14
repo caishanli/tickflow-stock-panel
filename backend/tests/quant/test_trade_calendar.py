@@ -1,5 +1,6 @@
 """新浪交易日历解码器 + 校验单测（零网络，payload 为 2026-09-13 实测原文内联）。"""
 
+import contextlib
 import json
 from datetime import date, timedelta
 
@@ -60,12 +61,24 @@ def test_check_drift_matrix():
     assert r["ok"] is True and r["level"] == "warn"
     r = tc.check_drift("2026-09-10", "2026-09-10", "2026-09-10")
     assert r["ok"] is True and r["level"] == "ok"
+    # 引擎超前权威（=权威文件陈旧）只报警告，不得判成"落后"
+    r = tc.check_drift("2026-12-31", "2026-09-14", "2026-09-11")
+    assert r["ok"] is True and r["level"] == "warn"
+    assert "超前" in r["reason"]
+
+
+def test_check_drift_probe_missing_skips_leg():
+    """探测不可用（腾讯抖动/未启网络）时跳过 probe 腿，不得整体判错。"""
+    assert tc.check_drift("2026-09-10", "2026-09-10")["level"] == "ok"
+    assert tc.check_drift("2026-09-10", "2026-09-10", None)["level"] == "ok"
+    assert tc.check_drift("2026-09-09", "2026-09-10", None)["ok"] is False
 
 
 def test_check_drift_none_is_error():
-    r = tc.check_drift("2026-09-10", "2026-09-10", None)
-    assert r == {"ok": False, "level": "error", "reason": r["reason"]}
+    assert tc.check_drift("2026-09-10", "2026-09-10", None)["level"] == "ok"
     r = tc.check_drift(None, "2026-09-10", "2026-09-10")
+    assert r["ok"] is False and r["level"] == "error"
+    r = tc.check_drift("2026-09-10", None, "2026-09-10")
     assert r["ok"] is False and r["level"] == "error"
 
 
@@ -180,6 +193,44 @@ def test_refresh_failure_never_raises(tmp_path, monkeypatch):
     assert json.loads(p.read_text())["dates"] == ["2026-09-10", "2026-09-11"]
 
 
+def test_refresh_failure_alert_skipped_while_file_still_fresh(tmp_path, monkeypatch):
+    """网络抖动不该天天告警：文件仍新鲜时刷新失败只记日志，不推钉钉。"""
+    p = tmp_path / "cal.json"
+    _write_cal(p, ["2026-09-10"], fetched_at=date.today().isoformat() + "T00:00:00")
+    monkeypatch.setenv("TRADE_CALENDAR_PATH", str(p))
+    monkeypatch.setattr(tc, "fetch_sina_payload",
+                        lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    sent = []
+    monkeypatch.setattr(tc, "push_stale_alert", lambda t: sent.append(t) or True)
+    tc.refresh_calendar(force=True)
+    assert sent == []
+
+
+def test_refresh_failure_alerts_when_file_stale(tmp_path, monkeypatch):
+    """设计 §6「任何降级都不静默」：文件已过期且刷新失败 → 必须告警。"""
+    p = tmp_path / "cal.json"
+    old = (date.today() - timedelta(days=30)).isoformat()
+    _write_cal(p, ["2026-09-10"], fetched_at=old + "T00:00:00")
+    monkeypatch.setenv("TRADE_CALENDAR_PATH", str(p))
+    monkeypatch.setattr(tc, "fetch_sina_payload",
+                        lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    sent = []
+    monkeypatch.setattr(tc, "push_stale_alert", lambda t: sent.append(t) or True)
+    tc.refresh_calendar(force=True)
+    assert len(sent) == 1 and "过期" in sent[0]
+
+
+def test_refresh_failure_alerts_when_file_missing(tmp_path, monkeypatch):
+    """无可用日历文件（全新部署）也算降级，必须告警。"""
+    monkeypatch.setenv("TRADE_CALENDAR_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(tc, "fetch_sina_payload",
+                        lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    sent = []
+    monkeypatch.setattr(tc, "push_stale_alert", lambda t: sent.append(t) or True)
+    tc.refresh_calendar(force=True)
+    assert len(sent) == 1
+
+
 def test_save_preserves_last_stale_push(tmp_path):
     p = tmp_path / "cal.json"
     _write_cal(p, ["2026-09-10"], last_push="2026-09-07")
@@ -264,8 +315,28 @@ def test_refresh_never_raises(monkeypatch):
     assert out["ok"] is False and "down" in out["reason"]
 
 
-def test_scheduler_hooks_calendar():
-    import inspect
-
+def test_scheduler_hooks_calendar(monkeypatch):
+    """收盘同步后必须刷新日历，且刷新失败不得中断同步（非阻断契约）。"""
     from app.services.stockdata import scheduler
-    assert "refresh_calendar" in inspect.getsource(scheduler._run_sync)
+
+    calls = []
+
+    def _boom():
+        calls.append(1)
+        raise ConnectionError("sina down")
+
+    monkeypatch.setattr("app.services.trade_calendar.refresh_calendar", _boom)
+    monkeypatch.setattr(scheduler, "_mark_active", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "_mark_idle", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "_trim_memory", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "_sync_lock", contextlib.nullcontext)
+    import app.services.mootdx_service as ms
+    for name in ("sync_etf_minute", "sync_adj_factor", "sync_stock_minute",
+                 "sync_daily", "sync_index_daily", "STOCK_MINUTE_BATCH_LIMIT"):
+        monkeypatch.setattr(ms, name, (lambda *a, **k: {}) if name[0] == "s" else 1,
+                            raising=False)
+    monkeypatch.setattr("app.services.etf_nav_service.sync_etf_nav", lambda *a, **k: {})
+    monkeypatch.setattr("app.services.tencent_minute.fill_recent_gaps", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.alt_daily.fill_recent_gaps_daily", lambda *a, **k: None)
+    scheduler._run_sync(full_stock_minute=True)
+    assert calls == [1]  # 刷新被调用；异常被吞，同步未中断

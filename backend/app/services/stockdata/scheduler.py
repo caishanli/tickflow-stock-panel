@@ -119,6 +119,13 @@ def _backfill_loop():
         with _lock:
             _scheduler_state["financials_sync"] = fin
         logger.info("stockdata financials sync done: %s", fin)
+        # 交易日历：启动时补齐运行期文件（15:35 cron 之外的第二触发点，设计 §3）。
+        # 幂等且新鲜时直接返回不触网；失败仅告警，守卫侧会回退随包种子。
+        from app.services.trade_calendar import refresh_calendar
+        cal = refresh_calendar()
+        with _lock:
+            _scheduler_state["trade_calendar"] = cal
+        logger.info("stockdata trade calendar: %s", cal)
     except Exception:  # noqa: BLE001
         logger.exception("stockdata startup backfill failed")
     finally:

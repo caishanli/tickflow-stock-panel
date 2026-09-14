@@ -300,7 +300,13 @@ def _fresh_result(path: str, today: date, max_age_days: int) -> dict | None:
 
 
 def refresh_calendar(force: bool = False, max_age_days: int = 7) -> dict:
-    """刷新日历文件，永不抛异常；返回 {"ok","reason","path","count"}。"""
+    """刷新日历文件，永不抛异常；返回 {"ok","reason","path","count"}。
+
+    陈旧策略（设计 §6「任何降级都不静默」）：
+    - 文件新鲜（< max_age_days）→ 直接用，不触网；
+    - 刷新失败 → 保留旧文件，warn 日志 **+ 钉钉**（`push_stale_alert`，同自然周
+      至多一次）。
+    """
     path = ""
     try:
         path = calendar_path()
@@ -317,8 +323,18 @@ def refresh_calendar(force: bool = False, max_age_days: int = 7) -> dict:
     except Exception as e:
         logger.warning("交易日历刷新失败: %s", e)
         count = 0
+        age = -1
         with contextlib.suppress(Exception):
-            count = len(load_calendar_file(path)["dates"])
+            data = load_calendar_file(path)
+            count = len(data["dates"])
+            fetched = datetime.fromisoformat(str(data.get("fetched_at") or ""))
+            age = (date.today() - fetched.date()).days
+        # 仅当"手上这份也已过期"才告警：单次刷新失败但文件仍新鲜不算降级，
+        # 否则网络抖动会天天推钉钉。
+        if age < 0 or age >= max_age_days:
+            with contextlib.suppress(Exception):
+                push_stale_alert(
+                    f"交易日历刷新失败且本地文件已过期（{age if age >= 0 else '无有效文件'} 天）：{e}")
         return {"ok": False, "reason": str(e), "path": path, "count": count}
 
 
@@ -357,18 +373,33 @@ def last_trading_day(dates: list[str], day: str | date) -> str | None:
 
 
 def check_drift(engine_end: str | None, file_end: str | None,
-                probe_end: str | None) -> dict:
-    """三方对账：引擎末端 vs 文件末端 vs 腾讯探测。"""
-    if engine_end is None or file_end is None or probe_end is None:
+                probe_end: str | None = None) -> dict:
+    """三方对账：引擎末端 vs 权威锚点 vs 腾讯探测（探测不可用传 None 跳过该腿）。
+
+    ``file_end`` 应当是**权威日历中早于今天的最后一个交易日**，而非文件末端，
+    也不是"今天"本身：引擎日历当日数据要到 15:35 同步才落盘，盘前引擎末端必然
+    停在上一交易日，拿"今天"当锚点会每个交易日早盘误报。
+
+    比较按序（字符串 ISO 日期可直接比大小）：引擎**落后**才是真漂移（error），
+    引擎超前（权威文件陈旧）与探测不一致只是可疑信号（warn），不可混为一谈。
+
+    调用方须保证 ``probe_end`` 是**已完成交易日**的最新 bar：交易日盘中腾讯已
+    返回当日 bar，而 ``file_end`` 按定义是"今天之前最后一个交易日"，直接比对
+    必然每个交易日误报（见 runner 侧过滤）。
+    """
+    if engine_end is None or file_end is None:
         return {"ok": False, "level": "error",
-                "reason": f"日历对账数据缺失: engine={engine_end} file={file_end} probe={probe_end}"}
-    if engine_end != file_end:
+                "reason": f"日历对账数据缺失: engine={engine_end} file={file_end}"}
+    if engine_end < file_end:
         return {"ok": False, "level": "error",
                 "reason": f"引擎日历末端{engine_end}落后权威{file_end}"}
-    if probe_end and probe_end != file_end:
+    if engine_end > file_end:
+        return {"ok": True, "level": "warn",
+                "reason": f"引擎日历末端{engine_end}超前权威{file_end}"}
+    if probe_end is not None and probe_end != file_end:
         return {"ok": True, "level": "warn",
                 "reason": f"腾讯探测末端{probe_end}与权威文件{file_end}不一致"}
-    return {"ok": True, "level": "ok", "reason": "三方一致"}
+    return {"ok": True, "level": "ok", "reason": "日历对账一致"}
 
 
 def push_stale_alert(text: str) -> bool:

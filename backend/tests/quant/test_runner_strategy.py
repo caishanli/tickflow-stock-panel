@@ -307,6 +307,38 @@ def test_run_loop_emits_progress_logs(tmp_quant, monkeypatch):
     assert any("策略模拟盘启动" in l["message"] for l in logs)
 
 
+def test_pre_market_sets_previous_date_even_without_calendar_file(tmp_quant, monkeypatch):
+    """盘前必须给引擎写 context.previous_date，且权威日历文件缺失不得影响它。
+
+    回归：runner 曾把该赋值当"死代码"删除（只对 rqalpha 回测路径成立——那边
+    StrategyContext.previous_date 是只读 property；实盘 jqengine 的 Context 是
+    普通属性）。删后策略拿到 None，end_date=None 传到
+    DataManager.get_daily_money_cached → np.datetime64(NaT) → TypeError，
+    流动性阈值静默降级为保守值（2026-09-14 ab_v56fix 实盘事故）。
+    """
+    seen = {}
+
+    class _JqApi:
+        def get_trade_days(self, end_date=None, count=None):
+            if count:
+                return [pd.Timestamp("2026-09-10"), pd.Timestamp("2026-09-11"),
+                        pd.Timestamp("2026-09-14")]
+            return [pd.Timestamp("2026-09-11")]
+
+        def on_new_day(self):
+            pass
+
+    ctx = SimpleNamespace(previous_date=None, current_dt=pd.Timestamp("2026-09-14 09:25"),
+                          universe=[], portfolio=SimpleNamespace(positions={}))
+    # 日历文件指向不存在的路径：守卫自身会失败，但 previous_date 必须已写入
+    monkeypatch.setenv("TRADE_CALENDAR_PATH", str(tmp_quant / "missing.json"))
+    runner._pre_market("acct_pd", SimpleNamespace(daily=[], minute=[],
+                                                  before_trading_start=None),
+                       ctx, seen, _JqApi(), pd.Timestamp("2026-09-14 09:25"),
+                       {"replay_mode": False})
+    assert ctx.previous_date == datetime.date(2026, 9, 11)
+
+
 # ---- run_daily 调度 ----
 def test_daily_due_times():
     assert runner._daily_due("open", pd.Timestamp("2026-07-17 09:31"))

@@ -656,35 +656,58 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
     # 恢复同一交易日不等于进入下一交易日，不能解冻存档中的当日买入股数。
     if not resume_same_day:
         jq_api.on_new_day()
+    # 引擎侧 previous_date：策略普遍用它锚定窗口与流动性阈值（如 wufu 系
+    # context.previous_date → get_daily_money_cached(end_date=...)）。这里必须
+    # 显式写入——jqengine 的 Context.previous_date 是普通实例属性（不是
+    # jqcompat 给 rqalpha StrategyContext 装的那个只读 property），不写就恒为
+    # None，end_date=None 一路传到 np.datetime64(NaT) 触发 TypeError。
+    # 与后续日历守卫分开 try：权威文件缺失不得连带吃掉本赋值。
     try:
-        import os as _os
-
+        days = jq_api.get_trade_days(end_date=str(now.date()), count=5)
+        prev = [d for d in days if pd.Timestamp(d).date() < now.date()]
+        if prev:
+            ctx.previous_date = pd.Timestamp(prev[-1]).date()
+    except Exception as e:
+        log.warning("[runner] previous_date 锚定失败（不阻断）: %s", e)
+    try:
         from app.services import trade_calendar as tcal
         cal_file = tcal.calendar_path()
         try:
-            mtime = _os.path.getmtime(cal_file)
+            mtime = os.path.getmtime(cal_file)
         except OSError:
             mtime = 0.0
-        if aux is not None and mtime > aux.get("cal_mtime", 0.0):
-            data = tcal.load_calendar_file(cal_file)
+        if aux is not None and mtime != aux.get("cal_mtime"):
+            # 文件优先、缺失回退随包种子（load_authoritative_dates 的语义）：
+            # 运行期文件由 15:35 cron 产出，全新部署/服务未跑过收盘同步时必须
+            # 仍能延长与对账，否则守卫在文件出现前整段失效。用 != 而非 >：
+            # 文件缺失时 mtime=0.0，首次（cal_mtime 未设）同样要跑一次种子。
+            data_dates, _origin = tcal.load_authoritative_dates()
             from app.quant import jqcompat as _jq
-            added = _jq.extend_engine_calendar(data["dates"])
+            added = _jq.extend_engine_calendar(data_dates)
             aux["cal_mtime"] = mtime
             if added:
-                _emit_log(account_id, "info", f"交易日历已延长{added}天")
+                _emit_log(account_id, "info", f"交易日历已延长{added}天（来源={_origin}）")
         eng_days = jq_api.get_trade_days()
         eng_end = str(pd.Timestamp(eng_days[-1]).date()) if len(eng_days) else None
-        fdata = tcal.load_calendar_file(cal_file)
-        file_end = tcal.last_trading_day(fdata["dates"], str(now.date()))
-        probe_end = tcal.probe_recent_anchor()
+        auth_dates, _ = tcal.load_authoritative_dates()
+        # 锚点=权威日历里早于今天的最后交易日（不是文件末端、也不是今天）：
+        # 当日 bar 要到 15:35 同步才落盘，盘前引擎末端本应停在上一交易日。
+        file_end = tcal.last_trading_day(
+            auth_dates, str(now.date() - datetime.timedelta(days=1)))
+        # 探测是 15s 超时的同步网络调用，补跑逐日会串行阻塞，仅实时模式做。
+        # 且只在它指向**已完成**交易日时作证：交易日盘中腾讯已有当日 bar
+        # （probe=今天），而锚点按定义是"今天之前最后一个交易日"，两者本就不
+        # 该相等——拿今天的 probe 比对必然每个交易日误报。
+        replay = bool(aux.get("replay_mode")) if aux is not None else False
+        probe_end = tcal.probe_recent_anchor() if not replay else None
+        if probe_end is not None and probe_end >= str(now.date()):
+            probe_end = None
         res = tcal.check_drift(eng_end, file_end, probe_end)
-        if not res["ok"] or res["level"] != "ok":
-            _emit_log(account_id, "error", f"🚨【日历漂移】{res['reason']}")
-            # 仅引擎真正落后权威才分页告警；probe-only 差异（腾讯抖动）与
-            # replay 补跑只记 error 日志，避免告警疲劳。
-            replay = aux.get("replay_mode") if aux is not None else False
-            if not replay and not res["ok"] and eng_end != file_end:
-                _send_dingtalk_async(account_id, f"🚨【日历漂移】{res['reason']}")
+        if res["level"] != "ok":
+            _emit_log(account_id, res["level"], f"🚨【日历漂移】{res['reason']}")
+        # 仅"引擎真正落后权威"分页告警；超前/probe 抖动与补跑只留日志。
+        if not replay and not res["ok"]:
+            _send_dingtalk_async(account_id, f"🚨【日历漂移】{res['reason']}")
     except Exception as e:
         log.warning("[runner] 日历守卫异常（不阻断）: %s", e)
     # 盘前日线新鲜度由按需取数保证（get_price/get_history 走网络批量读最新分区，
