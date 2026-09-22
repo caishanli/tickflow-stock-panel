@@ -160,14 +160,51 @@ def sync_daily_batch(symbols: list[str],
         if raw is None:
             continue
 
+        # 零贡献统计: 要了但一行没贡献的标的 = 失败(未发布/整段缺失)，
+        # 必须进 failed_syms 走 WARNING + failed_out 通道 — 09-22 北交所 344 只
+        # 返回空帧被 continue 吞掉、管线报 done 的教训。全停牌窗口(返回了但被
+        # 停牌过滤掉)无数据可写但非失败，不记录 — 否则日常停牌天天红灯。
+        # 只统计本 chunk 请求过的标的；chunks 互不相交，无需跨 chunk 去重。
+        chunk_set = set(chunk)
+        contributed: set[str] = set()
+        halt_only: set[str] = set()
+        chunk_failed: set[str] = set()
         # 兼容两种形态:dict[sym → df] 和扁平 df
         if isinstance(raw, dict):
             for sym, sub in raw.items():
-                if sub is None or len(sub) == 0:
+                norm = _normalize_daily(sub, default_symbol=sym)
+                if sym not in chunk_set:
+                    # 非请求 key：保持旧行为（落盘），不参与失败统计
+                    if not norm.is_empty():
+                        out.append(norm)
                     continue
-                out.append(_normalize_daily(sub, default_symbol=sym))
+                if sub is None or len(sub) == 0:
+                    chunk_failed.add(sym)
+                    continue
+                if norm.is_empty():
+                    halt_only.add(sym)
+                    continue
+                contributed.add(sym)
+                out.append(norm)
+            chunk_failed.update(s for s in chunk if s not in contributed and s not in halt_only)
         elif raw is not None and len(raw) > 0:
-            out.append(_normalize_daily(raw))
+            cols = list(raw.columns)
+            scol = "symbol" if "symbol" in cols else ("ts_code" if "ts_code" in cols else None)
+            raw_syms: set[str] | None = set(raw[scol].to_list()) if scol is not None else None
+            norm = _normalize_daily(raw)
+            if "symbol" in norm.columns:
+                contributed.update(norm["symbol"].unique().to_list())
+            out.append(norm)
+            if raw_syms is not None:
+                # 在返回帧里出现过但被停牌过滤的，不记失败
+                chunk_failed.update(s for s in chunk if s not in raw_syms)
+            # 无 symbol 列：无法观测谁缺席，保持旧行为（落盘、不统计）
+        else:
+            # 空扁平帧(raw 非 None 但 0 行)：整 chunk 可判定零贡献
+            chunk_failed.update(chunk)
+        for sym in chunk:
+            if sym in chunk_failed:
+                failed_syms.append(sym)
 
         if on_chunk_done:
             on_chunk_done(i + 1, len(chunks))
@@ -192,11 +229,15 @@ def sync_and_persist_daily_batch(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     on_chunk_done: Callable[[int, int], None] | None = None,
+    failed_out: list[str] | None = None,
 ) -> int:
     """批量同步日 K 并落到 Parquet。返回写入的行数。
 
     start_date/end_date: 外部传入的时间范围(由 pipeline 根据已有数据计算)。
     未传入时默认拉最近 1 年。
+    failed_out: 可选出参。零贡献/拉取失败的标的追加进该 list, 供上层判定
+        部分失败而非静默当成功(None 时保持旧行为，仅日志 WARNING)。
+        仅 TickFlow batch 路径回填；自定义源路径不经过此通道。
     """
     if not symbols:
         return 0
@@ -240,7 +281,7 @@ def sync_and_persist_daily_batch(
     df = sync_daily_batch(
         symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
         start_time=start_time, end_time=end_time,
-        on_chunk_done=on_chunk_done,
+        on_chunk_done=on_chunk_done, failed_out=failed_out,
     )
 
     if df.is_empty():

@@ -150,6 +150,10 @@ def run_now(
     today = _date.today()
     today_exists = latest_daily and latest_daily >= today
     new_daily_days = 0
+    # 本轮 batch 拉取零贡献的标的(未发布/整段缺失)：非空即部分失败，不能静默当成功。
+    # 覆盖三个 batch 分支；实时行情分支(sync_daily_by_quotes)形状不同未纳入，
+    # 其空返回已有独立 WARNING (get_by_universes failed/returned empty)。
+    daily_failed: list[str] = []
 
     # 完整性自愈: 检测最近交易日的盘中快照/缺口 (盘中停机后次日开实时会留下
     # 中午快照, 而下方"今天已有数据→只刷今天"分支会让它永久留存)。
@@ -200,6 +204,7 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failed,
         )
         gap_days = (today - start_date).days
         new_daily_days = gap_days
@@ -241,6 +246,7 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failed,
         )
         gap_days = (today - start_date).days
         new_daily_days = gap_days
@@ -261,10 +267,15 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failed,
         )
         new_daily_days = 365
         emit("sync_daily", 45, "日K 完成")
         logger.info("sync_daily: [%s ~ %s] done", start_date, today)
+    if daily_failed:
+        # 部分失败必须可见且计入终态：09-22 北交所 344 只空帧被吞、管线报 done 的教训
+        logger.warning("sync_daily: %d 只标的零贡献 (样例: %s)", len(daily_failed), daily_failed[:10])
+        stage_errors.append(f"sync_daily: {len(daily_failed)} 只标的零贡献 (样例: {daily_failed[:10]})")
     _invalidate("daily")
 
     # 完整性修复时删除股票 enriched 的坏分区: 增量重算只算 enriched 里不存在
