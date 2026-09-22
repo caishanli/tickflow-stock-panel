@@ -29,6 +29,19 @@ def _part_days(base, table: str) -> list[str]:
     return sorted(p.name[5:] for p in root.glob("date=*") if p.is_dir())
 
 
+def _cover_days(base, daily_table: str, enriched_table: str) -> list[str]:
+    """回填覆盖窗口：max(已有 enriched 最早日) 起的全部 daily 日。
+
+    只往已有覆盖窗口内和之后填，不往从未建过 enriched 的远古历史重建。
+    """
+    daily = set(_part_days(base, daily_table))
+    enriched = set(_part_days(base, enriched_table))
+    if not daily:
+        return []
+    start = min(enriched) if enriched else sorted(daily)[-5]
+    return sorted(d for d in daily if d >= start)
+
+
 def check() -> int:
     import polars as pl
 
@@ -45,28 +58,28 @@ def check() -> int:
             n = pl.scan_parquet(dp).select(pl.len()).collect().item()
             print(f"  stock {ds}: enriched 缺分区 (daily {n} 行)")
             issues += 1
-    etf_days = sorted(set(_part_days(base, "kline_etf_daily")) & set(_part_days(base, "kline_etf_enriched")))
+    etf_days = _cover_days(base, "kline_etf_daily", "kline_etf_enriched")
     missing = enriched_backfill.find_missing_cells(
         base, "kline_etf_daily", "kline_etf_enriched", etf_days,
     )
     for ds, syms in missing.items():
         print(f"  etf {ds}: 缺 {len(syms)} 只")
         issues += len(syms)
-    idx_days = sorted(set(_part_days(base, "kline_index_daily")) & set(_part_days(base, "kline_index_enriched")))
-    for ds in idx_days[-5:]:
-        d = set(pl.scan_parquet(base / "kline_index_daily" / f"date={ds}" / "*.parquet")
-                .select("symbol").collect()["symbol"].to_list())
-        e = set(pl.scan_parquet(base / "kline_index_enriched" / f"date={ds}" / "*.parquet")
-                .select("symbol").collect()["symbol"].to_list())
-        if d != e:
-            print(f"  index {ds}: 日线 {len(d)} 只 vs enriched {len(e)} 只，不一致!")
-            issues += 1
+    idx_days = _cover_days(base, "kline_index_daily", "kline_index_enriched")
+    idx_missing = enriched_backfill.find_missing_cells(
+        base, "kline_index_daily", "kline_index_enriched", idx_days,
+    )
+    for ds, syms in idx_missing.items():
+        print(f"  index {ds}: 缺 {len(syms)} 只")
+        issues += len(syms)
     if not issues:
         print("无缺口")
     return issues
 
 
 def repair() -> None:
+    import polars as pl
+
     from app.config import settings
     from app.indicators import pipeline as ind_pipeline
     from app.jobs import daily_pipeline
@@ -79,9 +92,32 @@ def repair() -> None:
     print("[repair] stock: run_pipeline(new_dates_only=True) ...", flush=True)
     written = ind_pipeline.run_pipeline(data_dir=base, new_dates_only=True)
     print(f"[repair] stock: +{written} 行")
+    # 股票分区内部缺格（分区存在但比日线薄，如被误删后只合并了部分标的）：
+    # 按日线基线找缺格，本地日线+60天前缀重算后 merge-upsert
+    stock_days = sorted(set(_part_days(base, "kline_daily")) & set(_part_days(base, "kline_daily_enriched")))
+    stock_missing = enriched_backfill.find_missing_cells(
+        base, "kline_daily", "kline_daily_enriched", stock_days,
+    )
+    stock_total = sum(len(v) for v in stock_missing.values())
+    print(f"[repair] stock: {len(stock_missing)} 天共缺 {stock_total} 格", flush=True)
+    if stock_total:
+        factors = ind_pipeline._load_factors(base / "adj_factor" / "all.parquet")
+        try:
+            instruments = pl.scan_parquet(
+                str(base / "instruments" / "**" / "*.parquet")).collect()
+        except Exception:
+            instruments = pl.DataFrame()
+        shares = ind_pipeline.load_share_history(base)
+        rows = enriched_backfill.compute_gap_rows(
+            base, "kline_daily", stock_missing,
+            factors=factors, instruments=instruments if not instruments.is_empty() else None,
+            historical_shares=shares,
+        )
+        print(f"[repair] stock: 算出 {rows.height} 行，落盘 ...", flush=True)
+        repo.append_enriched(rows)
     daily_pipeline._refresh_single_view(repo, "kline_enriched")
 
-    etf_days = sorted(set(_part_days(base, "kline_etf_daily")) & set(_part_days(base, "kline_etf_enriched")))
+    etf_days = _cover_days(base, "kline_etf_daily", "kline_etf_enriched")
     missing = enriched_backfill.find_missing_cells(
         base, "kline_etf_daily", "kline_etf_enriched", etf_days,
     )
@@ -94,7 +130,7 @@ def repair() -> None:
         )
         print(f"[repair] etf: 算出 {rows.height} 行，落盘 ...", flush=True)
         repo.append_etf_enriched(rows)
-    idx_days = sorted(set(_part_days(base, "kline_index_daily")) & set(_part_days(base, "kline_index_enriched")))
+    idx_days = _cover_days(base, "kline_index_daily", "kline_index_enriched")
     idx_missing = enriched_backfill.find_missing_cells(
         base, "kline_index_daily", "kline_index_enriched", idx_days,
     )

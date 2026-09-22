@@ -46,6 +46,7 @@ def compute_gap_rows(
     missing: dict[str, list[str]],
     factors: pl.DataFrame | None = None,
     instruments: pl.DataFrame | None = None,
+    historical_shares: pl.DataFrame | None = None,
     history_days: int = 60,
 ) -> pl.DataFrame:
     """计算缺失格的 enriched 行（含历史前缀供指标窗口使用，输出只保留目标格）。"""
@@ -71,7 +72,9 @@ def compute_gap_rows(
     raw = pl.concat(frames, how="diagonal_relaxed").sort(["symbol", "date"])
     if raw.is_empty():
         return pl.DataFrame()
-    out = pipeline.compute_enriched(raw, factors=factors, instruments=instruments)
+    out = pipeline.compute_enriched(
+        raw, factors=factors, instruments=instruments, historical_shares=historical_shares,
+    )
     if out.is_empty():
         return out
     want = pl.DataFrame({
