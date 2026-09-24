@@ -1,4 +1,8 @@
-"""日线备用史源链：腾讯 fqkline(day) 第一，新浪 K线(scale=240) 第二，mootdx 第三。
+"""日线备用链：腾讯 fqkline(day) 第一，新浪 K线(scale=240) 第二，mootdx 第三.
+
+股票另有 ``sync_stock_daily_official``（TickFlow adjust=none 逐 symbol/day
+校验后发布，保留北交所、只建缺失已收盘分区、永不覆盖）：熔断期主备皆无
+数据时的 qualified 增补入口，尚未接入调度，保持独立 + 单测锁定。
 
 背景：mootdx K 线全局返回空 + TickFlow 免费日线 T+1/限流时，日线分区
 （kline_daily / kline_etf_daily）缺口无人补。本模块只补**已收盘缺口日**，
@@ -316,6 +320,130 @@ def backfill_days(symbols: list[tuple[str, float]], days: list[_date],
             "uncovered": uncovered}
 
 
+def validate_official_stock_daily(frame: pl.DataFrame, symbols: list[str],
+                                  days: list[_date]) -> pl.DataFrame:
+    """Reject an invalid batch, retaining all missing keys in the caller receipt."""
+    frame = frame.select(list(_DAY_SCHEMA)).cast(_DAY_SCHEMA, strict=True)
+    if frame.is_empty():
+        return frame
+    if (frame.unique(["symbol", "date"]).height != frame.height
+            or not set(frame["symbol"]) <= set(symbols)
+            or not set(frame["date"]) <= set(days)):
+        raise ValueError("OFFICIAL_RAW_IDENTITY_OR_DUPLICATE")
+    numeric = ["open", "high", "low", "close", "volume", "amount"]
+    invalid = frame.filter(
+        pl.any_horizontal([pl.col(c).is_null() | ~pl.col(c).is_finite()
+                           | (pl.col(c) <= 0) for c in numeric])
+        | (pl.col("low") > pl.min_horizontal("open", "close"))
+        | (pl.col("high") < pl.max_horizontal("open", "close")))
+    if not invalid.is_empty():
+        raise ValueError("OFFICIAL_RAW_INVALID_OHLCVA")
+    return frame
+
+
+def fetch_official_stock_daily(symbols: list[str], days: list[_date], *,
+                               provider=None) -> dict:
+    """TickFlow-only raw stock batches; absence is unresolved, never suspension.
+
+    Provider owns units (stock volume in lots, amount in yuan) and adjust=none.
+    Failures retain the frozen symbol/day denominator; no estimated fields.
+    """
+    from zoneinfo import ZoneInfo
+
+    if provider is None:
+        from app.data_providers.tickflow_provider import TickFlowProvider
+        provider = TickFlowProvider()
+    symbols = sorted(set(symbols))
+    days = sorted(set(days))
+    frames = []
+    errors = []
+    if symbols and days:
+        start = _dt.datetime.combine(days[0], _dt.time(), ZoneInfo("Asia/Shanghai"))
+        end = _dt.datetime.combine(days[-1], _dt.time(23, 59, 59), ZoneInfo("Asia/Shanghai"))
+        for offset in range(0, len(symbols), 100):
+            batch = symbols[offset:offset + 100]
+            try:
+                frame = provider.get_daily(batch, start, end, "stock")
+                if not frame.is_empty():
+                    try:
+                        frames.append(validate_official_stock_daily(frame, batch, days))
+                    except ValueError:
+                        # 整批废弃会连累同批好 bar（如 08-05 920107.BJ 零成交占位行
+                        # 毒死整批 76 行）：先查身份污染——返回了没要的 symbol 则整批
+                        # 不可信；否则逐 symbol 隔离，只 quarantined 坏行。
+                        try:
+                            foreign = (set(frame.get_column("symbol").to_list()) - set(batch))
+                        except Exception:
+                            raise
+                        if foreign:
+                            errors.append({"symbols": batch,
+                                           "error": "quarantined:identity"})
+                            continue
+                        for sym in batch:
+                            sub = frame.filter(pl.col("symbol") == sym)
+                            if sub.is_empty():
+                                continue
+                            try:
+                                frames.append(validate_official_stock_daily(sub, [sym], days))
+                            except ValueError as vex:
+                                errors.append({"symbols": [sym],
+                                               "error": f"quarantined:{type(vex).__name__}"})
+            except Exception as exc:
+                errors.append({"symbols": batch, "error": type(exc).__name__})
+                # Credentials/certificates are not transient; never retry them.
+                if isinstance(exc, PermissionError) or "SSL" in type(exc).__name__:
+                    break
+            if offset + 100 < len(symbols):
+                time.sleep(1.1)
+    frame = pl.concat(frames) if frames else pl.DataFrame(schema=_DAY_SCHEMA)
+    have = set(frame.select("symbol", "date").iter_rows())
+    missing = [{"symbol": s, "date": str(d)} for s in symbols for d in days
+               if (s, d) not in have]
+    return {"frame": frame, "missing": missing, "errors": errors,
+            "expected": len(symbols) * len(days),
+            "status": "partial" if missing or errors else "complete",
+            "source": "tickflow_raw_none"}
+
+
+def publish_official_stock_daily(frame: pl.DataFrame, root) -> int:
+    """Create one missing partition; a racing/existing partition is never merged.
+
+    Stage through the deployed writer before acquiring the destination mutex.
+    link() is atomic no-replace even against a non-cooperating create. Staging
+    lives under ``root`` so link() never crosses filesystems (/tmp 可能是独立
+    挂载，EXDEV 会直接失败；实测 2026-09-24）。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from app.raw_partition_lock import daily_partition_lock
+    from app.services import mootdx_service as ms
+
+    if frame.is_empty():
+        return 0
+    days = frame["date"].unique().to_list()
+    if len(days) != 1:
+        raise ValueError("OFFICIAL_RAW_SINGLE_PARTITION_REQUIRED")
+    frame = validate_official_stock_daily(frame, frame["symbol"].to_list(), days)
+    target = Path(root) / f"date={days[0]}" / "part.parquet"
+    Path(root).mkdir(parents=True, exist_ok=True)  # staging 锚点必须存在
+    with tempfile.TemporaryDirectory(prefix="official-raw-", dir=Path(root)) as temporary:
+        staging = Path(temporary) / "kline_daily"
+        ms._write_daily_partition(frame, staging, table="kline_daily")
+        staged = staging / target.parent.name / "part.parquet"
+        expected = frame.sort(["symbol", "date"])
+        if not pl.read_parquet(staged).equals(expected):
+            raise ValueError("OFFICIAL_RAW_WRITER_READBACK")
+        with daily_partition_lock(target):
+            if target.exists():
+                raise FileExistsError(f"OFFICIAL_RAW_PARTITION_APPEARED: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.link(staged, target)
+            if not pl.read_parquet(target).equals(expected):
+                raise ValueError("OFFICIAL_RAW_PUBLISHED_READBACK")
+    return frame.height
+
+
 def _day_partition_symbols(root, day: _date) -> set[str]:
     """读某日日线分区已落盘 symbol 集（仅 symbol 列；兼容 ETF 无 date 列格式）。"""
     part = root / f"date={day}" / "part.parquet"
@@ -380,6 +508,7 @@ def sync_stock_daily_alt(days: list[_date], symbols: list[str] | None = None,
     """备用回补股票日线（kline_daily，volume 手）。
 
     ``symbols`` 指定标的子集（审计覆盖重填用）；None = 全宇宙。
+    Qualifed raw 需求走 ``sync_stock_daily_official``（含北交所、禁覆盖）。
     """
     from app.services import mootdx_service as ms
     stocks = [s for s in ms._stock_universe() if not s.endswith(".BJ")]
@@ -399,6 +528,48 @@ def sync_stock_daily_alt(days: list[_date], symbols: list[str] | None = None,
             todo.append((s, 100.0))
     return _sync_daily(todo, days, ms.STOCK_DAILY_ROOT, "股票",
                        prefer=prefer, overwrite=overwrite)
+
+
+def sync_stock_daily_official(days: list[_date],
+                              symbols: list[str] | None = None) -> dict:
+    """Official raw 股票日线：只创建缺失的已收盘分区，永不覆盖。
+
+    与 ``sync_stock_daily_alt``（腾讯 qfq/新浪/mootdx 传统链）并存：
+    本函数走 TickFlow adjust=none 逐 symbol/day 校验后发布，保留北交所、
+    逐 symbol/day 未决明细；已有（含残缺）分区需另行评审修复。
+    尚未接入调度，保持独立入口 + 单测锁定。
+    """
+    from zoneinfo import ZoneInfo
+
+    from app.services import mootdx_service as ms
+
+    stocks = sorted(set(ms._stock_universe()))
+    if symbols is not None:
+        stocks = [s for s in stocks if s in set(symbols)]
+    now = _dt.datetime.now(ZoneInfo("Asia/Shanghai"))
+    days = sorted({d for d in days if d < now.date()
+                   or (d == now.date() and now.time() >= _dt.time(15, 35))})
+    existing = [str(d) for d in days
+                if (ms.STOCK_DAILY_ROOT / f"date={d}" / "part.parquet").exists()]
+    days = [d for d in days if str(d) not in existing]
+    result = fetch_official_stock_daily(stocks, days)
+    frame = result.pop("frame")
+    rows = {}
+    for day in days:
+        sub = frame.filter(pl.col("date") == day)
+        try:
+            rows[str(day)] = publish_official_stock_daily(sub, ms.STOCK_DAILY_ROOT)
+        except FileExistsError:
+            result["errors"].append({"date": str(day), "error": "partition_appeared"})
+            result["status"] = "partial"
+            rows[str(day)] = 0
+    result.update(rows=rows, total=sum(rows.values()), existing_not_audited=existing,
+                  uncovered=sorted({m["symbol"] for m in result["missing"]}))
+    if not days or not stocks:
+        result["status"] = "no_missing_partition" if stocks else "blocked_empty_universe"
+    logger.warning("official raw fallback: %s, rows=%s, missing=%d", result["status"],
+                   rows, len(result["missing"]))
+    return result
 
 
 def sync_etf_daily_alt(days: list[_date], symbols: list[str] | None = None,

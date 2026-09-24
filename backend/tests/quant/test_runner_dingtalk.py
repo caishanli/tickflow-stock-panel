@@ -58,7 +58,64 @@ def test_info_level_never_triggers_dingtalk():
         os.unlink(p)
 
 
-from app.quant.simulate.runner import _build_stop_loss_notify, _dispatch_dingtalk
+from app.quant.simulate.runner import (
+    _build_stop_loss_notify,
+    _dispatch_dingtalk,
+    _MIGRATED_DIRECT_NOTIFY_ACCOUNTS,
+)
+
+# 已迁入统一事件通知器（paper_trade_watch.py → Gateway → qqbot/dingtalk）的量化账户。
+# 数据库 dingtalk_enabled 标志因 quant.db 只读约束未改写；进程内旧直发路径必须在此
+# 代码级收窄，否则与统一通知器双发重复消息。
+MIGRATED_DIRECT_NOTIFY_ACCOUNTS = tuple(sorted(_MIGRATED_DIRECT_NOTIFY_ACCOUNTS))
+
+
+def test_migrated_accounts_never_direct_dispatch_even_when_enabled(sync_dingtalk_executor):
+    """迁移账户：即便 dingtalk_enabled=1（只读约束下 DB 未改写），直发路径也不得调用。"""
+    for aid in MIGRATED_DIRECT_NOTIFY_ACCOUNTS:
+        p = _fresh_db()
+        db.insert_sim_account(aid, "migrated", 10000.0, 0.03, "created")
+        db.update_sim_account(aid, dingtalk_enabled=1)
+        try:
+            with patch("app.quant.simulate.runner._send_dingtalk_async") as mock_send:
+                _dispatch_dingtalk(aid, "📥 买入 测试")
+                mock_send.assert_not_called()
+        finally:
+            os.unlink(p)
+
+
+def test_non_migrated_enabled_account_still_direct_dispatches(sync_dingtalk_executor):
+    """非迁移账户旧直发契约保持不变：迁移是逐账户收窄，不是删除路径。"""
+    p = _fresh_db()
+    db.insert_sim_account("a1", "acc", 10000.0, 0.03, "created")
+    db.update_sim_account("a1", dingtalk_enabled=1)
+    try:
+        with patch("app.quant.simulate.runner._send_dingtalk_async") as mock_send:
+            _dispatch_dingtalk("a1", "📥 买入 测试")
+            mock_send.assert_called_once()
+    finally:
+        os.unlink(p)
+
+
+def test_migrated_account_emit_log_live_routes_to_gate_but_never_direct(sync_dingtalk_executor):
+    """实时 notify 经 _emit_log → _dispatch_dingtalk 统一调度口；迁移账户直发仍被闸住。"""
+    from app.quant.simulate import runner
+    for aid in MIGRATED_DIRECT_NOTIFY_ACCOUNTS:
+        p = _fresh_db()
+        db.insert_sim_account(aid, "migrated", 10000.0, 0.03, "created")
+        db.update_sim_account(aid, dingtalk_enabled=1)
+        try:
+            runner._replay_active_ids.discard(aid)
+            runner._replay_day_notifies.clear()
+            with patch("app.quant.simulate.runner._dispatch_dingtalk") as mock_d:
+                runner._emit_log(aid, "notify", "📥 买入 测试")
+                mock_d.assert_called_once()
+            with patch("app.quant.simulate.runner._send_dingtalk_async") as mock_send:
+                _dispatch_dingtalk(aid, "📥 买入 测试")
+                mock_send.assert_not_called()
+        finally:
+            runner._replay_day_notifies.clear()
+            os.unlink(p)
 
 
 class _SyncExecutor:

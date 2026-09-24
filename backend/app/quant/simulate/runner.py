@@ -201,13 +201,27 @@ def _dispatch_dingtalk(account_id: str, message: str, ts: str | None = None) -> 
     """账户开启钉钉推送时异步发送通知（fire-and-forget，失败仅告警）。
 
     ts 为引擎推进到的时间（补跑时为 bar 时间，用于通知落款；None 用当前墙钟）。
+
+    已迁移账户（_MIGRATED_DIRECT_NOTIFY_ACCOUNTS）的成交通知由统一事件通知器
+    （paper_trade_watch.py → 本机 Gateway → qqbot/dingtalk 适配器）投递：此处代码级
+    收窄直发路径，避免与统一通知器双发。quant.db 的 dingtalk_enabled 标志因只读约束
+    未改写；该集合之外的账户维持原直发契约。
     """
+    if account_id in _MIGRATED_DIRECT_NOTIFY_ACCOUNTS:
+        log.debug("[runner] %s 已迁入统一事件通知器，跳过进程内直发", account_id)
+        return
     try:
         acct = db.get_sim_account(account_id) or {}
         if acct.get("dingtalk_enabled"):
             _DINGTALK_EXECUTOR.submit(_send_dingtalk_async, account_id, message, ts)
     except Exception:
         log.warning("[runner] 钉钉推送调度失败: %s", message)
+
+
+# 已迁入统一事件通知器的量化账户（2026-09-15 收口）。事件ID与来源水位由统一发现器
+# paper_trade_delivery.discover 保持；此名单只收窄进程内旧直发路径。
+_MIGRATED_DIRECT_NOTIFY_ACCOUNTS: frozenset[str] = frozenset(
+    {"781c7d63", "ab_v56fix", "d00506e8", "lb_v2opt_sim"})
 
 
 _DINGTALK_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dingtalk")

@@ -134,6 +134,38 @@ def tdx_client(market='std'):
 _STOCK_NAMES_CACHE = None
 
 
+def _daily_observation(stage, symbol, date, error=None, category="unknown"):
+    """Log allowlisted evidence only; never exception text, repr, URL or headers.
+
+    Observational only: no policy, returned payload, source state or retry changes.
+    Endpoint evidence can precede a collapsed unknown result; it is not a claim
+    that the final error or any live incident has this cause.
+    """
+    import json
+    import re
+    from urllib.error import HTTPError
+    try:
+        status = None
+        if isinstance(error, HTTPError) and type(error.code) is int:
+            status = error.code if 100 <= error.code <= 599 else None
+        if isinstance(error, PermissionError) or status in (401, 403):
+            category = "auth"
+        elif isinstance(error, TimeoutError):
+            category = "timeout"
+        elif error is not None:
+            category = "unknown"
+        if category not in {"auth", "timeout", "schema", "empty", "missing_target", "unknown"}:
+            category = "unknown"
+        stage = stage if stage in {"endpoint", "query", "validate"} else "query"
+        symbol = symbol if type(symbol) is str and re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", symbol) else None
+        date = date if type(date) is str and re.fullmatch(r"[0-9]{8}", date) else None
+        logger.warning("daily_observation %s", json.dumps(dict(
+            stage=stage, category=category, status=status, symbol=symbol, date=date)))
+    except Exception:
+        # A diagnostic sink failure must not change query/retry/return semantics.
+        pass
+
+
 class MootdxSource(DataSource):
     name = "mootdx"
 
@@ -329,9 +361,13 @@ class MootdxSource(DataSource):
         """
         sym = _to_symbol(code)
         def _fn(c):
-            if _is_index(code):
-                return c.index_bars(symbol=sym, frequency=9)
-            return c.bars(symbol=sym, frequency=9)
+            try:
+                if _is_index(code):
+                    return c.index_bars(symbol=sym, frequency=9)
+                return c.bars(symbol=sym, frequency=9)
+            except Exception as exc:
+                _daily_observation("endpoint", code, start, error=exc)
+                raise
         df, err = self._with_server_retry(_fn)
         if df is None or df.empty:
             raise DataSourceError(f"mootdx 无日线数据 ({err})")

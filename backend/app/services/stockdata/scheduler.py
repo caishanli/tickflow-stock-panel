@@ -95,6 +95,22 @@ def get_status() -> dict:
     return _json_safe(state)
 
 
+def _run_daily_fallback() -> None:
+    """Keep primary failure and official fallback outcome separately observable."""
+    try:
+        from app.services import alt_daily
+        result = alt_daily.fill_recent_gaps_daily("stock", force=True)
+        if result is None:
+            result = {"status": "no_missing_partition", "total": 0,
+                      "source": "tickflow_raw_none"}
+    except Exception as exc:
+        result = {"status": "blocked", "total": 0, "error": type(exc).__name__,
+                  "source": "tickflow_raw_none"}
+        logger.exception("official raw fallback failed")
+    with _lock:
+        _scheduler_state["daily_fallback_result"] = result
+
+
 def _backfill_loop():
     _mark_active("backfill")
     try:
@@ -110,7 +126,6 @@ def _backfill_loop():
         tm.fill_recent_gaps("stock")
         tm.fill_recent_gaps("etf")
         from app.services import alt_daily as ad
-        ad.fill_recent_gaps_daily("stock")
         ad.fill_recent_gaps_daily("etf")
         ad.fill_recent_gaps_daily("index")
         # 季频财务（gpcw）幂等回源：已有分区秒级跳过，新季度才下载
@@ -129,6 +144,7 @@ def _backfill_loop():
     except Exception:  # noqa: BLE001
         logger.exception("stockdata startup backfill failed")
     finally:
+        _run_daily_fallback()
         _mark_idle("backfill")
         _trim_memory()
 
@@ -145,7 +161,10 @@ def _run_sync(full_stock_minute: bool = False):
         try:
             from app.services import mootdx_service
             minutes = mootdx_service.sync_etf_minute()
-            adj = mootdx_service.sync_adj_factor()
+            # Legacy xdxr/cliff publication is quarantined, not a successful sync.
+            adj = {"status": "BLOCKED_SOURCE", "written_symbols": 0,
+                   "reason": "UNQUALIFIED_FACTOR_SOURCE"}
+            logger.error("factor sync BLOCKED_SOURCE: qualified factors unavailable")
             daily: dict | None = None
             index_daily: dict | None = None
             cross_daily: dict | None = None
@@ -173,7 +192,6 @@ def _run_sync(full_stock_minute: bool = False):
             tm.fill_recent_gaps("etf")
             # 日线备用链（腾讯fqkline→新浪→mootdx）：收盘后缺口仍在且开路时回补
             from app.services import alt_daily as ad
-            ad.fill_recent_gaps_daily("stock")
             ad.fill_recent_gaps_daily("etf")
             ad.fill_recent_gaps_daily("index")
             try:
@@ -192,6 +210,7 @@ def _run_sync(full_stock_minute: bool = False):
         except Exception:  # noqa: BLE001
             logger.exception("scheduled mootdx sync failed")
         finally:
+            _run_daily_fallback()
             _mark_idle("sync")
             _trim_memory()
 

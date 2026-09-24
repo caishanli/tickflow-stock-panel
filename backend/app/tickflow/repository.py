@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
+from app.raw_partition_lock import daily_partition_lock
 import logging
 import sys
 import threading
@@ -2132,19 +2134,20 @@ class KlineRepository:
                 ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
                 out = base / f"date={ds}" / "part.parquet"
                 out.parent.mkdir(parents=True, exist_ok=True)
-                existing = pl.DataFrame()
-                if out.exists():
-                    existing = pl.read_parquet(out)
-                    date_df = pl.concat([existing, date_df], how="diagonal_relaxed").unique(
-                        subset=["symbol", "date"], keep="last"
-                    )
-                date_df = date_df.sort(["symbol", "date"])
-                if not existing.is_empty() and existing.equals(date_df):
-                    continue
-                if publication is None:
-                    self._atomic_write_parquet(date_df, out)
-                else:
-                    publication.write_parquet(date_df, out)
+                with daily_partition_lock(out):
+                    existing = pl.DataFrame()
+                    if out.exists():
+                        existing = pl.read_parquet(out)
+                        date_df = pl.concat([existing, date_df], how="diagonal_relaxed").unique(
+                            subset=["symbol", "date"], keep="last"
+                        )
+                    date_df = date_df.sort(["symbol", "date"])
+                    if not existing.is_empty() and existing.equals(date_df):
+                        continue
+                    if publication is None:
+                        self._atomic_write_parquet(date_df, out)
+                    else:
+                        publication.write_parquet(date_df, out)
             if publication is not None:
                 publication.commit()
 
@@ -2165,13 +2168,14 @@ class KlineRepository:
         out = base / f"date={ds}" / "part.parquet"
         out.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock:
-            date_df = df.sort(["symbol", "date"])
-            if out.exists():
-                existing = pl.read_parquet(out)
-                date_df = pl.concat([existing, date_df], how="diagonal_relaxed").unique(
-                    subset=["symbol", "date"], keep="last"
-                )
-            self._atomic_write_parquet(date_df.sort(["symbol", "date"]), out)
+            with daily_partition_lock(out):
+                date_df = df.sort(["symbol", "date"])
+                if out.exists():
+                    existing = pl.read_parquet(out)
+                    date_df = pl.concat([existing, date_df], how="diagonal_relaxed").unique(
+                        subset=["symbol", "date"], keep="last"
+                    )
+                self._atomic_write_parquet(date_df.sort(["symbol", "date"]), out)
 
     def _with_instrument_metadata(self, asset_type: str, df: pl.DataFrame) -> pl.DataFrame:
         """补齐实时内存缓存所需的维表字段；这些字段不会写入 enriched 分区。"""
@@ -2228,7 +2232,7 @@ class KlineRepository:
             if asset_type in {"stock", "etf"}
             else None
         )
-        with self._write_lock:
+        with self._write_lock, daily_partition_lock(out):
             existing = pl.DataFrame()
             if out.exists():
                 existing = pl.read_parquet(out)
@@ -2277,7 +2281,8 @@ class KlineRepository:
         out = base / f"date={ds}" / "part.parquet"
         out.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock:
-            self._atomic_write_parquet(df.sort(["symbol", "date"]), out)
+            with daily_partition_lock(out):
+                self._atomic_write_parquet(df.sort(["symbol", "date"]), out)
 
     def flush_live_enriched(self, df: pl.DataFrame) -> None:
         """覆写当天 kline_daily_enriched 分区 (实时 enriched 落盘, 非merge)。
@@ -2313,7 +2318,7 @@ class KlineRepository:
             if asset_type in {"stock", "etf"}
             else None
         )
-        with self._write_lock:
+        with self._write_lock, daily_partition_lock(out):
             existing = pl.read_parquet(out) if out.exists() else pl.DataFrame()
             if existing.is_empty() or not existing.equals(df_storage):
                 if publication is None:

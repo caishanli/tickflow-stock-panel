@@ -12,6 +12,9 @@ _load_minute_from_partitions），本服务不参与策略执行。
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
+from app.raw_partition_lock import daily_partition_lock
+
 import datetime as _dt
 import logging
 import os
@@ -207,7 +210,7 @@ def _etf_universe() -> list[str]:
     return sorted(set(out))
 
 
-def sync_etf_minute(day: _date | None = None) -> dict:
+def sync_etf_minute(day: _date | None = None, *, only_missing_keys: bool = False) -> dict:
     """收盘后同步指定交易日（默认今天）全部 ETF 分钟到按日分区。
 
     逐标的拉真实 1m：近期日（≤5 天）用 ``get_minute_recent``（含当日盘中），
@@ -276,7 +279,7 @@ def sync_etf_minute(day: _date | None = None) -> dict:
         return {"rows": 0, "query_failed": failed}
     out = pl.concat(ok1).unique(
         subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
-    n = _write_minute_partition(out, ETF_MINUTE_ROOT, day)
+    n = _write_minute_partition(out, ETF_MINUTE_ROOT, day, only_missing_keys=only_missing_keys)
     return {"rows": n, "query_failed": failed}
 
 
@@ -335,8 +338,34 @@ def clean_phantom_noon_partitions() -> dict:
     return {"partitions": cleaned}
 
 
-def _write_minute_partition(df: pl.DataFrame, root: Path, day: _date) -> int:
-    """按 date 分区原子写分钟（读旧→concat→unique→归位假bar→tmp→rename）。返回行数。"""
+def _write_minute_partition(
+    df: pl.DataFrame, root: Path, day: _date, *, only_missing_keys: bool = False,
+) -> int:
+    """默认维护合并；启动模式锁内只补缺键，不修订任何既有 bar。"""
+    if only_missing_keys:
+        part = root / f"date={day}" / "part.parquet"
+        with daily_partition_lock(part):
+            old = pl.read_parquet(part) if part.exists() else None
+            keys = ["symbol", "datetime"]
+            # Filter before relabel too: a known 13:00 bar must not create a
+            # second revised historical observation at 11:30 during bootstrap.
+            if old is not None:
+                df = df.join(old.select(keys), on=keys, how="anti")
+            df = _relabel_phantom_noon_df(df).unique(subset=keys, keep="last")
+            if old is not None:
+                df = df.join(old.select(keys), on=keys, how="anti")
+            if df.is_empty():
+                return 0
+            added = df.height
+            out = pl.concat([old, df]) if old is not None else df
+            part.parent.mkdir(parents=True, exist_ok=True)
+            tmp = part.with_suffix(".tmp")
+            try:
+                out.sort(keys).write_parquet(tmp)
+                tmp.replace(part)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return added
     pdir = root / f"date={day}"
     pdir.mkdir(parents=True, exist_ok=True)
     part = pdir / "part.parquet"
@@ -371,7 +400,9 @@ _STOCK_MINUTE_RESUME_COVERAGE = float(
     os.getenv("STOCK_MINUTE_RESUME_COVERAGE", "0.95"))
 
 
-def _flush_stock_minute_chunk(chunk: list[pl.DataFrame]) -> None:
+def _flush_stock_minute_chunk(
+    chunk: list[pl.DataFrame], *, only_missing_keys: bool = False,
+) -> None:
     """把一批股票的分钟 bar 按日期分区一次性合并写入。
 
     先按交易日分组聚合 chunk 内所有股票，再对每个日期分区读旧→concat→
@@ -385,6 +416,9 @@ def _flush_stock_minute_chunk(chunk: list[pl.DataFrame]) -> None:
     for d, g in all_df.group_by("_day"):
         day = d[0]
         g = g.drop("_day").sort(["symbol", "datetime"])
+        if only_missing_keys:
+            _write_minute_partition(g, STOCK_MINUTE_ROOT, day, only_missing_keys=True)
+            continue
         pdir = STOCK_MINUTE_ROOT / f"date={day}"
         pdir.mkdir(parents=True, exist_ok=True)
         pfile = pdir / "part.parquet"
@@ -534,7 +568,7 @@ def _listing_date_map() -> dict[str, _date]:
     return out
 
 
-def sync_stock_minute(limit: int | None = None) -> dict:
+def sync_stock_minute(limit: int | None = None, *, only_missing_keys: bool = False) -> dict:
     """回源 4/1 起全市场 A 股分钟到 ``kline_minute`` 分区（一次拉全量多日）。
 
     对每只股票用 mootdx ``get_minute`` 拉一次全量历史 1m（约 3 个月，含
@@ -564,7 +598,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
     range_rows = 0
     missing_days = _missing_stock_minute_days()
     if missing_days:
-        range_rows = sync_stock_minute_range(missing_days)
+        range_rows = sync_stock_minute_range(missing_days, only_missing_keys=only_missing_keys)
         logger.info("mootdx_service: 股票分钟补齐缺失交易日 %s 共 %d 行",
                     [d.isoformat() for d in missing_days], range_rows)
     # 残片自愈: 回源中断会留下中间分区 symbol 数严重不足的残片(如 08-12 凌晨
@@ -573,7 +607,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
     fragments = _minute_fragment_days()
     fragment_rows = 0
     for day, missing in sorted(fragments.items()):
-        n = sync_stock_minute_day(day, symbols=missing)
+        n = sync_stock_minute_day(day, symbols=missing, only_missing_keys=only_missing_keys)
         fragment_rows += n
         logger.info("mootdx_service: 分钟残片日 %s 补齐 %d 行 (%d 只)",
                     day, n, len(missing))
@@ -673,7 +707,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
         pending.extend(batch_frames)
         if len(pending) >= _STOCK_MINUTE_BATCH:
             total_holder["rows"] += sum(f.height for f in pending)
-            _flush_stock_minute_chunk(pending.copy())
+            _flush_stock_minute_chunk(pending.copy(), only_missing_keys=only_missing_keys)
             _manifest_mark_done("stock_minute",
                                 [f["symbol"][0] for f in pending])
             pending.clear()
@@ -696,7 +730,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
         retry_syms = sorted(set(retry_syms) - ok_syms)
     if pending:
         total_holder["rows"] += sum(f.height for f in pending)
-        _flush_stock_minute_chunk(pending)
+        _flush_stock_minute_chunk(pending, only_missing_keys=only_missing_keys)
         _manifest_mark_done("stock_minute", [f["symbol"][0] for f in pending])
         pending.clear()
     total = total_holder["rows"]
@@ -710,7 +744,7 @@ def sync_stock_minute(limit: int | None = None) -> dict:
 
 
 
-def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
+def sync_stock_minute_day(day: _date, symbols: list[str] | None = None, *, only_missing_keys: bool = False) -> int:
     # NOTE: 本函数保持 int 契约（行数），不随 sync_stock_minute 改 dict
     """按缺失日补全股票分钟到 ``kline_minute/date={day}``。
 
@@ -783,7 +817,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
         pending.extend(batch_frames)
         if len(pending) >= _STOCK_MINUTE_BATCH:
             total_holder["rows"] += sum(f.height for f in pending)
-            _flush_stock_minute_chunk(pending.copy())
+            _flush_stock_minute_chunk(pending.copy(), only_missing_keys=only_missing_keys)
             pending.clear()
 
     result = _backfill_pool().map(_fetch_one, stocks,
@@ -791,7 +825,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
                                 on_batch_done=_on_batch, keep_frames=False)
     if pending:
         total_holder["rows"] += sum(f.height for f in pending)
-        _flush_stock_minute_chunk(pending)
+        _flush_stock_minute_chunk(pending, only_missing_keys=only_missing_keys)
         pending.clear()
     total = total_holder["rows"]
     logger.info("mootdx_service: 股票分钟按日回源 %s 完成, %d 行 (failed=%d)",
@@ -799,7 +833,7 @@ def sync_stock_minute_day(day: _date, symbols: list[str] | None = None) -> int:
     return total
 
 
-def sync_stock_minute_range(days: list[_date]) -> int:
+def sync_stock_minute_range(days: list[_date], *, only_missing_keys: bool = False) -> int:
     """批量回补多个缺失交易日：每只拉一次全量历史，一次写入所有缺失日分区。
 
     与 ``sync_stock_minute_day``（逐缺失日全市场重拉）不同，多日缺口时每个
@@ -870,7 +904,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
         pending.extend(batch_frames)
         if len(pending) >= _STOCK_MINUTE_BATCH:
             total_holder["rows"] += sum(f.height for f in pending)
-            _flush_stock_minute_chunk(pending.copy())
+            _flush_stock_minute_chunk(pending.copy(), only_missing_keys=only_missing_keys)
             pending.clear()
 
     result = _backfill_pool().map(_fetch_one, stocks,
@@ -878,7 +912,7 @@ def sync_stock_minute_range(days: list[_date]) -> int:
                                 on_batch_done=_on_batch, keep_frames=False)
     if pending:
         total_holder["rows"] += sum(f.height for f in pending)
-        _flush_stock_minute_chunk(pending)
+        _flush_stock_minute_chunk(pending, only_missing_keys=only_missing_keys)
         pending.clear()
     total = total_holder["rows"]
     logger.info("mootdx_service: 股票分钟批量回源 %d 个缺失日, %d 行 (failed=%d)",
@@ -1285,6 +1319,7 @@ def sync_adj_factor() -> dict:
 
     返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}.
     """
+    raise RuntimeError('UNQUALIFIED_FACTOR_SOURCE: legacy cached events/cliff synthesis publication disabled; exact verified factors required')
     src = MootdxSource()
     dm = DataManager()
     daily = dm._load_daily_from_partitions(asof=None)
@@ -1476,68 +1511,33 @@ def _authoritative_trade_days(start: _date, end: _date) -> list[_date]:
     return [_date.fromisoformat(d) for d in dates if lo <= d <= hi]
 
 
-def _trade_days_up_to(end: _date) -> list[_date]:
-    """返回 (end-回看窗口, end] 内 A 股交易日（从沪深300 日线索引推导）。"""
-    src = MootdxSource()
-    start = end - _dt.timedelta(days=_DAILY_BACKFILL_LIMIT_DAYS)
-    try:
-        df = src.get_daily("000300.XSHG", start.strftime("%Y%m%d"),
-                           end.strftime("%Y%m%d"))
-        if df is not None and not df.empty:
-            days = sorted(d.date() for d in df.index)
-            # mootdx get_daily 忽略 start 参数，返回 000300 全历史（自 2023 起）。
-            # 必须显式过滤下界，否则空分区 seed 会把全历史交易日列入回源
-            # （08-07 空 kline_daily 目录触发 2023-04-20 起连续数日全量回源）。
-            return [d for d in days if start <= d <= end]
-    except Exception as e:
-        logger.warning("mootdx_service: 交易日历获取失败: %s", e)
-    # 权威日历优先于本地 index 分区：本地分区恰是待修缺口，拿它做日历会自指
-    authority = _authoritative_trade_days(start, end)
-    if authority:
-        return authority
-    local = _local_000300_trade_days(start, end)
-    if local:
-        return local
-    # 兜底：工作日近似
-    days = []
+
+def _qualified_trade_days_2026(start: _date, end: _date) -> list[_date]:
+    """Bounded SSE 2026 schedule; never use index rows as completeness evidence.
+
+    Source: SSE c_20251222_10802507; see reviewed evidence manifest.
+    This market calendar does not establish symbol-level suspension eligibility.
+    """
+    if start.year != 2026 or end.year != 2026 or start > end:
+        raise ValueError("UNQUALIFIED_CALENDAR_YEAR_OR_RANGE")
+    holidays = (("01-01", "01-03"), ("02-15", "02-23"),
+                ("04-04", "04-06"), ("05-01", "05-05"),
+                ("06-19", "06-21"), ("09-25", "09-27"), ("10-01", "10-07"))
+    out = []
     d = start
     while d <= end:
-        if d.weekday() < 5:
-            days.append(d)
+        md = d.strftime("%m-%d")
+        if d.weekday() < 5 and not any(lo <= md <= hi for lo, hi in holidays):
+            out.append(d)
         d += _dt.timedelta(days=1)
-    return days
+    return out
+
+def _trade_days_up_to(end: _date) -> list[_date]:
+    return _qualified_trade_days_2026(end - _dt.timedelta(days=_DAILY_BACKFILL_LIMIT_DAYS), end)
 
 
 def _trade_days_in_range(start: _date, end: _date) -> list[_date]:
-    """返回 [start, end] 内 A 股交易日（从沪深300 日线推导，全区间不截断）。
-
-    与 ``_trade_days_up_to``（90 天窗口）不同，本函数支持 4/1 至今的全区间
-    扫描。取数失败回退工作日近似（不阻断检测）。
-    """
-    src = MootdxSource()
-    try:
-        df = src.get_daily("000300.XSHG", start.strftime("%Y%m%d"),
-                           end.strftime("%Y%m%d"))
-        if df is not None and not df.empty:
-            # mootdx get_daily 忽略 start 参数返回全历史，需显式过滤下界
-            return sorted(d.date() for d in df.index
-                            if start <= d.date() <= end)
-    except Exception as e:
-        logger.warning("mootdx_service: 交易日历获取失败: %s", e)
-    # 同 _trade_days_up_to：权威日历优先于自指的本地 index 分区
-    authority = _authoritative_trade_days(start, end)
-    if authority:
-        return authority
-    local = _local_000300_trade_days(start, end)
-    if local:
-        return local
-    days = []
-    d = start
-    while d <= end:
-        if d.weekday() < 5:
-            days.append(d)
-        d += _dt.timedelta(days=1)
-    return days
+    return _qualified_trade_days_2026(start, end)
 
 
 def _missing_days_in(calendar: list[_date], root: Path) -> list[_date]:
@@ -1996,6 +1996,7 @@ def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
     这里在调用外再包一层线程守护，超时则弃帧不阻断整批。
     """
     import threading as _th
+    from app.quant.jqengine.datasource.mootdx_src import _daily_observation
     box: dict = {}
 
     def _run() -> None:
@@ -2014,10 +2015,13 @@ def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
             src._server_idx = -1
         except Exception:
             pass
-        logger.warning("mootdx_service: %s 日线超时(%ss)，弃帧重建连接", sym, timeout)
-        return None
+        _daily_observation("query", sym, start, category="timeout")
+        raise TimeoutError("daily query timeout")
     if "err" in box:
-        return None
+        _daily_observation("query", sym, start, error=box["err"])
+        raise box["err"]
+    if box.get("df") is None:
+        _daily_observation("query", sym, start)
     return box.get("df")
 
 
@@ -2058,12 +2062,14 @@ def _guarded_get_minute(src: MootdxSource, sym: str, max_bars: int = 40000,
     return box.get("df")
 
 
-def sync_daily(day: _date) -> dict:
+def sync_daily(day: _date, *, create_only: bool = False) -> dict:
     """回源指定交易日全市场日线（股票 kline_daily + ETF kline_etf_daily）。
 
     取数经 :class:`BackfillPool` 并发（每 worker 独立连接，坏连接由池自愈
     重建），逐标的用 mootdx ``get_daily`` 拉最近日线，取 ``day`` 那根写分区：
     股票 volume 换手（mootdx 股 ÷100），ETF volume 保持股。返回统计。
+    启动回补传 create_only=True：两类分区只允许新建，既有 partial 保留
+    并记录零写入；默认维护入口保留原 merge 契约，不代表获得覆盖授权。
     """
     # 北交所（920xxx.BJ）mootdx 通达信接口无数据（每只轮换全服务器 ~8-11s 超时），
     # 全量回源时跳过，避免 331 只累积 ~50 分钟纯失败。
@@ -2086,6 +2092,8 @@ def sync_daily(day: _date) -> dict:
     class _QueryFailedError(Exception):
         """守护超时/查询错误被折叠成 None——必须重试，不能静默跳过。"""
 
+    from app.quant.jqengine.datasource.mootdx_src import _daily_observation
+
     def _fetch_one(src, sym):
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
@@ -2094,11 +2102,15 @@ def sync_daily(day: _date) -> dict:
         if df is None:
             raise _QueryFailedError(sym)
         if df.empty:
-            return None  # 正常无数据(停牌/未上市), 不算失败
+            _daily_observation("validate", sym, day_str, category="empty")
+            return None  # Absence alone does not certify suspension/completeness.
         # 只保留目标日那根（索引含 15:00 时间戳）
         hit = df[[x.date() == day for x in df.index]]
         if hit.empty:
+            _daily_observation("validate", sym, day_str, category="missing_target")
             return None
+        if not {"open", "high", "low", "close", "volume", "amount"}.issubset(hit.columns):
+            _daily_observation("validate", sym, day_str, category="schema")
         row = hit.iloc[-1]
         return pl.DataFrame({
             "symbol": [sym],
@@ -2154,10 +2166,18 @@ def sync_daily(day: _date) -> dict:
     if sdf is None and edf is None:
         logger.warning("mootdx_service: 日线回源 %s 股票与 ETF 全部失败", day)
 
-    if sdf is not None:
-        _write_daily_partition(sdf, STOCK_DAILY_ROOT)
-    if edf is not None:
-        _write_daily_partition(edf, ETF_DAILY_ROOT)
+    for key, frame, root in (("stock", sdf, STOCK_DAILY_ROOT),
+                             ("etf", edf, ETF_DAILY_ROOT)):
+        if frame is not None:
+            if create_only:
+                try:
+                    _write_daily_partition(frame, root, create_only=True)
+                except FileExistsError:
+                    written[key] = 0
+                    logger.warning("mootdx_service: startup preserves existing %s %s; "
+                                   "partial repair requires separate review", key, day)
+            else:
+                _write_daily_partition(frame, root)
     logger.info("mootdx_service: 日线回源 %s 完成: %s", day, written)
     query_failed = failed_s + failed_e
     if query_failed:
@@ -2166,7 +2186,8 @@ def sync_daily(day: _date) -> dict:
     return {**written, "query_failed": query_failed}
 
 
-def _write_daily_partition(df: pl.DataFrame, root: Path) -> None:
+def _write_daily_partition(df: pl.DataFrame, root: Path, *, table: str | None = None,
+                           create_only: bool = False) -> None:
     """按 date 分区原子写日线（读旧→concat→unique→tmp→rename）。
 
     兼容两类既有格式：
@@ -2175,24 +2196,63 @@ def _write_daily_partition(df: pl.DataFrame, root: Path) -> None:
       目录名隐含。若既有分区无 date 列，合并前去掉新帧的 date 列，保持
       与既有格式一致（否则 concat 列数不一致报 ShapeError）。
     """
+    # Canonical ownership is authoritative, including for explicit table claims.
+    # Reject ambiguity/conflicts before mkdir or publication; spelling is not identity.
+    roots = {"kline_daily": STOCK_DAILY_ROOT,
+             "kline_etf_daily": ETF_DAILY_ROOT,
+             "kline_index_daily": INDEX_DAILY_ROOT}
+    root = Path(root)
+    if table is not None and table not in roots:
+        raise ValueError(f"DAILY_TABLE_IDENTITY: unsupported table {table}")
+    resolved = root.resolve()
+    matches = {name for name, configured in roots.items()
+               if resolved == configured.resolve()}
+    if not matches:
+        matches = {name for name in roots
+                   if resolved == (root.parent / name).resolve()}
+    if len(matches) > 1:
+        raise ValueError(f"DAILY_TABLE_IDENTITY: ambiguous root {root}")
+    if matches:
+        owner = next(iter(matches))
+        if table is not None and table != owner:
+            raise ValueError(f"DAILY_TABLE_IDENTITY: {table} conflicts with {owner}: {root}")
+        table = owner
+    elif table != "kline_daily":
+        # Preserve explicit raw aliases (always locked). Unknown nonraw identity
+        # has no established caller contract and must not opt out of exclusion.
+        raise ValueError(f"DAILY_TABLE_IDENTITY: unknown root {root}")
     ds = df["date"][0].isoformat() if hasattr(df["date"][0], "isoformat") else str(df["date"][0])
     pdir = root / f"date={ds}"
     pdir.mkdir(parents=True, exist_ok=True)
     part = pdir / "part.parquet"
     tmp = pdir / "part.tmp"
-    if part.exists():
-        old = pl.read_parquet(part)
-        if "date" not in old.columns:
-            df = df.drop("date")
-            merged = pl.concat([old, df]).unique(
-                subset=["symbol"], keep="last").sort(["symbol"])
+    with daily_partition_lock(part):
+        if create_only:
+            # A stable mutex coordinates enrolled writers; hard-link publication
+            # also refuses a destination created after our existence check.
+            import os
+            import tempfile
+
+            if part.exists():
+                raise FileExistsError(f"DAILY_PARTITION_PRESERVED: {part}")
+            with tempfile.TemporaryDirectory(prefix=".daily-create-", dir=pdir) as staging:
+                staged = Path(staging) / "part.parquet"
+                df.sort(["symbol", "date"]).write_parquet(staged)
+                os.link(staged, part)
+            return
+        if part.exists():
+            old = pl.read_parquet(part)
+            if "date" not in old.columns:
+                df = df.drop("date")
+                merged = pl.concat([old, df]).unique(
+                    subset=["symbol"], keep="last").sort(["symbol"])
+            else:
+                merged = pl.concat([old, df]).unique(
+                    subset=["symbol", "date"], keep="last").sort(["symbol", "date"])
         else:
-            merged = pl.concat([old, df]).unique(
-                subset=["symbol", "date"], keep="last").sort(["symbol", "date"])
-    else:
-        merged = df.sort(["symbol", "date"])
-    merged.write_parquet(tmp)
-    tmp.rename(part)
+            merged = df.sort(["symbol", "date"])
+        merged.write_parquet(tmp)
+        tmp.rename(part)
 
 
 def _index_universe() -> list[str]:
@@ -2224,14 +2284,21 @@ def sync_index_daily(day: _date) -> dict:
     indices = [s for s in _index_universe() if not s.endswith(".BJ")]
     day_str = day.strftime("%Y%m%d")
 
+    from app.quant.jqengine.datasource.mootdx_src import _daily_observation
+
     def _fetch_one(src, sym):
         try:
             df = _guarded_get_daily(src, sym, day_str, day_str)
             if df is None or df.empty:
+                if df is not None:
+                    _daily_observation("validate", sym, day_str, category="empty")
                 return None
             hit = df[[x.date() == day for x in df.index]]
             if hit.empty:
+                _daily_observation("validate", sym, day_str, category="missing_target")
                 return None
+            if not {"open", "high", "low", "close", "volume", "amount"}.issubset(hit.columns):
+                _daily_observation("validate", sym, day_str, category="schema")
             row = hit.iloc[-1]
             return pl.DataFrame({
                 "symbol": [sym],
@@ -2726,7 +2793,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     for day in sorted(set(_missing_minute_days()) | incomplete_etf_minute
                       | etf_minute_shortfall | short_etf_minute):
         try:
-            res = sync_etf_minute(day)
+            res = sync_etf_minute(day, only_missing_keys=True)
             result["minute_days"].append(str(day))
             result["minute_rows"] += res["rows"]
             result.setdefault("query_failed", []).extend(
@@ -2756,7 +2823,9 @@ def _backfill_to_now_locked() -> dict[str, Any]:
                             | set(incomplete_stock_daily) | set(incomplete_etf_daily))
     for day in daily_days:
         try:
-            w = sync_daily(day)
+            # ETF gaps must never authorize replacing an existing stock (or ETF)
+            # partition. Check at publication too, not only before acquisition.
+            w = sync_daily(day, create_only=True)
             result["daily_days"].append(str(day))
             query_failed = w.pop("query_failed", [])
             for k, v in w.items():
@@ -2780,9 +2849,19 @@ def _backfill_to_now_locked() -> dict[str, Any]:
         try:
             w = _repair_index_day(day, allow_cross_source=shortfall_ok)
             result["index_daily_days"].append(str(day))
-            cross = w.pop("cross", 0)
-            w["cross"] = cross
-            for k, v in w.items():
+            if not isinstance(w, dict) or set(w) != {"mootdx", "cross"}:
+                raise ValueError("invalid index daily repair count shape")
+            mootdx_written = w["mootdx"]
+            if isinstance(mootdx_written, dict):
+                if ("written" not in mootdx_written
+                        or set(mootdx_written) - {"written", "symbols"}):
+                    raise ValueError("invalid index daily mootdx count shape")
+                mootdx_written = mootdx_written["written"]
+            counts = {"mootdx": mootdx_written, "cross": w["cross"]}
+            # Validate both before merging; symbols is attempts, not written rows.
+            if any(type(v) is not int or v < 0 for v in counts.values()):
+                raise ValueError("invalid index daily written count")
+            for k, v in counts.items():
                 result["index_daily_written"][k] = result["index_daily_written"].get(k, 0) + v
         except Exception as e:
             logger.warning("mootdx_service: 指数日线回源 %s 失败: %s", day, e)
@@ -2804,7 +2883,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
     if incomplete_minute:
         try:
             min_days = sorted(incomplete_minute)
-            n = sync_stock_minute_range(min_days)
+            n = sync_stock_minute_range(min_days, only_missing_keys=True)
             result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + n
             result["stock_minute_days"] = [d.isoformat() for d in min_days]
         except Exception as e:
@@ -2812,7 +2891,7 @@ def _backfill_to_now_locked() -> dict[str, Any]:
                            sorted(incomplete_minute), e)
             result["errors"].append(f"stock_minute_range {sorted(incomplete_minute)}: {e}")
     try:
-        res = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT)
+        res = sync_stock_minute(limit=STOCK_MINUTE_BATCH_LIMIT, only_missing_keys=True)
         result["stock_minute_rows"] = result.get("stock_minute_rows", 0) + res["rows"]
         result.setdefault("query_failed", []).extend(
             [f"stock_minute:{x}" for x in res["query_failed"]])
