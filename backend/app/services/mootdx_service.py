@@ -912,9 +912,13 @@ def backfill_missing_partitions(missing: _MissingPartitions) -> dict:
         "etf_nav_days": [], "errors": [],
     }
 
-    for day in missing.get("kline_daily", []) + missing.get("kline_etf_daily", []):
+    # 股票/ETF 日线同一天缺失是常态（整天缺失）：_repair_stock_etf_day 本就
+    # 同时修两个分区，按天去重后只调一次，避免一次全市场拉取打两遍。
+    stock_etf_days = list(dict.fromkeys(
+        missing.get("kline_daily", []) + missing.get("kline_etf_daily", [])))
+    for day in stock_etf_days:
         try:
-            sync_daily(day)
+            _repair_stock_etf_day(day)
             result["daily_days"].append(str(day))
         except Exception as e:
             result["errors"].append(f"daily {day}: {e}")
@@ -1024,8 +1028,8 @@ def check_and_repair_day(day: _date) -> dict:
         idx = []
 
     for key, root, target, repair in [
-        ("stock_daily", STOCK_DAILY_ROOT, set(stocks), lambda: sync_daily(day)),
-        ("etf_daily", ETF_DAILY_ROOT, etf_tf, lambda: sync_daily(day)),
+        ("stock_daily", STOCK_DAILY_ROOT, set(stocks), lambda: _repair_stock_etf_day(day)),
+        ("etf_daily", ETF_DAILY_ROOT, etf_tf, lambda: _repair_stock_etf_day(day)),
         ("index_daily", INDEX_DAILY_ROOT, set(idx),
          lambda: _repair_index_day(day)),
         ("etf_minute", ETF_MINUTE_ROOT, etf_tf, lambda: sync_etf_minute(day)),
@@ -2465,6 +2469,78 @@ def _repair_index_day(day: _date,
             "mootdx_service: 指数日线 %s 相对基线缺 %d 只（盘前/盘中不跨源，"
             "留待当日 00:00 巡检或收盘后补齐）", day, len(missing))
     return {"mootdx": w, "cross": n_cross}
+
+
+def _cross_source_stock_repair(day: _date, missing: list[str]) -> int:
+    """TickFlow 源补齐股票日K缺口（仅缺口清单，按需拉取）。"""
+    from app.services import kline_sync
+    from app.tickflow.policy import detect_capabilities
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    store = DataStore()
+    repo = KlineRepository(store)
+    start = _dt.datetime.combine(day, _dt.time.min)
+    end = _dt.datetime.combine(day + _dt.timedelta(days=1), _dt.time.min)
+    return kline_sync.sync_and_persist_daily_batch(
+        sorted(missing), repo, detect_capabilities(),
+        start_date=start, end_date=end)
+
+
+def _cross_source_etf_repair(day: _date, missing: list[str]) -> int:
+    """TickFlow 源补齐 ETF 日K缺口（仅缺口清单，按需拉取）。"""
+    from app.services.index_sync import sync_and_persist_etf_daily
+    from app.tickflow.policy import detect_capabilities
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    store = DataStore()
+    repo = KlineRepository(store)
+    start = _dt.datetime.combine(day, _dt.time.min)
+    end = _dt.datetime.combine(day + _dt.timedelta(days=1), _dt.time.min)
+    return sync_and_persist_etf_daily(
+        repo, detect_capabilities(),
+        start_date=start, end_date=end,
+        symbols_override=sorted(missing))
+
+
+def repair_stock_etf_cross_source(day: _date) -> dict:
+    """股票/ETF 日线跨源二级：相对基线有缺口且熔断开路时走 TickFlow。
+
+    熔断关闭（mootdx 健康）时零开销 no-op，不耗 TickFlow 配额。
+    供 15:35 收盘同步在 mootdx ``sync_daily`` 之后调用。
+    """
+    from app.quant.jqengine.datasource.mootdx_breaker import kline_allowed
+
+    out = {"stock": 0, "etf": 0}
+    jobs = (("stock", STOCK_DAILY_ROOT, _cross_source_stock_repair),
+            ("etf", ETF_DAILY_ROOT, _cross_source_etf_repair))
+    for key, root, cross in jobs:
+        missing = _missing_vs_baseline(root, day)
+        if not missing:
+            continue
+        if kline_allowed():
+            logger.debug("mootdx_service: %s日线 %s 相对基线缺 %d 只但熔断关闭，"
+                         "主源自行处理", key, day, len(missing))
+            continue
+        logger.warning("mootdx_service: %s日线 %s 相对基线缺 %d 只，路由 TickFlow 源补齐",
+                       key, day, len(missing))
+        try:
+            out[key] = cross(day, missing) or 0
+            logger.info("mootdx_service: 跨源补齐 %s %s 完成 +%d 行", key, day, out[key])
+        except Exception as e:
+            logger.warning("mootdx_service: 跨源补齐 %s %s 失败: %s", key, day, e)
+    return out
+
+
+def _repair_stock_etf_day(day: _date, allow_cross_source: bool = True) -> dict:
+    """股票/ETF 日线单日两级修复：先 mootdx，再缺口路由 TickFlow。
+
+    供 00:00 午夜巡检与手动单日补齐调用（对标指数的 ``_repair_index_day``）。
+    """
+    w = sync_daily(day)
+    cross = {"stock": 0, "etf": 0}
+    if allow_cross_source:
+        cross = repair_stock_etf_cross_source(day)
+    return {"mootdx": w, "cross": cross}
 
 
 def _stale_daily_days(root: Path, now: _dt.datetime | None = None,

@@ -1181,11 +1181,26 @@ def get_security_name(code):
                 _state["sec_names"] = names
         except Exception:
             pass
+    if (names is None or code not in names) and _name_source() != "jq":
+        # service/smart 模式兜底：service 名单与 etf_list 都缺（如免费名单
+        # 外的 QDII/LOF）时回退聚宽快照；jq 模式上游已合并，无需重复。
+        try:
+            jq = _jq_names()
+            if jq and code in jq:
+                if names is None:
+                    names = {}
+                names[code] = jq[code]
+                _state["sec_names"] = names
+        except Exception:
+            pass
     result = names.get(code, code) if names else code
-    # 智能分类模式：对未缓存的名称也添加分类前缀
+    # 智能分类模式：对未缓存的名称也添加分类前缀，并写回缓存——否则首调
+    # 返回带前缀、缓存留原始名，二次调用走顶部早返回直接拿到无前缀值。
     if _name_source() == "smart" and result != code:
         from ....smart_classification import get_smart_name
         result = get_smart_name(code, result)
+        names[code] = result
+        _state["sec_names"] = names
     return result
 
 

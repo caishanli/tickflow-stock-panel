@@ -24,6 +24,22 @@ def _default_data_dir():
     return new
 
 
+def _resolve_data_dir(raw: str | None) -> str:
+    """解析 DATA_DIR：绝对路径原样归一；相对路径锚定仓库根。
+
+    根因（2026-09-16 501018 无名事故）：.env 写 ``DATA_DIR=./data``，
+    服务进程 CWD=backend/ 时相对路径漂移到 ``backend/data`` 影子目录，
+    jq 快照/回测快照/引擎磁盘缓存全部错位且静默失败（文件不存在即空）。
+    锚定后任意 CWD 结果一致；Docker 的 ``/app/data`` 绝对路径不受影响。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return _default_data_dir()
+    if os.path.isabs(text):
+        return os.path.normpath(text)
+    return os.path.normpath(os.path.join(os.path.dirname(BASE_DIR), text))
+
+
 def load_config():
     return {
         "DATASOURCE_PRIORITY": [
@@ -34,7 +50,7 @@ def load_config():
         "FEE_RATE": float(os.getenv("FEE_RATE", "0.0003")),
         "SLIPPAGE": float(os.getenv("SLIPPAGE", "0.001")),
         "DEFAULT_STOP_LOSS": float(os.getenv("DEFAULT_STOP_LOSS", "0.03")),
-        "DATA_DIR": os.getenv("DATA_DIR", _default_data_dir()),
+        "DATA_DIR": _resolve_data_dir(os.getenv("DATA_DIR")),
         "RUNTIME_DIR": os.getenv("RUNTIME_DIR", os.path.join(BASE_DIR, "app", "quant", "jqengine", "runtime")),
         "STRATEGY_DIR": os.getenv(
             "STRATEGY_DIR", os.path.join(REPO_ROOT, "strategy")

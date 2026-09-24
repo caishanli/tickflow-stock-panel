@@ -148,6 +148,7 @@ def _run_sync(full_stock_minute: bool = False):
             adj = mootdx_service.sync_adj_factor()
             daily: dict | None = None
             index_daily: dict | None = None
+            cross_daily: dict | None = None
             if full_stock_minute:
                 # 收盘后：当天全市场股票分钟一次拉全（增量慢跑 20 只/轮
                 # 每交易日只补 20 只，5200 只需 260 轮，永远追不上当天）。
@@ -157,6 +158,9 @@ def _run_sync(full_stock_minute: bool = False):
                 today = _dt.date.today()
                 daily = mootdx_service.sync_daily(today)
                 index_daily = mootdx_service.sync_index_daily(today)
+                # 股票/ETF 日线跨源二级：mootdx 熔断期残缺由 TickFlow 按缺口补齐，
+                # 健康时零开销 no-op
+                cross_daily = mootdx_service.repair_stock_etf_cross_source(today)
             else:
                 stock = mootdx_service.sync_stock_minute(
                     limit=mootdx_service.STOCK_MINUTE_BATCH_LIMIT)
@@ -181,9 +185,10 @@ def _run_sync(full_stock_minute: bool = False):
                 _scheduler_state["last_sync"] = str(_dt.datetime.now())
                 _scheduler_state["sync_result"] = {
                     "minute_rows": minutes, "adj": adj, "stock_minute_rows": stock,
-                    "nav_rows": nav, "daily": daily, "index_daily": index_daily}
-            logger.info("scheduled mootdx sync done: minute=%s, adj=%s, stock_minute=%s, nav_rows=%s, daily=%s, index_daily=%s",
-                        minutes, adj, stock, nav, daily, index_daily)
+                    "nav_rows": nav, "daily": daily, "index_daily": index_daily,
+                    "cross_daily": cross_daily}
+            logger.info("scheduled mootdx sync done: minute=%s, adj=%s, stock_minute=%s, nav_rows=%s, daily=%s, index_daily=%s, cross_daily=%s",
+                        minutes, adj, stock, nav, daily, index_daily, cross_daily)
         except Exception:  # noqa: BLE001
             logger.exception("scheduled mootdx sync failed")
         finally:

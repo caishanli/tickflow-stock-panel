@@ -105,7 +105,8 @@ def test_fill_gaps_policy(monkeypatch):
     from app.quant.jqengine.datasource import mootdx_breaker as mbr
     called = []
     monkeypatch.setattr(ad, "sync_stock_daily_alt",
-                        lambda days: called.append(days) or {"total": 1})
+                        lambda days, symbols=None: called.append(days) or {"total": 1})
+    monkeypatch.setattr(ad, "_recent_closed_days", lambda lookback=5: [])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
     assert ad.fill_recent_gaps_daily("stock") is None
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [D10])
@@ -123,7 +124,8 @@ def test_fill_gaps_force_bypasses_closed_breaker(monkeypatch):
     from app.quant.jqengine.datasource import mootdx_breaker as mbr
     called = []
     monkeypatch.setattr(ad, "sync_etf_daily_alt",
-                        lambda days: called.append(days) or {"total": 1})
+                        lambda days, symbols=None: called.append(days) or {"total": 1})
+    monkeypatch.setattr(ad, "_recent_closed_days", lambda lookback=5: [])
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [D10])
     monkeypatch.setattr(mbr, "kline_allowed", lambda: True)  # 新进程：熔断闭合
     assert ad.fill_recent_gaps_daily("etf") is None
@@ -176,3 +178,124 @@ def test_only_missing_never_overwrites(monkeypatch):
     assert fetched == ["sz000001"]  # 600000 两天都有，不碰网
     assert res["total"] == 2
     assert {f["symbol"][0] for f in written} == {"000001.SZ"}
+
+
+def _partial_store(monkeypatch, have):
+    """残缺分区桩：have: {date: {symbols}}；窗口固定 [D10, D11]；整日缺口为空。"""
+    import app.services.mootdx_service as ms
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
+    monkeypatch.setattr(ad, "_recent_closed_days", lambda lookback=5: [D10, D11],
+                        raising=False)
+    monkeypatch.setattr(ad, "_day_partition_symbols",
+                        lambda root, d: set(have.get(d, set())))
+
+
+def test_partial_gap_filled_without_breaker(monkeypatch):
+    """残缺分区（D11 缺 000001.SZ）：熔断闭合也不再跳过， subject 不覆盖已有。"""
+    import app.services.mootdx_service as ms
+    from app.quant.jqengine.datasource import mootdx_breaker as mbr
+    _partial_store(monkeypatch, {D10: {"600000.SH", "000001.SZ"},
+                                 D11: {"600000.SH"}})
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.SH", "000001.SZ"])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(mbr, "kline_allowed", lambda: True)  # 熔断闭合
+    fetched = []
+    monkeypatch.setattr(ad, "fetch_tencent_day",
+                        lambda session, vendor, count=10: fetched.append(vendor) or T_ROWS)
+    monkeypatch.setattr(ad, "fetch_sina_day", lambda *a, **k: [])
+    written = []
+    monkeypatch.setattr(ms, "_write_daily_partition",
+                        lambda df, root: written.append(df))
+    res = ad.fill_recent_gaps_daily("stock")
+    assert res is not None
+    assert res["total"] == 1
+    assert fetched == ["sz000001"]  # 600000 两天齐全，不碰网
+    assert len(written) == 1
+    assert written[0].filter(pl.col("symbol") == "000001.SZ").to_dicts()[0]["date"] == D11
+
+
+def test_partial_gap_prelisting_excluded(monkeypatch):
+    """缺席标的上市日晚于缺口日：不补拉（000001.SZ 9-12 才上市）。"""
+    import app.services.mootdx_service as ms
+    _partial_store(monkeypatch, {D10: {"600000.SH", "000001.SZ"},
+                                 D11: {"600000.SH"}})
+    monkeypatch.setattr(ms, "_listing_date_map",
+                        lambda: {"000001.SZ": date(2026, 9, 12)})
+    assert ad._partial_symbol_gaps("stock", [D10, D11]) == {}
+
+
+def test_partial_gap_empty_source_keeps_gap(monkeypatch):
+    """两源皆失败：不写盘、不伪报成功，uncovered 保留待下轮重试。"""
+    import app.services.mootdx_service as ms
+    _partial_store(monkeypatch, {D10: {"600000.SH", "000001.SZ"},
+                                 D11: {"600000.SH"}})
+    monkeypatch.setattr(ms, "_stock_universe", lambda: ["600000.SH", "000001.SZ"])
+    monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
+    monkeypatch.setattr(ad, "fetch_tencent_day", lambda *a, **k: None)
+    monkeypatch.setattr(ad, "fetch_sina_day", lambda *a, **k: None)
+    written = []
+    monkeypatch.setattr(ms, "_write_daily_partition",
+                        lambda df, root: written.append(df))
+    res = ad.fill_recent_gaps_daily("stock")
+    assert res is not None
+    assert res["total"] == 0
+    assert res["uncovered"] == ["000001.SZ"]
+    assert written == []
+
+
+E_ROWS = [["2026-09-11", "2.09", "2.10", "2.12", "2.08", "3003224.000"]]
+
+
+def test_partial_gap_etf_without_breaker(monkeypatch):
+    """ETF 残缺分区同样不受熔断限制；volume 保持股。"""
+    import app.services.mootdx_service as ms
+    from app.quant.jqengine.datasource import mootdx_breaker as mbr
+    _partial_store(monkeypatch, {D10: {"510300.SH", "501018.SH"},
+                                 D11: {"510300.SH"}})
+    monkeypatch.setattr(ms, "_etf_universe", lambda: ["510300.XSHG", "501018.XSHG"])
+    monkeypatch.setattr(ad, "_etf_listed_map", lambda: {}, raising=False)
+    monkeypatch.setattr(mbr, "kline_allowed", lambda: True)  # 熔断闭合
+    monkeypatch.setattr(ad, "fetch_tencent_day",
+                        lambda session, vendor, count=10: E_ROWS if vendor == "sh501018" else [])
+    monkeypatch.setattr(ad, "fetch_sina_day", lambda *a, **k: [])
+    written = []
+    monkeypatch.setattr(ms, "_write_daily_partition",
+                        lambda df, root: written.append(df))
+    res = ad.fill_recent_gaps_daily("etf")
+    assert res is not None
+    assert res["total"] == 1
+    row = written[0].filter(pl.col("symbol") == "501018.SH").to_dicts()[0]
+    assert row["date"] == D11
+    assert row["volume"] == 300322400.0  # ETF：股
+
+
+def test_index_ignores_partial_gaps(monkeypatch):
+    """指数不在本次范围：分区残缺 + 熔断闭合仍 no-op（整日缺失旧口径不变）。"""
+    import app.services.mootdx_service as ms
+    from app.quant.jqengine.datasource import mootdx_breaker as mbr
+    _partial_store(monkeypatch, {D10: {"000001.SH"}, D11: set()})
+    monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [D10])
+    monkeypatch.setattr(mbr, "kline_allowed", lambda: True)
+    called = []
+    monkeypatch.setattr(ad, "sync_index_daily_alt",
+                        lambda days, symbols=None: called.append((days, symbols)))
+    assert ad.fill_recent_gaps_daily("index") is None
+    assert called == []
+
+
+def test_recent_closed_days_last_five(monkeypatch):
+    """窗口口径：权威日历倒数 5 个已收盘日；今天收盘后计入今天。"""
+    from app.services import mootdx_service as ms
+    from app.services import trade_calendar as tc
+    days = ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11",
+            "2026-09-12", "2026-09-14", "2026-09-15"]
+    monkeypatch.setattr(tc, "load_authoritative_dates", lambda: (days, "file"))
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: False)
+    assert ad._recent_closed_days(5) == [date(2026, 9, 10), date(2026, 9, 11),
+                                         date(2026, 9, 12), date(2026, 9, 14),
+                                         date(2026, 9, 15)]
+    monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
+    monkeypatch.setattr(tc, "load_authoritative_dates",
+                        lambda: ([*days, "2026-09-19"], "file"))
+    got = ad._recent_closed_days(5)
+    assert got[-1] == date(2026, 9, 19) and len(got) == 5

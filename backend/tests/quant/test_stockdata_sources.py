@@ -274,6 +274,11 @@ def test_metadata_methods_with_ohlcv_only_partitions(src, monkeypatch):
         "app.services.index_sync._fetch_instruments_by_type",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")),
     )
+    # 快照兜底同样隔离：本用例断言全离线时映射为空，快照存在会补名
+    monkeypatch.setattr(
+        "app.quant.jqengine.engine.jq.jq_names.load_jq_names",
+        lambda: {},
+    )
     df = src.get_all_securities(["stock"], None)
     assert not df.is_empty()
     assert list(df.columns) == ["symbol", "type", "name", "list_date"]

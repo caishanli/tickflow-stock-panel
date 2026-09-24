@@ -955,19 +955,34 @@ class DataSources:
                                exc_info=True)
         return []
 
+    def _merge_jq_snapshot(self, out: dict[str, str]) -> None:
+        """聚宽快照兜底并入名称映射：免费 ETF 名单缺 QDII/LOF 类
+        （如 501018 南方原油）时补名；setdefault 不覆盖已有名，
+        快照缺失/损坏时静默跳过。"""
+        try:
+            from app.quant.jqengine.engine.jq.jq_names import load_jq_names
+            for jq_code, name in (load_jq_names() or {}).items():
+                if name:
+                    out.setdefault(str(jq_code).split(".")[0], str(name))
+        except Exception:
+            logger.warning("get_stock_names: 聚宽快照兜底失败", exc_info=True)
+
     def _build_name_map(self) -> dict[str, str]:
         """构建 {纯6位代码: 名称} 映射：优先读本地缓存命中，否则本地 instruments（股票）
         + ETF（本地或免费 API），构建后写回缓存。
 
         名称属展示层：任何失败降级为空/部分映射，不影响行情路径。
         """
-        # 0) 缓存命中直接返回（免重复构建/免网络）
+        # 0) 缓存命中直接返回（免重复构建/免网络）；陈旧缓存同样过
+        # 快照兜底，避免缺口被钉死
         try:
             if os.path.exists(self._names_cache_file):
                 with open(self._names_cache_file, encoding="utf-8") as f:
                     cached = _json.load(f)
                 if isinstance(cached, dict) and cached:
-                    return {str(k): str(v) for k, v in cached.items()}
+                    out = {str(k): str(v) for k, v in cached.items()}
+                    self._merge_jq_snapshot(out)
+                    return out
         except Exception:
             pass
         out: dict[str, str] = {}
@@ -1006,6 +1021,8 @@ class DataSources:
                         etf_ok = True
         except Exception:
             logger.warning("get_stock_names: ETF 名称获取失败，降级本地", exc_info=True)
+        # 2.5) 聚宽快照兜底（见 _merge_jq_snapshot）。
+        self._merge_jq_snapshot(out)
         # 3) 落盘缓存：仅当 ETF 段成功（etf_ok）时写，避免 ETF API 失败时
         #    钉住股票-only 映射
         if etf_ok:

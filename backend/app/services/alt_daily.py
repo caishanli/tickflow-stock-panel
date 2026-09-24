@@ -17,11 +17,14 @@
   日，qfq 恒等于 raw，无需审计）。
 
 触发纪律同分钟 fallback（见 tencent_minute.fill_recent_gaps）：近 lookback
-天有已收盘缺口 **且** K 线熔断开路才回补。
+天有已收盘缺口 **且** K 线熔断开路才回补。例外：股票/ETF 的标的级缺口
+（分区存在但少标的）不再以熔断为必要条件——主源局部漏数但未熔断时也
+要自愈（2026-09-15/18 ETF 日线同批 54 只缺席两天无人补）。
 """
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import logging
 import os
 import threading
@@ -387,10 +390,12 @@ def sync_stock_daily_alt(days: list[_date], symbols: list[str] | None = None,
         logger.warning("alt_daily: 股票宇宙为空，跳过")
         return {"rows": {}, "total": 0, "uncovered": [], "source": "alt"}
     listing = ms._listing_date_map()
-    earliest = min(days) if days else _dt.date.today()
+    latest = max(days) if days else _dt.date.today()
     todo = []
     for s in stocks:
-        if s not in listing or (_date(1970, 1, 1) < listing[s] <= earliest):
+        # 按窗口最晚日判定上市（不用最早日）：窗口中段上市的标的在后段缺席
+        # 仍要补，早段的上市前空窗由源端无 bar 自然落空，不会误写。
+        if s not in listing or (_date(1970, 1, 1) < listing[s] <= latest):
             todo.append((s, 100.0))
     return _sync_daily(todo, days, ms.STOCK_DAILY_ROOT, "股票",
                        prefer=prefer, overwrite=overwrite)
@@ -439,6 +444,92 @@ def sync_index_daily_alt(days: list[_date], symbols: list[str] | None = None,
                        prefer=prefer, overwrite=overwrite)
 
 
+def _recent_closed_days(lookback: int = 5) -> list[_date]:
+    """近 lookback 个已收盘交易日（权威日历；今天收盘后计入今天）。
+
+    仅取已收盘日：盘中回源只能拿到半日快照，写入即污染分区（与
+    ``_missing_daily_days`` 同一纪律）。日历不可用返回 []=无法判定。
+    """
+    from app.services import mootdx_service as ms
+    from app.services import trade_calendar as tc
+    try:
+        dates, _origin = tc.load_authoritative_dates()
+    except Exception:
+        return []
+    now = _dt.datetime.now()
+    today = now.date()
+    out = [_date.fromisoformat(d) for d in dates if _date.fromisoformat(d) < today]
+    if ms._market_closed(now):
+        out += [_date.fromisoformat(d) for d in dates if _date.fromisoformat(d) == today]
+    return sorted(out)[-lookback:]
+
+
+def _etf_listed_map() -> dict[str, _date]:
+    """{TFsymbol: 上市日期}（ETF 快照 list_dates；文件缺失回退空=不过滤）。
+
+    快照缺失时不过滤而非全过滤：空映射走"全部尝试"方向，缺口至多是多
+    几次空请求，不会漏补；反之会把残缺分区的缺口永久挡在门外。
+    """
+    from app.services import mootdx_service as ms
+    out: dict[str, _date] = {}
+    try:
+        snap = json.loads((ms.DATA_ROOT / "quant_kline"
+                           / "etf_universe_snapshot.json").read_text())
+    except Exception:
+        return out
+    for jq, v in (snap.get("list_dates") or {}).items():
+        try:
+            pure, mkt = str(jq).split(".")
+            tf = pure + (".SH" if mkt == "XSHG" else ".SZ")
+            out[tf] = _date.fromisoformat(str(v[0])[:10])
+        except (ValueError, IndexError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def _partial_symbol_gaps(kind: str, days: list[_date]) -> dict[_date, list[str]]:
+    """标的级缺口：窗口内并集基线 − 各日分区已落盘集，再按上市日期过滤。
+
+    仅 stock/etf；index 不在此处理（另有口径，见调用方守卫）。分区整日
+    缺失的日跳过（走整日缺失路径）；基线为空（无分区可比）返回 {}。
+    """
+    from app.services import mootdx_service as ms
+    if kind == "stock":
+        root = ms.STOCK_DAILY_ROOT
+        listed = ms._listing_date_map()
+    elif kind == "etf":
+        root = ms.ETF_DAILY_ROOT
+        listed = _etf_listed_map()
+    else:
+        return {}
+    per_day = {d: _day_partition_symbols(root, d) for d in days}
+    have_days = {d: s for d, s in per_day.items() if s}
+    if not have_days:
+        return {}
+    base = set().union(*have_days.values())
+    out: dict[_date, list[str]] = {}
+    for d, syms in have_days.items():
+        missing = [s for s in sorted(base - syms)
+                   if s not in listed or listed[s] <= d]
+        if missing:
+            out[d] = missing
+    return out
+
+
+def _merge_gap_results(res: dict | None, part: dict) -> dict:
+    """整日缺失结果与标的级缺口结果合并（行数相加、未覆盖并集）。"""
+    if res is None:
+        return part
+    rows = dict(res.get("rows") or {})
+    for day, n in (part.get("rows") or {}).items():
+        rows[day] = rows.get(day, 0) + (n or 0)
+    return {"rows": rows,
+            "total": (res.get("total") or 0) + (part.get("total") or 0),
+            "uncovered": sorted(set(res.get("uncovered") or [])
+                                | set(part.get("uncovered") or [])),
+            "source": "alt"}
+
+
 def fill_recent_gaps_daily(kind: str = "stock", lookback: int = 5,
                            force: bool = False) -> dict | None:
     """近期日线缺口的备用链兜底（调度侧唯一入口；健康时零开销 no-op）。
@@ -447,6 +538,11 @@ def fill_recent_gaps_daily(kind: str = "stock", lookback: int = 5,
     1. 近 ``lookback`` 天内有缺口；
     2. K 线熔断开路（mootdx/TickFlow 当轮已确认不可用）。
     ``force=True`` 跳过条件 2（运维手动补跑用，默认关闭）。
+
+    股票/ETF 另有标的级缺口：分区存在但少标的（整日缺失路径覆盖不到），
+    按近 ``lookback`` 个已收盘日并集基线判定、上市日期过滤，只补缺失、
+    永不覆盖；该路径不再以熔断为必要条件（缺口仍在就回补）。指数保持
+    旧口径（整日缺失 + 熔断门槛）。
     """
     from app.quant.jqengine.datasource.mootdx_breaker import kline_allowed
     from app.services import mootdx_service as ms
@@ -454,18 +550,30 @@ def fill_recent_gaps_daily(kind: str = "stock", lookback: int = 5,
         raise ValueError(f"未知 kind: {kind}")
     roots = {"etf": ms.ETF_DAILY_ROOT, "index": ms.INDEX_DAILY_ROOT}
     root = roots.get(kind, ms.STOCK_DAILY_ROOT)
+    res: dict | None = None
     missing = [d for d in ms._missing_daily_days(root)][-lookback:]
-    if not missing:
-        return None
-    if kline_allowed() and not force:
-        logger.debug("alt_daily: %s日线缺口 %s 但熔断关闭，主源自行处理",
-                     kind, [d.isoformat() for d in missing])
-        return None
-    logger.warning("alt_daily: %s日线缺口 %s 且%s，切备用链回补",
-                   kind, [d.isoformat() for d in missing],
-                   "force 绕过熔断状态" if force else "熔断开路")
-    if kind == "etf":
-        return sync_etf_daily_alt(missing)
-    if kind == "index":
-        return sync_index_daily_alt(missing)
-    return sync_stock_daily_alt(missing)
+    if missing:
+        if kline_allowed() and not force:
+            logger.debug("alt_daily: %s日线缺口 %s 但熔断关闭，主源自行处理",
+                         kind, [d.isoformat() for d in missing])
+        else:
+            logger.warning("alt_daily: %s日线缺口 %s 且%s，切备用链回补",
+                           kind, [d.isoformat() for d in missing],
+                           "force 绕过熔断状态" if force else "熔断开路")
+            if kind == "etf":
+                res = sync_etf_daily_alt(missing)
+            elif kind == "index":
+                res = sync_index_daily_alt(missing)
+            else:
+                res = sync_stock_daily_alt(missing)
+    if kind in ("stock", "etf"):
+        gaps = _partial_symbol_gaps(kind, _recent_closed_days(lookback))
+        days = sorted(gaps)
+        if days:
+            syms = sorted({s for d in days for s in gaps[d]})
+            logger.warning("alt_daily: %s标的级缺口 %s，共 %d 只，切备用链回补",
+                           kind, [d.isoformat() for d in days], len(syms))
+            part = (sync_etf_daily_alt(days, symbols=syms) if kind == "etf"
+                    else sync_stock_daily_alt(days, symbols=syms))
+            res = _merge_gap_results(res, part)
+    return res

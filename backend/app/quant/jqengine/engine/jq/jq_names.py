@@ -17,6 +17,22 @@ MAX_AGE = _dt.timedelta(days=30)
 _CACHE: dict[str, str] | None = None
 
 
+def _snapshot_paths() -> list[str]:
+    """快照候选路径：SNAPSHOT_PATH 优先，其次 DATA_DIR 直下与 quant_kline 子目录。
+
+    双路径兼容两种布局（2026-09-16 501018 无名事故）：默认口径嵌套
+    quant_kline，.env（./data，经仓库根锚定）与容器（/app/data）口径扁平，
+    文件实际落在嵌套侧，扁平侧直读永远命中不了。
+    """
+    paths = [SNAPSHOT_PATH]
+    base = _JQ_CONFIG["DATA_DIR"]
+    for cand in (os.path.join(base, "etf_universe_snapshot.json"),
+                 os.path.join(base, "quant_kline", "etf_universe_snapshot.json")):
+        if cand not in paths:
+            paths.append(cand)
+    return paths
+
+
 def load_jq_names() -> dict[str, str]:
     """返回 {JQ码: 聚宽 display_name}，进程内缓存；文件缺失/损坏返回空。
 
@@ -28,18 +44,22 @@ def load_jq_names() -> dict[str, str]:
     if _CACHE is not None:
         return _CACHE
     out: dict[str, str] = {}
-    try:
-        with open(SNAPSHOT_PATH, encoding="utf-8") as f:
-            snap = json.load(f)
-        fetched_at = _dt.datetime.fromisoformat(str(snap.get("fetched_at")))
-        age = _dt.datetime.now() - fetched_at
-        out = {str(k): str(v) for k, v in (snap.get("names") or {}).items()}
-        if age > MAX_AGE:
-            import logging
-            logging.getLogger("app.quant.jqengine.jq_names").warning(
-                "ETF 名称快照已过期 %d 天（fetched_at=%s），降级沿用旧名；"
-                "跑一次量化回测即可刷新", age.days, fetched_at.date())
-    except Exception:
-        pass
+    for _path in _snapshot_paths():
+        try:
+            with open(_path, encoding="utf-8") as f:
+                snap = json.load(f)
+            if not isinstance(snap, dict):
+                continue
+            fetched_at = _dt.datetime.fromisoformat(str(snap.get("fetched_at")))
+            age = _dt.datetime.now() - fetched_at
+            out = {str(k): str(v) for k, v in (snap.get("names") or {}).items()}
+            if age > MAX_AGE:
+                import logging
+                logging.getLogger("app.quant.jqengine.jq_names").warning(
+                    "ETF 名称快照已过期 %d 天（fetched_at=%s），降级沿用旧名；"
+                    "跑一次量化回测即可刷新", age.days, fetched_at.date())
+            break
+        except Exception:
+            continue
     _CACHE = out
     return out
