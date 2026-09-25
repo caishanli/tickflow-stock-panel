@@ -81,11 +81,18 @@ def test_empty_local_uses_authoritative_calendar(monkeypatch, tmp_path):
 
 
 def test_weekday_fallback_only_when_no_calendar(monkeypatch, tmp_path):
-    """权威日历与本地分区都不可用 → 才退回工作日近似（最后兜底，不断链）。"""
+    """权威日历与本地分区都不可用 → 退回 2026 法定节假日感知的日历（不断链）。
+
+    8ceacc2 起 fallback 不再是朴素工作日：端午 6-19 不得再被误判为交易日
+    （09-11 事故根因），但正常交易日仍在、列表不退化为空。
+    """
     monkeypatch.setattr(ms, "MootdxSource", _BoomSource)
     monkeypatch.setattr(ms, "INDEX_DAILY_ROOT", tmp_path / "nope")
     monkeypatch.setattr(ms, "_authoritative_trade_days", lambda s, e: [])
-    assert D619 in ms._trade_days_up_to(D911)
+    days = ms._trade_days_up_to(D911)
+    assert len(days) > 50
+    assert D618 in days
+    assert D619 not in days
 
 
 def test_outage_unblocks_fill_recent_gaps(monkeypatch, tmp_path):
@@ -97,11 +104,13 @@ def test_outage_unblocks_fill_recent_gaps(monkeypatch, tmp_path):
     """
     from app.services import alt_daily as ad
 
-    day = date(2026, 9, 14)               # 周一，交易日
+    # 用窗口内最近已收盘交易日（相对今天，不写死）：fill_recent_gaps_daily
+    # 只看近 lookback 天，写死历史日期会随时间滑出窗口导致零触发。
+    day = ad._recent_closed_days()[-1]
     # 三根根目录各写一个受控的"已有历史"分区集合：只缺当日。
     # 不能用真实近期日期枚举——_missing_daily_days 扫的是 90 天窗口，任何未列举
-    # 的交易日都会算缺口。这里让窗口内只有 D911 存在，则 09-14 之外的缺失日
-    # 同样是"缺"，因此下面只断言**当日出现在触发列表里**（核心契约），不苛求唯一。
+    # 的交易日都会算缺口。这里让窗口内只有 D911 存在，因此下面只断言**当日
+    # 出现在触发列表里**（核心契约），不苛求唯一。
     for name in ("idx", "stk", "etf"):
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
         _write_index_day(tmp_path / name, D911)

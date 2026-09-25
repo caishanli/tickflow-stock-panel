@@ -42,9 +42,11 @@ def _write_cal(path, dates, fetched_at="2026-09-13T00:00:00", last_push=None):
 
 
 def test_refresh_uses_cache_when_fresh(tmp_path, monkeypatch):
+    # fetched_at 取当天（相对日期）：缓存是否新鲜取决于与今天的差值，
+    # 写死历史日期会随时间推移变 stale，导致本该 no-op 的用例去触网。
     p = tmp_path / "cal.json"
     p.write_text(json.dumps({"dates": ["2026-09-10", "2026-09-11"],
-                             "fetched_at": "2026-09-13T00:00:00",
+                             "fetched_at": date.today().isoformat() + "T00:00:00",
                              "source": "sina", "meta": {"last_stale_push": None}}))
     monkeypatch.setenv("TRADE_CALENDAR_PATH", str(p))
     called = []

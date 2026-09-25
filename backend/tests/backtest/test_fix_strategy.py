@@ -3,7 +3,7 @@
 覆盖:
 - A3: 风控 override 统一语义 (0/""/None → None 关闭; 非零才钳制)
 - 死代码 _run_full_simulation 已删除
-- 未知信号名 logger.warning + 结果带 warnings 字段
+- 未知信号名 resolver 前置 fail-closed (ValueError → result.error), 不再静默忽略
 - order_by 原始因子排序与 [0,100] score 过滤不兼容 → 忽略 score 过滤并告警
 """
 from __future__ import annotations
@@ -21,14 +21,13 @@ def _strategy(**kwargs) -> StrategyDef:
     defaults = dict(
         meta={"id": "test", "name": "test", "scoring": {}, "params": [], "limit": 100},
         basic_filter={"enabled": False},
-        entry_signals=["foo"],
+        entry_signals=[],
         exit_signals=[],
         stop_loss=None,
         trailing_stop=None,
         trailing_take_profit_activate=None,
         trailing_take_profit_drawdown=None,
         max_hold_days=None,
-        alerts=[],
         filter_fn=lambda df, params: pl.lit(True),
         filter_history_fn=None,
         lookback_days=1,
@@ -63,8 +62,19 @@ class _EngineStub:
     def load_panel(self, symbols, start, end, columns=None, asset_type: str = "stock") -> pl.DataFrame:
         return self.panel
 
+    def load_panel_for_backtest(self, symbols, start, end, feature_plan, asset_type="stock") -> pl.DataFrame:
+        return self.load_panel(symbols, start, end, columns=sorted(feature_plan.base_columns),
+                               asset_type=asset_type)
+
     def simulate_portfolio(self, panel, entries, exits, config, progress_cb=None, cancel_event=None,
                            entry_signal_ids=None, exit_signal_ids=None) -> SimResult:
+        self.matcher_config = config
+        return SimResult(equity_curve=[], drawdown_curve=[], trades=[], per_symbol_stats=[], stats={})
+
+    def simulate_market_matrix(self, matrix, config, progress_cb=None, cancel_event=None,
+                               options=None) -> SimResult:
+        # position 模式现行撮合口（与 test_strategy_backtest_correctness 同桩）：
+        # 只捕获 MatcherConfig，不真撮合。
         self.matcher_config = config
         return SimResult(equity_curve=[], drawdown_curve=[], trades=[], per_symbol_stats=[], stats={})
 
@@ -74,8 +84,7 @@ def _panel() -> pl.DataFrame:
     return pl.DataFrame([
         {"symbol": "A", "name": "A", "date": start + timedelta(days=i),
          "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
-         "volume": 100_000, "amount": 1e8,
-         "signal_foo": i == 0, "signal_bar": False}
+         "volume": 100_000, "amount": 1e8}
         for i in range(3)
     ]).sort(["symbol", "date"])
 
@@ -159,20 +168,24 @@ def test_run_full_simulation_removed():
     assert not hasattr(StrategyBacktestService, "_run_full_simulation")
 
 
-# ── 未知信号名 warning + warnings 字段 ──────────────────────────
+# ── 未知信号名 fail-closed (resolver 前置校验) ───────────────────
 
 def test_unknown_exit_signal_warns_and_surfaces_in_result():
-    """exit_signals 拼错名字 → logger.warning + result.warnings, 不再静默忽略。"""
+    """exit_signals 拼错名字 → resolver 前置 fail-closed, result.error 带"不存在的信号"。
+
+    现行意图 (b6cf049 起): 未知信号在 resolver 层直接 ValueError, 不再走到
+    mask builder 的 warning 流程。"""
     result, _ = _run({"exit_signals": ["bar", "macd_dead_typo"]})
-    assert result.error is None
-    assert any("macd_dead_typo" in w for w in result.warnings)
+    assert result.error is not None
+    assert "不存在的信号" in result.error
+    assert "macd_dead_typo" in result.error
 
 
 def test_unknown_entry_signal_falls_back_to_error():
-    """entry 侧信号名全错 → 沿用既有兜底报错 (区间内未产生买入信号)。"""
+    """entry 侧信号名全错 → resolver 前置 fail-closed (此前断言的"买入信号"兜底已不可达)。"""
     result, _ = _run({"entry_signals": ["no_such_entry"]})
     assert result.error is not None
-    assert "买入信号" in result.error
+    assert "不存在的信号" in result.error
 
 
 # ── order_by 与 score 钳制不兼容 ────────────────────────────────

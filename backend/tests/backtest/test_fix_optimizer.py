@@ -37,7 +37,8 @@ class _FakeResult:
 
 
 class _FakeService:
-    def run(self, config, progress_cb=None, cancel_event=None):
+    def run(self, config, progress_cb=None, cancel_event=None,
+            result_policy=None, prepared=None):
         return _FakeResult(stats={
             "sharpe": 1.0, "total_return": 0.1, "win_rate": 0.5,
             "max_drawdown": -0.1, "avg_holding_days": 3.0,

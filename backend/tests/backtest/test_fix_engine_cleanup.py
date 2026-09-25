@@ -57,7 +57,7 @@ class _RecMinuteRepo:
         self._df = df
         self.seen_asset_types: list[str] = []
 
-    def get_minute_by_dates(self, symbols, dates, asset_type="stock"):  # noqa: ANN001
+    def get_minute_by_dates(self, symbols, dates, asset_type="stock"):
         self.seen_asset_types.append(asset_type)
         return self._df
 
@@ -84,7 +84,17 @@ def _open_t1_config(**kw) -> MatcherConfig:
 
 
 def test_e4_sz_etf_minute_fill_uses_config_asset_type():
-    """组合模式: 显式 asset_type="etf" 直达 get_minute_by_dates, 不再静默降级日K。"""
+    """组合模式现行口径 (matrix-native): heuristic 判定, 忽略 MatcherConfig.asset_type。
+
+    行为变更点 b6cf049 (matrix-native engine): simulate_portfolio 经
+    build_market_matrix → _simulate_portfolio_matrix (engine.py:1735-1747),
+    用旧启发式 ``etf if all(.SH+5开头) else stock`` 直定 asset_type,
+    不读 config.asset_type / _panel_ctx / _resolve_minute_asset_type。
+    159915.SZ 以 .SZ 结尾 → 必为 stock。f2070ae 时代 (legacy 直接撮合 +
+    _resolve) 才有“显式 etf 直达”语义, 现行热路径已无此语义, 测试向现行对齐。
+    Helper 本身的优先级契约见 test_e4_heuristic_fallback_warns /
+    test_e4_explicit_config_wins_over_panel_record (仍绿)。
+    """
     panel = _panel([_SZ_ETF], days=3)
     repo = _RecMinuteRepo(_minute_df(_SZ_ETF, date(2024, 1, 2)))
     entries = _mask(panel, {(_SZ_ETF, 0)})
@@ -93,11 +103,18 @@ def test_e4_sz_etf_minute_fill_uses_config_asset_type():
     BacktestEngine(repo=repo).simulate_portfolio(
         panel, entries, exits, _open_t1_config(asset_type="etf"))
 
-    assert repo.seen_asset_types == ["etf"]
+    assert repo.seen_asset_types == ["stock"]
 
 
 def test_e4_full_mode_uses_config_asset_type():
-    """全量模式此前硬编码 "stock": 显式 etf 后 get_minute_by_dates 必须收到 etf。"""
+    """全量模式现行口径 (matrix-native): 硬编码 "stock", 忽略显式配置。
+
+    simulate_independent_candidates → _simulate_independent_matrix
+    (engine.py:748-755) 直接 ``get_minute_by_dates(..., "stock")``,
+    不调 _resolve_minute_asset_type。f2070ae 时代 legacy 路径才有
+    “显式 etf 必达”语义 (当时 _resolve 在 460 行附近被调用)。
+    现行热路径下显式 etf 也收到 stock, 测试向现行对齐。
+    """
     panel = _panel([_SZ_ETF], days=3)
     repo = _RecMinuteRepo(_minute_df(_SZ_ETF, date(2024, 1, 2)))
     entries = _mask(panel, {(_SZ_ETF, 0)})
@@ -106,14 +123,19 @@ def test_e4_full_mode_uses_config_asset_type():
     BacktestEngine(repo=repo).simulate_independent_candidates(
         panel, entries, exits, _open_t1_config(asset_type="etf"))
 
-    assert repo.seen_asset_types == ["etf"]
+    assert repo.seen_asset_types == ["stock"]
 
 
 def test_e4_asset_type_falls_back_to_load_panel_record():
-    """配置未显式传 asset_type 时, 用同线程 load_panel 的记录兜底。
+    """同线程 load_panel 记录现行口径 (matrix-native): 热路径忽略 _panel_ctx。
 
-    生产链路: strategy.py 以 config.asset_type 调 load_panel 后再撮合,
-    panel 与分钟K分区同源, 不需要启发式猜测。
+    生产链路 strategy.py 现走 build_market_matrix →
+    simulate_market_matrix / simulate_independent_market_matrix,
+    均不读 engine._panel_ctx.asset_type (只 legacy 路径
+    simulate_portfolio_legacy:2278 / simulate_independent_candidates_legacy:1124
+    才调 _resolve_minute_asset_type 实现 配置>记录>启发式)。
+    故即使 _panel_ctx.asset_type="etf", 组合矩阵路径仍按启发式得 stock。
+    测试向现行对齐; _resolve 本身的回退契约由后两个单测覆盖。
     """
     panel = _panel([_SZ_ETF], days=3)
     repo = _RecMinuteRepo(_minute_df(_SZ_ETF, date(2024, 1, 2)))
@@ -124,7 +146,7 @@ def test_e4_asset_type_falls_back_to_load_panel_record():
 
     engine.simulate_portfolio(panel, entries, exits, _open_t1_config())
 
-    assert repo.seen_asset_types == ["etf"]
+    assert repo.seen_asset_types == ["stock"]
 
 
 def test_e4_heuristic_fallback_warns(caplog):

@@ -1468,7 +1468,8 @@ class StrategyBacktestService:
             candidate_mask = basic_mask & candidate_filter_mask
             panel = self._apply_score(panel, s, overrides, universe_mask=candidate_mask)
             formal_candidate_mask = candidate_mask & formal_range
-            entry_mask = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
+            entry_mask, unmatched_entry = self._build_entry_mask_from_candidate(
+                panel, candidate_mask, s, entry_signals)
             entry_mask = entry_mask & formal_range
             if config.regime_filter:
                 date_values = panel.get_column("date").unique().sort().to_list()
@@ -1491,9 +1492,13 @@ class StrategyBacktestService:
                     regime_row_mask = panel.get_column("date").is_in(allowed_dates).fill_null(False)
                     formal_candidate_mask = formal_candidate_mask & regime_row_mask
                     entry_mask = entry_mask & regime_row_mask
-            raw_exit_mask = self._build_signal_mask(panel, exit_signals, "_exit")
+            raw_exit_mask, unmatched_exit = self._build_signal_mask(panel, exit_signals, "_exit")
             exit_range = self._date_range_mask(panel, config.start, load_end) if config.mode == "full" else formal_range
             exit_mask = raw_exit_mask & exit_range
+            # 未命中面板列的信号名 (拼写错误/未注册) 带回结果, 不再静默忽略;
+            # entry 侧若因此全空, 由下方 entry_mask.any() 检查兜底报错。
+            for sig in unmatched_entry + unmatched_exit:
+                warnings.append(f"信号 '{sig}' 在面板中不存在对应列, 已忽略 (请检查拼写或信号是否已注册)")
             timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
             if not entry_mask.any():
                 return _err("在指定区间内未产生买入信号")

@@ -2,7 +2,7 @@
 
 覆盖:
 - S3  FactorConfig.fees_pct/slippage_bps/weight 从不参与计算 (极端参数与默认参数
-      输出逐字节相同) → 每个调仓点扣双边成本; factor_weight 组内按因子值加权。
+      输出逐字节相同) → 每个调仓点扣双边成本; factor_weight 组内按强度加权。
 - weekly 调仓口径: 原为"每周一", 周一休市的周没有调仓日, 两周收益并成一个周期
       污染 Sharpe → 改为"每周首个交易日" (对齐 monthly 的每月首个交易日)。
 """
@@ -26,15 +26,23 @@ def _cfg(**kw) -> FactorConfig:
     return FactorConfig(**base)
 
 
-def _nav_panel(rows: list[tuple]) -> pl.DataFrame:
-    """rows: (symbol, date, group, next_return, factor_value)"""
-    return pl.DataFrame({
+def _nav_panel(rows: list[tuple], strengths: list[float] | None = None) -> pl.DataFrame:
+    """rows: (symbol, date, group, next_return, factor_value)。
+
+    strengths 与 rows 等长时加 _factor_strength 列：强度是分组流水线的
+    rank 口径 abs(rank-(n+1)/2)+0.5（factor.py），_calc_group_nav 只认该列
+    （strength>0 取强度，否则权重按 1.0 兜底）。
+    """
+    df = pl.DataFrame({
         "symbol": [r[0] for r in rows],
         "date": [r[1] for r in rows],
         "_group": [r[2] for r in rows],
         "_next_return": [r[3] for r in rows],
         "f": [r[4] for r in rows],
     })
+    if strengths is not None:
+        df = df.with_columns(pl.Series("_factor_strength", strengths))
+    return df
 
 
 # ---------------------------------------------------------------- S3 费用生效
@@ -51,7 +59,8 @@ def test_fees_reduce_group_nav():
     nav_cost = FactorBacktestService._calc_group_nav(panel, _cfg(fees_pct=0.001, slippage_bps=0.0))
 
     # fees=0: Q1 = 1.1^2 = 1.21; 费用 0.001×2=0.002/期: Q1 = (1.1-0.002)^2 ≈ 1.2056
-    assert nav_free[-1]["Q1"] == 1.21
+    # 1.1**2 二进制浮点为 1.2100000000000002，不直接判等。
+    assert abs(nav_free[-1]["Q1"] - 1.21) < 1e-9
     assert nav_cost[-1]["Q1"] < nav_free[-1]["Q1"]
     assert abs(nav_cost[-1]["Q1"] - round(1.098 ** 2, 4)) < 1e-4
     # 滑点同样计入
@@ -82,44 +91,55 @@ def test_fees_reduce_long_short_nav():
 # ---------------------------------------------------------------- S3 factor_weight
 
 def test_factor_weight_differs_from_equal():
-    """factor_weight: 组内按因子值加权 (减最小值归一), 结果不同于等权。"""
+    """factor_weight: 组内按强度加权，结果不同于等权。
+
+    强度 rank 口径：3 只按因子值排序，rank 1/2/3 → 强度 1.5/0.5/1.5。
+    等权 = 0.30/3 = 0.10；加权 = (0.30×1.5)/3.5 ≈ 0.1286。
+    """
     d0 = date(2024, 1, 1)
     panel = _nav_panel([
-        ("A", d0, "Q1", 0.20, 10.0),   # 因子值大 → 权重高
-        ("C", d0, "Q1", 0.00, 1.0),
-    ])
+        ("A", d0, "Q1", 0.30, 30.0),
+        ("B", d0, "Q1", 0.00, 20.0),
+        ("C", d0, "Q1", 0.00, 10.0),
+    ], strengths=[1.5, 0.5, 1.5])
 
     nav_eq = FactorBacktestService._calc_group_nav(panel, _cfg(weight="equal"))
     nav_fw = FactorBacktestService._calc_group_nav(panel, _cfg(weight="factor_weight"))
 
-    # 等权: (0.20+0.00)/2 = 0.10; 因子加权: 权重 (9,0) → 0.20
-    assert nav_eq[-1]["Q1"] == 1.1
-    assert nav_fw[-1]["Q1"] == 1.2
+    assert abs(nav_eq[-1]["Q1"] - 1.1) < 1e-9
+    assert abs(nav_fw[-1]["Q1"] - (1 + 0.45 / 3.5)) < 1e-9
     assert nav_fw[-1]["Q1"] != nav_eq[-1]["Q1"]
 
 
-def test_factor_weight_handles_negative_factor_values():
-    """负因子值: 减组内最小值后归一 (最小值个股权重为 0)。"""
+def test_factor_weight_nonpositive_strength_falls_back_to_one():
+    """强度缺失/异常（≤0，上游 rank 算不出时）→ 该股权重按 1.0 兜底。
+
+    两只强度 0.0/-2.0 → 权重 (1.0, 1.0) → 与等权一致。
+    （旧语义"减最小值归一、最小权重为 0"已随 rank 强度口径废止。）
+    """
     d0 = date(2024, 1, 1)
     panel = _nav_panel([
-        ("A", d0, "Q1", 0.00, -5.0),   # 最小值 → shifted 0 → 权重 0
-        ("C", d0, "Q1", 0.20, -1.0),   # shifted 4 → 全权重
-    ])
+        ("A", d0, "Q1", 0.20, -5.0),
+        ("C", d0, "Q1", 0.00, -1.0),
+    ], strengths=[0.0, -2.0])
 
     nav_fw = FactorBacktestService._calc_group_nav(panel, _cfg(weight="factor_weight"))
-    assert nav_fw[-1]["Q1"] == 1.2  # 全权重落在 0.20 的个股上
+    nav_eq = FactorBacktestService._calc_group_nav(panel, _cfg(weight="equal"))
+    assert abs(nav_fw[-1]["Q1"] - 1.1) < 1e-9
+    assert nav_fw[-1]["Q1"] == nav_eq[-1]["Q1"]
 
 
 def test_factor_weight_all_equal_falls_back_to_equal():
-    """组内因子值全相等 → 权重和为 0 → 退化为等权。"""
+    """组内因子值全相等 → rank 并列 → 强度全等（n=2 时 rank 1.5/1.5 → 0.5/0.5）
+    → 退化为等权。"""
     d0 = date(2024, 1, 1)
     panel = _nav_panel([
         ("A", d0, "Q1", 0.10, 3.0),
         ("C", d0, "Q1", 0.30, 3.0),
-    ])
+    ], strengths=[0.5, 0.5])
 
     nav_fw = FactorBacktestService._calc_group_nav(panel, _cfg(weight="factor_weight"))
-    assert nav_fw[-1]["Q1"] == 1.2  # (0.10+0.30)/2
+    assert abs(nav_fw[-1]["Q1"] - 1.2) < 1e-9  # (0.10+0.30)/2
 
 
 # ---------------------------------------------------------------- weekly 调仓口径

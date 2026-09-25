@@ -5,7 +5,7 @@ null); 历史交易日的 quote_ts 时刻 < 15:00 即盘中快照 → 坏。
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 
 import polars as pl
@@ -198,9 +198,9 @@ def test_branch4_start_without_stale_day_uses_latest():
 
 def test_timezone_conversion_is_cn():
     # quote_ts 是毫秒 Unix 时间戳, 必须按 UTC+8 折算 — 15:00 边界用例
-    ts = int(datetime(2026, 8, 21, 7, 0, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 15:00
+    ts = int(datetime(2026, 8, 21, 7, 0, tzinfo=UTC).timestamp() * 1000)  # 北京 15:00
     assert _is_snapshot(FRIDAY, ts) is False
-    ts_morning = int(datetime(2026, 8, 21, 3, 58, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 11:58
+    ts_morning = int(datetime(2026, 8, 21, 3, 58, tzinfo=UTC).timestamp() * 1000)  # 北京 11:58
     assert _is_snapshot(FRIDAY, ts_morning) is True
 
 
@@ -264,11 +264,29 @@ class _QuoteServiceStub:
         self.enabled = False
 
 
+def _freeze_gate_day(monkeypatch):
+    """把 data_integrity 的"今天"冻在 TODAY(2026-08-24 周一盘中)。
+
+    门控扫"最近 N 天"窗口：写死的历史分区会随时间滑出窗口，坏数据变
+    "不可见"，409 断言永不触发。用例意图是"坏分区在窗口内"，冻今天。
+    """
+    from app.services import data_integrity
+
+    class _FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 24, 12, 0, 0, tzinfo=tz or CN_TZ)
+
+    monkeypatch.setattr(data_integrity, "datetime", _FrozenDT)
+
+
 def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypatch):
     from fastapi import HTTPException
 
     from app.api import settings as settings_api
     from app.services import data_integrity
+
+    _freeze_gate_day(monkeypatch)
 
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, _ts_ms(FRIDAY, time(11, 58)))
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
@@ -301,6 +319,7 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
 def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
+    _freeze_gate_day(monkeypatch)
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None)
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
 
@@ -321,6 +340,7 @@ def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
 def test_realtime_gate_ignores_old_issues_beyond_window(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
+    _freeze_gate_day(monkeypatch)
     old_day = TODAY - timedelta(days=AUTO_REPAIR_MAX_LAG_DAYS + 1)
     while old_day.weekday() >= 5:
         old_day -= timedelta(days=1)
