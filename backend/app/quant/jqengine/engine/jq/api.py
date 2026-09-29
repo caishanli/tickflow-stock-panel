@@ -59,12 +59,17 @@ def init(context):
     pass
 
 
-def run_daily(func, time="open"):
-    """注册每日定时任务（time: 'open'/'close'/'every_bar' 或 'HH:MM'）。"""
+def run_daily(func, time="open", **kwargs):
+    """注册每日定时任务（time: 'open'/'close'/'every_bar' 或 'HH:MM'）。
+
+    **kwargs 吞掉聚宽扩展参数（如 reference_security——仅调度参考标的，
+    本地按分钟 bar 时刻触发，无需该字段；缺它会 NameError/TypeError 使
+    策略 init 直接失败，首板高开策略 5313ae33 实测）。
+    """
     _state["daily"].append((func, time))
 
 
-def run_minute(func, minute="every"):
+def run_minute(func, minute="every", **kwargs):
     """注册每分钟定时任务。"""
     _state["minute"].append((func, minute))
 
@@ -102,7 +107,8 @@ def _filter_up_to(df, dt):
 def _default_snapshot(code):
     return SimpleNamespace(
         paused=False, last_price=0.0, day_open=0.0,
-        high_limit=0.0, low_limit=0.0, amount=0, volume=0
+        high_limit=0.0, low_limit=0.0, amount=0, volume=0,
+        name="", is_st=False,
     )
 
 
@@ -227,10 +233,16 @@ class CurrentDataProxy:
         info = self._daily_info(code)
         lp = self._live_last_price(code)
         last = lp if lp is not None else 0.0
+        name = ""
+        try:
+            name = get_security_name(code) or ""
+        except Exception:
+            pass
         return SimpleNamespace(
             paused=info.paused, last_price=last, day_open=info.day_open,
             high_limit=info.high_limit, low_limit=info.low_limit,
             amount=info.amount, volume=info.volume,
+            name=name, is_st=("ST" in name.upper()),
         )
 
     def get(self, code, default=None):
