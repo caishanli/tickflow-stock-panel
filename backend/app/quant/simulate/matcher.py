@@ -10,9 +10,27 @@
 """
 from __future__ import annotations
 
+import os
+
 from ..config import CONFIG
 from ..core import STAMP_TAX_RATE as DEFAULT_STAMP_TAX
 from ..core import commission, fill_price, stamp_tax_rate
+
+
+def _legacy_rounding() -> bool:
+    """legacy 止损取整开关（``QUANT_LEGACY_MATCHER_ROUNDING=1``），仅 A/B 用。
+
+    复现服务器 ``93e6e796`` 所跑的 ``05d2a7d`` 之前口径：止损成交价不做
+    tick 取整、保留 4 位小数（2.1429）。该口径与正常委托无关——正常委托
+    两机一直对齐 tick（2.132），所以本开关**只作用于 Matcher 止损路径**，
+    不碰 :func:`~app.quant.core.fees.fill_price`，否则正常买单会变 2.1322
+    而与服务器首笔就分叉。
+
+    滑点不传导（回落 ``CONFIG.slippage``）同样由开关在 runner 侧控制，见
+    ``simulate/runner.py``。该口径已被 ``05d2a7d`` 判定为缺陷（回测 vs
+    补跑逐笔错位），且 2.1429 非 ETF 报价档位价，不要用于实盘。
+    """
+    return os.getenv("QUANT_LEGACY_MATCHER_ROUNDING", "").strip() in ("1", "true", "legacy")
 
 
 def _resolve_name(code: str) -> str:
@@ -67,7 +85,8 @@ class Matcher:
                 continue
             sell_amount = min(amount, sellable)
             # 1 Core：卖出滑点+tick 取整+佣金+印花税率走 core.fees（数字与旧内联公式一致）
-            fill = fill_price(price, "sell", slippage, code)
+            fill = (round(price * (1 - slippage), 4) if _legacy_rounding()
+                    else fill_price(price, "sell", slippage, code))
             tax_rate = stamp_tax_rate(code, stamp_tax)
             commission_amt = commission(sell_amount * fill, fee, min_commission,
                                           ndigits=None)

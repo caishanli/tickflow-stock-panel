@@ -20,7 +20,12 @@ def fill_price(price: float, side: str, slippage: float, code) -> float:
     """成交价：买 ``price*(1+slip)`` / 卖 ``price*(1-slip)``，按 tick 取整。
 
     ``slippage=None`` 时抛 TypeError（旧内联公式同行为；禁止静默按 0 处理，
-    见契约 §7.3）。"""
+    见契约 §7.3）。
+
+    注意：``05d2a7d`` 之前止损路径也不取整，但该差异**只存在于 Matcher**
+    （见 ``simulate/matcher.py`` 的 legacy 开关），正常委托一直对齐 tick。
+    本函数是正常委托的唯一入口，不接受 legacy 覆盖。
+    """
     slip = float(slippage)
     raw = float(price) * (1 + slip) if side == "buy" else float(price) * (1 - slip)
     return round_to_tick(raw, code)
