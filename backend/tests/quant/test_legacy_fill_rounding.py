@@ -69,9 +69,9 @@ def test_legacy_does_not_touch_normal_orders(monkeypatch):
     返回 2.1322，首笔即与服务器分叉——A/B 就失去意义。
     """
     _reload(monkeypatch, legacy=True)
-    from app.quant.core import fees
-
     import importlib
+
+    from app.quant.core import fees
 
     fees = importlib.reload(fees)
     assert fees.fill_price(2.132, "buy", 0.0001, ETF) == pytest.approx(2.132)

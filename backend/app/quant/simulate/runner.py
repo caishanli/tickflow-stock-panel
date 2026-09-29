@@ -27,7 +27,8 @@ from ..jqengine.datasource.manager import is_halted_by_volume
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
 from . import live_feed, names
-from .matcher import Matcher, _legacy_rounding as _legacy_fill_rounding
+from .matcher import Matcher
+from .matcher import _legacy_rounding as _legacy_fill_rounding
 from .protocol import is_paused, read_state, save_state
 
 log = logging.getLogger("app.quant.simulate.runner")
