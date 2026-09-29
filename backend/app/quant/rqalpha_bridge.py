@@ -1665,9 +1665,12 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
     print("[universe] 数据源覆盖标的: {} 只（含固定池+基准，惰性加载日线）".format(len(valid_universe)))
 
     # 安装兼容层（注册 shim + 补丁 + 假 jqdata；list_dates 供
-    # get_all_securities(date=...) 按上市/退市日期过滤，避免幸存者偏差）
+    # get_all_securities(date=...) 按上市/退市日期过滤，避免幸存者偏差）。
+    # stock_codes：股票宇宙码登记给 get_all_securities('stock') 的类型过滤
+    #（否则股票策略会把混入数据源宇宙的 benchmark ETF 误当股票选入）。
     install_jqcompat(valid_universe, names=etf_names, benchmark=benchmark,
-                     list_dates=etf_list_dates)
+                     list_dates=etf_list_dates,
+                     stock_codes=set(stock_universe) if stock_universe else None)
 
     # 在 init/initialize 内注入 update_universe 与 _replay_run_daily，
     # 确保 1m 事件循环有标的、且全局 run_daily 在正确上下文内重放注册。
@@ -1709,14 +1712,18 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             "accounts": {"stock": float(params.get("capital", 100000.0))},
             "benchmark": benchmark,
             "data_bundle_path": params.get("bundle_dir") or _dt_dir(),
-            "matching_type": "current_bar",
+            # matching_type 可由 params 覆盖：聚宽式策略在 09:26（本地映射到
+            # 09:31 bar）下单，成交价 = 当日开盘价；current_bar 口径按该 bar
+            # 收盘撮合会系统性偏移一个首分钟漂移（2026-09-30 首板高开策略对齐
+            # 实测）。next_bar_open 决策器取当前 bar 的 open，与聚宽一致。
+            "matching_type": params.get("matching_type", "current_bar"),
             "strategy_file": "strategy.py",
         },
         "mod": {
             "sys_analyser": {"record": True, "benchmark": benchmark},
             "sys_simulation": {
                 "slippage": float(params.get("slippage", 0.0001)),
-                "matching_type": "current_bar",
+                "matching_type": params.get("matching_type", "current_bar"),
                 "price_limit": False,
                 "volume_limit": False,
                 "inactive_limit": False,

@@ -34,9 +34,23 @@ def limit_rate(pure: str, exch: str, is_st: bool = False) -> float:
     return 0.10
 
 
+def round_half_up_price(x, decimals: int = 2):
+    """价格四舍五入（交易所口径），替代 numpy 银行家舍入。
+
+    交易所规则为四舍五入：9.95×1.1=10.945 → 10.95；np.round 半偶舍入得
+    10.94，导致 601609 等股票的涨停判定整体错位（2026-09-30 首板高开策略
+    对齐实测）。1e-6 容差吸收二进制浮点表示误差（10.945 的二进制近似为
+    10.9449999…），对真实非半分位值（距 .005 远大于 1e-6）无影响。
+    """
+    import numpy as np
+
+    scale = 10 ** decimals
+    return np.floor(np.asarray(x, dtype="float64") * scale + 0.5 + 1e-6) / scale
+
+
 def limit_prices_from_prev_close(close, rate: float = 0.10):
-    """按昨收计算涨跌停价序列：limit = round(prev_close × (1±rate), 2)。"""
+    """按昨收计算涨跌停价序列：limit = round_half_up(prev_close × (1±rate), 2)。"""
     prev_close = close.shift(1)
-    limit_up = (prev_close * (1 + rate)).round(2)
-    limit_down = (prev_close * (1 - rate)).round(2)
-    return limit_up.to_numpy(dtype="float64"), limit_down.to_numpy(dtype="float64")
+    limit_up = round_half_up_price(prev_close * (1 + rate))
+    limit_down = round_half_up_price(prev_close * (1 - rate))
+    return limit_up, limit_down
