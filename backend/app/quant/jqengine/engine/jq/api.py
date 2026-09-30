@@ -122,29 +122,40 @@ def _limit_rate(code):
 
 
 class _SecData:
-    """current_data 单标的快照（last_price 惰性）。
+    """current_data 单标的快照（last_price / day_open 惰性）。
 
-    静态字段（paused/涨跌停/name/is_st）在下标访问时即取；``last_price`` 改为
-    property 惰性求值——全市场 ST/停牌过滤（l0_filter_st_paused_stock）逐只读
-    ``current_data[code]`` 但不读 last_price，急切求值会为每只触发一次分钟数据
-    网络加载（5400 只 ≈ 4.5 分钟/交易日，首板高开策略补跑实测）。仅真正读价
-    的调用方付出加载成本，语义与急切版完全一致。
+    静态字段（paused/涨跌停/name/is_st）在下标访问时即取；``last_price`` 与
+    ``day_open`` 改为 property 惰性求值——全市场 ST/停牌过滤（l0_filter_st_
+    paused_stock）逐只读 ``current_data[code]`` 但不读价，急切求值会为每只
+    触发一次分钟数据网络加载（5400 只 ≈ 4.5~20 分钟/次扫描，首板高开策略
+    实测）。仅真正读价的调用方付出加载成本，语义与急切版完全一致。
     """
 
-    __slots__ = ("_proxy", "_code", "paused", "day_open", "high_limit",
+    __slots__ = ("_proxy", "_code", "_info", "paused", "high_limit",
                  "low_limit", "amount", "volume", "name", "is_st")
 
     def __init__(self, proxy, code, info, name):
         self._proxy = proxy
         self._code = code
+        self._info = info
         self.paused = info.paused
-        self.day_open = info.day_open
         self.high_limit = info.high_limit
         self.low_limit = info.low_limit
         self.amount = info.amount
         self.volume = info.volume
         self.name = name
         self.is_st = "ST" in (name or "").upper()
+
+    @property
+    def day_open(self):
+        v = getattr(self._info, "day_open", 0.0)
+        if v is None:
+            v = self._proxy._day_open_of(self._code)
+            try:
+                self._info.day_open = v  # 回填：info 对象在 _daily 缓存内跨访问复用
+            except Exception:
+                pass
+        return v or 0.0
 
     @property
     def last_price(self):
@@ -179,7 +190,23 @@ class CurrentDataProxy:
         if mgr and dt:
             try:
                 start = (pd.Timestamp(dt) - pd.Timedelta(days=10)).strftime("%Y%m%d")
-                df = mgr.fetch("get_daily", code, start, dt)
+                # 优先内存帧：_daily_mem 预载覆盖回看窗口，实时模式下「今日」日线
+                # 未落盘会让 fetch 判定覆盖不足 → 每股一次网络回源（5400 只
+                # ST/停牌过滤实测卡 20+ 分钟，09:26 选股到 10:18 仍未产出日志）。
+                # 内存帧新鲜（末行距今 ≤15 自然日）时直接用：今日 bar 缺失时
+                # day_open 走下方分钟兜底、昨收取今日前最后一根，语义与补跑一致。
+                df = None
+                _mem = getattr(mgr, "_daily_mem", None)
+                if _mem:
+                    _m = _mem.get(f"get_daily_{code}")
+                    if _m is not None and not getattr(_m, "empty", True) \
+                            and isinstance(_m.index, pd.DatetimeIndex):
+                        _lag = (pd.Timestamp(dt).normalize()
+                                - _m.index[-1].normalize()).days
+                        if _lag <= 15:
+                            df = _m
+                if df is None:
+                    df = mgr.fetch("get_daily", code, start, dt)
                 if df is not None and not df.empty and isinstance(df.index, pd.DatetimeIndex):
                     dt_ts = pd.Timestamp(dt)
                     day0 = dt_ts.normalize()
@@ -208,8 +235,12 @@ class CurrentDataProxy:
                         if _tvol is not None and _tvol < 1.0:
                             paused = True
                     else:
-                        day_open = float(mgr.get_day_open(code, dt_ts) or 0.0) \
-                            if hasattr(mgr, "get_day_open") else 0.0
+                        # day_open 惰性化：实时/补跑「今日」日线未落盘时，兜底
+                        # get_day_open 会给每只标的加载分钟窗口（全市场 ST/停牌
+                        # 过滤实测逐只网络加载卡死 09:26 选股 20+ 分钟）。
+                        # 存 None 由 _SecData.day_open 首次访问时再算（仅真正
+                        # 读价的下单/持仓路径少数几只付代价）。
+                        day_open = None
                         volume = (float(prev_df.iloc[-1].get("volume", 0))
                                   if len(prev_df) else 0.0)
                     if prev_close > 0:
@@ -234,6 +265,23 @@ class CurrentDataProxy:
             paused=False, day_open=0.0, high_limit=float("inf"),
             low_limit=0.0, amount=0, volume=0,
         )
+
+    def _day_open_of(self, code):
+        """当日开盘价（惰性，仅真正读 day_open 时调用）。
+
+        今日日线未落盘（实时盘中/补跑的当日）时由 manager 以当日首根分钟
+        bar 的 open 兜底（≈集合竞价开盘价）；失败返回 0.0（择价方自行跳过）。
+        """
+        mgr = _state.get("manager")
+        ctx = _state.get("ctx")
+        if mgr is None or ctx is None or ctx.current_dt is None:
+            return 0.0
+        try:
+            if hasattr(mgr, "get_day_open"):
+                return float(mgr.get_day_open(code, pd.Timestamp(ctx.current_dt)) or 0.0)
+        except Exception:
+            pass
+        return 0.0
 
     def _live_last_price(self, code):
         if not _state.get("minute_mode"):
