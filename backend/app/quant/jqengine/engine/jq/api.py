@@ -1254,7 +1254,11 @@ def order(security, amount, _price=None):
         )
         return False
     if security not in no_buy and security not in no_sell:
-        px = _live_price(security)
+        # 涨跌停判定用「本单实际成交价」：显式价单（竞价单按 day_open 在
+        # 09:31 tick 提交）不能用当前分钟价——聚宽竞价单在开盘价成交，而
+        # 首分钟冲到涨停的标的（fixture 000980：开盘 1.94 竞价买入、09:31
+        # 已封 2.02）会被"现价已到涨停"误拦（模拟盘实测拒单一次）。
+        px = _price if _price is not None else _live_price(security)
         if px:
             try:
                 cd = get_current_data()[security]

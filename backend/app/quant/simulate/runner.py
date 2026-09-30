@@ -717,7 +717,16 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
         probe_end = tcal.probe_recent_anchor() if not replay else None
         if probe_end is not None and probe_end >= str(now.date()):
             probe_end = None
-        res = tcal.check_drift(eng_end, file_end, probe_end)
+        # 补跑模式不做漂移判定：引擎日历末端固定为「数据末端」（如 09-29），
+        # 而权威锚点 file_end 随回放日逐日推进（= 回放日的上一交易日），
+        # 「引擎超前权威」在补跑中结构上必然成立 → 每个回放日刷一条 warn
+        # 误报（2026-09-30 sb_gaokai_sim 补跑 57 天刷 57 条，账户异常标签
+        # 全是假告警）。漂移只在实时模式有意义：那时引擎末端应跟随最新落盘
+        # 分区，落后权威才代表数据断档。
+        if replay:
+            res = {"level": "ok", "ok": True, "reason": ""}
+        else:
+            res = tcal.check_drift(eng_end, file_end, probe_end)
         if res["level"] != "ok":
             _emit_log(account_id, res["level"], f"🚨【日历漂移】{res['reason']}")
         # 仅"引擎真正落后权威"分页告警；超前/probe 抖动与补跑只留日志。
