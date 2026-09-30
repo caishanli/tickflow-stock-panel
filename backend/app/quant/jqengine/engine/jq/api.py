@@ -121,6 +121,37 @@ def _limit_rate(code):
     return _core_limit_rate(pure, exch)
 
 
+class _SecData:
+    """current_data 单标的快照（last_price 惰性）。
+
+    静态字段（paused/涨跌停/name/is_st）在下标访问时即取；``last_price`` 改为
+    property 惰性求值——全市场 ST/停牌过滤（l0_filter_st_paused_stock）逐只读
+    ``current_data[code]`` 但不读 last_price，急切求值会为每只触发一次分钟数据
+    网络加载（5400 只 ≈ 4.5 分钟/交易日，首板高开策略补跑实测）。仅真正读价
+    的调用方付出加载成本，语义与急切版完全一致。
+    """
+
+    __slots__ = ("_proxy", "_code", "paused", "day_open", "high_limit",
+                 "low_limit", "amount", "volume", "name", "is_st")
+
+    def __init__(self, proxy, code, info, name):
+        self._proxy = proxy
+        self._code = code
+        self.paused = info.paused
+        self.day_open = info.day_open
+        self.high_limit = info.high_limit
+        self.low_limit = info.low_limit
+        self.amount = info.amount
+        self.volume = info.volume
+        self.name = name
+        self.is_st = "ST" in (name or "").upper()
+
+    @property
+    def last_price(self):
+        lp = self._proxy._live_last_price(self._code)
+        return lp if lp is not None else 0.0
+
+
 class CurrentDataProxy:
     """current_data 代理。
 
@@ -231,19 +262,12 @@ class CurrentDataProxy:
 
     def __getitem__(self, code):
         info = self._daily_info(code)
-        lp = self._live_last_price(code)
-        last = lp if lp is not None else 0.0
         name = ""
         try:
             name = get_security_name(code) or ""
         except Exception:
             pass
-        return SimpleNamespace(
-            paused=info.paused, last_price=last, day_open=info.day_open,
-            high_limit=info.high_limit, low_limit=info.low_limit,
-            amount=info.amount, volume=info.volume,
-            name=name, is_st=("ST" in name.upper()),
-        )
+        return _SecData(self, code, info, name)
 
     def get(self, code, default=None):
         try:
@@ -697,6 +721,19 @@ def get_price(security, start_date=None, end_date=None, count=None,
     result = pd.concat(dfs, ignore_index=True)
     if not panel and len(security) > 1:
         return _synth_jq_fields(result, security, frequency, fields, panel)
+    if (not panel) and len(security) == 1:
+        # 与回测侧 jqcompat 同口径：单标的 panel=False 返回「索引=time，
+        # 列=fields」（无 code/time 列）。缺该分支时索引为 RangeIndex，
+        # 策略 df.index[mask][0].strftime() 直接 AttributeError（首板高开
+        # 策略 5313ae33 分钟封板时间提取实测）。
+        single = dfs[0]
+        if "time" in single.columns:
+            single = single.set_index("time")
+            single = single.drop(columns=["code"], errors="ignore")
+            for drop_c in ("datetime", "trade_date", "date"):
+                if drop_c in single.columns:
+                    single = single.drop(columns=[drop_c])
+            return _synth_jq_fields(single, security, frequency, fields, panel)
     if panel and len(security) == 1:
         single = dfs[0]
         if "time" in single.columns:
@@ -712,11 +749,25 @@ def get_price(security, start_date=None, end_date=None, count=None,
 _SYNTH_PREV_CACHE = {}
 
 
+def _day_num_array(idx) -> np.ndarray:
+    """DatetimeIndex → 整数日数组（YYYYMMDD），纯 numpy 无 pandas 频率推断。
+
+    ``idx.normalize()`` 会触发 inferred_freq/infer_freq（每次 ~百微秒且随
+    长度放大），全市场逐行调用（首板高开策略 5400 码 × 多日）实测量级分钟级
+    卡顿——本函数是热路径专用替代（实测把单日补跑从 >7min 压回秒级）。
+    """
+    return np.asarray(idx, dtype="datetime64[D]").astype(np.int64)
+
+
+_SYNTH_DAYS_CACHE: dict = {}
+
+
 def _synth_daily_prev_close_and_day_vol(code, day_ts):
     """日线频率合成用：(D 日前最后一根收盘, D 日当日 volume)。
 
     停牌日分区照出 bar（OHLC=昨收、volume≈0 哨兵），故 paused 按「当日量<1」
     判定（口径同 _daily_info）；prev_close 为 D 前最后一根 close（前复权）。
+    searchsorted + 日数组缓存，避免逐行布尔掩膜的 O(n²)。
     """
     key = (code, int(day_ts.strftime("%Y%m%d")), "d")
     if key in _SYNTH_PREV_CACHE:
@@ -727,14 +778,19 @@ def _synth_daily_prev_close_and_day_vol(code, day_ts):
         df = mgr._daily_mem.get(f"get_daily_{code}")
         if df is not None and not (hasattr(df, "empty") and df.empty) \
                 and isinstance(df.index, pd.DatetimeIndex):
-            norm = df.index.normalize()
-            day0 = day_ts.normalize()
-            prev = df[norm < day0]
-            if len(prev):
-                out = (float(prev["close"].iloc[-1]), float("nan"))
-            today = df[norm == day0]
-            if len(today) and "volume" in today.columns:
-                out = (out[0], float(today["volume"].iloc[-1]))
+            cache = _SYNTH_DAYS_CACHE.get(code)
+            if cache is None or cache[0] is not df:
+                cache = (df, _day_num_array(df.index))
+                _SYNTH_DAYS_CACHE[code] = cache
+            days = cache[1]
+            target = np.datetime64(day_ts.date(), "D").astype(np.int64)
+            pos = int(np.searchsorted(days, target, side="left"))
+            # pos = 第一个 >= D 的行；pos-1 即 D 前最后一根
+            if pos > 0:
+                out = (float(df["close"].iloc[pos - 1]), float("nan"))
+            if pos < len(days) and int(days[pos]) == int(target) \
+                    and "volume" in df.columns:
+                out = (out[0], float(df["volume"].iloc[pos]))
     except Exception:
         pass
     _SYNTH_PREV_CACHE[key] = out
@@ -746,7 +802,7 @@ def _synth_minute_prev_close(code, day_ts, asof_ts=None):
     收盘，与撮合同源），供 close >= high_limit×0.9999 的分钟涨停判定。
 
     与 get_price 主路径同口径：分钟帧若含未来拆股前复权，按 as-of 撤销因子
-    同步缩放（否则涨停价与分钟价量纲错位）。
+    同步缩放（否则涨停价与分钟价量纲错位）。searchsorted + 日数组缓存。
     """
     _c = _state.get("ctx")
     asof = pd.Timestamp(asof_ts) if asof_ts is not None else (
@@ -758,20 +814,52 @@ def _synth_minute_prev_close(code, day_ts, asof_ts=None):
         return _SYNTH_PREV_CACHE[key]
     mgr = _state["manager"]
     out = float("nan")
+    target = np.datetime64(day_ts.date(), "D").astype(np.int64)
+
+    def _from_frame(df):
+        if df is None or (hasattr(df, "empty") and df.empty) \
+                or not isinstance(df.index, pd.DatetimeIndex):
+            return None
+        cache = _SYNTH_DAYS_CACHE.get(("m", code))
+        if cache is None or cache[0] is not df:
+            cache = (df, _day_num_array(df.index))
+            _SYNTH_DAYS_CACHE[("m", code)] = cache
+        days = cache[1]
+        pos = int(np.searchsorted(days, target, side="left"))
+        if pos <= 0:
+            return None
+        val = float(df["close"].iloc[pos - 1])
+        _rev = getattr(mgr, "revoke_future_split_factor", None)
+        if _rev is not None:
+            _ff = _rev(code, asof)
+            if _ff != 1.0:
+                val = val * _ff
+        return val
+
     try:
-        df = mgr._minute_mem.get(code) if hasattr(mgr, "_minute_mem") else None
-        if df is not None and not (hasattr(df, "empty") and df.empty) \
-                and isinstance(df.index, pd.DatetimeIndex):
-            prev = df[df.index.normalize() < day_ts.normalize()]
-            if len(prev):
-                out = float(prev["close"].iloc[-1])
-                _rev = getattr(mgr, "revoke_future_split_factor", None)
-                if _rev is not None:
-                    _ff = _rev(code, asof)
-                    if _ff != 1.0:
-                        out = out * _ff
+        out = _from_frame(mgr._minute_mem.get(code) if hasattr(mgr, "_minute_mem") else None)
+        if out is None:
+            # 缓存缺该码或缓存帧被 get_price 单标的取数裁短（不含前一日）：
+            # 显式按日回取；缺这步 prev_close=NaN → high_limit=NaN → 首板
+            # 分钟校验整段「昨日分钟数据无效」（模拟盘首板高开策略实测）。
+            try:
+                df = mgr.get_minute(
+                    code, day_ts.strftime("%Y%m%d"),
+                    (day_ts - pd.Timedelta(days=10)).strftime("%Y%m%d"))
+            except Exception:
+                df = None
+            out = _from_frame(df)
+        if out is None:
+            # 补跑窗口起点前的交易日无分钟分区（如 07-13 校验 07-10 的板需要
+            # 07-09 收盘）：回退日线帧昨收（前复权价；除权日与原始价有差，
+            # 对既有无分红标的无差）。缺此回退窗口首周日全部「昨日分钟数据无效」。
+            out = _synth_daily_prev_close_and_day_vol(code, day_ts)[0]
+            if out != out:
+                out = None
     except Exception:
         pass
+    if out is None:
+        out = float("nan")
     _SYNTH_PREV_CACHE[key] = out
     return out
 
@@ -895,8 +983,10 @@ def attribute_history(security, count, unit="1d", fields=None, skip_paused=True,
     result = get_price(security, count=count, frequency=freq, fields=fields,
                        panel=True, fq=fq)
     if isinstance(result, pd.DataFrame) and not result.empty:
-        result = result.reset_index(drop=True)
-        result.index = range(-len(result), 0)
+        # 索引口径与回测侧 jqcompat 对齐：保留时间索引。聚宽习惯写法
+        # ``df['close'][0]``（最早）与 ``[-1]``（最新）在整数标签索引下前者
+        # 直接 KeyError(0)（首板高开策略 5313ae33 实测），时间索引则可按位置
+        # 回退同时支持两者；``.iloc`` 用法不受影响。
         result.index.name = "date" if unit == "1d" else "datetime"
         return result
     return pd.DataFrame()
@@ -1003,31 +1093,36 @@ def _minute_day_slice(code: str, day_ts: pd.Timestamp):
     """某标的某交易日分钟 bar 切片 (hm, open, close, volume_股)；无数据 None。"""
     mgr = _state["manager"]
     day_int = int(day_ts.strftime("%Y%m%d"))
-    df = mgr._minute_mem.get(code) if hasattr(mgr, "_minute_mem") else None
-    if df is None or (hasattr(df, "empty") and df.empty):
-        try:
-            df = mgr.get_minute(code, day_ts.strftime("%Y%m%d"),
-                                day_ts.strftime("%Y%m%d"))
-        except Exception:
-            df = None
-    if df is None or (hasattr(df, "empty") and df.empty):
+    day_str = day_ts.strftime("%Y%m%d")
+
+    def _slice(df):
+        if df is None or (hasattr(df, "empty") and df.empty) \
+                or not isinstance(df.index, pd.DatetimeIndex):
+            return None
+        idx = df.index
+        mask = (idx.year * 10000 + idx.month * 100 + idx.day) == day_int
+        sub = df[mask]
+        if sub.empty:
+            return None
+        idx = sub.index
+        hm = (idx.hour * 100 + idx.minute).to_numpy()
+        vol = pd.to_numeric(sub["volume"], errors="coerce").to_numpy() \
+            if "volume" in sub.columns else np.full(len(sub), np.nan)
+        op = pd.to_numeric(sub["open"], errors="coerce").to_numpy() \
+            if "open" in sub.columns else np.full(len(sub), np.nan)
+        cl = pd.to_numeric(sub["close"], errors="coerce").to_numpy() \
+            if "close" in sub.columns else np.full(len(sub), np.nan)
+        return hm, op, cl, vol
+
+    sub = _slice(mgr._minute_mem.get(code) if hasattr(mgr, "_minute_mem") else None)
+    if sub is not None:
+        return sub
+    # 缓存帧不覆盖目标日（如已被 get_price 的单标的窗口取数裁短）时按日回取；
+    # 缺这一步会让竞价整段 EMPTY → 策略静默跳过全部候选（模拟盘实测）。
+    try:
+        return _slice(mgr.get_minute(code, day_str, day_str))
+    except Exception:
         return None
-    if not isinstance(df.index, pd.DatetimeIndex):
-        return None
-    idx = df.index
-    mask = (idx.year * 10000 + idx.month * 100 + idx.day) == day_int
-    sub = df[mask]
-    if sub.empty:
-        return None
-    idx = sub.index
-    hm = (idx.hour * 100 + idx.minute).to_numpy()
-    vol = pd.to_numeric(sub["volume"], errors="coerce").to_numpy() \
-        if "volume" in sub.columns else np.full(len(sub), np.nan)
-    op = pd.to_numeric(sub["open"], errors="coerce").to_numpy() \
-        if "open" in sub.columns else np.full(len(sub), np.nan)
-    cl = pd.to_numeric(sub["close"], errors="coerce").to_numpy() \
-        if "close" in sub.columns else np.full(len(sub), np.nan)
-    return hm, op, cl, vol
 
 
 def get_call_auction(security, start_date=None, end_date=None, fields=None,
@@ -1086,7 +1181,7 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
             [f for f in want if f not in ("code", "time")]
         out = out[keep]
     elif fields and out.empty:
-        out = pd.DataFrame(columns=["code", "time", *list(fields)])
+        out = pd.DataFrame(columns=["code", "time", *[f for f in fields if f != "time"]])
     return out
 
 
