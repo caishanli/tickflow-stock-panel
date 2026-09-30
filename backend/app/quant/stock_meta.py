@@ -128,6 +128,8 @@ def shares_for(bare_symbol: str, anchor_date_int: int) -> tuple[float, float]:
         row = ins[ins["symbol"] == f"{bare_symbol}.SH"]
         if row.empty:
             row = ins[ins["symbol"] == f"{bare_symbol}.SZ"]
+        if row.empty:
+            row = ins[ins["symbol"] == f"{bare_symbol}.BJ"]
         if not row.empty:
             r = row.iloc[-1]
             if float_shares != float_shares:

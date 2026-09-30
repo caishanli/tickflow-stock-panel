@@ -1593,6 +1593,23 @@ def _load_stock_meta(codes):
     return names, dates
 
 
+_VALID_MATCHING_TYPES = ("current_bar", "next_bar", "vwap")
+
+
+def _norm_matching_type(mt) -> str:
+    """matching_type 白名单归一（非法值回退 current_bar 并告警）。
+
+    rqalpha 的 parse_matching_type 只认 current_bar/next_bar/vwap/last/...，
+    非法值会在引擎深处抛裸 KeyError，报错位置离参数很远。
+    """
+    v = str(mt or "current_bar").strip().lower()
+    if v in _VALID_MATCHING_TYPES:
+        return v
+    if mt:
+        logger.warning("[bridge] 未知 matching_type=%r，回退 current_bar", mt)
+    return "current_bar"
+
+
 def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_path,
                            max_universe=None, strategy_path="", universe=None):
     """run_jq_backtest 主体（独立成函数，便于上层用 try/finally 恢复 dm._offline）。"""
@@ -1716,14 +1733,14 @@ def _run_jq_backtest_inner(dm, strategy_text, params, benchmark, start, end, db_
             # 09:31 bar）下单，成交价 = 当日开盘价；current_bar 口径按该 bar
             # 收盘撮合会系统性偏移一个首分钟漂移（2026-09-30 首板高开策略对齐
             # 实测）。next_bar_open 决策器取当前 bar 的 open，与聚宽一致。
-            "matching_type": params.get("matching_type", "current_bar"),
+            "matching_type": _norm_matching_type(params.get("matching_type")),
             "strategy_file": "strategy.py",
         },
         "mod": {
             "sys_analyser": {"record": True, "benchmark": benchmark},
             "sys_simulation": {
                 "slippage": float(params.get("slippage", 0.0001)),
-                "matching_type": params.get("matching_type", "current_bar"),
+                "matching_type": _norm_matching_type(params.get("matching_type")),
                 "price_limit": False,
                 "volume_limit": False,
                 "inactive_limit": False,

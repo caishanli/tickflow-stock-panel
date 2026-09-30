@@ -61,6 +61,7 @@ def load_strategy(code, manager, fee, slippage, cash):
     ``run_daily``/``run_minute`` 的注册会被收集。
     """
     ctx = api._reset(manager, fee, slippage, cash)
+    api.clear_synth_caches()
     ns = {
         "g": ctx.g,
         "context": ctx,

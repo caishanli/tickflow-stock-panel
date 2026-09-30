@@ -115,10 +115,27 @@ def _default_snapshot(code):
 _LISTING_DATES = None   # {6位代码: listing_date}，get_security_info 惰性加载
 
 
-def _limit_rate(code):
+def _limit_rate(code, is_st=False):
     """涨跌停幅度（1 Core 薄适配：码制归一化转调 core.limits，jq/pt 域均可）。"""
     pure, _, exch = str(code).partition(".")
-    return _core_limit_rate(pure, exch)
+    return _core_limit_rate(pure, exch, is_st)
+
+
+def _limit_rate_by_name(code):
+    """按标的简称解析 ST（5%）分档后的涨跌停幅度；名称取不到退非 ST。
+
+    与回测侧 jqcompat._limit_rate 口径一致：缺 ST 分档会让合成 high_limit
+    对 ST/退市票永远算错档（10%/20% 而非 5%）。名称走 get_security_name
+    （sec_names 进程缓存），仅合成路径按需调用。
+    """
+    pure, _, exch = str(code).partition(".")
+    is_st = False
+    try:
+        nm = get_security_name(code)
+        is_st = bool(nm) and ("ST" in str(nm).upper() or "退" in str(nm))
+    except Exception:
+        pass
+    return _core_limit_rate(pure, exch, is_st)
 
 
 class _SecData:
@@ -244,7 +261,7 @@ class CurrentDataProxy:
                         volume = (float(prev_df.iloc[-1].get("volume", 0))
                                   if len(prev_df) else 0.0)
                     if prev_close > 0:
-                        rate = _limit_rate(code)
+                        rate = _limit_rate_by_name(code)
                         from ....core import round_half_up_price as _rhu
 
                         info = SimpleNamespace(
@@ -309,12 +326,12 @@ class CurrentDataProxy:
         return None
 
     def __getitem__(self, code):
+        import contextlib as _cl
+
         info = self._daily_info(code)
         name = ""
-        try:
+        with _cl.suppress(Exception):
             name = get_security_name(code) or ""
-        except Exception:
-            pass
         return _SecData(self, code, info, name)
 
     def get(self, code, default=None):
@@ -810,6 +827,17 @@ def _day_num_array(idx) -> np.ndarray:
 _SYNTH_DAYS_CACHE: dict = {}
 
 
+def clear_synth_caches():
+    """清空 get_price 字段合成 / 昨收缓存（每次策略装载/回测安装时调用）。
+
+    缓存键含 (代码, 日期, as-of)，但降级路径的答案（如日线回退的昨收）与
+    强引用的日线/分钟帧不应跨回测、跨策略复用——否则复用的旧降级值会让
+    涨跌停价与实际撮合价错位且不可复现。
+    """
+    _SYNTH_PREV_CACHE.clear()
+    _SYNTH_DAYS_CACHE.clear()
+
+
 def _synth_daily_prev_close_and_day_vol(code, day_ts):
     """日线频率合成用：(D 日前最后一根收盘, D 日当日 volume)。
 
@@ -940,7 +968,7 @@ def _synth_jq_fields(result, security, frequency, fields, panel):
     for i in range(len(result)):
         code = result["code"].iloc[i] if has_code_col else code_for_all
         day_ts = pd.Timestamp(idx[i])
-        rate = _limit_rate(code)
+        rate = _limit_rate_by_name(code)  # ST 5% 分档
         if is_minute:
             prev_close = _synth_minute_prev_close(code, day_ts)
             day_vol = float("nan")
@@ -1092,25 +1120,66 @@ def _daily_bar_at(code: str, anchor) -> tuple[float, float]:
     return close, vol
 
 
+def _daily_bar_on(code: str, anchor_ts) -> tuple[float, float]:
+    """anchor **当日**的日线 (close, volume)；该日无 bar 返回 nan（不产伪行）。"""
+    mgr = _state["manager"]
+    try:
+        df = mgr._daily_mem.get(f"get_daily_{code}")
+        if df is None or (hasattr(df, "empty") and df.empty):
+            df = mgr.fetch("get_daily", code,
+                           anchor_ts.strftime("%Y%m%d"), anchor_ts.strftime("%Y%m%d"))
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return float("nan"), float("nan")
+        days = _day_num_array(pd.DatetimeIndex(df.index))
+        target = np.datetime64(pd.Timestamp(anchor_ts).date(), "D").astype(np.int64)
+        pos = int(np.searchsorted(days, target, side="left"))
+        if pos >= len(days) or int(days[pos]) != int(target):
+            return float("nan"), float("nan")
+        close = float(df["close"].iloc[pos]) if "close" in df.columns else float("nan")
+        vol = float(df["volume"].iloc[pos]) if "volume" in df.columns else float("nan")
+        return close, vol
+    except Exception:
+        return float("nan"), float("nan")
+
+
 def get_valuation(security, start_date=None, end_date=None, fields=None,
                   count=None):
     """聚宽 get_valuation 兼容（jqengine 版）：换手率 + 总/流通市值（亿元）。"""
     from .... import stock_meta
 
     codes = [security] if isinstance(security, str) else list(security)
+    ctx = _state.get("ctx")
+    base = pd.Timestamp(ctx.current_dt) if ctx and ctx.current_dt \
+        else pd.Timestamp.today()
+
+    def _prev_trading_day(ts):
+        try:
+            tds = get_trade_days(end_date=str(pd.Timestamp(ts).date()), count=2)
+            prev = [pd.Timestamp(d) for d in tds
+                    if pd.Timestamp(d).normalize() < pd.Timestamp(ts).normalize()]
+            return prev[-1] if prev else pd.Timestamp(ts).normalize()
+        except Exception:
+            return pd.Timestamp(ts).normalize()
+
     if start_date is not None:
         days = pd.date_range(start_date, end_date or start_date, freq="D")
+    elif count is not None:
+        # count=N：当前日前最近 N 个交易日（与 jqcompat 同口径）
+        try:
+            tds = [pd.Timestamp(d) for d in
+                   get_trade_days(end_date=str(base.date()), count=int(count) + 1)]
+            tds = [d for d in tds if d.normalize() < base.normalize()][-int(count):]
+            days = pd.DatetimeIndex(tds) if tds else pd.DatetimeIndex([])
+        except Exception:
+            days = pd.DatetimeIndex([_prev_trading_day(base)])
     else:
-        ctx = _state.get("ctx")
-        base = pd.Timestamp(ctx.current_dt) if ctx and ctx.current_dt \
-            else pd.Timestamp.today()
-        days = pd.DatetimeIndex([base.normalize()])
+        days = pd.DatetimeIndex([_prev_trading_day(base)])
     rows = []
     for day in days:
         anchor_ts = pd.Timestamp(day).normalize()
         anchor_int = int(anchor_ts.strftime("%Y%m%d"))
         for code in codes:
-            close, vol = _daily_bar_at(code, anchor_ts)
+            close, vol = _daily_bar_on(code, anchor_ts)
             if close != close:
                 continue
             fs, ts = stock_meta.shares_for(str(code).split(".")[0], anchor_int)
@@ -1342,12 +1411,29 @@ def order(security, amount, _price=None):
 
 
 def _jq_style_limit(limit_price):
-    """MarketOrderStyle/数值 → 保护价 float；无则 None（与 jqcompat 同口径）。"""
+    """MarketOrderStyle/数值 → 保护价 float；无/无效（0/NaN）则 None。
+
+    与 jqcompat 同口径：无效保护价不得进入竞价分支——0 会退化为 0 价单被
+    静默拒（day_open 回填失败路径），NaN 会污染账户现金。
+    """
     lp = getattr(limit_price, "limit_price", limit_price)
     try:
-        return float(lp) if lp is not None else None
+        v = float(lp)
     except (TypeError, ValueError):
         return None
+    if v != v or v <= 0:
+        return None
+    return v
+
+
+def _in_jq_auction_window():
+    """当前是否聚宽集合竞价窗口（首根 bar / 09:31 前）——与 jqcompat 同口径。"""
+    ctx = _state.get("ctx")
+    t = getattr(ctx, "current_dt", None)
+    if t is None:
+        return False
+    ts = pd.Timestamp(t)
+    return (ts.hour, ts.minute) <= (9, 31)
 
 
 def _auction_amount(security, value, limit_price):
@@ -1380,7 +1466,7 @@ def order_value(security, value, limit_price=None, **kwargs):
     静默中断（模拟盘首板高开策略实测）。
     """
     lp = _jq_style_limit(limit_price)
-    if lp is not None and float(value) > 0:
+    if lp is not None and float(value) > 0 and _in_jq_auction_window():
         amount = _auction_amount(security, float(value), lp)
         if amount:
             return order(security, amount, _price=lp)
@@ -1411,11 +1497,12 @@ def order_target_value(security, value, limit_price=None, **kwargs):
 
     与 order_target 同构：目标股数 = value/现价 向下取整整手，差额走 order。
     此前缺失——首板高开一进二策略（5313ae33）卖出腿调用即 NameError。
+    无有效价（停牌/无快照）直接放弃本单：旧实现对任何 value 都退回「卖出全部
+    持仓」，order_target_value(s, 正数目标) 在无行情时会被误执行成清仓。
     """
     price = _live_price(security)
-    if price == 0:
-        return order(security, -int(getattr(
-            _state["ctx"].portfolio.get_position(security), "amount", 0) or 0))
+    if not price or price != price:
+        return False
     return order_target(security, order_value_amount(value, price, _state["fee"]))
 
 

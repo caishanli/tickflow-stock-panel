@@ -724,7 +724,13 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
         # 全是假告警）。漂移只在实时模式有意义：那时引擎末端应跟随最新落盘
         # 分区，落后权威才代表数据断档。
         if replay:
-            res = {"level": "ok", "ok": True, "reason": ""}
+            # 补跑期只保留「引擎落后权威」（error，真漂移：数据断档），屏蔽
+            # 「引擎超前」——补跑中引擎末端固定为数据末端、权威锚点随回放日
+            # 推进，超前结构上必然成立，逐日刷 warn 是纯误报（2026-09-30
+            # sb_gaokai_sim 补跑 57 天刷 57 条）。
+            res = tcal.check_drift(eng_end, file_end, None)
+            if res.get("level") != "error":
+                res = {"level": "ok", "ok": True, "reason": ""}
         else:
             res = tcal.check_drift(eng_end, file_end, probe_end)
         if res["level"] != "ok":
