@@ -1233,8 +1233,8 @@ def _halted_for_order(code) -> bool:
         return False
 
 
-def order(security, amount):
-    """按股数下单（正买负卖）。
+def order(security, amount, _price=None):
+    """按股数下单（正买负卖；_price 显式指定成交价，竞价单用）。
 
     1 Core：撮合真身在 ``core.execution.execute_order``，此处只做取价+委托。
     交易规则：买入 100 股整手；T+1（当日买入不可卖，卖出量按 closeable 截断）；
@@ -1280,7 +1280,8 @@ def order(security, amount):
                 _logger.debug("order 涨跌停兜底判定失败 %s: %s", security, e)
     return execute_order(
         portfolio=ctx.portfolio, position_factory=Position,
-        code=security, amount=amount, price=_live_price(security),
+        code=security, amount=amount,
+        price=_price if _price is not None else _live_price(security),
         current_dt=ctx.current_dt, fee=_state["fee"], slippage=_state["slippage"],
         fee_config=_state.get("fee_config"),
         no_buy=no_buy, no_sell=no_sell,
@@ -1288,8 +1289,49 @@ def order(security, amount):
     )
 
 
-def order_value(security, value):
-    """按金额下单（1 Core：股数换算走 core，成交走 order）。"""
+def _jq_style_limit(limit_price):
+    """MarketOrderStyle/数值 → 保护价 float；无则 None（与 jqcompat 同口径）。"""
+    lp = getattr(limit_price, "limit_price", limit_price)
+    try:
+        return float(lp) if lp is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _auction_amount(security, value, limit_price):
+    """聚宽竞价单定量：昨收折算、整手向下、按可用现金（限价×1.001）钳制。
+
+    与 jqcompat 同口径（聚宽允许透支，本地引擎不允许，故按现金钳制）。
+    """
+    ctx = _state["ctx"]
+    try:
+        prev = _synth_minute_prev_close(security, pd.Timestamp(ctx.current_dt))
+        if prev == prev and prev > 0 and value > 0:
+            amount = int(value / prev) // 100 * 100
+            cash = float(getattr(ctx.portfolio, "cash", 0.0) or 0.0)
+            if amount > 0 and cash > 0:
+                per_share = (limit_price or prev) * 1.001
+                amount = min(amount, int(cash / per_share) // 100 * 100)
+            return amount
+    except Exception:
+        pass
+    return 0
+
+
+def order_value(security, value, limit_price=None, **kwargs):
+    """按金额下单（1 Core：股数换算走 core，成交走 order）。
+
+    带 MarketOrderStyle 保护价时复刻聚宽竞价单语义：按昨收定量 + 以保护价
+    （策略传 current_data.day_open）为成交价——聚宽 09:26 市价单在开盘价
+    成交（fixture 000989 买价 9.15 = 开盘价），随 bar 收盘成交会系统性偏移
+    一个首分钟漂移。缺 limit_price 参数时策略调用直接 TypeError、买入整段
+    静默中断（模拟盘首板高开策略实测）。
+    """
+    lp = _jq_style_limit(limit_price)
+    if lp is not None and float(value) > 0:
+        amount = _auction_amount(security, float(value), lp)
+        if amount:
+            return order(security, amount, _price=lp)
     price = _live_price(security)
     if price == 0 or value == 0:
         return False
@@ -1312,7 +1354,7 @@ def order_target(security, amount):
     return order(security, delta)
 
 
-def order_target_value(security, value):
+def order_target_value(security, value, limit_price=None, **kwargs):
     """调整持仓到目标市值（聚宽语义；value=0 即清仓）。
 
     与 order_target 同构：目标股数 = value/现价 向下取整整手，差额走 order。
