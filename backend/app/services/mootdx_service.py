@@ -1303,6 +1303,11 @@ def _sentinel_is_fresh(row: dict, max_age_days: int = 90) -> bool:
         return False
 
 
+# 8ceacc2 quarantine：旧缓存事件/悬崖合成发布的因子未达质量口径，函数整体
+# 禁用，待 qualified 源接入。单元测试用 monkeypatch 置 False 以单测内部逻辑。
+_ADJ_FACTOR_QUARANTINED = True
+
+
 def sync_adj_factor() -> dict:
     """增量更新 ETF+股票 前复权因子表(mootdx xdxr 事件重建, 三层加固).
     对宇宙内每只有除权事件的标的，用 xdxr 记录 + 日线 close 重建逐日
@@ -1319,7 +1324,8 @@ def sync_adj_factor() -> dict:
 
     返回 {written_symbols, rows, total_symbols, query_failed, audit_uncovered}.
     """
-    raise RuntimeError('UNQUALIFIED_FACTOR_SOURCE: legacy cached events/cliff synthesis publication disabled; exact verified factors required')
+    if _ADJ_FACTOR_QUARANTINED:
+        raise RuntimeError('UNQUALIFIED_FACTOR_SOURCE: legacy cached events/cliff synthesis publication disabled; exact verified factors required')
     src = MootdxSource()
     dm = DataManager()
     daily = dm._load_daily_from_partitions(asof=None)

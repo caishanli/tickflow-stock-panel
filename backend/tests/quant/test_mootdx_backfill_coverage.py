@@ -83,16 +83,20 @@ class _D:
 
 
 def test_trade_days_in_range(monkeypatch):
-    class _FakeSrc:
+    """8ceacc2 起 _trade_days_in_range 走有界 2026 权威日历（数据行不再作为
+    完整性证据）：08-01~08-06 全为交易日（含 08-06），且不依赖行情源。"""
+    class _BoomSrc:
         def get_daily(self, code, start, end):
-            idx = pd.DatetimeIndex([
-                _dt.datetime(2026, 8, 3), _dt.datetime(2026, 8, 4),
-                _dt.datetime(2026, 8, 5)])
-            return pd.DataFrame({"open": [1.0] * 3}, index=idx)
+            raise RuntimeError("数据行不得作为交易日证据")
 
-    monkeypatch.setattr(ms, "MootdxSource", lambda: _FakeSrc())
+    monkeypatch.setattr(ms, "MootdxSource", lambda: _BoomSrc())
     days = ms._trade_days_in_range(_dt.date(2026, 8, 1), _dt.date(2026, 8, 6))
-    assert days == [_dt.date(2026, 8, 3), _dt.date(2026, 8, 4), _dt.date(2026, 8, 5)]
+    assert days == [_dt.date(2026, 8, 3), _dt.date(2026, 8, 4),
+                    _dt.date(2026, 8, 5), _dt.date(2026, 8, 6)]
+    # 中秋调休（09-25~09-27）剔除：09-24(四)→09-28(一)
+    days2 = ms._trade_days_in_range(_dt.date(2026, 9, 22), _dt.date(2026, 9, 28))
+    assert _dt.date(2026, 9, 25) not in days2
+    assert days2[-1] == _dt.date(2026, 9, 28)
 
 
 def test_trade_days_in_range_filters_lower_bound(monkeypatch):
@@ -219,12 +223,13 @@ def test_backfill_to_now_includes_index_and_adj(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])
     monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
     monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: True)  # 空文件 → stale
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
     adj = {"written_symbols": 1, "rows": 5, "total_symbols": 2}
     monkeypatch.setattr(ms, "sync_adj_factor", lambda: adj)
     sent = []
@@ -273,10 +278,11 @@ def test_backfill_noop_when_all_current(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     calls = {"n": 0}
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("n", calls["n"] + 1))
-    monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(ms, "sync_adj_factor", lambda: calls.__setitem__("n", calls["n"] + 1))
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -307,16 +313,17 @@ def test_backfill_runs_sync_per_gap_day(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
     monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
     # 股票+ETF 日线都缺 8/5、8/6 两个交易日
     gap = [_d(2026, 8, 5), _d(2026, 8, 6)]
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: list(gap))
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     days = []
-    monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: days.append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -374,10 +381,11 @@ def test_backfill_skips_bj_only_shortfall_day(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_index_shortfall_days", lambda: {})
     calls = {"n": 0}
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("n", calls["n"] + 1))
-    monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(ms, "sync_adj_factor", lambda: calls.__setitem__("n", calls["n"] + 1))
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -407,14 +415,15 @@ def test_backfill_seeds_window_when_root_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
     monkeypatch.setattr(ms, "_missing_stock_minute_days", lambda now=None: [])
     monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
     monkeypatch.setattr(ms, "_missing_daily_days", lambda root: [])  # 空根返回 []（既有语义）
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [_d(2026, 8, 3), _d(2026, 8, 4)])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
     days = []
-    monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: days.append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
 
     res = ms.backfill_to_now()
@@ -632,12 +641,13 @@ def test_backfill_to_now_resyncs_sparse_etf_daily(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
     days = []
-    monkeypatch.setattr(ms, "sync_daily", lambda d: days.append(d) or {"stock": 1, "etf": 1000})
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: days.append(d) or {"stock": 1, "etf": 1000})
 
     res = ms.backfill_to_now()
 
@@ -1098,10 +1108,11 @@ def test_backfill_to_now_flags_missing_universe_segments(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_incomplete_stock_minute_days", lambda recent=None: [])
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
     sent = []
     monkeypatch.setattr(ms, "_notify_missing", lambda m: sent.append(m))
 
@@ -1276,7 +1287,7 @@ def test_backfill_missing_partitions_routes_to_sync(monkeypatch):
     from app.services import mootdx_service as ms
 
     calls = {"daily": [], "index": [], "etf_min": [], "stock_min": []}
-    monkeypatch.setattr(ms, "sync_daily", lambda d: calls["daily"].append(d) or {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: calls["daily"].append(d) or {"stock": 1, "etf": 1})
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls["index"].append(d) or {"written": 1})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d: calls["etf_min"].append(d) or 5)
     monkeypatch.setattr(ms, "sync_stock_minute_range",
@@ -1308,7 +1319,7 @@ def test_backfill_missing_partitions_survives_per_day_error(monkeypatch):
     monkeypatch.setattr(ms, "sync_daily", _boom)
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 1})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d: 0)
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
 
     missing = {
         "kline_daily": [_dt.date(2026, 6, 15), _dt.date(2026, 6, 16)],
@@ -1509,13 +1520,14 @@ def test_backfill_to_now_resyncs_sparse_stock_minute(tmp_path, monkeypatch):
     monkeypatch.setattr(ms, "_missing_index_daily_days", lambda: [])
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1000})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: {"stock": 1, "etf": 1000})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
     calls = []
     monkeypatch.setattr(ms, "sync_stock_minute_range",
-                        lambda days: calls.append(list(days)) or 100)
+                        lambda days, **kwargs: calls.append(list(days)) or 100)
 
     res = ms.backfill_to_now()
 
@@ -1960,7 +1972,7 @@ def test_sync_stock_minute_pulls_missing_day_first(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
     ranges = []
     monkeypatch.setattr(ms, "sync_stock_minute_range",
-                        lambda days: ranges.append(list(days)) or 10)
+                        lambda days, **kwargs: ranges.append(list(days)) or 10)
 
     n = ms.sync_stock_minute(limit=None)
 
@@ -2069,10 +2081,11 @@ def test_backfill_to_now_resyncs_content_flagged_index(monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "_incomplete_index_daily_days", _flagged_index)
     monkeypatch.setattr(ms, "_trade_days_up_to", lambda end: [])
     monkeypatch.setattr(ms, "_adj_factor_stale", lambda: False)
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: 0)
-    monkeypatch.setattr(ms, "sync_daily", lambda d: {"stock": 1, "etf": 1})
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None, **kwargs: 0)
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: {"stock": 1, "etf": 1})
+    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None, **kwargs: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kwargs: {"written_symbols": 0, "rows": 0, "total_symbols": 0, "query_failed": [], "audit_uncovered": []})
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kwargs: 0)
     monkeypatch.setattr(ms, "_notify_missing", lambda m: None)
     days = []
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: days.append(d) or {"written": 1})
@@ -2103,7 +2116,7 @@ def test_check_and_repair_day_repairs_sparse_index(tmp_path, monkeypatch):
     pl.DataFrame({"symbol": ["000300.SH"], "open": [1.0], "close": [1.0]}).write_parquet(
         root / "date=2026-07-31" / "part.parquet")
     calls = {"daily": 0, "index": [], "etf_minute": 0, "stock_minute": []}
-    monkeypatch.setattr(ms, "sync_daily", lambda d: calls.__setitem__("daily", calls["daily"] + 1))
+    monkeypatch.setattr(ms, "sync_daily", lambda d, **kwargs: calls.__setitem__("daily", calls["daily"] + 1))
     monkeypatch.setattr(ms, "sync_index_daily", lambda d: calls["index"].append(d) or {"written": 3})
     monkeypatch.setattr(ms, "sync_etf_minute", lambda d=None: calls.__setitem__("etf_minute", calls["etf_minute"] + 1))
     monkeypatch.setattr(ms, "sync_stock_minute_day",

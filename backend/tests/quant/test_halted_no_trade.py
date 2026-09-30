@@ -19,7 +19,13 @@ SENTINEL = 2.0 ** -127  # 停牌占位量（mootdx 无量 bar 原样透传）
 STOCK = "605577.XSHG"
 
 
-def _today_bars(n=60, start="09:31"):
+def _today_bars(n=60, start="00:01"):
+    """bars 起点固定 00:01：任何墙钟时刻（含盘后/凌晨）均满足 idx <= now。
+
+    原 09:31 起点在盘后运行时 idx <= now_ts 全 False → 停牌判定永远放行，
+    3 个回归测试只有盘中时段能过（时间依赖测试）。bar 的语义只是
+    「当日无量平线」，具体小时不影响判定。
+    """
     day = pd.Timestamp.now().date().isoformat()
     return pd.DatetimeIndex(pd.date_range(f"{day} {start}", periods=n, freq="min"))
 
