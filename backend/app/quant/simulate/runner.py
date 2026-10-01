@@ -1394,8 +1394,9 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
             _px = _t.get("price", 0)
             _act = "买入" if _amt > 0 else "卖出"
             _emoji = "📈" if _amt > 0 else "📉"
+            _sname = aux.get("strategy_name", "")
             _emit_log(account_id, "notify",
-                      f"{_emoji} {_act} {_code} {abs(int(_amt))}股 @{_px}")
+                      f"{_emoji} [{_sname}] {_act} {_code} {abs(int(_amt))}股 @{_px}")
     aux["_prev_trade_count"] = len(_cur)
     # 晨选后增量预热：选股回调（09:25/09:30）重建 g.pool 后，当日新入池码未在
     # 盘前预热覆盖内，后续决策 bar 会逐码 60ms 懒加载重付。回调一结束就对
@@ -1478,7 +1479,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     aux = {"jq_api": jq_api, "start_cash": start_cash, "fired": set(),
            "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
            "frequency": (acct.get("frequency") or "minute"), "daily_done": None,
-           "dm": dm}
+           "dm": dm, "strategy_name": (strat or {}).get("name", "") or acct.get("name", "")}
     state: dict = {
         "cash": cash, "start_cash": start_cash,
         "net_value": float(st.get("net_value", cash)) if has_saved else cash,
