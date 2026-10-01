@@ -270,6 +270,32 @@ def _sync_cron_loop():
         time.sleep(30)
 
 
+def _auction_cron_loop():
+    """09:25:05（工作日）触发集合竞价快照采集。
+
+    竞价撮合在 09:25:00 完成，09:25:05 腾讯行情已反映竞价结果（价格=撮合价、
+    累计量=竞价量）。09:30 连续竞价开始后量价均偏移，必须在窗口内抓取。
+    数据写入 data/auction_cache/date=…/part.parquet，get_call_auction 优先读。
+    """
+    from app.quant.auction_cache import fetch_and_save
+
+    while not _stop.is_set():
+        now = _dt.datetime.now()
+        if (now.weekday() < 5 and now.time() >= _dt.time(9, 25, 5)
+                and now.time() < _dt.time(9, 29, 55)):
+            with _lock:
+                last = _scheduler_state.get("auction_job")
+            if last != now.date().isoformat():
+                _scheduler_state["auction_job"] = now.date().isoformat()
+                logger.info("[auction] %s 集合竞价快照采集开始", now.isoformat())
+                try:
+                    df = fetch_and_save()
+                    logger.info("[auction] %s 只已保存", len(df))
+                except Exception as e:
+                    logger.warning("[auction] 采集失败: %s", e)
+        time.sleep(5)
+
+
 def _run_full_scan_once() -> None:
     """00:00 全量缺失巡检 + 补全（单次执行体，与 15:35 用 _sync_lock 串行）。
 
@@ -438,8 +464,8 @@ def start_scheduler(data_sources=None) -> None:
     if _threads:
         return
     _stop.clear()
-    targets = [_backfill_loop, _sync_cron_loop, _midnight_scan_loop,
-               _full_scan_watchdog_loop, _idle_trim_loop]
+    targets = [_backfill_loop, _sync_cron_loop, _auction_cron_loop,
+               _midnight_scan_loop, _full_scan_watchdog_loop, _idle_trim_loop]
     if data_sources is not None:
         targets.append(lambda: _midnight_clear_loop(data_sources))
         targets.append(lambda: _dayfile_sweep_loop(data_sources))
