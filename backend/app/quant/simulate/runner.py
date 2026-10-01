@@ -1479,7 +1479,7 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
     aux = {"jq_api": jq_api, "start_cash": start_cash, "fired": set(),
            "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
            "frequency": (acct.get("frequency") or "minute"), "daily_done": None,
-           "dm": dm, "strategy_name": (strat or {}).get("name", "") or acct.get("name", "")}
+           "dm": dm, "strategy_name": acct.get("name", "")}
     state: dict = {
         "cash": cash, "start_cash": start_cash,
         "net_value": float(st.get("net_value", cash)) if has_saved else cash,
