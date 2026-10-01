@@ -1384,6 +1384,19 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     jq_api._state["no_buy"] = no_buy
     _fire_session(account_id, bundle, ctx, bar_ts, aux["fired"], jq_api,
                   force_all=aux.get("frequency") == "daily")
+    # 成交钉钉通知：每次回调后检查新增 trade，逐笔推 notify（DingTalk）
+    _cur = jq_api._state.get("trades") or []
+    _prev_n = aux.get("_prev_trade_count", 0)
+    if len(_cur) > _prev_n:
+        for _t in _cur[_prev_n:]:
+            _code = _t.get("code", "?")
+            _amt = _t.get("amount", 0)
+            _px = _t.get("price", 0)
+            _act = "买入" if _amt > 0 else "卖出"
+            _emoji = "📈" if _amt > 0 else "📉"
+            _emit_log(account_id, "notify",
+                      f"{_emoji} {_act} {_code} {abs(int(_amt))}股 @{_px}")
+    aux["_prev_trade_count"] = len(_cur)
     # 晨选后增量预热：选股回调（09:25/09:30）重建 g.pool 后，当日新入池码未在
     # 盘前预热覆盖内，后续决策 bar 会逐码 60ms 懒加载重付。回调一结束就对
     # （可能已变的）universe 做分块增量预热，todo 过滤跳过已缓存码，只补新码。
