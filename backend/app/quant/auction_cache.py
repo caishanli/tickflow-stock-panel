@@ -35,7 +35,7 @@ import pandas as pd
 
 logger = logging.getLogger("auction_cache")
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 CACHE_ROOT = os.path.join(_REPO_ROOT, "data", "auction_cache")
 
 _lock = threading.Lock()
