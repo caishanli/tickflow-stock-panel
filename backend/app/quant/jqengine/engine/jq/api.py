@@ -1266,7 +1266,22 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
     rows = []
     for day in days:
         day_ts = pd.Timestamp(day).normalize()
+        _day_date = day_ts.date()
         for code in codes:
+            # 优先读竞价缓存（09:25:30 采集的真实集合竞价数据）
+            try:
+                from app.quant.auction_cache import lookup as _auc_lookup
+
+                _hit = _auc_lookup(code, _day_date)
+                if _hit is not None:
+                    _auc_vol, _auc_px = _hit
+                    rows.append({"code": code,
+                                 "time": pd.Timestamp.combine(day_ts.date(),
+                                                              datetime.time(9, 25)),
+                                 "volume": _auc_vol, "current": _auc_px})
+                    continue
+            except Exception:
+                pass
             sl = _minute_day_slice(code, day_ts)
             if sl is None:
                 continue
