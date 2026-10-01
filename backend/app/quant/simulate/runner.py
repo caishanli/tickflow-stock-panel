@@ -28,6 +28,7 @@ from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
 from . import live_feed, names
 from .matcher import Matcher
+from .matcher import _legacy_rounding as _legacy_fill_rounding
 from .protocol import is_paused, read_state, save_state
 
 log = logging.getLogger("app.quant.simulate.runner")
@@ -716,7 +717,22 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
         probe_end = tcal.probe_recent_anchor() if not replay else None
         if probe_end is not None and probe_end >= str(now.date()):
             probe_end = None
-        res = tcal.check_drift(eng_end, file_end, probe_end)
+        # 补跑模式不做漂移判定：引擎日历末端固定为「数据末端」（如 09-29），
+        # 而权威锚点 file_end 随回放日逐日推进（= 回放日的上一交易日），
+        # 「引擎超前权威」在补跑中结构上必然成立 → 每个回放日刷一条 warn
+        # 误报（2026-09-30 sb_gaokai_sim 补跑 57 天刷 57 条，账户异常标签
+        # 全是假告警）。漂移只在实时模式有意义：那时引擎末端应跟随最新落盘
+        # 分区，落后权威才代表数据断档。
+        if replay:
+            # 补跑期只保留「引擎落后权威」（error，真漂移：数据断档），屏蔽
+            # 「引擎超前」——补跑中引擎末端固定为数据末端、权威锚点随回放日
+            # 推进，超前结构上必然成立，逐日刷 warn 是纯误报（2026-09-30
+            # sb_gaokai_sim 补跑 57 天刷 57 条）。
+            res = tcal.check_drift(eng_end, file_end, None)
+            if res.get("level") != "error":
+                res = {"level": "ok", "ok": True, "reason": ""}
+        else:
+            res = tcal.check_drift(eng_end, file_end, probe_end)
         if res["level"] != "ok":
             _emit_log(account_id, res["level"], f"🚨【日历漂移】{res['reason']}")
         # 仅"引擎真正落后权威"分页告警；超前/probe 抖动与补跑只留日志。
@@ -1391,11 +1407,19 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
     # 未设置时回退 CONFIG（与 order() 的 comm_rate/slippage 默认口径一致）。
     # 此前滑点漏传、Matcher 用 CONFIG.slippage——策略 set_slippage(0.0001) 被
     # 0.001 覆盖，止损成交价与引擎撮合/回测系统性差 1‰。
+    # QUANT_LEGACY_MATCHER_ROUNDING=1（仅 A/B 对照）：还原 05d2a7d 之前的
+    # 双缺陷——滑点不传（回落 CONFIG.slippage）+ 止损成交价不对齐 tick，
+    # 用于复现服务器 93e6e796 的历史数字。默认仍走上面的正确口径。
     fee_cfg = (jq_api._state.get("fee_config") or {})
-    matcher.step(state, prices, no_sell=no_sell,
-                 fee=fee_cfg.get("close_commission"),
-                 min_commission=fee_cfg.get("min_commission"),
-                 slippage=jq_api._state.get("slippage"))
+    if _legacy_fill_rounding():
+        matcher.step(state, prices, no_sell=no_sell,
+                     fee=fee_cfg.get("close_commission"),
+                     min_commission=fee_cfg.get("min_commission"))
+    else:
+        matcher.step(state, prices, no_sell=no_sell,
+                     fee=fee_cfg.get("close_commission"),
+                     min_commission=fee_cfg.get("min_commission"),
+                     slippage=jq_api._state.get("slippage"))
     _apply_matcher_result(ctx, state)
     for code, pos in ctx.portfolio.positions.items():
         if code in prices:

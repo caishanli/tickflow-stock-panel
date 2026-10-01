@@ -71,6 +71,8 @@ _install_stub_modules()
 # ---------------------------------------------------------------------------
 _CURRENT_BAR_DICT = None          # 当前 bar 的 bar_dict（由 bar 缓存 mod 写入）
 _UNIVERSE = []                    # ETF 代码列表（get_all_securities 返回）
+_STOCK_CODES = set()              # 股票宇宙码（universe='all_stocks' 时注入；
+                                  # get_all_securities('stock') 只返回其中的码）
 _NAMES = {}                       # code -> display_name
 _BENCHMARK = "000300.XSHG"
 _LIST_DATES = {}                  # code -> (list_date, delist_date) 'YYYY-MM-DD'（get_all_securities 过滤用）
@@ -290,10 +292,11 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
                     sd = pd.Timestamp(start_date)
                     out = out[(out["time"] >= sd) & (out["time"] <= end_dt)]
                 out = _fallback_volume_daily(out, codes, freq, fields, end_dt)
+                out = _fill_paused_daily(out, freq, fields)
                 return out
             out_empty = _fallback_volume_daily(
                 pd.DataFrame(columns=["time", "code"] + fields), codes, freq, fields, end_dt)
-            return out_empty
+            return _fill_paused_daily(out_empty, freq, fields)
         except Exception as e:
             logger.debug("get_price 批量路径失败，回退逐只: %s", e)
 
@@ -322,13 +325,61 @@ def get_price(security, start_date=None, end_date=None, frequency="1d", fields=N
             frames.append(df)
 
     if not frames:
-        return _fallback_volume_daily(
-            pd.DataFrame(columns=["time", "code"] + fields), codes, freq, fields, end_dt)
+        return _fill_paused_daily(_fallback_volume_daily(
+            pd.DataFrame(columns=["time", "code"] + fields), codes, freq, fields, end_dt),
+            freq, fields)
     out = pd.concat(frames, ignore_index=True)
     out = _fallback_volume_daily(out, codes, freq, fields, end_dt)
+    out = _fill_paused_daily(out, freq, fields)
     if isinstance(security, str) and not panel:
         # 聚宽语义：单标的 panel=False 返回「索引=time，列=fields」（无 code 列）
         out = out.drop(columns=["code"], errors="ignore").set_index("time")
+    return out
+
+
+def _fill_paused_daily(out, freq, fields):
+    """日线请求含 paused 时填充（bar recarray 无此字段，缺省 NaN 会让策略
+    `query('paused==0')` 全空——首板/连板类策略的涨停过滤依赖该字段）。
+
+    本地日线口径：停牌日整根 bar 缺失（行不存在），volume==0 的残缺行同停牌；
+    分钟频率不填充：单分钟无量 ≠ 全日停牌。
+    """
+    if freq != "1d" or "paused" not in getattr(out, "columns", []):
+        return out
+    out = out.copy()
+    if "volume" in out.columns:
+        vol = pd.to_numeric(out["volume"], errors="coerce")
+        out["paused"] = np.where(vol.isna(), np.nan, (vol == 0).astype(np.float64))
+        return out
+    # 未请求 volume：按日线帧逐行取「当日量」（停牌日 volume≈0 哨兵 → paused=1）。
+    # 只读内存帧（不回源）；取不到按 0（不误杀）。原实现无脑全 0，与 jqengine
+    # 侧从日线帧判定的口径不一致。
+    dm = _active_dm()
+    paused = np.zeros(len(out), dtype=np.float64)
+    if dm is not None and "code" in out.columns and "time" in out.columns:
+        vol_cache: dict = {}
+        for i, (code, ts) in enumerate(zip(out["code"].tolist(),
+                                           out["time"].tolist(), strict=False)):
+            try:
+                m = vol_cache.get(code)
+                if m is None:
+                    df = dm._daily_mem.get(f"get_daily_{code}")
+                    m = {}
+                    if df is not None and not getattr(df, "empty", True) \
+                            and "volume" in df.columns:
+                        idx = pd.DatetimeIndex(df.index)
+                        days = (idx.year * 10000 + idx.month * 100
+                                + idx.day).to_numpy()
+                        vals = pd.to_numeric(df["volume"], errors="coerce").to_numpy()
+                        m = dict(zip(days.tolist(), vals.tolist(), strict=False))
+                    vol_cache[code] = m
+                t = pd.Timestamp(ts)
+                vv = m.get(t.year * 10000 + t.month * 100 + t.day)
+                if vv is not None and vv == vv and vv < 1.0:
+                    paused[i] = 1.0
+            except Exception:
+                continue
+    out["paused"] = paused
     return out
 
 
@@ -416,6 +467,7 @@ def get_all_securities(types=None, date=None):
     type_set = None
     if types is not None:
         type_set = {str(t).lower() for t in (types if isinstance(types, (list, tuple, set)) else [types])}
+    want_stocks = type_set is not None and "stock" in type_set
     rows = []
     for code in _UNIVERSE:
         is_idx = _is_index_code(code)
@@ -423,6 +475,13 @@ def get_all_securities(types=None, date=None):
             if is_idx and "index" not in type_set:
                 continue
             if not is_idx and type_set == {"index"}:
+                continue
+            # types 含 'stock' 时只返回已登记的股票宇宙码（排除混入数据源
+            # 宇宙的 ETF/LOF——如 benchmark 510300 会被股票策略的
+            # get_all_securities('stock') 误当股票选入）。
+            if want_stocks and not is_idx and _STOCK_CODES and code not in _STOCK_CODES:
+                continue
+            if want_stocks and not is_idx and not _STOCK_CODES and _is_jq_etf_code(code):
                 continue
         start_s, end_s = _LIST_DATES.get(code, ("2000-01-01", "2999-12-31"))
         if cutoff is not None and not (start_s <= cutoff <= end_s):
@@ -433,7 +492,7 @@ def get_all_securities(types=None, date=None):
             "name": _NAMES.get(code, code),
             "start_date": start_s,
             "end_date": end_s,
-            "type": "index" if is_idx else "etf",
+            "type": "index" if is_idx else ("stock" if code in _STOCK_CODES else "etf"),
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -876,20 +935,160 @@ from rqalpha.api import order_target_value as _RQ_OTV  # noqa: E402
 from rqalpha.api import order_value as _RQ_OV  # noqa: E402
 
 
+def _raw_prev_close(code):
+    """昨收（原始价）：取分钟帧今日之前最后一根收盘（= 前日 15:00 收盘，
+    与撮合同源的原始价）；无分钟数据回退日线帧收盘（前复权口径，除权期会偏）。"""
+    try:
+        ds = Environment.get_instance().data_source
+    except Exception:
+        ds = None
+    if ds is not None and hasattr(ds, "_ensure_minute"):
+        try:
+            arr = ds._ensure_minute(code)
+            if arr is not None and len(arr):
+                env = Environment.get_instance()
+                today_int = int(pd.Timestamp(env.trading_dt).strftime("%Y%m%d"))
+                mask = (arr["datetime"] // 1000000) < today_int
+                if mask.any():
+                    return float(arr["close"][mask][-1])
+        except Exception:
+            pass
+    try:
+        close, _vol = _daily_bar_at(code, pd.Timestamp(
+            Environment.get_instance().trading_dt).normalize() - pd.Timedelta(days=1))
+        return close
+    except Exception:
+        return float("nan")
+
+
+def _jq_style_limit(limit_price):
+    """MarketOrderStyle/数值 → 保护价 float；无/无效保护价返回 None。
+
+    要求有限正数：0/NaN 视为「无保护价」——否则 0 会退化为 0 价单被静默拒、
+    NaN 会穿透执行层的 `cost > cash` 比较污染账户现金。
+    """
+    lp = getattr(limit_price, "limit_price", limit_price)
+    try:
+        v = float(lp)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v <= 0:
+        return None
+    return v
+
+
+def _in_jq_auction_window():
+    """当前是否聚宽集合竞价下单窗口（首根 bar / 09:31 前）。
+
+    聚宽 09:15~09:30 无当前 bar：市价单按昨收定量、开盘价成交。仅该窗口内
+    才启用竞价语义——日内其它时刻传 MarketOrderStyle（如 high_limit 风控价）
+    的订单仍按市价+保护价走原生路径，不会被当成竞价单。
+    """
+    try:
+        env = Environment.get_instance()
+        t = pd.Timestamp(env.trading_dt)
+    except Exception:
+        return False
+    return (t.hour, t.minute) <= (9, 31)
+
+
 def order_target_value(security, value, limit_price=None):
-    """聚宽 order_target_value：调仓到目标市值（元）。基于 rqalpha 原生实现。"""
+    """聚宽 order_target_value：调仓到目标市值（元）。基于 rqalpha 原生实现。
+
+    带 MarketOrderStyle 保护价时按「昨收」折算目标股数（聚宽 09:15~09:30
+    无当前 bar，目标市值以昨收换算——fixture 湘财股份 12300 股 = 现金/昨收
+    8.69 即此口径），limit_price 数值路径仍走 rqalpha 原生。
+    """
+    lp = _jq_style_limit(limit_price)
+    if lp is not None and float(value) > 0 and _in_jq_auction_window():
+        target = _jq_auction_amount(security, float(value), lp)
+        if target:
+            # 「调仓到目标市值」= 目标股数 - 现有持仓的差额（原实现直接按目标
+            # 股数买入，已有持仓时超买）
+            try:
+                env = Environment.get_instance()
+                pos = env.portfolio.positions.get(security)
+                current = int(getattr(pos, "quantity", 0) or 0) if pos else 0
+            except Exception:
+                current = 0
+            delta = target - current
+            if delta:
+                return order_shares(security, delta, limit_price=lp)
+            return None
     order = _RQ_OTV(security, float(value))
     return _JqOrderProxy(order) if order is not None else None
 
 
+def _jq_auction_amount(security, value, limit_price=None):
+    """聚宽竞价单定量：昨收折算、100 股整手向下取整。
+
+    与聚宽的差异：聚宽允许成交额超过下单时现金（fixture 000989 现金 100000
+    昨收 8.89 定量 11100 股、开盘 9.15 成交后现金 -1595）；rqalpha 冻结现金
+    语义不允许透支，故按「限价×1.001 费率余量」钳制到可用现金内——选股与
+    成交价与聚宽一致，仓位比聚宽小 ~高开幅度（vendor 引擎限制， documented）。
+    """
+    try:
+        prev = _raw_prev_close(security)
+        if prev and prev > 0 and value > 0:
+            amount = int(value / prev) // 100 * 100
+            cash = _available_cash()
+            if amount > 0 and cash == cash:
+                per_share = (limit_price or prev) * 1.001
+                amount = min(amount, int(cash / per_share) // 100 * 100)
+            return amount
+    except Exception:
+        pass
+    return 0
+
+
+def _available_cash():
+    env = Environment.get_instance()
+    pf = getattr(env, "portfolio", None)
+    if pf is None:
+        return float("nan")
+    try:
+        return float(pf.cash)
+    except Exception:
+        pass
+    try:
+        return float(sum(a.cash for a in pf.accounts.values()))
+    except Exception:
+        return float("nan")
+
+
 def order_value(security, value, limit_price=None):
-    """聚宽 order_value：按金额下单（负数卖出）。基于 rqalpha 原生实现。"""
+    """聚宽 order_value：按金额下单（负数卖出）。
+
+    带 MarketOrderStyle 保护价时复刻聚宽竞价单语义：按昨收定量 + 以保护价
+    （策略传 current_data.day_open）挂限价单——聚宽 09:26 市价单在开盘价
+    成交（fixture 000989 买价 9.15 = 开盘价），rqalpha 市价单按当前 bar
+    收盘撮合会系统性偏移一个首分钟漂移。
+    """
+    lp = _jq_style_limit(limit_price)
+    if lp is not None and float(value) > 0 and _in_jq_auction_window():
+        amount = _jq_auction_amount(security, float(value), lp)
+        if amount:
+            # 经 order_shares shim 下单：打竞价标记（_JQ_AUCTION_ORDER_IDS）+
+            # 置 _JQ_AUCTION_SUBMITTING，撮合以当前 bar 开盘价成交
+            return order_shares(security, amount, limit_price=lp)
     order = _RQ_OV(security, float(value))
     return _JqOrderProxy(order) if order is not None else None
 
 
 def order_shares(security, amount, limit_price=None):
-    order = _RQ_OS(security, float(amount))
+    global _JQ_AUCTION_SUBMITTING
+    lp = _jq_style_limit(limit_price)
+    if lp is not None:
+        # 提交瞬间 rqalpha 会同步撮合（current_bar 口径），标志位须先于提交
+        _JQ_AUCTION_SUBMITTING = True
+    try:
+        order = _RQ_OS(security, float(amount), lp)
+    finally:
+        _JQ_AUCTION_SUBMITTING = False
+    if order is not None and lp is not None:
+        # 标记聚宽竞价口径单（MarketOrderStyle）：撮合时以当前 bar 开盘价成交
+        # （见 _patch_matcher_auction_open），复刻聚宽 09:26 市价单=开盘价语义。
+        _JQ_AUCTION_ORDER_IDS.add(order.order_id)
     return _JqOrderProxy(order) if order is not None else None
 
 
@@ -1443,45 +1642,34 @@ def _load_financials_cached():
     return df
 
 
-_SHARE_EVENTS_CACHE = None  # {bare_sym: [(exdate_int, hou_zgb_wan, pan_hou_lt_wan), ...]}
-
-
 def _load_share_events_cached():
-    """mootdx xdxr category-5 股本变化时间线（data/pools/stock_xdxr_events.parquet）。
+    """mootdx xdxr category-5 股本变化时间线（委托 stock_meta 共享实现）。
 
     返回 {裸6位码: [(exdate, houzongguben万股, panhouliutong万股), ...]} 按 exdate 升序；
-    文件缺失返回空 dict。
+    文件缺失返回空 dict。get_fundamentals 的既有调用方沿用万股口径。
     """
-    global _SHARE_EVENTS_CACHE
-    if _SHARE_EVENTS_CACHE is not None:
-        return _SHARE_EVENTS_CACHE
-    out: dict = {}
-    try:
-        import polars as pl
+    from . import stock_meta
 
-        from app.services.tdx_financials import DATA_ROOT as _DATA_ROOT
-        f = _DATA_ROOT / "pools" / "stock_xdxr_events.parquet"
-        df = pl.read_parquet(f).filter(pl.col("category") == 5)
-        for sym, exdate, hz, plt_ in zip(
-                df["symbol"], df["exdate"], df["houzongguben"],
-                df["panhouliutong"]):
-            if plt_ is None or plt_ != plt_ or plt_ <= 0:
-                continue
-            out.setdefault(str(sym), []).append(
-                (int(exdate), float(hz) if hz == hz else None, float(plt_)))
-        for v in out.values():
-            v.sort(key=lambda t: t[0])
-    except Exception:
-        out = {}
-    _SHARE_EVENTS_CACHE = out
-    return out
+    events = stock_meta.load_share_events()
+    # stock_meta 返回单位为股（供 get_valuation 直接用）；此处降回万股
+    #（/1e4）保持 get_fundamentals 原口径不变。
+    return {
+        sym: [(exdate, (hz / 1e4) if hz == hz else None, plt / 1e4)
+              for exdate, hz, plt in ev]
+        for sym, ev in events.items()
+    }
 
 
 def reset_fundamentals_cache():
     global _FINANCIALS_CACHE
     _FINANCIALS_CACHE = None
-    global _SHARE_EVENTS_CACHE
-    _SHARE_EVENTS_CACHE = None
+    # 股本事件缓存已移交 stock_meta（模块级缓存），此处一并失效
+    try:
+        from . import stock_meta as _sm
+
+        _sm._EVENTS_CACHE = None
+    except Exception:
+        pass
     _INDEX_STOCKS_CACHE.clear()
 
 
@@ -1616,6 +1804,278 @@ def get_fundamentals(q: _FinQuery, date=None):
         names.append(name)
         data[name] = [r.get((tab, col), float("nan")) for r in out_rows]
     return pd.DataFrame(data, columns=names)
+
+
+# ---------------------------------------------------------------------------
+# get_valuation / get_call_auction（股票策略依赖；数据口径见 stock_meta 模块头）
+# ---------------------------------------------------------------------------
+def _daily_bar_at(code: str, anchor) -> tuple[float, float]:
+    """anchor 日（含）往前最近一根日线的 (close, volume)，volume 单位为股。"""
+    dm = _active_dm()
+    if dm is None:
+        return float("nan"), float("nan")
+    try:
+        df = dm._daily_mem.get(f"get_daily_{code}")
+        if df is None or getattr(df, "empty", True):
+            df = dm.fetch("get_daily", code, "20240101",
+                          pd.Timestamp(anchor).strftime("%Y%m%d"))
+        if df is None or getattr(df, "empty", True):
+            return float("nan"), float("nan")
+        col = ("trade_date" if "trade_date" in df.columns
+               else "date" if "date" in df.columns else None)
+        if col is not None:
+            dts = pd.to_datetime(df[col])
+            sub = df[dts <= pd.Timestamp(anchor)]
+        else:
+            idx = pd.to_datetime(df.index)
+            sub = df[idx <= pd.Timestamp(anchor)]
+        if getattr(sub, "empty", True):
+            return float("nan"), float("nan")
+        row = sub.iloc[-1]
+        close = float("nan")
+        for pc in ("close", "raw_close"):
+            if pc in sub.columns:
+                v = row[pc]
+                if v == v and v is not None:
+                    close = float(v)
+                    break
+        vol = float("nan")
+        if "volume" in sub.columns:
+            v = row["volume"]
+            if v == v and v is not None:
+                vol = float(v)
+        return close, vol
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def _daily_bar_on(code: str, anchor) -> tuple[float, float]:
+    """anchor **当日**的日线 (close, volume)；该日无 bar（周末/停牌/缺数）返回 nan。
+
+    与 _daily_bar_at（取 ≤anchor 的最近一根）不同：get_valuation 只对真实存在
+    bar 的交易日产出行，避免周末/节假日重复产出上一交易日的伪行。
+    """
+    dm = _active_dm()
+    if dm is None:
+        return float("nan"), float("nan")
+    try:
+        df = dm._daily_mem.get(f"get_daily_{code}")
+        if df is None or getattr(df, "empty", True):
+            return float("nan"), float("nan")
+        col = ("trade_date" if "trade_date" in df.columns
+               else "date" if "date" in df.columns else None)
+        dts = pd.to_datetime(df[col]) if col else pd.to_datetime(df.index)
+        anchor_ts = pd.Timestamp(anchor).normalize()
+        sub = df[dts.normalize() == anchor_ts]
+        if getattr(sub, "empty", True):
+            return float("nan"), float("nan")
+        row = sub.iloc[-1]
+        close = float(row["close"]) if "close" in sub.columns and row["close"] == row["close"] \
+            else float("nan")
+        vol = float(row["volume"]) if "volume" in sub.columns and row["volume"] == row["volume"] \
+            else float("nan")
+        return close, vol
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def get_valuation(security, start_date=None, end_date=None, fields=None,
+                  count=None):
+    """聚宽 get_valuation 兼容：换手率 + 总市值/流通市值（亿元）。
+
+    turnover_ratio = 当日成交量 / 流通股本 × 100（volume 已是股，见
+    DataManager 分区加载口径）；流通/总股本按锚点日取 xdxr 股本事件，
+    缺事件回退 instruments 快照（口径与误差说明见 stock_meta 模块头）。
+    返回 DataFrame（RangeIndex，含 day/code + 请求字段），无数据返回空表。
+    """
+    from . import stock_meta
+
+    codes = [security] if isinstance(security, str) else list(security)
+    def _engine_prev_trading_day():
+        """回测时钟锚点：trading_dt 的前一交易日（墙钟今天会前视到回测区间外）。"""
+        try:
+            env = Environment.get_instance()
+            base = pd.Timestamp(getattr(env, "trading_dt", pd.Timestamp.today()))
+            tds = get_trade_days(end_date=base.date(), count=2)
+            prev = [pd.Timestamp(d) for d in tds
+                    if pd.Timestamp(d).normalize() < base.normalize()]
+            return prev[-1] if prev else base.normalize()
+        except Exception:
+            return pd.Timestamp.today().normalize()
+
+    if start_date is not None:
+        days = pd.date_range(start_date, end_date or start_date, freq="D")
+    elif count is not None:
+        # count=N：锚点前（不含当前日）最近 N 个交易日——原实现取 count+1 日
+        # 且含未完成的当日，多产一行并带盘中日线（前视）。
+        try:
+            env = Environment.get_instance()
+            base = pd.Timestamp(getattr(env, "trading_dt", pd.Timestamp.today()))
+            tds = [pd.Timestamp(d) for d in
+                   get_trade_days(end_date=base.date(), count=int(count) + 1)]
+            tds = [d for d in tds if d.normalize() < base.normalize()][-int(count):]
+            days = pd.DatetimeIndex(tds) if tds else pd.DatetimeIndex([])
+        except Exception:
+            days = pd.DatetimeIndex([_engine_prev_trading_day()])
+    else:
+        days = pd.DatetimeIndex([_engine_prev_trading_day()])
+    rows = []
+    for day in days:
+        anchor = pd.Timestamp(day).normalize()
+        anchor_int = int(anchor.strftime("%Y%m%d"))
+        for code in codes:
+            close, vol = _daily_bar_on(code, anchor)
+            if close != close:
+                continue  # 非交易日/无数据：聚宽不产出该行
+            fs, ts = stock_meta.shares_for(str(code).split(".")[0], anchor_int)
+            turnover = vol / fs * 100.0 if (fs == fs and fs > 0 and vol == vol) \
+                else float("nan")
+            mcap = ts * close / 1e8 if ts == ts else float("nan")
+            cmcap = fs * close / 1e8 if fs == fs else float("nan")
+            rows.append({
+                "day": anchor.date(),
+                "code": code,
+                "turnover_ratio": turnover,
+                "market_cap": mcap,
+                "circulating_market_cap": cmcap,
+            })
+    out = pd.DataFrame(rows)
+    if fields:
+        if out.empty:
+            out = pd.DataFrame(columns=fields)
+        else:
+            want = [f for f in fields if f in out.columns]
+            keep = [c for c in ("day", "code") if c in out.columns] + \
+                [f for f in want if f not in ("day", "code")]
+            out = out[keep]
+    return out
+
+
+def _minute_day_slice(code: str, day_ts: pd.Timestamp):
+    """取某标的某交易日的分钟 bar 切片。
+
+    返回 (hm数组, open数组, close数组, volume数组_股)；无数据返回 None。
+    优先走 JqDataSource 的分钟 recarray 缓存（与 get_price 1m 同一份内存）。
+    """
+    day_int = int(day_ts.strftime("%Y%m%d"))
+    try:
+        ds = Environment.get_instance().data_source
+    except Exception:
+        ds = None
+    arr = None
+    if ds is not None and hasattr(ds, "_ensure_minute"):
+        try:
+            arr = ds._ensure_minute(code)
+        except Exception:
+            arr = None
+        if arr is not None and len(arr):
+            arr = arr[(arr["datetime"] // 1000000) == day_int]
+    if arr is None or len(arr) == 0:
+        dm = _active_dm()
+        if dm is None:
+            return None
+        try:
+            mdf = dm.get_minute_feed(code, day_ts.strftime("%Y%m%d"),
+                                     day_ts.strftime("%Y%m%d"))
+        except Exception:
+            return None
+        if mdf is None or getattr(mdf, "empty", True):
+            return None
+        idx = pd.DatetimeIndex(pd.to_datetime(mdf.index))
+        mdf = mdf[(idx.year * 10000 + idx.month * 100 + idx.day) == day_int]
+        if getattr(mdf, "empty", True):
+            return None
+        idx = pd.DatetimeIndex(pd.to_datetime(mdf.index))
+        hm = (idx.hour * 100 + idx.minute).to_numpy()
+        vol = pd.to_numeric(mdf["volume"], errors="coerce").to_numpy() \
+            if "volume" in mdf.columns else np.full(len(mdf), np.nan)
+        op = pd.to_numeric(mdf["open"], errors="coerce").to_numpy() \
+            if "open" in mdf.columns else np.full(len(mdf), np.nan)
+        cl = pd.to_numeric(mdf["close"], errors="coerce").to_numpy() \
+            if "close" in mdf.columns else np.full(len(mdf), np.nan)
+        return hm, op, cl, vol
+    hm = (arr["datetime"] % 1000000) // 100
+    return (hm.astype(np.int64),
+            np.asarray(arr["open"], dtype=np.float64),
+            np.asarray(arr["close"], dtype=np.float64),
+            np.asarray(arr["volume"], dtype=np.float64))
+
+
+def get_call_auction(security, start_date=None, end_date=None, fields=None,
+                     **kwargs):
+    """聚宽 get_call_auction 兼容：集合竞价成交量 + 匹配价。
+
+    竞价匹配价 = 当日开盘价；竞价量优先取分钟数据的 09:30 竞价 bar（精确），
+    旧分区（09:31 起始）用首根量占比回归近似（系数与误差见 stock_meta）。
+    volume 单位为股（与引擎日线一致，策略用它除以昨日日线量与聚宽同语义）。
+    """
+    from . import stock_meta
+
+    codes = [security] if isinstance(security, str) else list(security)
+    if start_date is not None:
+        sd = pd.Timestamp(str(start_date)[:10]).normalize()
+        ed = pd.Timestamp(str(end_date)[:10]).normalize() if end_date else sd
+        days = pd.date_range(sd, ed, freq="D")
+    else:
+        try:
+            env = Environment.get_instance()
+            days = pd.DatetimeIndex(
+                [pd.Timestamp(getattr(env, "trading_dt", pd.Timestamp.today()))
+                 .normalize()])
+        except Exception:
+            days = pd.DatetimeIndex([pd.Timestamp.today().normalize()])
+    rows = []
+    for day in days:
+        day_ts = pd.Timestamp(day).normalize()
+        for code in codes:
+            sl = _minute_day_slice(code, day_ts)
+            if sl is None:
+                continue
+            hm, op, cl, vol = sl
+            # 前一交易日日线量：日线帧内该日之前最近一根（无日历依赖）
+            dm = _active_dm()
+            prev_vol = float("nan")
+            if dm is not None:
+                df = dm._daily_mem.get(f"get_daily_{code}")
+                if df is not None and not getattr(df, "empty", True):
+                    col = ("trade_date" if "trade_date" in df.columns
+                           else "date" if "date" in df.columns else None)
+                    dts = pd.to_datetime(df[col]) if col else pd.to_datetime(df.index)
+                    prev_mask = dts < day_ts
+                    if prev_mask.any():
+                        prev_vol = float(df.loc[prev_mask, "volume"].iloc[-1]) \
+                            if "volume" in df.columns else float("nan")
+            auc, cur = stock_meta.auction_from_day_bars(
+                hm.astype(int), op, cl, vol, prev_vol)
+            if auc != auc and cur != cur:
+                continue
+            rows.append({
+                "code": code,
+                "time": pd.Timestamp.combine(day_ts.date(), _dt.time(9, 25)),
+                "volume": auc,
+                "current": cur,
+            })
+    out = pd.DataFrame(rows)
+    if fields and not out.empty:
+        want = [f for f in fields if f in out.columns]
+        keep = [c for c in ("code", "time") if c in out.columns] + \
+            [f for f in want if f not in ("code", "time")]
+        out = out[keep]
+    elif fields and out.empty:
+        out = pd.DataFrame(columns=["code", "time"] + list(fields))
+    return out
+
+
+class MarketOrderStyle:
+    """聚宽市价单风格（保护价仅记录；撮合由引擎 current_bar 口径决定）。"""
+
+    def __init__(self, limit_price=None, **kwargs):
+        try:
+            self.limit_price = float(limit_price) if limit_price is not None \
+                else None
+        except (TypeError, ValueError):
+            self.limit_price = None
+        self.value = self.limit_price
 
 
 def run_daily(func, time=None, *args, **kwargs):
@@ -2167,8 +2627,10 @@ def _minute_to_recarray(minute_df, prev_close_map=None, code=None):
     else:
         _prev = np.full(n, np.nan)
     _rate = _limit_rate(code) if code else 0.10
-    arr["limit_up"] = np.round(_prev * (1 + _rate), 2)
-    arr["limit_down"] = np.round(_prev * (1 - _rate), 2)
+    from .core import round_half_up_price as _rhu
+
+    arr["limit_up"] = _rhu(_prev * (1 + _rate))
+    arr["limit_down"] = _rhu(_prev * (1 - _rate))
     return arr
 
 
@@ -3003,6 +3465,9 @@ def _register_jq_apis():
         ("order_target_value", order_target_value),
         ("order_value", order_value),
         ("order_shares", order_shares),
+        ("MarketOrderStyle", MarketOrderStyle),
+        ("get_valuation", get_valuation),
+        ("get_call_auction", get_call_auction),
         ("get_index_stocks", get_index_stocks),
         ("get_fundamentals", get_fundamentals),
         ("query", query),
@@ -3030,6 +3495,108 @@ def _register_jq_apis():
     _jqlib_mod.technical_analysis = _jqlib_ta_mod
     sys.modules.setdefault("jqlib", _jqlib_mod)
     sys.modules.setdefault("jqlib.technical_analysis", _jqlib_ta_mod)
+
+
+_JQ_AUCTION_ORDER_IDS = set()
+_JQ_AUCTION_SUBMITTING = False
+
+
+def _patch_cash_validator_overdraw() -> bool:
+    """sys_risk 现金校验允许小幅透支（≤12%）。
+
+    聚宽竞价市价单按昨收定量、开盘价成交：高开时成交额必然超出下单时现金
+    （fixture 000989：现金 100000，昨收 8.98 定量 11100 股，开盘 9.15 成交
+    后现金 -1595）。rqalpha CashValidator 对 cost>cash 一律拒单，会让全部
+    竞价买单失效。高开 ≤10% ⇒ 透支 ≤1.10×；12% 容差内放行，其余仍拒。
+    """
+    try:
+        from rqalpha.mod.rqalpha_mod_sys_risk.validators import cash_validator as _cv
+
+        if getattr(_cv, "_jq_overdraw_patched", False):
+            return True
+        _orig = _cv.validate_cash
+
+        def _patched(env, order, cash):
+            # 容差只给「聚宽竞价单」（order_shares shim 的提交标志或已打标的
+            # order_id）：普通订单维持原语义——超出现金由 auto_switch_order_value
+            # 缩量重算（api_stock），全局放宽会改变所有策略的成交组与资金曲线。
+            try:
+                is_auction = _JQ_AUCTION_SUBMITTING or (
+                    order is not None
+                    and getattr(order, "order_id", None) in _JQ_AUCTION_ORDER_IDS)
+            except Exception:
+                is_auction = False
+            if is_auction:
+                cash = cash * 1.12
+            return _orig(env, order, cash)
+
+        _cv.validate_cash = _patched
+        _cv._jq_overdraw_patched = True
+        # api_stock 在导入时已 `from ...cash_validator import validate_cash`
+        # 绑定自有引用，必须连同该绑定一起补丁（否则现金不足会回退
+        # _order_value 按可用现金重算数量，聚宽竞价单按昨收定量被覆盖）。
+        try:
+            from rqalpha.mod.rqalpha_mod_sys_accounts.api import api_stock as _api_stock
+
+            _api_stock.validate_cash = _patched
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _patch_matcher_auction_open() -> bool:
+    """撮合器对「聚宽竞价口径单」以当前 bar 开盘价撮合。
+
+    策略经 order_value/order_target_value + MarketOrderStyle(day_open) 下单
+    （order_shares shim 里以 _JQ_AUCTION_SUBMITTING / _JQ_AUCTION_ORDER_IDS
+    标记）。聚宽 09:26 市价单成交价 = 集合竞价匹配价 = 当日开盘价 = 09:31
+    bar 的 open；rqalpha 默认以该 bar 收盘撮合，系统性偏移一个首分钟漂移
+    （fixture 000989 买 9.15 = 开盘价 vs 引擎 9.16 = 收盘价）。限价判定同步
+    用开盘价：limit == open ⇒ 立即成交，语义与市价单一致。其它订单不受影响。
+
+    标记双通道：rqalpha 对 current_bar 模式的订单在**提交瞬间同步撮合**
+    （此时 order_id 标记尚未及打上，须用 _JQ_AUCTION_SUBMITTING 提交标志）；
+    未即时成交的单后续按 bar 重撮合时以 _JQ_AUCTION_ORDER_IDS 识别。
+    """
+    try:
+        from rqalpha.mod.rqalpha_mod_sys_simulation import matcher as _matcher_mod
+
+        _cls = None
+        for _name in ("DefaultBarMatcher", "SimMatcher"):
+            _cls = getattr(_matcher_mod, _name, None)
+            if _cls is not None:
+                break
+        if _cls is None or getattr(_cls, "_jq_auction_patched", False):
+            return bool(_cls is not None and getattr(_cls, "_jq_auction_patched", False))
+        _orig = _cls._get_deal_price
+
+        def _patched(self, order, open_auction=False):
+            _hit = (not open_auction) and (
+                _JQ_AUCTION_SUBMITTING or order.order_id in _JQ_AUCTION_ORDER_IDS)
+            if os.getenv("JQ_AUCTION_DEBUG"):
+                print("[auction] oid=%s hit=%s submitting=%s flagged=%s" % (
+                    getattr(order, "order_id", None), _hit, _JQ_AUCTION_SUBMITTING,
+                    order.order_id in _JQ_AUCTION_ORDER_IDS), flush=True)
+            if _hit:
+                try:
+                    _o = self._env.get_bar(order.order_book_id).open
+                    if os.getenv("JQ_AUCTION_DEBUG"):
+                        print("[auction] deal_open=%s" % _o, flush=True)
+                    return _o
+                except Exception as e:
+                    if os.getenv("JQ_AUCTION_DEBUG"):
+                        print("[auction] err=%r" % e, flush=True)
+            return _orig(self, order, open_auction)
+
+        _cls._get_deal_price = _patched
+        _cls._jq_auction_patched = True
+        return True
+    except Exception as e:
+        logger.warning("[jqcompat] 竞价单开盘价撮合补丁未命中：%s（竞价单将按 "
+                       "bar 收盘价成交）", e)
+        return False
 
 
 def _patch_matcher_tick_rounding() -> bool:
@@ -3147,7 +3714,8 @@ def _patch_price_board():
     BarDictPriceBoard._jqcompat_patched = True
 
 
-def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=None):
+def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=None,
+                     stock_codes=None):
     """在 rqalpha.run() 之前调用：注册所有 shim 与补丁。
 
     每次调用全量重置模块级状态（宇宙/名称/基准/调度回调/当前 bar 快照），
@@ -3158,6 +3726,8 @@ def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=N
     """
     global _UNIVERSE, _NAMES, _BENCHMARK, _LIST_DATES, _CURRENT_BAR_DICT
     _UNIVERSE = list(universe)
+    _STOCK_CODES.clear()
+    _STOCK_CODES.update(stock_codes or [])
     _NAMES = dict(names or {})
     _BENCHMARK = benchmark
     _LIST_DATES = dict(list_dates or {})
@@ -3175,6 +3745,16 @@ def install_jqcompat(universe, names=None, benchmark="000300.XSHG", list_dates=N
     _register_jq_apis()
     _patch_rqalpha_objects()
     _patch_price_board()
+    _patch_cash_validator_overdraw()
+    _patch_matcher_auction_open()
+    _JQ_AUCTION_ORDER_IDS.clear()
+    # 合成缓存跨回测失效（"降级值"与强引用的数据帧不得跨回测复用）
+    try:
+        from .jqengine.engine.jq.api import clear_synth_caches as _csc
+
+        _csc()
+    except Exception:
+        pass
     if not _patch_matcher_tick_rounding():
         logger.warning("[jqcompat] tick 取整补丁未命中任何 rqalpha 布局——回测成交价"
                        "将带滑点尾数，与补跑逐笔错位")

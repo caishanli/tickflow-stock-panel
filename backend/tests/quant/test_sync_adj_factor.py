@@ -46,6 +46,8 @@ def _run_sync_adj_factor(monkeypatch, events_by_sym, daily_map, codes):
 
     monkeypatch.setattr(ms, "DataManager", lambda: _FakeDM())
     monkeypatch.setattr(ms, "MootdxSource", lambda: _fake_src(events_by_sym))
+    # 单测目标是因子重建内部逻辑：显式解除 8ceacc2 的生产隔离
+    monkeypatch.setattr(ms, "_ADJ_FACTOR_QUARANTINED", False)
     return ms.sync_adj_factor()
 
 
@@ -187,6 +189,8 @@ def test_audit_retries_and_warns(monkeypatch, tmp_path, caplog):
     # 隔离真实数据：宇宙只含测试标的，日线用构造帧（否则审计会扫到
     # 本地全市场分区里真实的大幅波动，误报断点缺口）
     monkeypatch.setattr(ms, "_etf_universe", lambda: [sym])
+    # 单测内部逻辑：解除生产隔离（同 _run_sync_adj_factor）
+    monkeypatch.setattr(ms, "_ADJ_FACTOR_QUARANTINED", False)
 
     class _FakeDM:
         def _load_daily_from_partitions(self, asof=None):
@@ -327,7 +331,7 @@ def test_sync_etf_minute_retry_round(monkeypatch):
                         lambda workers=None,
                         source_factory=None: _RoundPool(source_factory=_Src))
     monkeypatch.setattr(ms, "_write_minute_partition",
-                        lambda df, root, day=None: df.height)
+                        lambda df, root, day=None, **kwargs: df.height)
     from datetime import date as _d
     res = ms.sync_etf_minute(_d(2026, 8, 20))
     assert calls["n"] == 2, "失败标的应被重试"
@@ -347,7 +351,7 @@ def test_sync_stock_minute_retry_round(monkeypatch):
     monkeypatch.setattr(ms, "_minute_fragment_days", lambda: {})
     monkeypatch.setattr(ms, "_listing_date_map", lambda: {})
     monkeypatch.setattr(ms, "_market_closed", lambda now=None: True)
-    monkeypatch.setattr(ms, "_flush_stock_minute_chunk", lambda chunk: None)
+    monkeypatch.setattr(ms, "_flush_stock_minute_chunk", lambda chunk, **kwargs: None)
     monkeypatch.setattr(ms, "_guarded_get_minute",
                         lambda src, sym, max_bars=40000, since=None:
                         src.get_minute(sym, max_bars=max_bars))

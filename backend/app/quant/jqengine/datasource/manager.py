@@ -1506,11 +1506,18 @@ class DataManager:
         df = self._load_minute_from_partitions(code, lo_ts, hi_ts)
         if df is not None and not df.empty:
             self._minute_real_cov[code] = (df.index.min(), df.index.max())
-            return df
+            # 有历史帧但未覆盖今天且请求窗口覆盖今天 → 继续走 snapshot 兜底。
+            # 原实现直接 return：盘中今日分钟分区未落盘 + minute_store 无该标的
+            # 今日记录时，get_day_open 按今日过滤得空 → 0.0 → 开盘涨幅/生态门控
+            # 全灭、静默零交易（lb_v2opt_sim 09-22~29 连续 gap=0 根因）。
+            if not self._window_covers_today(lo_ts, hi_ts) \
+                    or df.index.max().normalize() >= pd.Timestamp.now().normalize():
+                return df
         # 盘中当日分钟暂缺（只读 get_minute 分区/内存库未就绪）→ 回退实时
         # 回源 current_snapshot，避免活跃标的被当成"临时停牌"静默换仓
         # （08-13 159768 案例）。仅当请求窗口覆盖"今天"（盘中实时场景）时
         # 才回退；历史日期缺失是真无数据，走 _minute_empty 缓存。
+        sdf = None
         if self._window_covers_today(lo_ts, hi_ts):
             try:
                 snap = self.client.current_snapshot([code], as_of=str(hi_ts or pd.Timestamp.now()))
@@ -1523,10 +1530,17 @@ class DataManager:
                 if getattr(self, "_diag_minute", False):
                     logger.info("[minute-diag] %s 盘中回退current_snapshot成功 "
                                 "bars=%d lo=%s hi=%s", code, len(sdf), lo_ts, hi_ts)
+                # 历史帧 + 今日 snapshot 合并返回（get_day_open 按今日过滤）
+                if df is not None and not df.empty:
+                    import pandas as pd
+                    merged = pd.concat([df, sdf]).sort_index()
+                    return merged[~merged.index.duplicated(keep="last")]
                 return sdf
             if getattr(self, "_diag_minute", False):
                 logger.warning("[minute-diag] %s 盘中回退current_snapshot也空 "
                                "lo=%s hi=%s (get_minute空+实时回源空)", code, lo_ts, hi_ts)
+        if df is not None and not df.empty:
+            return df
         if getattr(self, "_offline_missing_warn", False):
             logger.warning("[DataManager] 离线分钟缺失（网络无数据）: %s", code)
         return None
