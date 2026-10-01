@@ -1396,7 +1396,7 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
             _emoji = "📈" if _amt > 0 else "📉"
             _sname = aux.get("strategy_name", "")
             _emit_log(account_id, "notify",
-                      f"{_emoji} [{_sname}] {_act} {_code} {abs(int(_amt))}股 @{_px}")
+                      f"{_emoji} [{_sname}] {_act} {_code} {abs(int(_amt))}股 @{_px} ({bar_ts.strftime('%m-%d %H:%M')})")
     aux["_prev_trade_count"] = len(_cur)
     # 晨选后增量预热：选股回调（09:25/09:30）重建 g.pool 后，当日新入池码未在
     # 盘前预热覆盖内，后续决策 bar 会逐码 60ms 懒加载重付。回调一结束就对
