@@ -1008,7 +1008,9 @@ def _synth_jq_fields(result, security, frequency, fields, panel):
 
         if is_minute:
             for di, d in enumerate(unique_days):
-                day_ts = pd.Timestamp(f"{d // 10000:04d}-{d // 100 % 100:02d}-{d % 100:02d}")
+                # _day_num_array 产出 days-since-epoch（非 YYYYMMDD），
+                # 转回日期须用 np.datetime64 而非字符串拼接
+                day_ts = pd.Timestamp(np.datetime64(int(d), "D"))
                 pc = _synth_minute_prev_close(code_str, day_ts)
                 m2 = rows_days == d
                 pc_arr[m2] = pc
