@@ -121,13 +121,19 @@ def _limit_rate(code, is_st=False):
     return _core_limit_rate(pure, exch, is_st)
 
 
+_RATE_CACHE: dict = {}
+
+
 def _limit_rate_by_name(code):
     """按标的简称解析 ST（5%）分档后的涨跌停幅度；名称取不到退非 ST。
 
     与回测侧 jqcompat._limit_rate 口径一致：缺 ST 分档会让合成 high_limit
     对 ST/退市票永远算错档（10%/20% 而非 5%）。名称走 get_security_name
-    （sec_names 进程缓存），仅合成路径按需调用。
+    （sec_names 进程缓存），仅合成路径按需调用。结果按 code 缓存。
     """
+    cached = _RATE_CACHE.get(code)
+    if cached is not None:
+        return cached
     pure, _, exch = str(code).partition(".")
     is_st = False
     try:
@@ -135,7 +141,9 @@ def _limit_rate_by_name(code):
         is_st = bool(nm) and ("ST" in str(nm).upper() or "退" in str(nm))
     except Exception:
         pass
-    return _core_limit_rate(pure, exch, is_st)
+    r = _core_limit_rate(pure, exch, is_st)
+    _RATE_CACHE[code] = r
+    return r
 
 
 class _SecData:
@@ -836,6 +844,7 @@ def clear_synth_caches():
     """
     _SYNTH_PREV_CACHE.clear()
     _SYNTH_DAYS_CACHE.clear()
+    _RATE_CACHE.clear()
 
 
 def _synth_daily_prev_close_and_day_vol(code, day_ts):
@@ -947,6 +956,9 @@ def _synth_jq_fields(result, security, frequency, fields, panel):
     （close >= high_limit×0.9999）、`query('paused==0')` 涨停过滤等。
     涨停价 = round_half_up(昨收×(1±rate), 2)（core.limits 交易所口径）；
     分钟频率昨收取原始分钟收盘（与撮合同源），日线取日线帧昨收。
+
+    性能：按 code 分组 + numpy 向量化，替代逐行 Python 循环——
+    5400 行批量调用从 ~27000 次函数调用降到 ~5400 次 searchsorted。
     """
     if result is None or getattr(result, "empty", True) or not fields:
         return result
@@ -964,29 +976,78 @@ def _synth_jq_fields(result, security, frequency, fields, panel):
         else (result.index if isinstance(result.index, pd.DatetimeIndex) else None)
     if idx is None:
         return result
-    highs, lows, paused = [], [], []
-    for i in range(len(result)):
-        code = result["code"].iloc[i] if has_code_col else code_for_all
-        day_ts = pd.Timestamp(idx[i])
-        rate = _limit_rate_by_name(code)  # ST 5% 分档
+
+    n = len(result)
+    highs = np.full(n, np.nan)
+    lows = np.full(n, np.nan)
+    paused = np.zeros(n, dtype=np.float64)
+
+    if has_code_col:
+        code_arr = result["code"].values
+    else:
+        code_arr = np.full(n, code_for_all)
+    day_ints = _day_num_array(idx)
+
+    unique_codes = np.unique(code_arr)
+    mgr = _state["manager"]
+
+    for code in unique_codes:
+        mask = code_arr == code
+        if not mask.any():
+            continue
+        code_str = str(code)
+        rate = _limit_rate_by_name(code_str)
+        if rate != rate:
+            rate = 0.10
+
+        rows_days = day_ints[mask]
+        unique_days = np.unique(rows_days)
+
+        pc_arr = np.full(mask.sum(), np.nan)
+        vol_arr = np.full(mask.sum(), np.nan)
+
         if is_minute:
-            prev_close = _synth_minute_prev_close(code, day_ts)
-            day_vol = float("nan")
+            for di, d in enumerate(unique_days):
+                day_ts = pd.Timestamp(f"{d // 10000:04d}-{d // 100 % 100:02d}-{d % 100:02d}")
+                pc = _synth_minute_prev_close(code_str, day_ts)
+                m2 = rows_days == d
+                pc_arr[m2] = pc
         else:
-            prev_close, day_vol = _synth_daily_prev_close_and_day_vol(code, day_ts)
-        highs.append(_rhu(prev_close * (1 + rate)) if prev_close == prev_close
-                     else float("nan"))
-        lows.append(_rhu(prev_close * (1 - rate)) if prev_close == prev_close
-                    else float("nan"))
-        paused.append(1.0 if (day_vol == day_vol and 0 <= day_vol < 1.0) else 0.0)
-    if want_limit and "high_limit" not in result.columns:
-        result = result.copy()
+            df = mgr._daily_mem.get(f"get_daily_{code_str}")
+            if df is not None and not getattr(df, "empty", True) \
+                    and isinstance(df.index, pd.DatetimeIndex):
+                frame_days = _day_num_array(df.index)
+                closes = df["close"].values.astype(np.float64)
+                vols = (df["volume"].values.astype(np.float64)
+                        if "volume" in df.columns
+                        else np.full(len(df), np.nan))
+                for di, d in enumerate(unique_days):
+                    pos = int(np.searchsorted(frame_days, d, side="left"))
+                    m2 = rows_days == d
+                    if pos > 0:
+                        pc_arr[m2] = closes[pos - 1]
+                    if pos < len(frame_days) and frame_days[pos] == d:
+                        vol_arr[m2] = vols[pos]
+
+        valid = pc_arr == pc_arr
+        if valid.any():
+            pc_v = pc_arr[valid]
+            highs[mask] = np.where(valid,
+                _rhu(np.where(valid, pc_arr * (1 + rate), 0)), np.nan)
+            lows[mask] = np.where(valid,
+                _rhu(np.where(valid, pc_arr * (1 - rate), 0)), np.nan)
+        if want_paused and not is_minute:
+            paused[mask] = np.where(
+                vol_arr == vol_arr, (np.where(vol_arr == vol_arr, vol_arr, 1.0) < 1.0).astype(np.float64), 0.0)
+
+    result = result.copy()
+    if want_limit:
         result["high_limit"] = highs
         result["low_limit"] = lows
-    if want_paused and "paused" not in result.columns and not is_minute:
-        result = result.copy()
+    if want_paused and not is_minute:
         result["paused"] = paused
     return result
+
 
 
 def get_extras(field, securities, start_date=None, end_date=None, count=None,
