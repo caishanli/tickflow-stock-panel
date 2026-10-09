@@ -377,42 +377,17 @@ def _make_dm():
 
 
 def _is_trading_day(dm, today) -> bool:
-    """当日是否交易日：用日线数据校验历史日期，近期日期用 weekday 判定。
+    """当日是否交易日：优先权威交易日历成员检查，日历不可读才降级 weekday。
 
-    盘中/刚收盘时近几日的日线数据可能尚未生成，用 idx[-1]==today 判定会误判，
-    因此对 today >= now-2天 直接走 weekday 降级路径。
+    国庆等长假周内 weekday 会把休市误判为交易日（2026-10-05/06/07 中毒窗口
+    事故），因此不再对近期日期短路 weekday，也不再依赖盘中可能尚未生成的
+    指数日线。dm 参数保留（兼容现有调用与 mock），日历路径下不再使用 dm。
     """
-    now_date = pd.Timestamp.now().date()
-    td = pd.Timestamp(today).date()
-    if td >= now_date - datetime.timedelta(days=2):
-        # 近期日期：weekday 判定即可（日线可能尚未生成）
-        return td.weekday() < 5
     try:
-        start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
-        df = None
-        dm_client = getattr(dm, "client", None)
-        if dm_client is not None:
-            try:
-                out = dm_client.get_price("000300.XSHG", start_date=start,
-                                          end_date=str(today), frequency="daily")
-                df = out.get("000300.XSHG")
-            except Exception:
-                df = None
-        if df is None:
-            df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
-        if df is None or df.empty:
-            raise RuntimeError("指数日线为空")
-        idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
-        if idx is None:
-            dcol = next((c for c in ("date", "datetime", "dt", "trade_date", "trade_dt", "day")
-                         if c in df.columns), None)
-            if dcol is not None:
-                idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
-            elif "timestamp" in df.columns:
-                idx = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], unit="s"))
-            else:
-                raise RuntimeError("指数日线无日期列")
-        return bool(len(idx)) and pd.Timestamp(idx[-1]).date() == pd.Timestamp(today).date()
+        from app.services.trade_calendar import load_authoritative_dates
+
+        dates, _origin = load_authoritative_dates()
+        return str(pd.Timestamp(today).date()) in set(dates)
     except Exception as e:
         log.warning("[runner] 交易日判定失败，降级 weekday: %s", e)
         return pd.Timestamp(today).weekday() < 5
