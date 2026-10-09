@@ -63,3 +63,68 @@ def test_auction_0930_bar_needs_no_prev_volume():
     auc, cur = auction_from_day_bars(hm, op, cl, vol, float("nan"))
     assert auc == 9_235_400.0
     assert cur == 9.5
+
+
+# ---------------------------------------------------------------- ensure_auction
+_IN_WINDOW = datetime.datetime(2026, 10, 12, 9, 26)      # 周一 09:26 竞价窗口内
+_OUT_WINDOW = datetime.datetime(2026, 10, 12, 10, 0)     # 开盘后
+_PRE_WINDOW = datetime.datetime(2026, 10, 12, 9, 24)     # 撮合完成前
+
+
+def _seed_day(day, rows):
+    import os
+
+    d = os.path.join(auction_cache.CACHE_ROOT, f"date={day.isoformat()}")
+    os.makedirs(d, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(os.path.join(d, "part.parquet"), index=False)
+    auction_cache._memory_cache.clear()
+
+
+def test_ensure_auction_merges_without_dropping_cached(monkeypatch, tmp_path):
+    """按需抓取必须增量合并：不能只写新帧把当日已有行冲掉。"""
+    monkeypatch.setattr(auction_cache, "CACHE_ROOT", str(tmp_path / "ac"))
+    auction_cache._memory_cache.clear()
+    day = datetime.date(2026, 10, 12)
+    _seed_day(day, [{"symbol": "600000.XSHG", "auction_price": 10.0,
+                     "auction_volume": 100000.0, "prev_close": 9.9}])
+    monkeypatch.setattr(auction_cache, "fetch_tencent_auction", lambda codes: {
+        "600000.XSHG": {"price": 10.2, "volume_shares": 120000.0,
+                        "prev_close": 9.9, "open": 10.2},
+        "000001.XSHE": {"price": 11.0, "volume_shares": 200000.0,
+                        "prev_close": 10.8, "open": 11.0},
+    })
+    n = auction_cache.ensure_auction(["000001.XSHE"], day, now=_IN_WINDOW)
+    assert n == 2  # 缺失的 000001 抓到；600000 一并刷新（窗口内只会更完整）
+    assert auction_cache.lookup("600000.XSHG", day) == (120000.0, 10.2)
+    assert auction_cache.lookup("000001.XSHE", day) == (200000.0, 11.0)
+
+
+def test_ensure_auction_skips_when_all_cached(monkeypatch, tmp_path):
+    """本地已有 → 不触网（这才是"本地没有才去网络拿"的语义）。"""
+    monkeypatch.setattr(auction_cache, "CACHE_ROOT", str(tmp_path / "ac"))
+    auction_cache._memory_cache.clear()
+    day = datetime.date(2026, 10, 12)
+    _seed_day(day, [{"symbol": "600000.XSHG", "auction_price": 10.0,
+                     "auction_volume": 100000.0, "prev_close": 9.9}])
+
+    def _boom(codes):
+        raise AssertionError("cached codes must not hit network")
+
+    monkeypatch.setattr(auction_cache, "fetch_tencent_auction", _boom)
+    assert auction_cache.ensure_auction(["600000.XSHG"], day, now=_IN_WINDOW) == 0
+
+
+def test_ensure_auction_outside_window_never_fetches(monkeypatch, tmp_path):
+    """窗口外腾讯现价≠竞价撮合价（累计量含连续竞价）→ 禁止抓取。"""
+    monkeypatch.setattr(auction_cache, "CACHE_ROOT", str(tmp_path / "ac"))
+    auction_cache._memory_cache.clear()
+    day = datetime.date(2026, 10, 12)
+
+    def _boom(codes):
+        raise AssertionError("outside auction window must not hit network")
+
+    monkeypatch.setattr(auction_cache, "fetch_tencent_auction", _boom)
+    assert auction_cache.ensure_auction(["600000.XSHG"], day, now=_OUT_WINDOW) == 0
+    assert auction_cache.ensure_auction(["600000.XSHG"], day, now=_PRE_WINDOW) == 0
+    assert auction_cache.ensure_auction(["600000.XSHG"], day,
+                                        now=datetime.datetime(2026, 10, 10, 9, 26)) == 0
