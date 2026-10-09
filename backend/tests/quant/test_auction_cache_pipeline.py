@@ -44,3 +44,22 @@ def test_fetch_and_save_pandas_instruments(monkeypatch, tmp_path):
 def test_lookup_missing_day_returns_none(monkeypatch, tmp_path):
     _install(monkeypatch, tmp_path)
     assert auction_cache.lookup("600000.XSHG", datetime.date(2026, 10, 13)) is None
+
+
+def test_auction_0930_bar_needs_no_prev_volume():
+    """09:30 精确 bar 不得因 prev_day_vol 缺失而返回 NaN 量。
+
+    回归（2026-10-09 实盘路径实测）：prev_day_vol 守卫原在 0930 分支之前，
+    日线帧未缓存（get_call_auction 首调）时 09:30 真实竞价量白丢。
+    """
+    import numpy as np
+
+    from app.quant.stock_meta import auction_from_day_bars
+
+    hm = np.array([930, 931, 932, 933], dtype=int)
+    op = np.array([9.5, 9.6, 9.7, 9.8])
+    cl = np.array([9.5, 9.6, 9.7, 9.8])
+    vol = np.array([9_235_400.0, 31_531_100.0, 17_404_700.0, 9_077_900.0])
+    auc, cur = auction_from_day_bars(hm, op, cl, vol, float("nan"))
+    assert auc == 9_235_400.0
+    assert cur == 9.5

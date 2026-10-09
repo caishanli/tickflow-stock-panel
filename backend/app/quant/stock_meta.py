@@ -154,9 +154,10 @@ def auction_from_day_bars(minute_hm: np.ndarray, minute_open: np.ndarray,
         return float("nan"), float("nan")
     cur = float(minute_open[0]) if minute_open[0] == minute_open[0] else \
         float(minute_close[0])
-    if prev_day_vol is None or not (prev_day_vol > 0):
-        return float("nan"), cur
-    # 精确口径：09:30 竞价 bar（新分钟分区约定，volume 即撮合量）
+    # 精确口径：09:30 竞价 bar（新分钟分区约定，volume 即撮合量）。
+    # 该路径不依赖 prev_day_vol——守卫必须放在它后面：日线帧未缓存时
+    # prev_vol=NaN，提前返回会让 09:30 精确量白丢、竞价量比整项变 NaN
+    # （2026-10-09 实盘路径实测：get_call_auction 首调即此状）。
     idx_0930 = np.flatnonzero(minute_hm == 930)
     if len(idx_0930):
         i = int(idx_0930[0])
@@ -164,7 +165,10 @@ def auction_from_day_bars(minute_hm: np.ndarray, minute_open: np.ndarray,
         if minute_close[i] == minute_close[i]:
             cur = float(minute_close[i])
         return auc, cur
-    # 近似口径：首根（09:31）量含竞价+首分钟连续竞价 → 回归
+    # 近似口径（旧分区 09:31 起始）：首根量含竞价+首分钟连续竞价 → 回归，
+    # 需要 prev_day_vol 做分母，缺失即无解。
+    if prev_day_vol is None or not (prev_day_vol > 0):
+        return float("nan"), cur
     first = float(minute_vol[0])
     fm_ratio_pct = first / prev_day_vol * 100.0
     pred_pct = AUCTION_REG_INTERCEPT + AUCTION_REG_SLOPE * fm_ratio_pct
