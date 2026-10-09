@@ -170,7 +170,8 @@ def fetch_and_save(day: _dt.date | None = None,
 
     ins = instruments_frame()
     if codes is None:
-        codes = [r["symbol"] for _, r in ins.iter_rows(index=False)]
+        # instruments_frame 返回 pandas 帧（stock_meta.py:57-78），取 symbol 列
+        codes = ins["symbol"].tolist() if "symbol" in ins.columns else []
     else:
         codes = [c if "." in c else c for c in codes]
 
