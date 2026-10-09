@@ -26,7 +26,7 @@ from ..datasource.manager import QuantDataProvider
 from ..jqengine.datasource.manager import is_halted_by_volume
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
-from . import live_feed, names
+from . import live_feed, names, singleflight
 from .matcher import Matcher
 from .matcher import _legacy_rounding as _legacy_fill_rounding
 from .protocol import is_paused, read_state, save_state
@@ -1622,18 +1622,26 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
 def run_loop(account_id: str, provider: QuantDataProvider | None = None,
              matcher: Matcher | None = None, dm=None, feed=None,
              poll_interval: float = POLL_INTERVAL, idle_interval: float = IDLE_INTERVAL):
-    acct = db.get_sim_account(account_id)
-    if not acct:
+    try:
+        _lock = singleflight.acquire(account_id)
+    except singleflight.SimLockError:
+        _emit_log(account_id, "warn", "同账户实例运行中，本进程退出")
         return
-    # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
-    _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
-    stop = acct.get("stop_loss") or 0.03
-    def _notify_stop_loss(rec):
-        _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec),
-                  ts=str(rec["dt"]))
-    matcher = matcher or Matcher(stop, account_id=account_id, on_stop_loss=_notify_stop_loss)
-    if (acct.get("strategy_id") or "").strip():
-        _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
-                           idle_interval=idle_interval)
-        return
-    _run_watcher_loop(account_id, acct, provider, matcher, poll_interval, idle_interval)
+    try:
+        acct = db.get_sim_account(account_id)
+        if not acct:
+            return
+        # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
+        _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
+        stop = acct.get("stop_loss") or 0.03
+        def _notify_stop_loss(rec):
+            _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec),
+                      ts=str(rec["dt"]))
+        matcher = matcher or Matcher(stop, account_id=account_id, on_stop_loss=_notify_stop_loss)
+        if (acct.get("strategy_id") or "").strip():
+            _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
+                               idle_interval=idle_interval)
+            return
+        _run_watcher_loop(account_id, acct, provider, matcher, poll_interval, idle_interval)
+    finally:
+        singleflight.release(_lock)
