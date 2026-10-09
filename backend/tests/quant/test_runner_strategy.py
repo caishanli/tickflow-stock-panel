@@ -516,7 +516,9 @@ def test_replay_pins_minute_window_and_preloads_pool(tmp_quant, monkeypatch):
     runner.run_loop(aid, dm=dm, feed=_feed_factory(10.0), matcher=Matcher(0.03))
 
     assert dm.window_seen is not None
-    assert dm.window_seen[0] == str(days[0])
+    # 钉窗起点 = start_date − minute_lookback 余量（策略常读起点前的分钟，
+    # 如首板质量读"昨日"；直接钉 start 会把起点前裁掉致首日全员无数据）
+    assert dm.window_seen[0] == str(days[0] - datetime.timedelta(days=15))
     # 窗口上界 = 今天（start_date 在今天内，整个补跑区间被钉住）
     assert dm.window_seen[1] == str(today)
     assert dm.pool_seen is not None

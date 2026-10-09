@@ -1032,7 +1032,21 @@ def _pin_replay_minute_window(dm, ctx, start, end) -> None:
     set_win = getattr(dm, "set_minute_window", None)
     if set_win is not None:
         try:
-            set_win(str(start)[:10], str(end)[:10])
+            # 回看余量：策略常读窗口起点之前的分钟（如首板质量读"昨日"分钟）。
+            # 直接钉 [start, end] 会把起点前裁掉 → 补跑首日全员"无昨日分钟数据"
+            # （2026-10-09 sb_gaokai_sim 倒带补跑 10-08，603906 因此错过）。
+            # 起点前扩 minute_lookback（默认 15 天，随 dm 配置），复刻无钉滑窗语义；
+            # 批量预取仍锚定 start（span_days=2 不变），内存护栏不受影响。
+            base = pd.Timestamp(str(start)[:10])
+            lookback = getattr(dm, "minute_lookback", None)
+            try:
+                delta = pd.Timedelta(lookback) if lookback is not None else None
+            except Exception:
+                delta = None
+            if delta is None:
+                delta = pd.Timedelta(days=15)
+            pin_start = (base - delta).date().isoformat()
+            set_win(pin_start, str(end)[:10])
         except Exception as e:
             log.warning("[replay] set_minute_window 失败（回退滑窗）: %s", e)
     codes = []
