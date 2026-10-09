@@ -79,6 +79,24 @@ def test_get_day_open_backfills_today_via_snapshot(tmp_path):
     assert dm.get_day_open(CODE, today + pd.Timedelta(hours=9, minutes=31)) == 10.0
 
 
+def test_load_real_minute_history_only_no_unboundlocal(tmp_path):
+    """历史帧存在但未覆盖今天 → 走 snapshot 兜底，不得 UnboundLocalError。
+
+    回归（sb_gaokai_sim 2026-10-09 收盘时启动即崩溃循环）：
+    `_load_real_minute` 内的局部 `import pandas as pd` 把 `pd` 变成函数级
+    局部变量，致第 1514 行 `pd.Timestamp` 在 import 执行前即
+    UnboundLocalError。
+    """
+    today = pd.Timestamp.today().normalize()
+    history_days = [(today - pd.Timedelta(days=d)).date() for d in range(1, 6)]
+    dm = _make_dm(tmp_path, {CODE: _bars(history_days, 9.5)})
+    lo = today - pd.Timedelta(days=5)
+    hi = today + pd.Timedelta(hours=9, minutes=31)
+    out = dm._load_real_minute(CODE, lo, hi, None)
+    assert out is not None and not out.empty
+    assert out.index.max().normalize() == today
+
+
 def test_get_day_open_history_date_needs_no_snapshot(tmp_path):
     """历史日期（已落盘）→ 直接返回当日 open，不触 snapshot。"""
     today = pd.Timestamp.today().normalize()

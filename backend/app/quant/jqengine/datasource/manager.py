@@ -1532,7 +1532,6 @@ class DataManager:
                                 "bars=%d lo=%s hi=%s", code, len(sdf), lo_ts, hi_ts)
                 # 历史帧 + 今日 snapshot 合并返回（get_day_open 按今日过滤）
                 if df is not None and not df.empty:
-                    import pandas as pd
                     merged = pd.concat([df, sdf]).sort_index()
                     return merged[~merged.index.duplicated(keep="last")]
                 return sdf
