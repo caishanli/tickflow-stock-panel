@@ -128,3 +128,74 @@ def test_ensure_auction_outside_window_never_fetches(monkeypatch, tmp_path):
     assert auction_cache.ensure_auction(["600000.XSHG"], day, now=_PRE_WINDOW) == 0
     assert auction_cache.ensure_auction(["600000.XSHG"], day,
                                         now=datetime.datetime(2026, 10, 10, 9, 26)) == 0
+
+
+# ------------------------------------------------- 代码格式归一（cron 通路回归）
+#
+# 回归（2026-10-11 发现）：instruments_frame() 的 symbol 是短后缀 .SH/.SZ/.BJ，
+# 而策略侧 get_call_auction 传的是聚宽码 .XSHG/.XSHE。fetch_tencent_auction 的
+# _jq_to_tencent_prefix 只认 XSHG/SS 与 XSHE/SZ，.SH 落进 else → "bj600000"
+# → 沪市 2468 只全部抓空；深市虽抓到却按 .SZ 落盘 → lookup(".XSHE") 全 miss。
+# 结果：cron 写出的竞价缓存对 get_call_auction 永远不可用。
+
+
+class _FakeResp:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _install_tencent(monkeypatch, seen: list[str]):
+    """把 urlopen 换成按 URL 里请求码构造的真实结构腾讯响应（~60 字段）。"""
+    import urllib.request
+
+    def _urlopen(req, timeout=None):
+        url = getattr(req, "full_url", None) or str(req)
+        seen.append(url)
+        prefixes = url.split("q=", 1)[1].split(",")
+        lines = []
+        for p in prefixes:
+            fields = [""] * 60
+            fields[0], fields[1], fields[2] = "1", "名称", p[2:]
+            # 索引 3/4/5/6 = 最新价 / 昨收 / 今开 / 累计量(手)
+            fields[3], fields[4], fields[5], fields[6] = "10.50", "10.00", "10.50", "1234"
+            lines.append('v_{}="{}";'.format(p, "~".join(fields)))
+        return _FakeResp("\n".join(lines).encode("gbk"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+
+
+def test_fetch_tencent_auction_normalizes_short_suffix(monkeypatch):
+    """短后缀 .SH/.SZ 必须按沪/深前缀取数，且回成聚宽码。
+
+    break：_jq_to_tencent_prefix 不认 .SH → 沪市整段抓空。
+    """
+    seen: list[str] = []
+    _install_tencent(monkeypatch, seen)
+    out = auction_cache.fetch_tencent_auction(
+        ["600000.SH", "000001.SZ", "920001.BJ", "600519.XSHG"])
+    assert seen[0].split("q=", 1)[1].split(",") == [
+        "sh600000", "sz000001", "bj920001", "sh600519"]
+    assert set(out) == {"600000.XSHG", "000001.XSHE", "920001.BJ", "600519.XSHG"}
+
+
+def test_fetch_and_save_caches_jq_symbols_for_strategy_lookup(monkeypatch, tmp_path):
+    """cron 采集（真实 .SH/.SZ instruments）落盘必须是聚宽码，策略 lookup 才命中。
+
+    break：落盘仍为 .SH/.SZ → get_call_auction 的 lookup 全 miss。
+    """
+    import app.quant.stock_meta as sm
+
+    monkeypatch.setattr(
+        sm, "instruments_frame",
+        lambda: pd.DataFrame({"symbol": ["600000.SH", "000001.SZ"]}))
+    monkeypatch.setattr(auction_cache, "CACHE_ROOT", str(tmp_path / "auction_cache"))
+    auction_cache._memory_cache.clear()
+    _install_tencent(monkeypatch, [])
+    day = datetime.date(2026, 10, 12)
+    df = auction_cache.fetch_and_save(day=day)
+    assert set(df["symbol"]) == {"600000.XSHG", "000001.XSHE"}
+    assert auction_cache.lookup("600000.XSHG", day) == (123400.0, 10.50)
+    assert auction_cache.lookup("000001.XSHE", day) == (123400.0, 10.50)

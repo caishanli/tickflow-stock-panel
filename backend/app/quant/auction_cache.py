@@ -30,7 +30,6 @@ import os
 import threading
 import urllib.request
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("auction_cache")
@@ -50,11 +49,32 @@ def _code_to_jq(bare: str) -> str:
     return f"{bare}.XSHE"
 
 
+# 交易端口径后缀 → 聚宽后缀（instruments 用 .SH/.SZ/.BJ，策略侧用 .XSHG/.XSHE）
+_EXCH_TO_JQ = {"SH": "XSHG", "SS": "XSHG", "SZ": "XSHE",
+               "BJ": "BJ", "XSHG": "XSHG", "XSHE": "XSHE"}
+
+
+def _to_jq_code(code: str) -> str:
+    """统一成聚宽码：instruments 的 .SH/.SZ/.BJ、聚宽码、裸 6 位码都归一。
+
+    fetch_and_save 从 instruments_frame() 拿到的 symbol 是短后缀（.SH/.SZ），
+    直接喂 fetch_tencent_auction 会因 _jq_to_tencent_prefix 不认 "SH" 落进
+    bj 分支而整段抓空沪市，且落盘的 .SZ 与策略 lookup 的 .XSHE 不同口径。
+    归一收口在此，缓存 symbol 恒为聚宽码。
+    """
+    pure, _, exch = str(code).partition(".")
+    if exch:
+        mapped = _EXCH_TO_JQ.get(exch.upper())
+        if mapped:
+            return f"{pure}.{mapped}"
+    return _code_to_jq(pure)
+
+
 def _jq_to_tencent_prefix(jq_code: str) -> str:
     pure, _, exch = jq_code.partition(".")
-    if exch in ("XSHG", "SS"):
+    if exch.upper() in ("XSHG", "SS", "SH"):
         return f"sh{pure}"
-    if exch in ("XSHE", "SZ"):
+    if exch.upper() in ("XSHE", "SZ"):
         return f"sz{pure}"
     return f"bj{pure}"
 
@@ -65,16 +85,17 @@ def fetch_tencent_auction(codes: list[str]) -> dict[str, dict]:
     在 09:25:00~09:30:00 之间调用时，返回的 price/volume 即竞价撮合结果。
     盘后调用时返回全天数据（volume 是全天累计量，非竞价量）。
 
-    codes: JQ 格式代码列表（如 ['000989.XSHE', ...]），也接受 6 位裸码。
+    codes: JQ 格式代码列表（如 ['000989.XSHE', ...]），也接受 .SH/.SZ 短后缀
+    与 6 位裸码；返回的 key 恒为聚宽码。
     返回: {jq_code: {price, volume_shares, prev_close, open}}
     """
     prefixed = []
     jq_map = {}
     for c in codes:
-        bare = c.split(".")[0] if "." in c else c
-        prefix = _jq_to_tencent_prefix(c)
+        jq = _to_jq_code(c)
+        prefix = _jq_to_tencent_prefix(jq)
         prefixed.append(prefix)
-        jq_map[prefix[2:]] = c
+        jq_map[prefix[2:]] = jq
 
     out: dict[str, dict] = {}
     # 腾讯接口每批最多 ~60 只
@@ -226,7 +247,7 @@ def fetch_and_save(day: _dt.date | None = None,
         # instruments_frame 返回 pandas 帧（stock_meta.py:57-78），取 symbol 列
         codes = ins["symbol"].tolist() if "symbol" in ins.columns else []
     else:
-        codes = [c if "." in c else c for c in codes]
+        codes = list(codes)
 
     raw = fetch_tencent_auction(codes)
     if not raw:
