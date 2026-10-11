@@ -30,7 +30,6 @@ import os
 import threading
 import urllib.request
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("auction_cache")
@@ -50,11 +49,32 @@ def _code_to_jq(bare: str) -> str:
     return f"{bare}.XSHE"
 
 
+# 交易端口径后缀 → 聚宽后缀（instruments 用 .SH/.SZ/.BJ，策略侧用 .XSHG/.XSHE）
+_EXCH_TO_JQ = {"SH": "XSHG", "SS": "XSHG", "SZ": "XSHE",
+               "BJ": "BJ", "XSHG": "XSHG", "XSHE": "XSHE"}
+
+
+def _to_jq_code(code: str) -> str:
+    """统一成聚宽码：instruments 的 .SH/.SZ/.BJ、聚宽码、裸 6 位码都归一。
+
+    fetch_and_save 从 instruments_frame() 拿到的 symbol 是短后缀（.SH/.SZ），
+    直接喂 fetch_tencent_auction 会因 _jq_to_tencent_prefix 不认 "SH" 落进
+    bj 分支而整段抓空沪市，且落盘的 .SZ 与策略 lookup 的 .XSHE 不同口径。
+    归一收口在此，缓存 symbol 恒为聚宽码。
+    """
+    pure, _, exch = str(code).partition(".")
+    if exch:
+        mapped = _EXCH_TO_JQ.get(exch.upper())
+        if mapped:
+            return f"{pure}.{mapped}"
+    return _code_to_jq(pure)
+
+
 def _jq_to_tencent_prefix(jq_code: str) -> str:
     pure, _, exch = jq_code.partition(".")
-    if exch in ("XSHG", "SS"):
+    if exch.upper() in ("XSHG", "SS", "SH"):
         return f"sh{pure}"
-    if exch in ("XSHE", "SZ"):
+    if exch.upper() in ("XSHE", "SZ"):
         return f"sz{pure}"
     return f"bj{pure}"
 
@@ -65,16 +85,17 @@ def fetch_tencent_auction(codes: list[str]) -> dict[str, dict]:
     在 09:25:00~09:30:00 之间调用时，返回的 price/volume 即竞价撮合结果。
     盘后调用时返回全天数据（volume 是全天累计量，非竞价量）。
 
-    codes: JQ 格式代码列表（如 ['000989.XSHE', ...]），也接受 6 位裸码。
+    codes: JQ 格式代码列表（如 ['000989.XSHE', ...]），也接受 .SH/.SZ 短后缀
+    与 6 位裸码；返回的 key 恒为聚宽码。
     返回: {jq_code: {price, volume_shares, prev_close, open}}
     """
     prefixed = []
     jq_map = {}
     for c in codes:
-        bare = c.split(".")[0] if "." in c else c
-        prefix = _jq_to_tencent_prefix(c)
+        jq = _to_jq_code(c)
+        prefix = _jq_to_tencent_prefix(jq)
         prefixed.append(prefix)
-        jq_map[prefix[2:]] = c
+        jq_map[prefix[2:]] = jq
 
     out: dict[str, dict] = {}
     # 腾讯接口每批最多 ~60 只
@@ -158,6 +179,59 @@ def lookup(code: str, day: _dt.date) -> tuple[float, float] | None:
     return float(row["auction_volume"]), float(row["auction_price"])
 
 
+def _in_auction_window(now: _dt.datetime) -> bool:
+    """是否处于可采竞价快照的窗口：工作日 09:25:05 ≤ t < 09:30。
+
+    竞价撮合 09:25:00 完成，09:25:05 腾讯已反映撮合结果（现价=撮合价、
+    累计量=竞价量）；09:30 连续竞价开始后量价均偏移，窗口外抓到的不是
+    竞价数据。与 stockdata 竞价 cron（scheduler.py:284）同口径；节假日
+    weekday 判定的已知限制也与其一致。
+    """
+    return (now.weekday() < 5
+            and _dt.time(9, 25, 5) <= now.time() < _dt.time(9, 30))
+
+
+def ensure_auction(codes: list[str], day: _dt.date,
+                   now: _dt.datetime | None = None) -> int:
+    """本地无缓存时按需联网抓竞价快照，增量合并落盘。返回写入条数。
+
+    语义＝"本地没有才去网络拿"：已缓存的 symbol 不重复抓；窗口外直接返回
+    0 不触网（腾讯现价非竞价撮合价）。day 为缓存归属日（通常=今天）。
+
+    回归背景（2026-10-09）：实盘 09:26 选股时竞价缓存缺失（采集 cron 因
+    pandas 崩溃从未成功过），get_call_auction 只能落到分钟回归≈2.02% 的
+    假值，候选被 3% 门槛静默丢弃——该账户实盘期零买入即此。
+    """
+    now = now or _dt.datetime.now()
+    if not codes or not _in_auction_window(now):
+        return 0
+    have = load_day(day)
+    known = set()
+    if have is not None and not have.empty and "symbol" in have.columns:
+        known = set(have["symbol"].tolist())
+    uniq = list(dict.fromkeys(codes))
+    missing = [c for c in uniq if c not in known]
+    if not missing:
+        return 0
+    raw = fetch_tencent_auction(missing)
+    if not raw:
+        return 0
+    rows = [{"symbol": jq, "auction_price": d["price"],
+             "auction_volume": d["volume_shares"], "prev_close": d["prev_close"]}
+            for jq, d in sorted(raw.items())]
+    new = pd.DataFrame(rows)
+    if known:
+        # 增量合并：丢帧只写新行会把当日已有行冲掉（断点续抓场景）
+        merged = pd.concat([have, new], ignore_index=True).drop_duplicates(
+            subset=["symbol"], keep="last")
+    else:
+        merged = new
+    save_auction_day(day, merged)
+    with _lock:
+        _memory_cache[day.isoformat()] = merged
+    return len(rows)
+
+
 def fetch_and_save(day: _dt.date | None = None,
                    codes: list[str] | None = None) -> pd.DataFrame:
     """采集并保存竞价数据（每日 09:25:30 调用，或手动补采）。
@@ -170,9 +244,10 @@ def fetch_and_save(day: _dt.date | None = None,
 
     ins = instruments_frame()
     if codes is None:
-        codes = [r["symbol"] for _, r in ins.iter_rows(index=False)]
+        # instruments_frame 返回 pandas 帧（stock_meta.py:57-78），取 symbol 列
+        codes = ins["symbol"].tolist() if "symbol" in ins.columns else []
     else:
-        codes = [c if "." in c else c for c in codes]
+        codes = list(codes)
 
     raw = fetch_tencent_auction(codes)
     if not raw:

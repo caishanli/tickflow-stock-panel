@@ -1327,6 +1327,18 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
         days = pd.DatetimeIndex([base.normalize()])
     mgr = _state["manager"]
     rows = []
+    # 本地缓存缺失时，当日竞价窗口内按需联网抓一次（批量），失败/窗口外静默
+    # 回退原路径。修复实盘 09:26 零买入：cache miss + 当日无 09:30 bar 时
+    # 原实现只能落到分钟回归≈2.02% 假值，候选被竞价量比门槛静默丢弃。
+    try:
+        from app.quant import auction_cache as _auc
+
+        for day in days:
+            _d = pd.Timestamp(day).date()
+            if _d == datetime.date.today():
+                _auc.ensure_auction(codes, _d)
+    except Exception:
+        pass
     for day in days:
         day_ts = pd.Timestamp(day).normalize()
         _day_date = day_ts.date()

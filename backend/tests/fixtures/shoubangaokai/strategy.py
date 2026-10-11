@@ -870,6 +870,10 @@ def l0_prepare_stock_list(context):
         1
     )
 
+    if getattr(g.l0, '_last_pool_date', None) == yesterday:
+        hl1_list = set(g.l0.n_days_limit_up_list[-2]) if len(g.l0.n_days_limit_up_list) >= 2 else set()
+        return [s for s in hl_list if s not in hl1_list]
+
     g.l0.n_days_limit_up_list.append(hl_list)
 
     # 前一交易日涨停
@@ -886,6 +890,8 @@ def l0_prepare_stock_list(context):
     ]
 
     g.l0.n_days_limit_up_list.pop(0)
+
+    g.l0._last_pool_date = yesterday
 
     return hl_list
 

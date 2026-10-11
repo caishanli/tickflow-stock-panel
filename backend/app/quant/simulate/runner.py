@@ -26,7 +26,7 @@ from ..datasource.manager import QuantDataProvider
 from ..jqengine.datasource.manager import is_halted_by_volume
 from ..jqengine.engine.jq.context import Position
 from ..strategies.store import get_strategy
-from . import live_feed, names
+from . import live_feed, names, singleflight
 from .matcher import Matcher
 from .matcher import _legacy_rounding as _legacy_fill_rounding
 from .protocol import is_paused, read_state, save_state
@@ -377,42 +377,17 @@ def _make_dm():
 
 
 def _is_trading_day(dm, today) -> bool:
-    """当日是否交易日：用日线数据校验历史日期，近期日期用 weekday 判定。
+    """当日是否交易日：优先权威交易日历成员检查，日历不可读才降级 weekday。
 
-    盘中/刚收盘时近几日的日线数据可能尚未生成，用 idx[-1]==today 判定会误判，
-    因此对 today >= now-2天 直接走 weekday 降级路径。
+    国庆等长假周内 weekday 会把休市误判为交易日（2026-10-05/06/07 中毒窗口
+    事故），因此不再对近期日期短路 weekday，也不再依赖盘中可能尚未生成的
+    指数日线。dm 参数保留（兼容现有调用与 mock），日历路径下不再使用 dm。
     """
-    now_date = pd.Timestamp.now().date()
-    td = pd.Timestamp(today).date()
-    if td >= now_date - datetime.timedelta(days=2):
-        # 近期日期：weekday 判定即可（日线可能尚未生成）
-        return td.weekday() < 5
     try:
-        start = str(pd.Timestamp(today) - pd.Timedelta(days=15))[:10]
-        df = None
-        dm_client = getattr(dm, "client", None)
-        if dm_client is not None:
-            try:
-                out = dm_client.get_price("000300.XSHG", start_date=start,
-                                          end_date=str(today), frequency="daily")
-                df = out.get("000300.XSHG")
-            except Exception:
-                df = None
-        if df is None:
-            df = dm.fetch("get_daily", "000300.XSHG", start, str(today))
-        if df is None or df.empty:
-            raise RuntimeError("指数日线为空")
-        idx = df.index if isinstance(df.index, pd.DatetimeIndex) else None
-        if idx is None:
-            dcol = next((c for c in ("date", "datetime", "dt", "trade_date", "trade_dt", "day")
-                         if c in df.columns), None)
-            if dcol is not None:
-                idx = pd.DatetimeIndex(pd.to_datetime(df[dcol]))
-            elif "timestamp" in df.columns:
-                idx = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], unit="s"))
-            else:
-                raise RuntimeError("指数日线无日期列")
-        return bool(len(idx)) and pd.Timestamp(idx[-1]).date() == pd.Timestamp(today).date()
+        from app.services.trade_calendar import load_authoritative_dates
+
+        dates, _origin = load_authoritative_dates()
+        return str(pd.Timestamp(today).date()) in set(dates)
     except Exception as e:
         log.warning("[runner] 交易日判定失败，降级 weekday: %s", e)
         return pd.Timestamp(today).weekday() < 5
@@ -1057,7 +1032,21 @@ def _pin_replay_minute_window(dm, ctx, start, end) -> None:
     set_win = getattr(dm, "set_minute_window", None)
     if set_win is not None:
         try:
-            set_win(str(start)[:10], str(end)[:10])
+            # 回看余量：策略常读窗口起点之前的分钟（如首板质量读"昨日"分钟）。
+            # 直接钉 [start, end] 会把起点前裁掉 → 补跑首日全员"无昨日分钟数据"
+            # （2026-10-09 sb_gaokai_sim 倒带补跑 10-08，603906 因此错过）。
+            # 起点前扩 minute_lookback（默认 15 天，随 dm 配置），复刻无钉滑窗语义；
+            # 批量预取仍锚定 start（span_days=2 不变），内存护栏不受影响。
+            base = pd.Timestamp(str(start)[:10])
+            lookback = getattr(dm, "minute_lookback", None)
+            try:
+                delta = pd.Timedelta(lookback) if lookback is not None else None
+            except Exception:
+                delta = None
+            if delta is None:
+                delta = pd.Timedelta(days=15)
+            pin_start = (base - delta).date().isoformat()
+            set_win(pin_start, str(end)[:10])
         except Exception as e:
             log.warning("[replay] set_minute_window 失败（回退滑窗）: %s", e)
     codes = []
@@ -1647,18 +1636,26 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
 def run_loop(account_id: str, provider: QuantDataProvider | None = None,
              matcher: Matcher | None = None, dm=None, feed=None,
              poll_interval: float = POLL_INTERVAL, idle_interval: float = IDLE_INTERVAL):
-    acct = db.get_sim_account(account_id)
-    if not acct:
+    try:
+        _lock = singleflight.acquire(account_id)
+    except singleflight.SimLockError:
+        _emit_log(account_id, "warn", "同账户实例运行中，本进程退出")
         return
-    # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
-    _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
-    stop = acct.get("stop_loss") or 0.03
-    def _notify_stop_loss(rec):
-        _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec),
-                  ts=str(rec["dt"]))
-    matcher = matcher or Matcher(stop, account_id=account_id, on_stop_loss=_notify_stop_loss)
-    if (acct.get("strategy_id") or "").strip():
-        _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
-                           idle_interval=idle_interval)
-        return
-    _run_watcher_loop(account_id, acct, provider, matcher, poll_interval, idle_interval)
+    try:
+        acct = db.get_sim_account(account_id)
+        if not acct:
+            return
+        # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
+        _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
+        stop = acct.get("stop_loss") or 0.03
+        def _notify_stop_loss(rec):
+            _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec),
+                      ts=str(rec["dt"]))
+        matcher = matcher or Matcher(stop, account_id=account_id, on_stop_loss=_notify_stop_loss)
+        if (acct.get("strategy_id") or "").strip():
+            _run_strategy_loop(account_id, acct, matcher, dm=dm, feed=feed,
+                               idle_interval=idle_interval)
+            return
+        _run_watcher_loop(account_id, acct, provider, matcher, poll_interval, idle_interval)
+    finally:
+        singleflight.release(_lock)
