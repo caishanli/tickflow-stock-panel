@@ -51,9 +51,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
+    from app.services.forward_provenance_hooks_v1 import start_reader
+    start_reader()
     src = DataSources()
     server = StockDataServer((HOST, _port()), src)
-    scheduler.start_scheduler(data_sources=src)  # backfill + 15:35 + 00:00 内存清空
+    # Explicit supervised read-only maintenance must not launch full-market backfill.
+    # Default behavior remains unchanged for existing deployments.
+    if os.getenv("STOCKDATA_AUTONOMOUS_SYNC", "1") != "0":
+        scheduler.start_scheduler(data_sources=src)  # backfill + 15:35 + 00:00 内存清空
     logger = logging.getLogger("stockdata")
     logger.info("stockdata service listening on %s:%s", HOST, _port())
 

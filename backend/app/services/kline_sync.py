@@ -112,7 +112,8 @@ def sync_daily_batch(symbols: list[str],
                      start_time: datetime | None = None,
                      end_time: datetime | None = None,
                      on_chunk_done: Callable[[int, int], None] | None = None,
-                     failed_out: list[str] | None = None) -> pl.DataFrame:
+                     failed_out: list[str] | None = None,
+                     max_attempts: int = 3) -> pl.DataFrame:
     """批量拉取多股日 K。
 
     优先使用 start_time / end_time 区间 + count=10000,确保覆盖完整时间段。
@@ -121,7 +122,11 @@ def sync_daily_batch(symbols: list[str],
     failed_out: 可选出参。拉取失败的分块标的会追加进该 list, 供上层判定「部分失败」
                 而非静默当成功(某分块断网 → 这些标的本轮未更新, 保持旧数据)。
     """
+    if max_attempts not in (1, 3):
+        raise ValueError("Explicit bounded acceptance or unchanged normal attempt policy")
     tf = get_client()
+    from app.services import forward_provenance_hooks_v1 as forward
+    forward_enabled = forward.manager() is not None
     out: list[pl.DataFrame] = []
     chunks = chunked(symbols, batch_size)
     failed_syms: list[str] = []
@@ -132,7 +137,7 @@ def sync_daily_batch(symbols: list[str],
         # 按它说的等（上限 60s）；解析不到则指数退避。3 次耗尽才记失败——
         # 之前失败整 chunk 直接丢（09-11 曾一次丢 462 只）。
         raw = None
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 if start_time and end_time:
                     raw = tf.klines.batch(
@@ -140,14 +145,14 @@ def sync_daily_batch(symbols: list[str],
                         start_time=_datetime_to_ms(start_time),
                         end_time=_datetime_to_ms(end_time),
                         count=10000,
-                        as_dataframe=True, show_progress=False,
+                        as_dataframe=not forward_enabled, show_progress=False,
                     )
                 else:
                     raw = tf.klines.batch(chunk, period="1d", count=count or 250, adjust="none",
-                                          as_dataframe=True, show_progress=False)
+                                          as_dataframe=not forward_enabled, show_progress=False)
                 break
             except Exception as e:
-                if attempt >= 2:
+                if attempt >= max_attempts - 1:
                     logger.warning("batch fetch failed for %d symbols (chunk %d/%d): %s",
                                    len(chunk), i + 1, len(chunks), e)
                     failed_syms.extend(chunk)
@@ -159,6 +164,8 @@ def sync_daily_batch(symbols: list[str],
                 time.sleep(wait / 1000.0)
         if raw is None:
             continue
+        if forward_enabled:
+            raw = forward.dataframe_result(raw)
 
         # 零贡献统计: 要了但一行没贡献的标的 = 失败(未发布/整段缺失)，
         # 必须进 failed_syms 走 WARNING + failed_out 通道 — 09-22 北交所 344 只
@@ -218,7 +225,9 @@ def sync_daily_batch(symbols: list[str],
 
     if not out:
         return pl.DataFrame()
-    return pl.concat(out, how="diagonal_relaxed")
+    result = pl.concat(out, how="diagonal_relaxed")
+    forward.bind(result)
+    return result
 
 
 def sync_and_persist_daily_batch(

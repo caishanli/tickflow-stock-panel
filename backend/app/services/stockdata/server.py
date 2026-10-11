@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import socketserver
 
 from . import protocol
@@ -40,4 +42,32 @@ class StockDataServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, addr: tuple[str, int], data_sources: DataSources):
         self.data_sources = data_sources
+        self._readonly_server = None
+        self._readonly_thread = None
         super().__init__(addr, _Handler)
+        # Additive endpoint sharing the existing local reader. The TCP handler,
+        # scheduler, launcher and Forward V1 activation manifest remain unchanged.
+        if os.getenv("STOCKDATA_READONLY_UNIX", "1") == "1":
+            try:
+                from .readonly_unix import StockDataReadOnlyUnixServer
+                self._readonly_server = StockDataReadOnlyUnixServer(data_sources)
+                self._readonly_thread = threading.Thread(
+                    target=self._readonly_server.serve_forever,
+                    name="stockdata-readonly-unix", daemon=True)
+                self._readonly_thread.start()
+                logger.info("read-only Unix endpoint active")
+            except Exception:
+                if self._readonly_server is not None:
+                    self._readonly_server.server_close()
+                self._readonly_server = None
+                self._readonly_thread = None
+                logger.exception("read-only Unix endpoint unavailable; TCP preserved")
+
+    def server_close(self):
+        super().server_close()
+        if self._readonly_server is not None:
+            if self._readonly_thread is not None and self._readonly_thread.is_alive():
+                self._readonly_server.shutdown()
+                self._readonly_thread.join(timeout=2)
+            self._readonly_server.server_close()
+            self._readonly_server = None

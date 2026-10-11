@@ -2136,18 +2136,24 @@ class KlineRepository:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with daily_partition_lock(out):
                     existing = pl.DataFrame()
+                    from app.services import forward_provenance_hooks_v1 as forward
+                    incoming = date_df.clone()
                     if out.exists():
                         existing = pl.read_parquet(out)
                         date_df = pl.concat([existing, date_df], how="diagonal_relaxed").unique(
                             subset=["symbol", "date"], keep="last"
                         )
                     date_df = date_df.sort(["symbol", "date"])
+                    context = forward.before_write(out, table, existing, incoming)
+                    if context and context.get("skip_legacy_write"):
+                        continue
                     if not existing.is_empty() and existing.equals(date_df):
                         continue
                     if publication is None:
                         self._atomic_write_parquet(date_df, out)
                     else:
                         publication.write_parquet(date_df, out)
+                    forward.after_write(out, table, date_df, context)
             if publication is not None:
                 publication.commit()
 

@@ -65,6 +65,8 @@ def get_client() -> TickFlow:
         else:
             _sync_client = TickFlow(api_key=key, base_url=_base_url())
             logger.info("创建同步 SDK 客户端 (付费端点=%s, SDK超时=30s×重试3)", current_endpoint())
+    from app.services.forward_provenance_hooks_v1 import install
+    install(_sync_client)
     return _sync_client
 
 

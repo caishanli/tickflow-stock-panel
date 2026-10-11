@@ -35,6 +35,11 @@ def h_status(p, s: DataSources):
     return "json", get_status()
 
 
+def h_get_forward_provenance(p, s: DataSources):
+    from app.services.forward_provenance_hooks_v1 import read_proof
+    return "json", read_proof(p, s.data_root)
+
+
 def h_get_price(p, s: DataSources):
     codes = _norm_codes(p["security"])
     freq = p.get("frequency", "daily")
@@ -83,6 +88,9 @@ def h_current_snapshot(p, s: DataSources):
 
 
 def h_get_trade_days(p, s: DataSources):
+    if p.get("include_evidence") is True:
+        return "json", s.get_trade_days(p.get("start_date", "2000-01-01"),
+            p.get("end_date", _dt.date.today().isoformat()), with_evidence=True)
     return "json", s.get_trade_days(p.get("start_date", "2000-01-01"),
                                     p.get("end_date", _dt.date.today().isoformat()))
 
@@ -135,6 +143,7 @@ HANDLERS = {
     "ping": h_ping,
     "status": h_status,
     "get_price": h_get_price,
+    "get_forward_provenance": h_get_forward_provenance,
     "preload_daily": h_preload_daily,
     "get_minute": h_get_minute,
     "current_snapshot": h_current_snapshot,

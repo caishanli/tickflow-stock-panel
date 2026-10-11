@@ -459,6 +459,14 @@ def _pull_recent_guarded(src, code: str, timeout: float = 30.0):
     return df
 
 
+class CalendarCoverageUnavailable(LookupError):
+    """No safe calendar answer from the requested local coverage."""
+
+
+class CalendarDataQualityError(ValueError):
+    """Calendar/index content is corrupt; never replace it with an empty list."""
+
+
 class DataSources:
     """聚合源：本地分区读取为主 + 当日分钟内存库 + 共享网络拉取池。"""
 
@@ -778,11 +786,89 @@ class DataSources:
             subset=["symbol", "datetime"], keep="last").sort(["symbol", "datetime"])
 
     # ---- 元数据 ----
-    def get_trade_days(self, start_date: str, end_date: str) -> list[str]:
-        # 交易日历：从 kline_index_daily 分区索引推（沪深300 恒有数据）
-        df = self._scan_partitions("kline_index_daily", start_date, end_date, None,
-                                   ["date"]).unique(subset=["date"])
-        return sorted(str(d) for d in df["date"].to_list())
+    def get_trade_days(self, start_date: str, end_date: str,
+                       *, with_evidence: bool = False):
+        """Preserve legacy list output; distinguish declared closures from absent data.
+
+        No fetch, refresh, weekday approximation or exception-to-empty fallback.
+        """
+        import hashlib
+
+        lo, hi = str(pd_to_date(start_date)), str(pd_to_date(end_date))
+        if lo > hi:
+            raise ValueError("INVALID_CALENDAR_RANGE")
+        index_root = os.path.join(self.data_root, "kline_index_daily")
+        # A hive partition name must not conceal a missing physical date column.
+        for day in self._existing_day_files("kline_index_daily", lo, hi):
+            import glob
+            for path in glob.glob(os.path.join(index_root, f"date={day}", "*.parquet")):
+                try:
+                    schema = pl.read_parquet_schema(path)
+                except (OSError, pl.exceptions.PolarsError) as exc:
+                    raise CalendarDataQualityError("UNREADABLE_INDEX_PARQUET") from exc
+                if "date" not in schema:
+                    raise CalendarDataQualityError("INDEX_PARQUET_DATE_COLUMN_MISSING")
+        df = self._scan_partitions("kline_index_daily", lo, hi, None, ["date"])
+        evidence = {"requested_range": {"start": lo, "end": hi},
+                    "source": "LOCAL_INDEX_PARTITIONS", "coverage_complete": False,
+                    "as_of": None, "qualification": "OBSERVED_NOT_EXCHANGE_CERTIFIED",
+                    "unknowns": ["INDEX_PARTITIONS_NOT_A_COMPLETE_OFFICIAL_CALENDAR"]}
+        if "date" not in df.columns and df.width != 0:
+            raise CalendarDataQualityError("INDEX_RESULT_DATE_COLUMN_MISSING")
+        if not df.is_empty():
+            try:
+                days = sorted({str(d) for d in df["date"].to_list()})
+                if any(_dt.date.fromisoformat(d).isoformat() != d or not lo <= d <= hi
+                       for d in days):
+                    raise ValueError("INVALID_INDEX_DATE")
+            except (TypeError, ValueError, pl.exceptions.PolarsError) as exc:
+                raise CalendarDataQualityError("INVALID_INDEX_DATE") from exc
+            evidence["status"] = "OBSERVED_PARTITION_CALENDAR"
+        else:
+            path = os.environ.get("TRADE_CALENDAR_PATH") or os.path.join(
+                self.data_root, "trade_calendar.json")
+            try:
+                before = os.stat(path)
+                with open(path, "rb") as stream:
+                    raw = stream.read(524289)
+                after = os.stat(path)
+            except FileNotFoundError as exc:
+                raise CalendarCoverageUnavailable("CALENDAR_FILE_MISSING") from exc
+            except OSError as exc:
+                raise CalendarCoverageUnavailable("CALENDAR_FILE_UNREADABLE") from exc
+            if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise CalendarCoverageUnavailable("CALENDAR_FILE_CHANGED")
+            try:
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError("DUPLICATE_CALENDAR_KEY")
+                        result[key] = value
+                    return result
+                if len(raw) > 524288:
+                    raise ValueError("CALENDAR_FILE_TOO_LARGE")
+                data = _json.loads(raw, object_pairs_hook=unique)
+                dates = data["dates"]
+                if not isinstance(dates, list) or not dates:
+                    raise ValueError("INVALID_CALENDAR_DATES")
+                if any(not isinstance(d, str) or _dt.date.fromisoformat(d).isoformat() != d
+                       for d in dates) or any(a >= b for a, b in zip(dates, dates[1:], strict=False)):
+                    raise ValueError("INVALID_CALENDAR_DATES")
+            except (ValueError, TypeError, KeyError) as exc:
+                raise CalendarDataQualityError("CALENDAR_FILE_CORRUPT") from exc
+            if lo < dates[0] or hi > dates[-1]:
+                raise CalendarCoverageUnavailable("CALENDAR_RANGE_NOT_COVERED")
+            days = [d for d in dates if lo <= d <= hi]
+            if days:
+                raise CalendarCoverageUnavailable("LOCAL_INDEX_COVERAGE_MISSING_FOR_DECLARED_SESSIONS")
+            evidence.update(status="VALID_EMPTY_CALENDAR", source=data.get("source", "UNKNOWN"),
+                source_path=path, source_sha256=hashlib.sha256(raw).hexdigest(),
+                coverage={"start": dates[0], "end": dates[-1]}, coverage_complete=True,
+                as_of=data.get("fetched_at"),
+                unknowns=["SOURCE_PUBLICATION_IDENTITY_NOT_EXCHANGE_CERTIFIED"])
+        return {"sessions": days, "evidence": evidence} if with_evidence else days
 
     def get_all_securities(self, types: list[str] | None, date: str | None) -> pl.DataFrame:
         # 分区仅落 symbol/OHLCV（无 name/list_date）：只选 symbol，其余列以空值补齐
