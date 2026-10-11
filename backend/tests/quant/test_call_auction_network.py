@@ -1,14 +1,18 @@
 """get_call_auction 按需联网抓竞价的接线测试。"""
 
 import datetime
+from types import SimpleNamespace
 
 from app.quant import auction_cache
 from app.quant.jqengine.engine.jq import api as jq_api
+
+DAY = datetime.date(2026, 10, 12)
 
 
 def _setup(monkeypatch, tmp_path, calls):
     monkeypatch.setattr(auction_cache, "CACHE_ROOT", str(tmp_path / "ac"))
     auction_cache._memory_cache.clear()
+    monkeypatch.setattr(auction_cache, "_now", lambda: datetime.datetime(2026, 10, 12, 9, 26))
     real = auction_cache.ensure_auction
 
     def _spy(codes, day, now=None):
@@ -28,10 +32,10 @@ def test_cache_miss_today_triggers_network_fill(monkeypatch, tmp_path):
     calls = []
     _setup(monkeypatch, tmp_path, calls)
     out = jq_api.get_call_auction(
-        "603906.XSHG", start_date=f"{datetime.date.today()} 09:15:00",
-        end_date=f"{datetime.date.today()} 09:26:00",
+        "603906.XSHG", start_date=f"{DAY} 09:15:00",
+        end_date=f"{DAY} 09:26:00",
         fields=["time", "volume", "current"])
-    assert calls == [(["603906.XSHG"], str(datetime.date.today()))]
+    assert calls == [(["603906.XSHG"], str(DAY))]
     assert not out.empty
     row = out.iloc[0]
     assert row["volume"] == 2305400.0
@@ -53,7 +57,7 @@ def test_second_call_served_from_cache(monkeypatch, tmp_path):
     """抓过一次后同标的再次查询命中缓存，不重复触网。"""
     calls = []
     _setup(monkeypatch, tmp_path, calls)
-    today = datetime.date.today()
+    today = DAY
     for _ in range(2):
         out = jq_api.get_call_auction(
             "603906.XSHG", start_date=f"{today} 09:15:00", end_date=f"{today} 09:26:00",
@@ -72,7 +76,34 @@ def test_ensure_failure_does_not_break_lookup(monkeypatch, tmp_path):
                        lambda codes, day, now=None: (_ for _ in ()).throw(
                             RuntimeError("net down")))
     out = jq_api.get_call_auction(
-        "603906.XSHG", start_date=f"{datetime.date.today()} 09:15:00",
-        end_date=f"{datetime.date.today()} 09:26:00",
+        "603906.XSHG", start_date=f"{DAY} 09:15:00",
+        end_date=f"{DAY} 09:26:00",
         fields=["time", "volume", "current"])
     assert out.empty                      # 回退路径也没有数据，但不抛异常
+
+
+def test_preopen_failure_never_uses_future_minute_bar(monkeypatch, tmp_path):
+    import pytest
+
+    _setup(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(auction_cache, "ensure_auction",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr(jq_api, "_minute_day_slice", lambda *a:
+                        pytest.fail("live preopen must not read a future minute bar"))
+    out = jq_api.get_call_auction("603906.XSHG", start_date=str(DAY), fields=["volume"])
+    assert out.empty
+
+
+def test_delayed_preopen_callback_still_rejects_future_minute(monkeypatch, tmp_path):
+    import pytest
+
+    _setup(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(auction_cache, "_now",
+                        lambda: datetime.datetime(2026, 10, 12, 9, 31, 10))
+    jq_api._state["ctx"] = SimpleNamespace(
+        current_dt=datetime.datetime(2026, 10, 12, 9, 26))
+    monkeypatch.setattr(auction_cache, "ensure_auction", lambda *a, **k: 0)
+    monkeypatch.setattr(jq_api, "_minute_day_slice", lambda *a:
+                        pytest.fail("delayed live preopen must not read a future minute bar"))
+    out = jq_api.get_call_auction("603906.XSHG", start_date=str(DAY), fields=["volume"])
+    assert out.empty

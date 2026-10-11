@@ -751,6 +751,37 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
                       f"盘前分钟预取: {ok}/{len(uni)} 只（{chunk} 只/批）")
 
 
+def _fire_preopen_daily(account_id, bundle, ctx, state, aux, now) -> None:
+    """盘前 HH:MM 任务按时钟执行；不要求分钟 bar、不触发盘中逐 bar 钩子。"""
+    tasks = []
+    for func, task_time in bundle.daily:
+        scheduled = _parse_hhmm(str(task_time))
+        key = (id(func), str(task_time))
+        if (scheduled is not None and scheduled < datetime.time(9, 30)
+                and scheduled <= now.time() and key not in aux["fired"]):
+            tasks.append((func, str(task_time), key))
+    if not tasks:
+        return
+    jq_api = aux["jq_api"]
+    ctx.current_dt = now
+    # 昨日最后一根分钟快照不能冒充今日盘前价格。
+    jq_api._state.update(minute_mode=True, minute_prices={}, no_buy=set(), no_sell=set())
+    for func, tag, key in tasks:
+        aux["fired"].add(key)
+        trades = jq_api._state.get("trades") or []
+        before_trades = len(trades)
+        jq_api._state["preopen_auction_missing"] = False
+        _safe_call(account_id, func, ctx, tag)
+        # A strategy may query a live auction snapshot before it is published.
+        # Retry that task on the next poll only when it made no fills; replaying
+        # a callback after an order would duplicate its side effects.
+        if (jq_api._state.pop("preopen_auction_missing", False)
+                and len(jq_api._state.get("trades") or []) == before_trades):
+            aux["fired"].discard(key)
+    _seed_universe(ctx)
+    _persist(account_id, ctx, state, now, jq_api, aux)
+
+
 def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
     """成交增量 / 状态 / 净值快照落库（每轮一次）。"""
     trades = getattr(jq_api, "_state", {}).get("trades") or []
@@ -1559,6 +1590,14 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
             if hooks_done["pre"] != today and t >= datetime.time(9, 25):
                 _pre_market(account_id, bundle, ctx, aux["fired"], jq_api, now, aux)
                 hooks_done["pre"] = today
+                # 盘前钩子可能耗时，按完成后的时钟判断到期任务和竞价窗口。
+                now = datetime.datetime.now()
+                t = now.time()
+            if (not _is_ptrade_strategy(code)
+                    and datetime.time(9, 25, 5) <= t < datetime.time(9, 30)):
+                _fire_preopen_daily(account_id, bundle, ctx, state, aux, now)
+                time.sleep(min(idle_interval, 1))
+                continue
             if _tick_window(now):
                 if aux["frequency"] == "daily" and aux["daily_done"] == today:
                     # 日频账户：当日唯一 tick 已完成，仍做实时打标
@@ -1620,7 +1659,9 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                                                if state["start_cash"] else 0.0)
                 time.sleep(idle_interval)
             else:
-                time.sleep(idle_interval)
+                # 9:25 前后短轮询，避免 30s 空转错过 09:26 回调。
+                time.sleep(min(idle_interval, 1) if datetime.time(9, 24) <= t
+                           < datetime.time(9, 30) else idle_interval)
     except Exception:
         # 崩溃兜底置 failed，避免账户状态停留 running 误导前端
         db.update_sim_account(account_id, status="failed")

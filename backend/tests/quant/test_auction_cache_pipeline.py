@@ -8,8 +8,14 @@ auction_cache 永远只有一天数据，get_call_auction 的 09:25 精确通路
 import datetime
 
 import pandas as pd
+import pytest
 
 from app.quant import auction_cache
+
+
+@pytest.fixture(autouse=True)
+def auction_clock(monkeypatch):
+    monkeypatch.setattr(auction_cache, "_now", lambda: datetime.datetime(2026, 10, 12, 9, 26))
 
 
 class _FakeInstruments:
@@ -146,6 +152,9 @@ class _FakeResp:
     def read(self) -> bytes:
         return self._payload
 
+    def close(self):
+        pass
+
 
 def _install_tencent(monkeypatch, seen: list[str]):
     """把 urlopen 换成按 URL 里请求码构造的真实结构腾讯响应（~60 字段）。"""
@@ -161,6 +170,7 @@ def _install_tencent(monkeypatch, seen: list[str]):
             fields[0], fields[1], fields[2] = "1", "名称", p[2:]
             # 索引 3/4/5/6 = 最新价 / 昨收 / 今开 / 累计量(手)
             fields[3], fields[4], fields[5], fields[6] = "10.50", "10.00", "10.50", "1234"
+            fields[30] = "20261012092505"
             lines.append('v_{}="{}";'.format(p, "~".join(fields)))
         return _FakeResp("\n".join(lines).encode("gbk"))
 

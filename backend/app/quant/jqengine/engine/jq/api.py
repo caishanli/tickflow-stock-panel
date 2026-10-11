@@ -173,6 +173,9 @@ class _SecData:
 
     @property
     def day_open(self):
+        auction_price = _preopen_auction_price(self._code)
+        if auction_price is not None:
+            return auction_price
         v = getattr(self._info, "day_open", 0.0)
         if v is None:
             v = self._proxy._day_open_of(self._code)
@@ -309,6 +312,9 @@ class CurrentDataProxy:
         return 0.0
 
     def _live_last_price(self, code):
+        auction_price = _preopen_auction_price(code)
+        if auction_price is not None:
+            return auction_price
         if not _state.get("minute_mode"):
             return None
         snap = _state.get("minute_prices") or {}
@@ -1327,15 +1333,29 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
         days = pd.DatetimeIndex([base.normalize()])
     mgr = _state["manager"]
     rows = []
+    live_preopen = None
     # 本地缓存缺失时，当日竞价窗口内按需联网抓一次（批量），失败/窗口外静默
     # 回退原路径。修复实盘 09:26 零买入：cache miss + 当日无 09:30 bar 时
     # 原实现只能落到分钟回归≈2.02% 假值，候选被竞价量比门槛静默丢弃。
     try:
         from app.quant import auction_cache as _auc
 
+        ctx = _state.get("ctx")
+        strategy_dt = getattr(ctx, "current_dt", None) if ctx is not None else None
         for day in days:
             _d = pd.Timestamp(day).date()
-            if _d == datetime.date.today():
+            wall_now = _auc._now()
+            if _d == wall_now.date():
+                # Keep the no-future-bar guard tied to strategy time as well as
+                # wall time: a slow 09:26 callback can finish after 09:30.
+                strategy_preopen = False
+                if strategy_dt is not None:
+                    _strategy_ts = pd.Timestamp(strategy_dt)
+                    strategy_preopen = (
+                        _strategy_ts.date() == _d
+                        and _strategy_ts.time() < datetime.time(9, 30))
+                if wall_now.time() < datetime.time(9, 30) or strategy_preopen:
+                    live_preopen = _d
                 _auc.ensure_auction(codes, _d)
     except Exception:
         pass
@@ -1357,6 +1377,10 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
                     continue
             except Exception:
                 pass
+            if _day_date == live_preopen:
+                # 盘前没有可用快照就明确缺数，不使用未来 09:30/09:31 bar 估计。
+                _state["preopen_auction_missing"] = True
+                continue
             sl = _minute_day_slice(code, day_ts)
             if sl is None:
                 continue
@@ -1404,6 +1428,23 @@ class MarketOrderStyle:
         self.value = self.limit_price
 
 
+def _preopen_auction_price(security):
+    """09:25～09:30 可读已校验竞价快照；开盘后不拿竞价价替代实时价。"""
+    ctx = _state.get("ctx")
+    current = getattr(ctx, "current_dt", None)
+    if current is None:
+        return None
+    ts = pd.Timestamp(current)
+    if not datetime.time(9, 25) <= ts.time() < datetime.time(9, 30):
+        return None
+    from app.quant.auction_cache import _now, lookup
+
+    hit = lookup(security, ts.date())
+    if hit is not None:
+        return hit[1]
+    return 0.0 if ts.date() == _now().date() else None
+
+
 def _live_price(security):
     """取当前 bar 的成交价；分钟模式缺行情时返回 0。
 
@@ -1412,6 +1453,9 @@ def _live_price(security):
     close，分钟线用当前价），因此无论日线还是分钟模式都优先取该快照；
     分钟模式下再向 manager 精确取点，缺失则拒绝委托。
     """
+    auction_price = _preopen_auction_price(security)
+    if auction_price is not None:
+        return auction_price
     return resolve_live_price(
         _state.get("minute_prices"), security,
         minute_mode=_state.get("minute_mode"), manager=_state.get("manager"),

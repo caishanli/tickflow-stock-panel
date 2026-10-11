@@ -277,19 +277,23 @@ def _auction_cron_loop():
     累计量=竞价量）。09:30 连续竞价开始后量价均偏移，必须在窗口内抓取。
     数据写入 data/auction_cache/date=…/part.parquet，get_call_auction 优先读。
     """
-    from app.quant.auction_cache import fetch_and_save
+    from app.quant.auction_cache import _in_auction_window, _now, fetch_and_save
 
     while not _stop.is_set():
-        now = _dt.datetime.now()
-        if (now.weekday() < 5 and now.time() >= _dt.time(9, 25, 5)
-                and now.time() < _dt.time(9, 29, 55)):
+        now = _now()
+        if _in_auction_window(now) and now.time() < _dt.time(9, 29, 55):
             with _lock:
                 last = _scheduler_state.get("auction_job")
             if last != now.date().isoformat():
-                _scheduler_state["auction_job"] = now.date().isoformat()
                 logger.info("[auction] %s 集合竞价快照采集开始", now.isoformat())
                 try:
                     df = fetch_and_save()
+                    # 失败/空/部分结果仍可在窗口内重试；已采标的由缓存去重。
+                    with _lock:
+                        _scheduler_state["auction_rows"] = len(df)
+                        _scheduler_state["auction_missing"] = df.attrs.get("missing", 0)
+                        if not df.empty and df.attrs.get("complete", True):
+                            _scheduler_state["auction_job"] = now.date().isoformat()
                     logger.info("[auction] %s 只已保存", len(df))
                 except Exception as e:
                     logger.warning("[auction] 采集失败: %s", e)

@@ -889,3 +889,95 @@ def test_is_trading_day_holiday_weekday_is_not_trading():
     assert runner._is_trading_day(object(), "2026-10-07") is False
     assert runner._is_trading_day(object(), "2026-10-08") is True   # 节后首日
     assert runner._is_trading_day(object(), "2026-10-09") is True
+
+
+def test_live_preopen_callback_fetches_auction_without_minute_bar(tmp_quant, monkeypatch):
+    """09:26 must execute once before any minute bar; opening tick must not repeat it."""
+    from app.quant import auction_cache
+    from app.quant.jqengine.engine.jq import api
+
+    day = datetime.date(2026, 10, 12)
+    clock = {"now": datetime.datetime(2026, 10, 12, 9, 24)}
+
+    class ClockDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    class ClockDate(datetime.date):
+        @classmethod
+        def today(cls):
+            return day
+
+    clock_module = SimpleNamespace(datetime=ClockDateTime, date=ClockDate,
+                                   time=datetime.time, timedelta=datetime.timedelta)
+    monkeypatch.setattr(runner, "datetime", clock_module)
+    monkeypatch.setattr(api, "datetime", clock_module)
+    monkeypatch.setattr(auction_cache, "_now", lambda: clock["now"], raising=False)
+    monkeypatch.setattr(auction_cache, "CACHE_ROOT", str(tmp_quant / "auction"))
+    auction_cache._memory_cache.clear()
+    requests = []
+
+    def fetch(codes):
+        requests.append((clock["now"], codes))
+        return {code: {"price": 10.5, "volume_shares": 123400., "prev_close": 10.,
+                       "open": 10.5, "quote_time": "2026-10-12T09:25:05"} for code in codes}
+
+    monkeypatch.setattr(auction_cache, "fetch_tencent_auction", fetch)
+    monkeypatch.setattr(api, "get_security_name", lambda code: code)
+    monkeypatch.setattr(api, "_synth_minute_prev_close", lambda *a, **k: 10.)
+    monkeypatch.setattr(runner.names, "resolve_name", lambda code: code)
+    monkeypatch.setattr(runner, "_prev_close_dm", lambda *a, **k: 10.)
+    monkeypatch.setattr(runner, "_is_trading_day", lambda *a: True)
+    monkeypatch.setattr(runner.time, "sleep", lambda *a: None)
+
+    def pre(aid, bundle, ctx, fired, jq_api, now, aux):
+        ctx.current_dt = now
+        ctx.previous_date = datetime.date(2026, 10, 9)
+        fired.clear()
+        jq_api.on_new_day()
+
+    monkeypatch.setattr(runner, "_pre_market", pre)
+    times = iter([datetime.datetime(2026, 10, 12, 9, 25, 6),
+                  datetime.datetime(2026, 10, 12, 9, 26),
+                  datetime.datetime(2026, 10, 12, 9, 26, 2),
+                  datetime.datetime(2026, 10, 12, 9, 31)])
+
+    def paused(aid):
+        now = next(times, None)
+        if now is None:
+            return True
+        clock["now"] = now
+        return False
+
+    monkeypatch.setattr(runner, "is_paused", paused)
+    code = '''
+def initialize(context):
+    g.calls = []
+    g.bar_calls = 0
+    run_daily(buy, '09:26')
+def buy(context):
+    a = get_call_auction('600000.XSHG', fields=['volume', 'current'])
+    cd = get_current_data()['600000.XSHG']
+    g.calls.append((str(context.current_dt), a.iloc[0]['volume'], cd.last_price, cd.day_open))
+    order_value('600000.XSHG', 10000, MarketOrderStyle(cd.day_open))
+def handle_data(context):
+    g.bar_calls += 1
+'''
+    save_strategy("auction_strategy", "auction", code)
+    aid = service.account_create("auction", 100000., .05, "auction_strategy")
+    dm = _StubDM()
+    dm._daily_mem = {"get_daily_600000.XSHG": pd.DataFrame(
+        {"open": [10.], "close": [10.], "volume": [1000000.]},
+        index=pd.DatetimeIndex(["2026-10-09"]))}
+
+    def feed(dm, codes, now, acc):
+        assert now.time() >= datetime.time(9, 30), "preopen callback must not require a bar"
+        return {"600000.XSHG": 10.6}, pd.Timestamp(now), {}
+
+    runner.run_loop(aid, dm=dm, feed=feed, matcher=Matcher(.05))
+    assert api._state["ctx"].g.calls == [("2026-10-12 09:26:00", 123400., 10.5, 10.5)]
+    assert len(requests) == 1 and requests[0][0].time() == datetime.time(9, 26)
+    assert api._state["ctx"].g.bar_calls == 1
+    trades = db.get_sim_trades(aid)
+    assert len(trades) == 1 and trades[0]["ts"] == "2026-10-12 09:26:00"
