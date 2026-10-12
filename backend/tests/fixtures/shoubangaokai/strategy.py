@@ -1,3 +1,4 @@
+# 新策略
 # 克隆自聚宽文章：https://www.joinquant.com/post/80773
 # 标题：高质量首板高开一进二 - 长测年化100%，胜率65%
 # 作者：泰然金手指
@@ -55,6 +56,7 @@ def initialize(context):
 
     run_daily(l0_standalone_recon, time='15:20')
     log.info("【86TL拆分-A】78A1首板高开股票腿独立版启动")
+    log.info("【日志配置】09:25盘前准备，09:26选股；筛选数量、数据缺失及结果写入页面日志")
 
 
 def after_trading_end(context):
@@ -107,6 +109,8 @@ def l0_after_code_changed(context):
 
     pass  # [86合并] 原版 unschedule_all() 会清掉其它腿调度 -> 合并版禁用
 
+    run_daily(l0_morning_status, '09:25')
+
     # 09:26 选股并买入
     run_daily(l0_buy, '09:26')
 
@@ -119,7 +123,7 @@ def l0_after_code_changed(context):
 
 
 def l0_after_trading_end(context):
-    print('———————————————————————————————————')
+    log.info('———————————————————————————————————')
 
 
 # ====================== 基础股票池 ======================
@@ -132,11 +136,20 @@ def l0_set_stockpool(context):
 
 # ====================== 交易函数 ======================
 
+def l0_morning_status(context):
+    log.info('【盘前准备】交易日{} | 前一交易日{} | 现金{:.2f} | 持仓{}只 | 等待09:26选股'.format(
+        context.current_dt.date(), context.previous_date,
+        context.portfolio.available_cash, len(context.portfolio.positions)))
+
+
 def l0_buy(context):
+    log.info('【选股开始】{} | 前一交易日{}'.format(
+        context.current_dt.strftime('%Y-%m-%d %H:%M:%S'), context.previous_date))
     current_data = get_current_data()
     qualified_stocks = l0_get_stock_list(context)
 
     if not qualified_stocks:
+        log.info('【买入结束】今日无最终候选，不下单；筛选与数据缺失数量见选股汇总')
         return
 
     # 仍按原思路：把当前可用资金在最终Top1/Top2之间均分
@@ -157,7 +170,7 @@ def l0_buy(context):
                 value,
                 MarketOrderStyle(current_data[s].day_open)
             )
-            print('买入' + s)
+            log.info('买入' + s)
 
 
 def l0_hard_stop(context):
@@ -197,7 +210,7 @@ def l0_hard_stop(context):
 
             # 跌停时即使发单也大概率无法成交，日志单独提示
             if last_price <= current_data[s].low_limit:
-                print(
+                log.info(
                     '硬止损触发但跌停无法卖出 '
                     + get_security_info(s).display_name
                     + s
@@ -206,7 +219,7 @@ def l0_hard_stop(context):
                 continue
 
             l0_ord_order_target_value(s, 0)
-            print(
+            log.info(
                 '硬止损卖出 '
                 + get_security_info(s).display_name
                 + s
@@ -244,7 +257,7 @@ def l0_sell(context):
             ret = 100 * (last_price / avg_cost - 1)
 
             if last_price <= current_data[s].low_limit:
-                print(
+                log.info(
                     '硬止损触发但跌停无法卖出 '
                     + get_security_info(s).display_name
                     + s
@@ -253,7 +266,7 @@ def l0_sell(context):
                 continue
 
             l0_ord_order_target_value(s, 0)
-            print(
+            log.info(
                 '硬止损卖出 '
                 + get_security_info(s).display_name
                 + s
@@ -284,7 +297,7 @@ def l0_sell(context):
         ):
             l0_ord_order_target_value(s, 0)
             ret = 100 * (last_price / avg_cost - 1)
-            print(
+            log.info(
                 '止盈卖出 '
                 + get_security_info(s).display_name
                 + s
@@ -297,7 +310,7 @@ def l0_sell(context):
             # 跌停无法正常卖出时仅记录
             if last_price <= current_data[s].low_limit:
                 ret = 100 * (last_price / avg_cost - 1)
-                print(
+                log.info(
                     'MA5止损触发但跌停无法卖出 '
                     + get_security_info(s).display_name
                     + s
@@ -307,7 +320,7 @@ def l0_sell(context):
 
             l0_ord_order_target_value(s, 0)
             ret = 100 * (last_price / avg_cost - 1)
-            print(
+            log.info(
                 '止损卖出 '
                 + get_security_info(s).display_name
                 + s
@@ -572,6 +585,13 @@ def l0_calculate_quality_score(
 
 def l0_get_stock_list(context):
     target_list = l0_prepare_stock_list(context)
+    log.info('【首板候选池】{}只'.format(len(target_list)))
+    excluded = {
+        '昨日行情缺失': 0, '昨日量价无效': 0, '均价或成交额不符': 0,
+        '估值缺失': 0, '换手率不符': 0, '市值不符': 0, '首板质量不符': 0,
+        '竞价缺失': 0, '昨日成交量无效': 0, '竞价量比不符': 0,
+        '高开幅度不符': 0, '历史行情不足': 0, '左压条件不符': 0,
+    }
 
     # 不再“通过就全部买”，而是保存通过票及其评分
     scored_candidates = []
@@ -594,6 +614,7 @@ def l0_get_stock_list(context):
         )
 
         if prev_day_data is None or prev_day_data.empty:
+            excluded['昨日行情缺失'] += 1
             continue
 
         if (
@@ -602,6 +623,7 @@ def l0_get_stock_list(context):
             or prev_day_data['close'][0] is None
             or prev_day_data['close'][0] <= 0
         ):
+            excluded['昨日量价无效'] += 1
             continue
 
         avg_price_increase_value = (
@@ -617,6 +639,7 @@ def l0_get_stock_list(context):
             or prev_day_data['money'][0] < 5.5e8
             or prev_day_data['money'][0] > 20e8
         ):
+            excluded['均价或成交额不符'] += 1
             continue
 
         # --------------------------------------------------
@@ -634,6 +657,7 @@ def l0_get_stock_list(context):
         )
 
         if turnover_ratio_data.empty:
+            excluded['估值缺失'] += 1
             continue
 
         turnover_ratio = turnover_ratio_data['turnover_ratio'][0]
@@ -643,7 +667,7 @@ def l0_get_stock_list(context):
             or turnover_ratio < g.l0.turnover_min
             or turnover_ratio > g.l0.turnover_max
         ):
-            print(
+            log.info(
                 '【换手率过滤】{} {} | 昨日换手率:{}'
                 .format(
                     s,
@@ -653,12 +677,14 @@ def l0_get_stock_list(context):
                     else '{:.2f}%'.format(turnover_ratio)
                 )
             )
+            excluded['换手率不符'] += 1
             continue
 
         if (
             turnover_ratio_data['market_cap'][0] < 70
             or turnover_ratio_data['circulating_market_cap'][0] > 520
         ):
+            excluded['市值不符'] += 1
             continue
 
         # --------------------------------------------------
@@ -670,7 +696,7 @@ def l0_get_stock_list(context):
         )
 
         if not board_passed:
-            print(
+            log.info(
                 '【首板质量过滤】{} {} | {}'
                 .format(
                     s,
@@ -678,6 +704,7 @@ def l0_get_stock_list(context):
                     board_info['reason']
                 )
             )
+            excluded['首板质量不符'] += 1
             continue
 
         # --------------------------------------------------
@@ -691,12 +718,14 @@ def l0_get_stock_list(context):
         )
 
         if auction_data is None or auction_data.empty:
+            excluded['竞价缺失'] += 1
             continue
 
         if (
             prev_day_data['volume'][-1] is None
             or prev_day_data['volume'][-1] <= 0
         ):
+            excluded['昨日成交量无效'] += 1
             continue
 
         auction_volume_ratio = (
@@ -706,6 +735,7 @@ def l0_get_stock_list(context):
 
         # 原竞价量硬门槛 >=3%
         if auction_volume_ratio < 0.03:
+            excluded['竞价量比不符'] += 1
             continue
 
         current_ratio = (
@@ -715,6 +745,7 @@ def l0_get_stock_list(context):
 
         # 原高开范围：0%～6%
         if current_ratio <= 1 or current_ratio >= 1.06:
+            excluded['高开幅度不符'] += 1
             continue
 
         # --------------------------------------------------
@@ -729,6 +760,7 @@ def l0_get_stock_list(context):
         )
 
         if hst is None or len(hst) < 2:
+            excluded['历史行情不足'] += 1
             continue
 
         prev_high = hst['high'].iloc[-1]
@@ -753,6 +785,7 @@ def l0_get_stock_list(context):
             or volume_data.iloc[-1]
             <= volume_data.iloc[:-1].max() * 0.9
         ):
+            excluded['左压条件不符'] += 1
             continue
 
         # --------------------------------------------------
@@ -776,7 +809,7 @@ def l0_get_stock_list(context):
             'score_detail': score_detail
         })
 
-        print(
+        log.info(
             '【候选评分】{} {} | 总分{:.1f} | 换手{:.2f}% | '
             '首封{} | 炸板{}次 | 回封{} | 竞价量比{:.2f}% | 高开{:.2f}%'
             .format(
@@ -807,10 +840,10 @@ def l0_get_stock_list(context):
     qualified_stocks = [x['stock'] for x in top_candidates]
 
     if scored_candidates:
-        print('========== 今日候选质量排名 ==========')
+        log.info('========== 今日候选质量排名 ==========')
 
         for i, item in enumerate(scored_candidates, 1):
-            print(
+            log.info(
                 '第{}名 {} {} | 分数{:.1f} | 换手{:.2f}% | '
                 '首封{} | 炸板{}次 | 回封{} | 竞价量比{:.2f}%'
                 .format(
@@ -827,12 +860,21 @@ def l0_get_stock_list(context):
             )
 
     if qualified_stocks:
-        print('今日最终选股Top{}：{}'.format(
+        log.info('今日最终选股Top{}：{}'.format(
             g.l0.max_buy_num,
             qualified_stocks
         ))
-        print('首板高开：' + str(qualified_stocks))
+        log.info('首板高开：' + str(qualified_stocks))
 
+    log.info('【选股筛选汇总】首板候选{}只 | 通过全部条件{}只 | {}'.format(
+        len(target_list), len(scored_candidates),
+        ' | '.join('{}{}只'.format(reason, count) for reason, count in excluded.items())))
+    missing = sum(excluded[reason] for reason in (
+        '昨日行情缺失', '昨日量价无效', '估值缺失', '竞价缺失',
+        '昨日成交量无效', '历史行情不足'))
+    if missing:
+        log.warning('【选股数据提示】{}只候选因数据缺失、无效或不足被跳过，不能视为正常条件淘汰'.format(missing))
+    log.info('【选股结束】最终候选{}只：{}'.format(len(qualified_stocks), qualified_stocks))
     return qualified_stocks
 
 
@@ -843,9 +885,13 @@ def l0_prepare_stock_list(context):
     yesterday = context.previous_date
 
     initial_list = l0_set_stockpool(context)
+    log.info('【基础股票池】全市场{}只'.format(len(initial_list)))
     initial_list = l0_filter_kcbj_stock(initial_list)
+    log.info('【基础股票池】板块过滤后{}只'.format(len(initial_list)))
     initial_list = l0_filter_st_paused_stock(initial_list, today)
+    log.info('【基础股票池】ST及停牌过滤后{}只'.format(len(initial_list)))
     initial_list = l0_filter_new_stock(initial_list, today)
+    log.info('【基础股票池】新股过滤后{}只'.format(len(initial_list)))
 
     # 首次运行，添加前2天的数据
     if not g.l0.n_days_limit_up_list:

@@ -45,8 +45,14 @@ def _load_prepare_fn(ns):
 def _make_ns():
     hl_by_day = {SEP28: list(HL28), SEP29: list(HL29), SEP30: list(HL30)}
     g = SimpleNamespace(l0=SimpleNamespace(n_days_limit_up_list=[]))
+    log_lines: list = []
+    log = SimpleNamespace(
+        info=lambda msg, *a, **k: log_lines.append(("info", msg)),
+        warning=lambda msg, *a, **k: log_lines.append(("warning", msg)),
+    )
     ns = {
         "g": g,
+        "log": log,
         "get_trade_days": lambda end_date=None, count=None: [SEP28, SEP29, SEP30],
         "l0_get_hl_stock": lambda stock_list, day, n=1: list(hl_by_day[day]),
         "l0_set_stockpool": lambda ctx: ["STOCK_A", "STOCK_B", "STOCK_C", "STOCK_Z"],
@@ -54,7 +60,7 @@ def _make_ns():
         "l0_filter_st_paused_stock": lambda lst, today: lst,
         "l0_filter_new_stock": lambda lst, today: lst,
     }
-    return g, ns
+    return g, ns, log_lines
 
 
 def _make_context():
@@ -67,7 +73,7 @@ def _make_context():
 def test_repeat_yesterday_does_not_evict_window():
     # seed window [hl29, hl30] 后连续调 yesterday=Sep30 三次，
     # pool 应始终 == hl30-hl29 且窗口不变
-    g, ns = _make_ns()
+    g, ns, log_lines = _make_ns()
     prepare = _load_prepare_fn(ns)
     ctx = _make_context()
 
@@ -83,3 +89,8 @@ def test_repeat_yesterday_does_not_evict_window():
     window_after_repeats = [sorted(w) for w in g.l0.n_days_limit_up_list]
     assert window_after_repeats == window_after_first
     assert len(g.l0.n_days_limit_up_list) == 2
+    # 基础股票池分阶段统计走 log 通道（页面日志可见），而非 print（文件缓冲、
+    # SIGTERM 可丢——2026-10-12 sb_gaokai_sim 盘前无输出误判的根因之一）
+    stages = [m for lv, m in log_lines if lv == "info" and m.startswith("【基础股票池】")]
+    assert len(stages) == 4 * 3
+    assert stages[0] == "【基础股票池】全市场4只"
