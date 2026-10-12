@@ -507,6 +507,8 @@ def test_strategy_loop_replays_history_then_live(tmp_quant, monkeypatch):
 
 def test_replay_pins_minute_window_and_preloads_pool(tmp_quant, monkeypatch):
     """补跑前必须钉住整个区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源。"""
+    # 非抢跑期语义：钉死 _in_rush_window，避免套件恰在 09:24–09:30 跑时误跳预载。
+    monkeypatch.setattr(runner, "_in_rush_window", lambda *a, **k: False)
     today = datetime.date.today()
     days = [today - datetime.timedelta(days=n) for n in (4, 3, 2, 1)]
     save_strategy("s_pin", "s", STRATEGY_BUY)
@@ -981,3 +983,125 @@ def handle_data(context):
     assert api._state["ctx"].g.bar_calls == 1
     trades = db.get_sim_trades(aid)
     assert len(trades) == 1 and trades[0]["ts"] == "2026-10-12 09:26:00"
+
+
+def _rush_clock(monkeypatch, now):
+    """把 runner.datetime 换成固定时钟（同 _fire_preopen_daily 测试的 ClockModule 形态）。"""
+    day = now.date()
+
+    class ClockDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    class ClockDate(datetime.date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(runner, "datetime", SimpleNamespace(
+        datetime=ClockDateTime, date=ClockDate,
+        time=datetime.time, timedelta=datetime.timedelta))
+
+
+def _rush_replay_setup(tmp_quant, monkeypatch, now):
+    """rush 测试共用桩：09:xx 重启走 _replay_history 当日段，无历史整日可补。"""
+    _rush_clock(monkeypatch, now)
+    monkeypatch.setattr(runner, "_is_trading_day", lambda dm, today: True)
+    monkeypatch.setattr(runner, "_send_dingtalk_async", lambda *a, **k: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    days = [datetime.date(2026, 10, 9), datetime.date(2026, 10, 12)]
+
+    class RushDM(_replay_dm_cls(days)):
+        def __init__(self):
+            super().__init__()
+            self.daily_preloads = 0
+
+        def preload_daily(self, *a, **k):
+            self.daily_preloads += 1
+
+    dm = RushDM()
+    pool_calls = []
+    orig_pool = RushDM.preload_minute_for_pool
+
+    def counting_pool(self, codes, as_of=None, span_days=None):
+        pool_calls.append(list(codes) if codes else [])
+        return orig_pool(self, codes, as_of=as_of, span_days=span_days)
+
+    monkeypatch.setattr(RushDM, "preload_minute_for_pool", counting_pool)
+    save_strategy("s_rush", "s", STRATEGY_BUY)
+    aid = service.account_create("acct_rush", 100000.0, 0.03, "s_rush", "2026-10-09")
+    bundle = SimpleNamespace(daily=[], before_trading_start=None,
+                            minute=[], handle_data=None)
+    ctx = SimpleNamespace(
+        portfolio=SimpleNamespace(positions={}, cash=100000.0),
+        universe=["510300.XSHG"], current_dt=None, g=SimpleNamespace())
+    jq_api = SimpleNamespace(
+        on_new_day=lambda: None,
+        get_trade_days=lambda *a, **k: ["2026-10-09", "2026-10-12"],
+        _state={})
+    state = {"cash": 100000.0, "start_cash": 100000.0, "net_value": 100000.0,
+             "pnl": 0.0, "positions": {}, "stop_loss_log": [], "dt": None}
+    aux = {"jq_api": jq_api, "start_cash": 100000.0, "fired": set(),
+           "fresh_frames": {}, "trades_drained": 0, "last_bar": None,
+           "frequency": "minute", "daily_done": None, "dm": dm}
+    return dm, pool_calls, aid, bundle, ctx, state, aux
+
+
+def test_rush_window_restart_defers_heavy_preloads(tmp_quant, monkeypatch):
+    """回归：09:28 盘前重启时重型预载必须让路竞价窗口，窗口后补做。
+
+    2026-10-12 sb_gaokai_sim 09:28:40 重启 → 全市场日线预载(09:28:59) +
+    盘前分钟预取(09:29:21) 串行吃掉 09:25:05–09:30 窗口，盘前 09:26 回调没赶上，
+    state.dt 停滞、无快照无成交。
+    """
+    dm, pool_calls, aid, bundle, ctx, state, aux = _rush_replay_setup(
+        tmp_quant, monkeypatch, datetime.datetime(2026, 10, 12, 9, 28, 30))
+    runner._replay_history(
+        aid, bundle, ctx, dm, Matcher(0.03), state, aux, "2026-10-09",
+        strategy_code="x = get_all_securities('stock')",
+        resume_after=datetime.datetime(2026, 10, 9, 15, 5))
+
+    assert dm.daily_preloads == 0       # 全市场预载推迟，不在窗口内执行
+    assert pool_calls == []             # 分钟池预取（钉窗批量 + 盘前）同样推迟
+    assert dm.window_seen is not None   # 便宜的钉窗保留
+    assert aux.get("_deferred_heavy_preload") is not None  # 窗口后补做标记
+
+
+def test_heavy_preloads_run_outside_rush_window(tmp_quant, monkeypatch):
+    """窗口外行为不变：重型预载照常执行，不留推迟标记（防过跳）。"""
+    dm, pool_calls, aid, bundle, ctx, state, aux = _rush_replay_setup(
+        tmp_quant, monkeypatch, datetime.datetime(2026, 10, 12, 10, 0, 0))
+    runner._replay_history(
+        aid, bundle, ctx, dm, Matcher(0.03), state, aux, "2026-10-09",
+        strategy_code="x = get_all_securities('stock')",
+        resume_after=datetime.datetime(2026, 10, 9, 15, 5))
+
+    assert dm.daily_preloads == 1
+    assert pool_calls != []
+    assert aux.get("_deferred_heavy_preload") is None
+
+
+def test_in_rush_window_boundaries():
+    """抢跑期判定：09:24:00 ≤ t < 09:30:00（含下界不含上界）。"""
+    assert runner._in_rush_window(datetime.datetime(2026, 10, 12, 9, 23, 59)) is False
+    assert runner._in_rush_window(datetime.datetime(2026, 10, 12, 9, 24, 0)) is True
+    assert runner._in_rush_window(datetime.datetime(2026, 10, 12, 9, 29, 59)) is True
+    assert runner._in_rush_window(datetime.datetime(2026, 10, 12, 9, 30, 0)) is False
+
+
+def test_deferred_preloads_run_after_window(tmp_quant, monkeypatch):
+    """窗口后补做：推迟标记被消费，重型预载执行一次且标记清除。"""
+    dm, pool_calls, aid, _bundle, ctx, _state, aux = _rush_replay_setup(
+        tmp_quant, monkeypatch, datetime.datetime(2026, 10, 12, 9, 28, 30))
+    aux["_deferred_heavy_preload"] = {
+        "strategy_code": "x = get_all_securities('stock')",
+        "start": "2026-10-09", "end": "2026-10-12"}
+    runner._run_deferred_heavy_preloads(aid, dm, ctx, aux)
+
+    assert dm.daily_preloads == 1
+    assert pool_calls != []
+    assert aux.get("_deferred_heavy_preload") is None
+    # 幂等：无标记时调用无副作用
+    runner._run_deferred_heavy_preloads(aid, dm, ctx, aux)
+    assert dm.daily_preloads == 1
