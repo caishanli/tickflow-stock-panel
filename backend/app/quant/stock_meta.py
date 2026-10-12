@@ -49,32 +49,43 @@ AUCTION_REG_SLOPE = 0.09
 
 _INSTR_LOCK = threading.Lock()
 _INSTR_CACHE: pd.DataFrame | None = None
+_INSTR_VERSION: tuple | None = None
 
 _EVENTS_LOCK = threading.Lock()
 _EVENTS_CACHE: dict | None = None
 
 
 def instruments_frame() -> pd.DataFrame:
-    """instruments 快照（symbol/total_shares/float_shares/listing_date），进程级缓存。"""
-    global _INSTR_CACHE
-    with _INSTR_LOCK:
-        if _INSTR_CACHE is not None:
-            return _INSTR_CACHE
+    """instruments 快照；文件原子替换后长驻进程自动刷新。"""
+    global _INSTR_CACHE, _INSTR_VERSION
     from .config import CONFIG
 
     path = os.path.join(os.path.dirname(CONFIG.db_path),
                         "instruments", "instruments.parquet")
     try:
+        stat = os.stat(path)
+        version = (path, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        with _INSTR_LOCK:
+            if _INSTR_CACHE is not None and version == _INSTR_VERSION:
+                return _INSTR_CACHE
         import polars as pl
 
-        df = pl.read_parquet(path)
+        with open(path, "rb") as stream:
+            stat = os.fstat(stream.fileno())
+            version = (path, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            df = pl.read_parquet(stream)
         out = df.select(["symbol", "name", "total_shares", "float_shares",
                          "listing_date"]).to_pandas()
     except Exception:
-        out = pd.DataFrame(columns=["symbol", "name", "total_shares",
-                                    "float_shares", "listing_date"])
+        # 短暂读失败保留旧快照，下次调用重试，避免永久缓存空帧。
+        with _INSTR_LOCK:
+            if _INSTR_CACHE is not None:
+                return _INSTR_CACHE
+        return pd.DataFrame(columns=["symbol", "name", "total_shares",
+                                     "float_shares", "listing_date"])
     with _INSTR_LOCK:
         _INSTR_CACHE = out
+        _INSTR_VERSION = version
     return out
 
 

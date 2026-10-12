@@ -45,6 +45,7 @@ CACHE_ROOT = os.path.join(_REPO_ROOT, "data", "auction_cache")
 _lock = threading.Lock()
 _memory_cache: dict[str, pd.DataFrame] = {}  # date_iso -> DataFrame
 _memory_versions: dict[str, tuple] = {}
+_universe_cache: dict[str, list[str]] = {}
 
 
 def _now() -> _dt.datetime:
@@ -313,6 +314,32 @@ def ensure_auction(codes: list[str], day: _dt.date,
     return len(rows)
 
 
+def _market_codes(day: _dt.date) -> tuple[list[str], bool]:
+    """合并维表与 stockdata 名录，避免单交易所同步失败漏掉整块市场。"""
+    from .stock_meta import instruments_frame
+
+    ins = instruments_frame()
+    codes = ins["symbol"].tolist() if "symbol" in ins.columns else []
+    key = day.isoformat()
+    with _lock:
+        network_codes = _universe_cache.get(key)
+    if network_codes is None:
+        from .datasource.network_client import StockDataClient
+
+        try:
+            securities = StockDataClient(timeout=20).get_all_securities(["stock"])
+            network_codes = securities["symbol"].dropna().tolist()
+            if not network_codes:
+                raise LookupError("stockdata 股票名录为空")
+            with _lock:
+                _universe_cache.clear()
+                _universe_cache[key] = network_codes
+        except Exception as exc:
+            logger.warning("[auction] stockdata 名录读取失败，使用维表并继续重试: %s", exc)
+            return list(dict.fromkeys(_to_jq_code(c) for c in codes)), False
+    return list(dict.fromkeys(_to_jq_code(c) for c in [*codes, *network_codes])), True
+
+
 def fetch_and_save(day: _dt.date | None = None,
                    codes: list[str] | None = None) -> pd.DataFrame:
     """窗口内分批补齐缺失标的，每批立即发布，供 09:26 策略读取。"""
@@ -321,12 +348,9 @@ def fetch_and_save(day: _dt.date | None = None,
         day = now.date()
     if day != now.date() or not _in_auction_window(now):
         return pd.DataFrame()
-    from .stock_meta import instruments_frame
-
+    universe_complete = True
     if codes is None:
-        ins = instruments_frame()
-        # instruments_frame 返回 pandas 帧（stock_meta.py:57-78），取 symbol 列
-        codes = ins["symbol"].tolist() if "symbol" in ins.columns else []
+        codes, universe_complete = _market_codes(day)
     else:
         codes = list(codes)
 
@@ -338,6 +362,12 @@ def fetch_and_save(day: _dt.date | None = None,
     df = load_day(day)
     df = df.copy() if df is not None else pd.DataFrame()
     known = set(df["symbol"]) if not df.empty else set()
-    df.attrs["complete"] = bool(codes) and set(codes).issubset(known)
+    df.attrs["complete"] = universe_complete and bool(codes) and set(codes).issubset(known)
+    df.attrs["universe_complete"] = universe_complete
+    df.attrs["target"] = len(codes)
     df.attrs["missing"] = len(set(codes) - known)
+    logger.info("[auction] 名单 %d 只，已覆盖 %d 只，缺失 %d 只，名录完整=%s",
+                len(codes), len(set(codes) & known), df.attrs["missing"], universe_complete)
+    if df.attrs["missing"]:
+        logger.warning("[auction] 缺失标的示例: %s", ",".join(sorted(set(codes) - known)[:10]))
     return df

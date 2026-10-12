@@ -16,6 +16,11 @@ from app.quant import auction_cache
 @pytest.fixture(autouse=True)
 def auction_clock(monkeypatch):
     monkeypatch.setattr(auction_cache, "_now", lambda: datetime.datetime(2026, 10, 12, 9, 26))
+    from app.quant.datasource.network_client import StockDataClient
+
+    monkeypatch.setattr(StockDataClient, "get_all_securities",
+                        lambda *a, **k: pd.DataFrame({"symbol": ["600000.SH", "000001.SZ"]}))
+    monkeypatch.setattr(auction_cache, "_universe_cache", {})
 
 
 class _FakeInstruments:
@@ -209,3 +214,70 @@ def test_fetch_and_save_caches_jq_symbols_for_strategy_lookup(monkeypatch, tmp_p
     assert set(df["symbol"]) == {"600000.XSHG", "000001.XSHE"}
     assert auction_cache.lookup("600000.XSHG", day) == (123400.0, 10.50)
     assert auction_cache.lookup("000001.XSHE", day) == (123400.0, 10.50)
+
+
+def test_default_collection_includes_shenzhen_when_instruments_are_partial(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    import app.quant.stock_meta as sm
+
+    monkeypatch.setattr(sm, "instruments_frame", lambda: pd.DataFrame({"symbol": ["600000.SH"]}))
+    df = auction_cache.fetch_and_save()
+    assert set(df.symbol) == {"600000.XSHG", "000001.XSHE"}
+    assert df.attrs["target"] == 2 and df.attrs["complete"] is True
+
+
+def test_partial_catalog_fallback_never_claims_complete_market(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    from app.quant.datasource.network_client import StockDataClient
+
+    def fail(*args, **kwargs):
+        raise ConnectionError("stockdata unavailable")
+
+    monkeypatch.setattr(StockDataClient, "get_all_securities", fail)
+    df = auction_cache.fetch_and_save()
+    assert not df.empty and df.attrs["complete"] is False
+    assert df.attrs["universe_complete"] is False
+
+
+def test_network_market_catalog_is_reused_only_within_same_day(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    from app.quant.datasource.network_client import StockDataClient
+    calls = []
+
+    def catalog(*args, **kwargs):
+        calls.append(1)
+        return pd.DataFrame({"symbol": ["600000.SH", "000001.SZ"]})
+
+    monkeypatch.setattr(StockDataClient, "get_all_securities", catalog)
+    auction_cache.fetch_and_save()
+    auction_cache.fetch_and_save()
+    assert calls == [1]
+
+
+def test_instruments_memory_cache_refreshes_after_atomic_restore(monkeypatch, tmp_path):
+    import os
+    from types import SimpleNamespace
+
+    import polars as pl
+
+    import app.quant.config as config
+    import app.quant.stock_meta as sm
+
+    monkeypatch.setattr(config, "CONFIG", SimpleNamespace(db_path=str(tmp_path / "quant.db")))
+    monkeypatch.setattr(sm, "_INSTR_CACHE", None)
+    monkeypatch.setattr(sm, "_INSTR_VERSION", None)
+    path = tmp_path / "instruments" / "instruments.parquet"
+    path.parent.mkdir()
+
+    def frame(symbols):
+        return pl.DataFrame({"symbol": symbols, "name": symbols,
+                             "total_shares": [100] * len(symbols),
+                             "float_shares": [100] * len(symbols),
+                             "listing_date": ["2000-01-01"] * len(symbols)})
+
+    frame(["600000.SH"]).write_parquet(path)
+    assert list(sm.instruments_frame().symbol) == ["600000.SH"]
+    temporary = path.with_suffix(".tmp")
+    frame(["600000.SH", "000001.SZ"]).write_parquet(temporary)
+    os.replace(temporary, path)
+    assert set(sm.instruments_frame().symbol) == {"600000.SH", "000001.SZ"}

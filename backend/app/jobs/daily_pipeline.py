@@ -1,7 +1,7 @@
 """盘后管道 + 盘前维表同步。
 
 调度:
-  09:10 盘前 — 同步个股维表 instruments (全量覆盖)
+  09:05 / 09:10 / 09:15 盘前 — 同步个股维表，成功后跳过当天后续轮次
   15:30 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
 
 盘后同步策略:
@@ -10,12 +10,19 @@
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
+import threading
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -30,6 +37,7 @@ from app.tickflow.repository import KlineRepository
 logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[..., None]
+_pre_market_instruments_lock = threading.Lock()
 
 
 class PipelineStageError(RuntimeError):
@@ -96,7 +104,7 @@ def run_instruments_sync(repo: KlineRepository) -> dict:
     维表含当日涨跌停价 (limit_up/down), 同步完成后刷新 enriched 内存缓存,
     确保跨天后连板梯队/选股等读到的是基于最新维表的数据 (而非前一交易日残留)。
     """
-    rows = instrument_sync.sync_instruments(repo.store.data_dir)
+    rows = instrument_sync.sync_instruments(repo.store.data_dir, require_complete=True)
     _refresh_instruments_view(repo)
     _invalidate("instruments")
     # 维表更新后重建 enriched 缓存 (clear + refresh, 与设置页「清理并刷新」同等效果)
@@ -104,6 +112,57 @@ def run_instruments_sync(repo: KlineRepository) -> dict:
         repo.clear_cache()
         repo.refresh_cache()
     return {"instruments_rows": rows}
+
+
+def instruments_schedule_trigger(schedule: dict) -> OrTrigger:
+    """首次时间后每五分钟重试，最多三轮且不晚于北京时间 09:15。"""
+    start = schedule["hour"] * 60 + schedule["minute"]
+    return OrTrigger([
+        CronTrigger(day_of_week="mon-fri", hour=minute // 60, minute=minute % 60,
+                    timezone="Asia/Shanghai")
+        for minute in (start, start + 5, start + 10)
+        if minute <= 9 * 60 + 15
+    ])
+
+
+def _run_pre_market_instruments(repo: KlineRepository) -> None:
+    """只在当日尚未全量同步成功时运行；成功标记落盘以跨重启去重。"""
+    if not _pre_market_instruments_lock.acquire(blocking=False):
+        logger.info("盘前维表同步跳过：前一轮仍在运行")
+        return
+    try:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        marker = repo.store.data_dir / "user_data" / "instruments_sync_success.json"
+        try:
+            if json.loads(marker.read_text(encoding="utf-8")).get("date") == today:
+                logger.info("盘前维表同步跳过：%s 已全量同步成功", today)
+                return
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError):
+            logger.warning("盘前维表成功标记无法读取，重新尝试同步", exc_info=True)
+
+        def task(on_progress=None):
+            emit = on_progress or _noop
+            emit("sync_instruments", 0, "同步个股维表…")
+            result = run_instruments_sync(repo)
+            emit("done", 100, f"个股维表同步完成,{result['instruments_rows']} 只标的")
+            return result
+
+        if not _run_tracked(task, "instruments_sync"):
+            logger.warning("盘前维表本轮未成功，后续轮次继续尝试")
+            return
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=marker.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"date": today}, stream)
+            os.replace(temporary, marker)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        logger.info("盘前维表 %s 全量同步成功，跳过当天后续轮次", today)
+    finally:
+        _pre_market_instruments_lock.release()
 
 
 def run_now(
@@ -1015,7 +1074,7 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
 def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
     """启动调度器。
 
-    工作日 09:10 — 同步个股维表
+    工作日 09:05 / 09:10 / 09:15 — 同步个股维表，成功后跳过后续轮次
     工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 15:30）
     """
     from app.services import preferences
@@ -1024,23 +1083,16 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
 
     scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 
-    # 盘前: 同步 instruments（时间由偏好决定）
-    def _instruments_task(on_progress=None):
-        emit = on_progress or _noop
-        emit("sync_instruments", 0, "同步个股维表…")
-        result = run_instruments_sync(repo)
-        emit("done", 100, f"个股维表同步完成,{result.get('instruments_rows', 0)} 只标的")
-        return result
-
+    # 同一个 job 负责三个时点，沿用单飞任务槽，并在成功后每日去重。
+    inst_trigger = instruments_schedule_trigger(inst_sched)
     scheduler.add_job(
-        lambda: _run_tracked(_instruments_task, "instruments_sync"),
-        trigger=CronTrigger(day_of_week="mon-fri",
-                            hour=inst_sched["hour"], minute=inst_sched["minute"],
-                            timezone="Asia/Shanghai"),
+        lambda: _run_pre_market_instruments(repo),
+        trigger=inst_trigger,
         id="pre_market_instruments",
         misfire_grace_time=1800,
         replace_existing=True,
     )
+    logger.info("盘前维表已注册: %s；当日全量成功后跳过后续轮次", inst_trigger)
 
     # 盘后: 日 K + enriched（时间由偏好决定）
     def _pipeline_then_refresh(on_progress=None):

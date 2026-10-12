@@ -479,9 +479,9 @@ def set_pipeline_schedule(hour: int, minute: int) -> dict:
 
 
 def get_instruments_schedule() -> dict:
-    """返回盘前标的维表调度时间 {"hour": 9, "minute": 10}。"""
-    d = load().get("instruments_schedule", {"hour": 9, "minute": 10})
-    return {"hour": d.get("hour", 9), "minute": d.get("minute", 10)}
+    """返回盘前首轮同步时间，默认 09:05；失败时每五分钟重试至 09:15。"""
+    d = load().get("instruments_schedule", {"hour": 9, "minute": 5})
+    return {"hour": d.get("hour", 9), "minute": d.get("minute", 5)}
 
 
 def set_instruments_schedule(hour: int, minute: int) -> dict:

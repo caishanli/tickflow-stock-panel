@@ -8,6 +8,8 @@ Starter+ 盘后可用 quotes.get(universes) 顺便补充 name。
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -71,34 +73,67 @@ def _fetch_instruments_via_provider() -> list[dict] | None:
     return rows
 
 
-def sync_instruments(data_dir: Path) -> int:
+def sync_instruments(data_dir: Path, *, require_complete: bool = False) -> int:
     """全量同步标的维表 → data/instruments/instruments.parquet。
 
     返回写入的行数。
     """
     all_rows = _fetch_instruments_via_provider()
+    retained = None
+    out = data_dir / "instruments" / "instruments.parquet"
     if all_rows is None:
         # 未命中非 tickflow provider → 走 tickflow 直连
         tf = get_client()
         all_rows = []
+        failed = []
         for ex in _EXCHANGES:
             try:
                 items = tf.exchanges.get_instruments(ex, instrument_type="stock")
                 if items:
                     all_rows.extend(_flatten_instruments(items))
                     logger.info("instruments %s: %d stocks", ex, len(items))
+                else:
+                    failed.append(ex)
+                    logger.warning("get_instruments(%s) returned no stocks", ex)
             except Exception as e:
+                failed.append(ex)
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
 
+        if failed:
+            if require_complete:
+                raise RuntimeError(
+                    f"instruments {','.join(failed)} 同步失败，保留原文件，等待下一轮重试")
+            old = pl.read_parquet(out) if out.exists() else pl.DataFrame()
+            parts = []
+            for ex in failed:
+                cached = (old.filter(pl.col("exchange") == ex)
+                          if "exchange" in old.columns else pl.DataFrame())
+                if cached.is_empty():
+                    raise RuntimeError(
+                        f"instruments {ex} 同步失败且无旧快照，保留原文件，拒绝发布残缺名录")
+                parts.append(cached)
+                logger.warning("instruments %s 同步失败，保留旧快照 %d 只", ex, cached.height)
+            retained = pl.concat(parts, how="diagonal_relaxed")
+
     if not all_rows:
+        if require_complete:
+            raise RuntimeError("instruments 返回空名录，保留原文件，等待下一轮重试")
         return 0
 
     df = pl.DataFrame(all_rows)
     df = df.with_columns(pl.lit(date.today()).alias("as_of"))
+    if retained is not None:
+        # 旧交易所行保留原 as_of，不能把旧股本标成今日新数据。
+        df = pl.concat([df, retained], how="diagonal_relaxed")
 
-    out = data_dir / "instruments" / "instruments.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(out)
+    fd, temporary = tempfile.mkstemp(dir=out.parent, suffix=".tmp")
+    os.close(fd)
+    try:
+        df.write_parquet(temporary)
+        os.replace(temporary, out)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
     logger.info("instruments synced: %d rows → %s", df.height, out)
     return df.height

@@ -1526,19 +1526,14 @@ def update_instruments_schedule(req: PipelineScheduleIn, request: Request) -> di
     from app.services import preferences
     sched = preferences.set_instruments_schedule(req.hour, req.minute)
 
-    from apscheduler.triggers.cron import CronTrigger
+    from app.jobs.daily_pipeline import instruments_schedule_trigger
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler:
         scheduler.reschedule_job(
             "pre_market_instruments",
-            trigger=CronTrigger(
-                day_of_week="mon-fri",
-                hour=sched["hour"],
-                minute=sched["minute"],
-                timezone="Asia/Shanghai",
-            ),
+            trigger=instruments_schedule_trigger(sched),
         )
-        return sched
+    return sched
 
 
 class EnrichedBatchSizeIn(BaseModel):

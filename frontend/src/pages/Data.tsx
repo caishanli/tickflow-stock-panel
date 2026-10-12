@@ -202,7 +202,11 @@ export function Data() {
 
   const minuteAuto = prefs.data?.minute_sync_enabled ?? false
   const pipelineSched = prefs.data?.pipeline_schedule ?? { hour: 15, minute: 30 }
-  const instrumentsSched = prefs.data?.instruments_schedule ?? { hour: 9, minute: 10 }
+  const instrumentsSched = prefs.data?.instruments_schedule ?? { hour: 9, minute: 5 }
+  const instrumentsRounds = [0, 5, 10]
+    .map(offset => instrumentsSched.hour * 60 + instrumentsSched.minute + offset)
+    .filter(minute => minute <= 9 * 60 + 15)
+    .map(minute => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`)
   const indexDailyBatchSize = prefs.data?.index_daily_batch_size ?? 100
 
   useEffect(() => {
@@ -732,12 +736,12 @@ export function Data() {
                   <span className="text-muted">时区</span>
                   <span className="font-mono text-secondary">Asia/Shanghai</span>
                 </div>
-                <div className="flex items-center justify-between text-[11px]">
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px]">
                   <div className="flex items-center gap-1">
                     <span className="text-muted">盘前 · 个股维表</span>
                     <span className="text-muted/50">·</span>
                     <span className="font-mono text-secondary">
-                      {`${String(instrumentsSched.hour).padStart(2, '0')}:${String(instrumentsSched.minute).padStart(2, '0')}`}
+                      {instrumentsRounds.join(' / ')}
                     </span>
                     <button
                       onClick={() => setShowInstScheduleEdit(v => !v)}
@@ -761,6 +765,7 @@ export function Data() {
                     )}
                   </div>
                 </div>
+                <p className="text-[10px] text-muted">失败后下一轮重试，当天成功后跳过后续轮次</p>
                 <AnimatePresence>
                   {showInstScheduleEdit && (
                     <motion.div
@@ -774,7 +779,7 @@ export function Data() {
                         value={instrumentsSched}
                         onSave={(h, m) => updateInstSchedule.mutate({ hour: h, minute: m })}
                         loading={updateInstSchedule.isPending}
-                        hint="不晚于 09:15"
+                        hint="首次同步时间，失败后每 5 分钟重试，最多三轮，最晚 09:15"
                       />
                     </motion.div>
                   )}
