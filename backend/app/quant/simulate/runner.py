@@ -542,6 +542,42 @@ def _daily_due(task_time: str, bar_dt) -> bool:
     return t >= hhmm if hhmm else False
 
 
+def _in_rush_window(now=None) -> bool:
+    """是否处于竞价抢跑期（09:24:00 ≤ t < 09:30:00）：重型预载必须让路。
+
+    竞价撮合 09:25:00 完成、09:25:05 起可抓，09:30 连续竞价开始。_replay_history
+    的全市场 preload_daily、分钟池批量预取、_pre_market 的日历探测（15s 超时
+    网络调用）都是同步串行——09:28 重启实测 45s+ 才进主循环（2026-10-12
+    sb_gaokai_sim：预载 09:28:59、预取 09:29:21），盘前 09:26 回调赶不上窗口。
+    跳过的都是优化项（批量路径/滑窗/单条 warn），回退路径保证正确性；窗口后由
+    _run_deferred_heavy_preloads 补做一次。
+    """
+    t = (now or datetime.datetime.now()).time()
+    return datetime.time(9, 24) <= t < datetime.time(9, 30)
+
+
+def _run_deferred_heavy_preloads(account_id: str, dm, ctx, aux: dict) -> None:
+    """执行窗口期推迟的重型预载（幂等；失败保留标记下轮重试）。
+
+    补做结束必须复位钉住的分钟窗口（与 _replay_history 的 finally 配对语义一致）：
+    否则 _minute_win 钉死在补跑区间、实时预取永远走 full 窗口，且 set 钉窗时
+    清掉的实时分钟帧要重新回源。
+    """
+    spec = aux.get("_deferred_heavy_preload")
+    if not spec or dm is None:
+        return
+    try:
+        _pin_replay_minute_window(dm, ctx, spec.get("start"), spec.get("end"))
+        if _GET_ALL_SECURITIES_STOCK_RE.search(spec.get("strategy_code") or ""):
+            dm.preload_daily(fq="pre")
+        aux.pop("_deferred_heavy_preload", None)
+        _emit_log(account_id, "info", "竞价窗口后补做重型预载完成")
+    except Exception as e:
+        log.warning("[replay] 窗口后补做预载失败（下轮重试）: %s", e)
+    finally:
+        _unset_replay_minute_window(dm)
+
+
 def _replay_feed_codes(ctx, bundle, aux, bar_dt):
     """补跑取价范围决策：返回"只取这些标的"的列表，``None`` 表示取全池。
 
@@ -689,7 +725,9 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
         # （probe=今天），而锚点按定义是"今天之前最后一个交易日"，两者本就不
         # 该相等——拿今天的 probe 比对必然每个交易日误报。
         replay = bool(aux.get("replay_mode")) if aux is not None else False
-        probe_end = tcal.probe_recent_anchor() if not replay else None
+        # 抢跑期内跳过 15s 超时网络探测：只丢一条 warn 级对账信号，不影响交易。
+        probe_end = tcal.probe_recent_anchor() \
+            if (not replay and not _in_rush_window()) else None
         if probe_end is not None and probe_end >= str(now.date()):
             probe_end = None
         # 补跑模式不做漂移判定：引擎日历末端固定为「数据末端」（如 09-29），
@@ -730,7 +768,10 @@ def _pre_market(account_id: str, bundle, ctx, fired: set, jq_api, now,
     # 补跑加速：把当日宇宙新增标的的分钟数据一次性批量预取（一次服务端批量
     # scan），替代逐 bar 逐标的滑窗加载。全市场选股类策略每日轮动 ~百只新码，
     # 每码要拼 ~40 个分钟分区，惰性加载是补跑 2-3 分钟/天的主因。
-    if aux is not None and aux.get("replay_mode") and dm is not None:
+    # 抢跑期内跳过：窗口后由 _run_deferred_heavy_preloads 补做；盘前回调
+    # （_fire_preopen_daily）不需要分钟 bar（minute_prices 置空）。
+    if aux is not None and aux.get("replay_mode") and dm is not None \
+            and not _in_rush_window():
         pre = getattr(dm, "preload_minute_for_pool", None)
         uni = list(getattr(ctx, "universe", None) or [])
         if pre is not None and uni:
@@ -1013,7 +1054,14 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         today = from_ts.date()
         now = datetime.datetime.now()
         # 钉住补跑区间分钟窗口并批量预取池（当日场景，窗口即为当天）
-        _pin_replay_minute_window(dm, ctx, from_ts, today)
+        # 抢跑期内只钉窗口、预取推迟（同 _replay_history）。
+        _partial_rush = _in_rush_window(now)
+        if _partial_rush:
+            aux["_deferred_heavy_preload"] = {
+                "strategy_code": "",
+                "start": str(from_ts)[:10], "end": str(today),
+            }
+        _pin_replay_minute_window(dm, ctx, from_ts, today, skip_preload=_partial_rush)
         if now.time() >= datetime.time(9, 25) and from_ts.time() < datetime.time(15, 5):
             pre_time = max(from_ts, datetime.datetime.combine(today, datetime.time(9, 25)))
             _pre_market(account_id, bundle, ctx, aux["fired"], aux["jq_api"],
@@ -1052,11 +1100,13 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         _unset_replay_minute_window(dm)
 
 
-def _pin_replay_minute_window(dm, ctx, start, end) -> None:
+def _pin_replay_minute_window(dm, ctx, start, end, *, skip_preload: bool = False) -> None:
     """补跑前把整个补跑区间钉为分钟窗口并批量预取池，消除逐日滑动窗口的重复回源。
 
     回测由 rqalpha_bridge 在启动前 set_minute_window；模拟盘补跑此处补上同口径。
     用 hasattr 兜底：stub DM（既有测试）无此方法时静默跳过，不影响行为。
+    skip_preload（抢跑期）：只钉窗口不做批量预取，预取由窗口后的
+    _run_deferred_heavy_preloads 补做。
     """
     if dm is None:
         return
@@ -1087,7 +1137,7 @@ def _pin_replay_minute_window(dm, ctx, start, end) -> None:
             list(getattr(ctx, "universe", None) or [])
             + (list(pf.positions.keys()) if pf is not None else [])))
     preload = getattr(dm, "preload_minute_for_pool", None)
-    if preload is not None and codes:
+    if preload is not None and codes and not skip_preload:
         try:
             preload(codes, pd.Timestamp(start), span_days=2)
         except Exception as e:
@@ -1132,7 +1182,15 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
             resume_after is None
             or datetime.datetime.combine(d, datetime.time(15, 5)) > resume_after)]
         # 钉住整个补跑区间分钟窗口并批量预取池，否则滑窗导致池内标的逐日网络回源
-        _pin_replay_minute_window(dm, ctx, start_date, today)
+        # 抢跑期内只钉窗口、批量预取推迟到窗口后（_run_deferred_heavy_preloads），
+        # 否则重型预载串行吃掉仅 ~5 分钟的竞价窗口（2026-10-12 sb_gaokai_sim 实测）。
+        rush = _in_rush_window(now)
+        if rush:
+            aux["_deferred_heavy_preload"] = {
+                "strategy_code": strategy_code or "",
+                "start": str(start_date)[:10], "end": str(today),
+            }
+        _pin_replay_minute_window(dm, ctx, start_date, today, skip_preload=rush)
         first_ts = (datetime.datetime.combine(days[0], datetime.time(9, 25))
                     if days else now)
         _emit_log(account_id, "info",
@@ -1148,8 +1206,10 @@ def _replay_history(account_id: str, bundle, ctx, dm, matcher: Matcher,
         # 让引擎 get_price 的批量路径生效。否则落逐只网络取数（4400 只/次，
         # 慢且异常被吞 → 曾出现「41 天零成交 40 秒跑完」的假补跑）。
         # 正则匹配调用形态（'stock'/"stock" 均可，注释里提到 stock 不触发）。
+        # 抢跑期内跳过（回退逐只取数保证正确），窗口后补做。
         try:
-            if dm is not None and _GET_ALL_SECURITIES_STOCK_RE.search(strategy_code or ""):
+            if dm is not None and _GET_ALL_SECURITIES_STOCK_RE.search(strategy_code or "") \
+                    and not rush:
                 dm.preload_daily(fq="pre")
                 _emit_log(account_id, "info", "全市场日线预载完成（批量 get_price 路径）")
         except Exception as e:
@@ -1599,6 +1659,10 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                 time.sleep(min(idle_interval, 1))
                 continue
             if _tick_window(now):
+                # 竞价窗口后把抢跑期推迟的重型预载补做一次（只在 09:30 后触发，
+                # 且 _run_deferred_heavy_preloads 无标记时是空操作）。
+                if now.time() >= datetime.time(9, 30):
+                    _run_deferred_heavy_preloads(account_id, dm, ctx, aux)
                 if aux["frequency"] == "daily" and aux["daily_done"] == today:
                     # 日频账户：当日唯一 tick 已完成，仍做实时打标
                     dirty = _mark_to_market(feed, dm, ctx, state,
