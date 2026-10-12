@@ -1082,6 +1082,24 @@ def test_heavy_preloads_run_outside_rush_window(tmp_quant, monkeypatch):
     assert aux.get("_deferred_heavy_preload") is None
 
 
+def test_rush_window_partial_day_defers_pin_preload(tmp_quant, monkeypatch):
+    """同日盘中重启（如 09:28）同样推迟分钟池预取；其标记不含 strategy_code，
+    窗口后补做只跑分钟预取、不跑全市场日线预载。"""
+    dm, pool_calls, aid, bundle, ctx, state, aux = _rush_replay_setup(
+        tmp_quant, monkeypatch, datetime.datetime(2026, 10, 12, 9, 28, 30))
+    runner._replay_partial_day(
+        aid, bundle, ctx, dm, Matcher(0.03), state, aux,
+        datetime.datetime(2026, 10, 12, 9, 20, 0))
+
+    assert dm.window_seen is not None
+    assert pool_calls == []
+    assert aux.get("_deferred_heavy_preload", {}).get("strategy_code") == ""
+    runner._run_deferred_heavy_preloads(aid, dm, ctx, aux)
+    assert pool_calls != []
+    assert dm.daily_preloads == 0
+    assert aux.get("_deferred_heavy_preload") is None
+
+
 def test_in_rush_window_boundaries():
     """抢跑期判定：09:24:00 ≤ t < 09:30:00（含下界不含上界）。"""
     assert runner._in_rush_window(datetime.datetime(2026, 10, 12, 9, 23, 59)) is False
@@ -1102,6 +1120,9 @@ def test_deferred_preloads_run_after_window(tmp_quant, monkeypatch):
     assert dm.daily_preloads == 1
     assert pool_calls != []
     assert aux.get("_deferred_heavy_preload") is None
+    # 补做结束复位分钟钉窗（与 _replay_history 的 finally 配对，否则实时预取
+    # 永远走 full 窗口）；warmed 帧保留在缓存内（unset 只清窗口标记）
+    assert dm.unset_seen is True
     # 幂等：无标记时调用无副作用
     runner._run_deferred_heavy_preloads(aid, dm, ctx, aux)
     assert dm.daily_preloads == 1

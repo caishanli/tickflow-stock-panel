@@ -557,7 +557,12 @@ def _in_rush_window(now=None) -> bool:
 
 
 def _run_deferred_heavy_preloads(account_id: str, dm, ctx, aux: dict) -> None:
-    """执行窗口期推迟的重型预载（幂等；失败保留标记下轮重试）。"""
+    """执行窗口期推迟的重型预载（幂等；失败保留标记下轮重试）。
+
+    补做结束必须复位钉住的分钟窗口（与 _replay_history 的 finally 配对语义一致）：
+    否则 _minute_win 钉死在补跑区间、实时预取永远走 full 窗口，且 set 钉窗时
+    清掉的实时分钟帧要重新回源。
+    """
     spec = aux.get("_deferred_heavy_preload")
     if not spec or dm is None:
         return
@@ -569,6 +574,8 @@ def _run_deferred_heavy_preloads(account_id: str, dm, ctx, aux: dict) -> None:
         _emit_log(account_id, "info", "竞价窗口后补做重型预载完成")
     except Exception as e:
         log.warning("[replay] 窗口后补做预载失败（下轮重试）: %s", e)
+    finally:
+        _unset_replay_minute_window(dm)
 
 
 def _replay_feed_codes(ctx, bundle, aux, bar_dt):
