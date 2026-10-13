@@ -600,44 +600,64 @@ def l0_get_stock_list(context):
     start = date_now + ' 09:15:00'
     end = date_now + ' 09:26:00'
 
+    # 批量预取：昨日 1 天 + 左压 101 天 + 当日竞价一次拉齐，循环内只做切分
+    # （attribute_history/逐只 get_call_auction 都是单标的网络往返；batch 口径
+    # 与原逐只调用一致：count 锚定、fq='pre'、fill_paused 默认 True）。
+    prev_frame = get_price(
+        target_list,
+        count=1,
+        frequency='daily',
+        fields=['close', 'volume', 'money'],
+        panel=False,
+        fq='pre',
+    ) if target_list else None
+    hist_frame = get_price(
+        target_list,
+        count=101,
+        frequency='daily',
+        fields=['high', 'volume'],
+        panel=False,
+        fq='pre',
+    ) if target_list else None
+    auction_frame = get_call_auction(
+        target_list,
+        start_date=start,
+        end_date=end,
+        fields=['time', 'volume', 'current'],
+    ) if target_list else None
+
     for s in target_list:
 
         # --------------------------------------------------
         # 条件一：原均价 / 成交额
         # --------------------------------------------------
-        prev_day_data = attribute_history(
-            s,
-            1,
-            '1d',
-            fields=['close', 'volume', 'money'],
-            skip_paused=True
-        )
+        prev_day_data = _rows_for_code(prev_frame, s)
 
         if prev_day_data is None or prev_day_data.empty:
             excluded['昨日行情缺失'] += 1
             continue
 
         if (
-            prev_day_data['volume'][0] is None
-            or prev_day_data['volume'][0] <= 0
-            or prev_day_data['close'][0] is None
-            or prev_day_data['close'][0] <= 0
+            prev_day_data['volume'].iloc[0] is None
+            or prev_day_data['volume'].iloc[0] <= 0
+            or prev_day_data['close'].iloc[0] is None
+            or prev_day_data['close'].iloc[0] <= 0
         ):
             excluded['昨日量价无效'] += 1
             continue
 
         avg_price_increase_value = (
-            prev_day_data['money'][0]
-            / prev_day_data['volume'][0]
-            / prev_day_data['close'][0]
+            prev_day_data['money'].iloc[0]
+            / prev_day_data['volume'].iloc[0]
+            / prev_day_data['close'].iloc[0]
             * 1.1
             - 1
         )
 
         if (
             avg_price_increase_value < 0.07
-            or prev_day_data['money'][0] < 5.5e8
-            or prev_day_data['money'][0] > 20e8
+            or prev_day_data['money'].iloc[0] < 5.5e8
+            or prev_day_data['money'].iloc[0] > 20e8
         ):
             excluded['均价或成交额不符'] += 1
             continue
@@ -710,27 +730,22 @@ def l0_get_stock_list(context):
         # --------------------------------------------------
         # 条件二：原竞价量 + 高开
         # --------------------------------------------------
-        auction_data = get_call_auction(
-            s,
-            start_date=start,
-            end_date=end,
-            fields=['time', 'volume', 'current']
-        )
+        auction_data = _rows_for_code(auction_frame, s)
 
         if auction_data is None or auction_data.empty:
             excluded['竞价缺失'] += 1
             continue
 
         if (
-            prev_day_data['volume'][-1] is None
-            or prev_day_data['volume'][-1] <= 0
+            prev_day_data['volume'].iloc[-1] is None
+            or prev_day_data['volume'].iloc[-1] <= 0
         ):
             excluded['昨日成交量无效'] += 1
             continue
 
         auction_volume_ratio = (
-            auction_data['volume'][0]
-            / prev_day_data['volume'][-1]
+            auction_data['volume'].iloc[0]
+            / prev_day_data['volume'].iloc[-1]
         )
 
         # 原竞价量硬门槛 >=3%
@@ -739,8 +754,8 @@ def l0_get_stock_list(context):
             continue
 
         current_ratio = (
-            auction_data['current'][0]
-            / prev_day_data['close'][-1]
+            auction_data['current'].iloc[0]
+            / prev_day_data['close'].iloc[-1]
         )
 
         # 原高开范围：0%～6%
@@ -751,13 +766,7 @@ def l0_get_stock_list(context):
         # --------------------------------------------------
         # 条件三：原左压
         # --------------------------------------------------
-        hst = attribute_history(
-            s,
-            101,
-            '1d',
-            fields=['high', 'volume'],
-            skip_paused=True
-        )
+        hst = _rows_for_code(hist_frame, s)
 
         if hst is None or len(hst) < 2:
             excluded['历史行情不足'] += 1
@@ -769,7 +778,7 @@ def l0_get_stock_list(context):
             (
                 i - 1
                 for i, high in enumerate(
-                    hst['high'][-3::-1],
+                    hst['high'].iloc[-3::-1],
                     2
                 )
                 if high >= prev_high
@@ -778,7 +787,7 @@ def l0_get_stock_list(context):
         )
 
         zyts = zyts_0 + 5
-        volume_data = hst['volume'][-zyts:]
+        volume_data = hst['volume'].iloc[-zyts:]
 
         if (
             len(volume_data) < 2
@@ -893,28 +902,43 @@ def l0_prepare_stock_list(context):
     initial_list = l0_filter_new_stock(initial_list, today)
     log.info('【基础股票池】新股过滤后{}只'.format(len(initial_list)))
 
-    # 首次运行，添加前2天的数据
+    # 首次运行：一次 count=3 拉齐 seed 2 天 + 昨日，逐日切分，
+    # 替代 3 次全市场 batch 取数（见 _hl_from_frame）。
     if not g.l0.n_days_limit_up_list:
         days = get_trade_days(
             end_date=yesterday,
             count=3
-        )[:-1]
+        )
+        seed_frame = get_price(
+            initial_list,
+            end_date=yesterday,
+            count=3,
+            frequency='daily',
+            fields=[
+                'close',
+                'high_limit',
+                'paused'
+            ],
+            panel=False,
+            fill_paused=False,
+            skip_paused=False
+        )
 
-        for day in days:
+        for day in days[:-1]:
             g.l0.n_days_limit_up_list.append(
-                l0_get_hl_stock(
-                    initial_list,
-                    day,
-                    1
+                _hl_from_frame(
+                    seed_frame,
+                    day
                 )
             )
-
-    # 昨日涨停
-    hl_list = l0_get_hl_stock(
-        initial_list,
-        yesterday,
-        1
-    )
+        hl_list = _hl_from_frame(seed_frame, yesterday)
+    else:
+        # 常态：仅昨日一天，走原单日路径
+        hl_list = l0_get_hl_stock(
+            initial_list,
+            yesterday,
+            1
+        )
 
     if getattr(g.l0, '_last_pool_date', None) == yesterday:
         hl1_list = set(g.l0.n_days_limit_up_list[-2]) if len(g.l0.n_days_limit_up_list) >= 2 else set()
@@ -966,6 +990,40 @@ def l0_get_hl_stock(stock_list, date1, days=1):
     ).groupby('code').size()
 
     return h_s.index.tolist()
+
+
+def _hl_from_frame(frame, day):
+    """由批量日线帧切某日涨停名单（与 l0_get_hl_stock 同口径：收盘==涨停价且未停牌）。
+
+    批量优化：首次 seed 需连续 3 天，一次 count=3 拉取后逐日切分，替代 3 次
+    全市场 batch（2026-10-13 实测首板段 35s→~12s）。frame 须含 code/time 列
+    （get_price panel=False 长表口径）。
+    """
+    if frame is None or frame.empty:
+        return []
+    day_ts = pd.Timestamp(day).normalize()
+    sub = frame[pd.to_datetime(frame['time']).dt.normalize() == day_ts]
+    return sub.query(
+        'close==high_limit and paused==0'
+    ).groupby('code').size().index.tolist()
+
+
+def _rows_for_code(frame, code):
+    """批量帧按 code 切分并按 time 排序（缺失→空帧，调用方走原缺失分支）。
+
+    deep 环批量优化配套：昨日 1 天 / 左压 101 天 / 当日竞价各一次拉齐，
+    循环内只做切分（2026-10-13 实测 deep 环 43s→~12s）。
+    """
+    if frame is None or getattr(frame, 'empty', True):
+        return frame
+    if 'code' not in frame.columns:
+        return frame
+    sub = frame[frame['code'] == code]
+    if sub.empty:
+        return sub
+    if 'time' in sub.columns:
+        return sub.sort_values('time').reset_index(drop=True)
+    return sub.reset_index(drop=True)
 
 
 # ====================== 过滤函数 ======================

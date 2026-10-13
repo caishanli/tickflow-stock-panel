@@ -1,8 +1,9 @@
 """首板滚动窗口对重复 yesterday 幂等（国庆假日重跑回归）。
 
-纯逻辑测试：从 fixture 策略文件提取 `l0_prepare_stock_list` 源码并 exec，
-fake g/context + stub `get_trade_days`/`l0_get_hl_stock`，不起引擎、不碰 DB、
-不 import pandas（回测边界外禁 pandas）。
+纯逻辑测试：从 fixture 策略文件提取 `l0_prepare_stock_list`（及批量切分
+helper `_hl_from_frame`）源码并 exec，fake g/context + stub
+`get_trade_days`/`l0_get_hl_stock`/`get_price`，不起引擎、不碰 DB。
+`pandas` 仅用于构造 canned 日线帧（被测函数做 frame 切分），不连网络。
 """
 from __future__ import annotations
 
@@ -10,6 +11,8 @@ import ast
 import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+import pandas as pd
 
 FIXTURE = (
     Path(__file__).resolve().parent.parent
@@ -31,15 +34,32 @@ EXPECTED_POOL = ["STOCK_C"]  # hl30 - hl29
 def _load_prepare_fn(ns):
     src = FIXTURE.read_text(encoding="utf-8")
     mod = ast.parse(src)
-    node = next(
-        n
-        for n in mod.body
-        if isinstance(n, ast.FunctionDef) and n.name == "l0_prepare_stock_list"
-    )
-    fn_src = ast.get_source_segment(src, node)
-    assert fn_src, "fixture 缺少 l0_prepare_stock_list"
-    exec(compile(fn_src, str(FIXTURE), "exec"), ns)
+    for name in ("l0_prepare_stock_list", "_hl_from_frame"):
+        node = next(
+            n
+            for n in mod.body
+            if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+        fn_src = ast.get_source_segment(src, node)
+        assert fn_src, f"fixture 缺少 {name}"
+        exec(compile(fn_src, str(FIXTURE), "exec"), ns)
     return ns["l0_prepare_stock_list"]
+
+
+def _hl_frame():
+    """3 天 canned 日线（列仿真实 batch 输出：code/time/close/high_limit/paused）。"""
+    rows = []
+
+    def bar(code, day, close, high_limit, paused=0):
+        rows.append({"code": code, "time": pd.Timestamp(day),
+                     "close": close, "high_limit": high_limit, "paused": paused})
+
+    bar("STOCK_Z", SEP28, 10.0, 10.0)
+    bar("STOCK_A", SEP29, 10.0, 10.0)
+    bar("STOCK_B", SEP29, 10.0, 10.0)
+    bar("STOCK_B", SEP30, 11.0, 11.0)
+    bar("STOCK_C", SEP30, 11.0, 11.0)
+    return pd.DataFrame(rows)
 
 
 def _make_ns():
@@ -50,10 +70,13 @@ def _make_ns():
         info=lambda msg, *a, **k: log_lines.append(("info", msg)),
         warning=lambda msg, *a, **k: log_lines.append(("warning", msg)),
     )
+    frame = _hl_frame()
     ns = {
         "g": g,
         "log": log,
+        "pd": pd,
         "get_trade_days": lambda end_date=None, count=None: [SEP28, SEP29, SEP30],
+        "get_price": lambda *a, **k: frame,
         "l0_get_hl_stock": lambda stock_list, day, n=1: list(hl_by_day[day]),
         "l0_set_stockpool": lambda ctx: ["STOCK_A", "STOCK_B", "STOCK_C", "STOCK_Z"],
         "l0_filter_kcbj_stock": lambda lst: lst,

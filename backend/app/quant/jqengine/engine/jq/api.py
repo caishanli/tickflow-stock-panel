@@ -113,6 +113,7 @@ def _default_snapshot(code):
 
 
 _LISTING_DATES = None   # {6位代码: listing_date}，get_security_info 惰性加载
+_STOCK_NAMES: dict = {}   # {日期ISO: {6位代码: 名称}}，整表日级缓存（见 _bulk_stock_names）
 
 
 def _limit_rate(code, is_st=False):
@@ -1879,20 +1880,41 @@ def _jq_names() -> dict[str, str]:
     return jq_names.load_jq_names()
 
 
+def _bulk_stock_names(mgr):
+    """通达信简称整表（日级进程缓存）：首只命中拉全表，同日其余全是 dict 命中。
+
+    背景（2026-10-13 实测）：首板高开 09:26 选股中新股过滤 4415×get_security_info
+    （每只 2 次 get_security_name、每次全量传输 ~5k 名称表）占 36s，ST 过滤同理。
+    名称是 point-in-time 口径（回放/补跑本来拿的也是当日最新名），日级缓存不改语义；
+    拉取失败返回空（与原来一致）、不污染缓存，下次调用重试。与 _LISTING_DATES
+    同类无锁缓存：竞态最多重复拉一次，结果都是同一日整表。
+    """
+    global _STOCK_NAMES
+    key = datetime.date.today().isoformat()
+    hit = _STOCK_NAMES.get(key)
+    if hit is not None:
+        return hit
+    names: dict = {}
+    try:
+        sources = getattr(mgr, "sources", None) or {}
+        if "network" in sources:
+            names = sources["network"].get_stock_names() or {}
+    except Exception:
+        names = {}
+    if names:
+        _STOCK_NAMES.clear()
+        _STOCK_NAMES[key] = names
+    return names
+
+
 def get_security_name(code):
     names = _state.get("sec_names")
     if names and code in names:
         return names[code]
     mgr = _state.get("manager")
     if mgr:
-        # 先尝试网络源通达信简称（与 get_all_securities 同口径：网络异常时
-        # jq 名替换块仍执行，保证 jq 名生效）
-        mootdx_names = {}
-        if "network" in mgr.sources:
-            try:
-                mootdx_names = mgr.sources["network"].get_stock_names()
-            except Exception:
-                pass
+        # 整表走日级缓存（_bulk_stock_names）：逐只解析不再每次全量传输
+        mootdx_names = _bulk_stock_names(mgr)
         if _name_source() == "jq":
             jq = _jq_names()
             if jq:

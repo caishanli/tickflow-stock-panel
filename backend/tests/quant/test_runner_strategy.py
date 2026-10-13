@@ -1126,3 +1126,60 @@ def test_deferred_preloads_run_after_window(tmp_quant, monkeypatch):
     # 幂等：无标记时调用无副作用
     runner._run_deferred_heavy_preloads(aid, dm, ctx, aux)
     assert dm.daily_preloads == 1
+
+
+def test_grace_tick_without_bar_leaves_trace(tmp_quant, monkeypatch):
+    """宽限内无新bar不再静默：11:32 取不到数必须留一条日志。
+
+    回归（2026-10-13）：11:30–11:34 的 grace tick 全静默跳过，复盘时
+    state 停 11:29 却无任何痕迹。非宽限时段保持原样（不刷屏）。
+    """
+    from app.quant.simulate.matcher import Matcher
+
+    aid = service.account_create("acct_grace", 100000.0, 0.03, "")
+    ctx = SimpleNamespace(
+        universe=["510300.XSHG"],
+        portfolio=SimpleNamespace(positions={}),
+        current_dt=None)
+    aux = {"jq_api": SimpleNamespace(_state={}), "fresh_frames": {}}
+    state: dict = {}
+    feed = lambda dm, codes, now, acc: ({}, None, {})  # noqa: E731
+    bundle = SimpleNamespace(daily=[], minute=[], handle_data=None)
+    runner._strategy_tick(
+        aid, bundle, ctx, None, feed, Matcher(0.03), state, aux,
+        datetime.datetime(2026, 10, 13, 11, 32, 8))
+    msgs = [row["message"] for row in db.get_sim_logs(aid)]
+    assert any("无新bar" in m for m in msgs), msgs
+    # 非宽限时段（10:00 取不到数）不新增此类日志
+    runner._strategy_tick(
+        aid, bundle, ctx, None, feed, Matcher(0.03), state, aux,
+        datetime.datetime(2026, 10, 13, 10, 0, 8))
+    msgs2 = [row["message"] for row in db.get_sim_logs(aid)]
+    assert len([m for m in msgs2 if "无新bar" in m]) == \
+        len([m for m in msgs if "无新bar" in m])
+
+
+def test_preopen_callback_logs_start_and_finish(tmp_quant, monkeypatch):
+    """盘前回调起止落库：解决“sim_logs 全空无法区分慢与死”的复盘盲区。"""
+    aid = service.account_create("acct_preopen_log", 100000.0, 0.03, "")
+    fired_calls: list = []
+
+    def buy(ctx):
+        fired_calls.append(str(ctx.current_dt))
+
+    bundle = SimpleNamespace(daily=[(buy, "09:26")], minute=[],
+                             handle_data=None, before_trading_start=None)
+    ctx = SimpleNamespace(
+        portfolio=SimpleNamespace(positions={}, cash=100000.0),
+        universe=[], current_dt=None)
+    aux = {"jq_api": SimpleNamespace(_state={}), "start_cash": 100000.0,
+           "fired": set(), "trades_drained": 0}
+    state = {"cash": 100000.0, "start_cash": 100000.0, "net_value": 100000.0,
+             "pnl": 0.0, "positions": {}, "stop_loss_log": [], "dt": None}
+    runner._fire_preopen_daily(
+        aid, bundle, ctx, state, aux,
+        datetime.datetime(2026, 10, 13, 9, 26, 5))
+    assert fired_calls == ["2026-10-13 09:26:05"]
+    msgs = [row["message"] for row in db.get_sim_logs(aid)]
+    assert any("盘前回调开始" in m and "09:26" in m for m in msgs), msgs
+    assert any("盘前回调完成" in m for m in msgs), msgs

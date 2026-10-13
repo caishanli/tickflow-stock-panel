@@ -492,6 +492,8 @@ def test_realtime_stale_gate_configurable(tmp_path, monkeypatch):
     try:
         monkeypatch.setattr("app.services.stockdata.sources._in_trading",
                             lambda *a, **k: True)
+        monkeypatch.setattr("app.services.stockdata.sources._in_trading_or_grace",
+                            lambda *a, **k: True)
         # 内存库放一根 20s 前的 bar：默认 10s 门槛 → 判陈旧 → todo 含该标的
         now = dt.datetime.now()
         old_bar = pl.DataFrame({
@@ -585,3 +587,103 @@ def test_get_minute_concurrent_past_purge_threshold_no_deadlock(tmp_path):
         t.join(timeout=8)
     assert all(not t.is_alive() for t in ts), "s.get_minute 并发触发 purge 自死锁"
     assert all(isinstance(r, int) and r >= 0 for r in results)
+
+
+def _mem_frame(symbol_tf, rows):
+    return pl.DataFrame([{
+        "symbol": symbol_tf, "datetime": dt, "open": o, "high": o,
+        "low": o, "close": c, "volume": v, "amount": o * v,
+    } for dt, o, c, v in rows])
+
+
+def test_realtime_snapshot_fetches_closing_bar_in_grace(src, monkeypatch):
+    """回归（2026-10-13）：11:30:08 的 tick 必须能拉到 11:30 bar。
+
+    服务端拉取门在 11:30:00 整关闭，而 runner 每分钟第 8 秒才取数，
+    11:30 及 11:31–11:35 宽限重试全部被挡，state 停在 11:29。
+    """
+    from types import SimpleNamespace
+
+    import app.services.stockdata.sources as mod
+
+    day = "2026-10-12"  # 周一
+    now = _dt.datetime(2026, 10, 12, 11, 30, 8)
+    monkeypatch.setattr(mod, "_now", lambda: now)
+    src.minute_store.update(day, _mem_frame("600000.SH", [
+        (f"{day} 11:29:00", 9.5, 9.5, 100.0)]))
+
+    pulled = []
+
+    def fake_fetch_many(todo):
+        pulled.append(list(todo))
+        return [_mem_frame("600000.SH", [(f"{day} 11:30:00", 9.5, 9.6, 200.0)])]
+
+    class FakeSynth:
+        def last_quote_time(self, sym):
+            return None
+
+    src.puller = SimpleNamespace(fetch_many=fake_fetch_many, synth=FakeSynth())
+    df = src.get_realtime_snapshot(["600000.XSHG"], as_of=f"{day} 11:30:08")
+    assert pulled == [["600000.XSHG"]]  # 门必须放行
+    dts = df.filter(pl.col("symbol") == "600000.SH")["datetime"].to_list()
+    assert any(str(d)[:16] == f"{day} 11:30" for d in dts)
+
+
+def test_realtime_snapshot_no_fetch_after_grace(src, monkeypatch):
+    """宽限外行为不变：11:36 不触网（防门放太宽）。"""
+    from types import SimpleNamespace
+
+    import app.services.stockdata.sources as mod
+
+    day = "2026-10-12"
+    now = _dt.datetime(2026, 10, 12, 11, 36, 8)
+    monkeypatch.setattr(mod, "_now", lambda: now)
+    src.minute_store.update(day, _mem_frame("600000.SH", [
+        (f"{day} 11:29:00", 9.5, 9.5, 100.0)]))
+
+    pulled = []
+
+    class FakeSynth:
+        def last_quote_time(self, sym):
+            return None
+
+    src.puller = SimpleNamespace(
+        fetch_many=lambda todo: (pulled.append(list(todo)), [])[1],
+        synth=FakeSynth())
+    src.get_realtime_snapshot(["600000.XSHG"], as_of=f"{day} 11:36:08")
+    assert pulled == []
+
+
+def test_in_trading_or_grace_boundaries():
+    """收盘宽限判定：早盘到 11:35、午盘到 15:02（含上界），之外关闭。"""
+    import app.services.stockdata.sources as mod
+
+    mon = _dt.date(2026, 10, 12)
+
+    def at(h, mi, s=0):
+        return _dt.datetime.combine(mon, _dt.time(h, mi, s))
+    assert mod._in_trading_or_grace(at(9, 30)) is True
+    assert mod._in_trading_or_grace(at(11, 30)) is True
+    assert mod._in_trading_or_grace(at(11, 35)) is True
+    assert mod._in_trading_or_grace(at(11, 35, 1)) is False
+    assert mod._in_trading_or_grace(at(13, 0)) is True
+    assert mod._in_trading_or_grace(at(15, 2)) is True
+    assert mod._in_trading_or_grace(at(15, 2, 1)) is False
+    assert mod._in_trading_or_grace(_dt.datetime(2026, 10, 11, 10, 0)) is False  # 周日
+
+
+def test_realtime_gap_summary_logged_once_per_interval(caplog):
+    """整轮回源颗粒无收必须留痕（601069 式静默冻结的复盘依据），同区间只记一次。"""
+    import logging
+
+    import app.services.stockdata.sources as mod
+
+    mod._RT_GAP_LAST_LOG.clear()
+    with caplog.at_level(logging.WARNING, logger="app.services.stockdata.sources"):
+        mod._maybe_log_realtime_gap(["600000.SH"], {})
+        mod._maybe_log_realtime_gap(["600000.SH"], {})
+    recs = [r for r in caplog.records if "实时回源缺口" in r.message]
+    assert len(recs) == 1
+    assert "600000.SH" in recs[0].message
+    mod._maybe_log_realtime_gap([], {})
+    assert len([r for r in caplog.records if "实时回源缺口" in r.message]) == 1

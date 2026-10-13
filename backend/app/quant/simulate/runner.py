@@ -807,6 +807,9 @@ def _fire_preopen_daily(account_id, bundle, ctx, state, aux, now) -> None:
     ctx.current_dt = now
     # 昨日最后一根分钟快照不能冒充今日盘前价格。
     jq_api._state.update(minute_mode=True, minute_prices={}, no_buy=set(), no_sell=set())
+    _emit_log(account_id, "info",
+              f"盘前回调开始：{', '.join(tag for _, tag, _ in tasks)}")
+    fills_before = len(jq_api._state.get("trades") or [])
     for func, tag, key in tasks:
         aux["fired"].add(key)
         trades = jq_api._state.get("trades") or []
@@ -821,6 +824,8 @@ def _fire_preopen_daily(account_id, bundle, ctx, state, aux, now) -> None:
             aux["fired"].discard(key)
     _seed_universe(ctx)
     _persist(account_id, ctx, state, now, jq_api, aux)
+    _emit_log(account_id, "info",
+              f"盘前回调完成：新增成交{len(jq_api._state.get('trades') or []) - fills_before}笔")
 
 
 def _persist(account_id: str, ctx, state: dict, bar_dt, jq_api, aux: dict) -> None:
@@ -1388,13 +1393,19 @@ def _strategy_tick(account_id: str, bundle, ctx, dm, feed, matcher: Matcher,
         if os.getenv("SIM_TICK_DEBUG") == "1":
             print(f"[tick-debug] bar_dt=None now={now} watch_n={len(watch_codes)} "
                   f"watch_head={watch_codes[:2]}", flush=True)
-        # 收盘宽限期内无实时数据属正常，不报警
+        # 收盘宽限期内无实时数据属正常，不报警；但宽限内（11:30–11:35 /
+        # 15:00–15:02）有规律 tick，无新 bar 必留痕——2026-10-13 的 11:30
+        # 漏 bar 全程静默，复盘无据。宽限外保持静默。
         t = pd.Timestamp(now).time()
         if t <= SESSION_END_GRACE:
-            pass  # 静默跳过
+            if datetime.time(11, 30) < t <= MORNING_END_GRACE \
+                    or datetime.time(15, 0) < t <= SESSION_END_GRACE:
+                _emit_log(account_id, "info",
+                          f"收盘宽限无新bar（last={aux.get('last_bar')}），等待数据补齐")
+            return None
         else:
             _emit_log(account_id, "warn", "实时行情为空，本轮跳过")
-        return None
+            return None
     bar_ts = pd.Timestamp(bar_dt)
     if bar_ts.date() != now.date():
         return None  # 盘前/数据源滞后只拿到昨日 bar，不触发

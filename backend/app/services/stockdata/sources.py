@@ -76,6 +76,47 @@ def _in_trading(now: _dt.datetime | None = None) -> bool:
                  or _dt.time(13, 0) <= t <= _dt.time(15, 0)))
 
 
+def _in_trading_or_grace(ts: _dt.datetime | None = None) -> bool:
+    """实时拉取门：交易时段 + 收盘宽限（早盘 11:30→11:35、午盘 15:00→15:02）。
+
+    runner 侧 _tick_window 在宽限内重试收市 bar（MORNING_END_GRACE /
+    SESSION_END_GRACE，注释写明防 11:30 bar 掉进午休）；服务端门若在整点
+    关闭则重试永远拿不到 11:30/15:00（2026-10-13 sb_gaokai_sim 实测 state
+    停 11:29，runner tick 在 11:30:08）。仅用于实时回源 todo 门，其余
+    _in_trading 用处（冷启动自举等）不动。
+    """
+    now = ts or _now()
+    t = now.time()
+    return (now.weekday() < 5
+            and (_dt.time(9, 30) <= t <= _dt.time(11, 35)
+                 or _dt.time(13, 0) <= t <= _dt.time(15, 2)))
+
+
+_RT_GAP_LAST_LOG: dict = {}   # {"gap": monotonic}，整轮缺口汇总节流
+_RT_GAP_INTERVAL_SEC = 300.0
+
+
+def _maybe_log_realtime_gap(asked: list[str], out: dict) -> None:
+    """整轮回源颗粒无收留痕：请求的标的中无分钟帧的列名汇总（300s 节流）。
+
+    背景（2026-10-13）：601069 在腾讯缺报价 + mootdx 熔断后整早盘只有 2 根 bar，
+    而 HTTP 缺失与熔断兜底失败两条路全是静默的，复盘无据。正常轮（asked 全命中、
+    或 asked 为空）零日志。
+    """
+    unfilled = [s for s in dict.fromkeys(asked) if s not in out]
+    if not unfilled:
+        return
+    now_m = time.monotonic()
+    if now_m - _RT_GAP_LAST_LOG.get("gap", 0.0) < _RT_GAP_INTERVAL_SEC:
+        return
+    _RT_GAP_LAST_LOG["gap"] = now_m
+    show = ",".join(unfilled[:10])
+    if len(unfilled) > 10:
+        show += f"等{len(unfilled)}只"
+    logger.warning("[sources] 实时回源缺口：%d只请求标的无分钟帧（%s），"
+                   "HTTP快照缺失或mootdx兜底失败", len(unfilled), show)
+
+
 def _normalize_etf_volume_unit(df: pl.DataFrame) -> pl.DataFrame:
     """ETF 日线 volume 归一为「股」（同 DataManager._normalize_etf_volume_unit）。"""
     if df is None or df.is_empty() or "volume" not in df.columns:
@@ -383,6 +424,7 @@ class NetworkPuller:
                         self._seed_synth_from_frame(tf, frame)
             # ③④ 腾讯批量 → 新浪批量 → 合成；forced=mootdx 跳过 HTTP 链
             forced = os.getenv("STOCKDATA_RT_SOURCE", "auto") or "auto"
+            asked = list(todo)
             if forced != "mootdx" and todo:
                 quotes: dict[str, _rt.RTQuote] = {}
                 if self.tencent is not None:
@@ -415,6 +457,7 @@ class NetworkPuller:
                     if frame is not None and not frame.is_empty():
                         out[frame["symbol"][0]] = frame
                         self._cache_put(frame["symbol"][0], frame)
+            _maybe_log_realtime_gap(asked, out)
             return list(out.values())
 
     def shutdown(self) -> None:
@@ -768,7 +811,8 @@ class DataSources:
 
         latest_by_sym = dict(base.group_by("symbol").agg(pl.col("datetime").max()).iter_rows())
         todo = [c for c in dict.fromkeys(codes)
-                if is_today and _in_trading(now) and _in_trading(asof_ts) and not _is_index(c)
+                if is_today and _in_trading_or_grace(now) and _in_trading_or_grace(asof_ts)
+                and not _is_index(c)
                 and (_tf_symbol(c) not in latest_by_sym
                      or is_stale(_tf_symbol(c), latest_by_sym[_tf_symbol(c)]))]
         if todo:
