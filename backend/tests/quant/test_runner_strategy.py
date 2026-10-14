@@ -1108,6 +1108,39 @@ def test_in_rush_window_boundaries():
     assert runner._in_rush_window(datetime.datetime(2026, 10, 12, 9, 30, 0)) is False
 
 
+def test_partial_day_replay_preloads_daily_outside_rush(tmp_quant, monkeypatch):
+    """回归（2026-10-14）：同日重启走 partial 路径也必须暖日线内存。
+
+    昨晚 20:03 同日重启 → partial 路径无预载 → _daily_mem 整冷 →
+    今晨 ST 循环 4606 只逐只网络回源、双进程打穿服务端 LRU，~90s/只。
+    非窗口期直接预载；窗口期沿用推迟标记（此时带上真实 strategy_code）。
+    """
+    dm, _pool_calls, aid, bundle, ctx, state, aux = _rush_replay_setup(
+        tmp_quant, monkeypatch, datetime.datetime(2026, 10, 13, 20, 3, 0))
+    runner._replay_partial_day(
+        aid, bundle, ctx, dm, Matcher(0.03), state, aux,
+        datetime.datetime(2026, 10, 13, 15, 5, 0),
+        strategy_code="x = get_all_securities('stock')")
+
+    assert dm.daily_preloads == 1
+    assert aux.get("_deferred_heavy_preload") is None
+
+
+def test_partial_day_rush_marker_carries_strategy_code(tmp_quant, monkeypatch):
+    """窗口期 partial 推迟标记必须带真实 strategy_code，否则窗口后补做
+    永远跳过全市场日线预载（之前写死 ""）。"""
+    dm, _pool_calls, aid, bundle, ctx, state, aux = _rush_replay_setup(
+        tmp_quant, monkeypatch, datetime.datetime(2026, 10, 12, 9, 28, 30))
+    runner._replay_partial_day(
+        aid, bundle, ctx, dm, Matcher(0.03), state, aux,
+        datetime.datetime(2026, 10, 12, 9, 20, 0),
+        strategy_code="x = get_all_securities('stock')")
+
+    assert dm.daily_preloads == 0
+    assert aux.get("_deferred_heavy_preload", {}).get("strategy_code") == \
+        "x = get_all_securities('stock')"
+
+
 def test_deferred_preloads_run_after_window(tmp_quant, monkeypatch):
     """窗口后补做：推迟标记被消费，重型预载执行一次且标记清除。"""
     dm, pool_calls, aid, _bundle, ctx, _state, aux = _rush_replay_setup(

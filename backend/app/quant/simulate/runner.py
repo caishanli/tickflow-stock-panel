@@ -1048,7 +1048,8 @@ def _seed_fired_before(fired: set, bundle, from_ts: datetime.datetime) -> None:
 
 
 def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
-                        state: dict, aux: dict, from_ts: datetime.datetime) -> None:
+                        state: dict, aux: dict, from_ts: datetime.datetime,
+                        *, strategy_code: str = "") -> None:
     """补跑同一天内从 from_ts 到当前时间的分钟 bar（盘中重启场景）。"""
     _replay_active_ids.add(account_id)
     try:
@@ -1059,13 +1060,21 @@ def _replay_partial_day(account_id: str, bundle, ctx, dm, matcher: Matcher,
         today = from_ts.date()
         now = datetime.datetime.now()
         # 钉住补跑区间分钟窗口并批量预取池（当日场景，窗口即为当天）
-        # 抢跑期内只钉窗口、预取推迟（同 _replay_history）。
+        # 抢跑期内只钉窗口、预取推迟（同 _replay_history）；非窗口期顺手把
+        # 全市场日线预载了——否则 _daily_mem 整冷，次日 ST 过滤 4606 只逐只
+        # 网络回源（2026-10-14 实测 ~90s/只）。_replay_history 同款门控。
         _partial_rush = _in_rush_window(now)
         if _partial_rush:
             aux["_deferred_heavy_preload"] = {
-                "strategy_code": "",
+                "strategy_code": strategy_code or "",
                 "start": str(from_ts)[:10], "end": str(today),
             }
+        elif dm is not None and _GET_ALL_SECURITIES_STOCK_RE.search(strategy_code or ""):
+            try:
+                dm.preload_daily(fq="pre")
+                _emit_log(account_id, "info", "全市场日线预载完成（批量 get_price 路径）")
+            except Exception as e:
+                _emit_log(account_id, "error", f"全市场日线预载失败: {e}")
         _pin_replay_minute_window(dm, ctx, from_ts, today, skip_preload=_partial_rush)
         if now.time() >= datetime.time(9, 25) and from_ts.time() < datetime.time(15, 5):
             pre_time = max(from_ts, datetime.datetime.combine(today, datetime.time(9, 25)))
@@ -1641,7 +1650,8 @@ def _run_strategy_loop(account_id: str, acct: dict, matcher: Matcher, dm=None,
                         strategy_code=code, resume_after=saved_ts if has_saved else None)
     elif replay_partial:
         assert saved_ts is not None  # replay_partial=True 蕴含 saved_ts 有效
-        _replay_partial_day(account_id, bundle, ctx, dm, matcher, state, aux, saved_ts)
+        _replay_partial_day(account_id, bundle, ctx, dm, matcher, state, aux, saved_ts,
+                            strategy_code=code)
     # 回放已准备过今天，接实时不能再次清空 fired / 解冻 T+1 / 执行盘前钩子。
     saved_eod = (str(saved_ts.date()) if saved_ts is not None
                  and saved_ts.time() >= datetime.time(15, 5) else None)

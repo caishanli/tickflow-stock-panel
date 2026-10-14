@@ -171,6 +171,7 @@ def _select_ns(calls):
         "g": g,
         "log": log,
         "pd": pd,
+        "datetime": datetime.datetime,
         "l0_prepare_stock_list": lambda ctx: ["A", "B", "C"],
         "attribute_history": attribute_history,
         "get_price": get_price,
@@ -202,3 +203,41 @@ def test_select_batches_daily_history_and_auction(tmp_path):
     assert sorted(c[2] for c in calls if c[0] == "get_price") == [1, 101], calls
     auc = [c for c in calls if c[0] == "get_call_auction"]
     assert len(auc) == 1 and auc[0][1] == ["A", "B", "C"], calls
+
+
+def test_st_filter_emits_heartbeat_on_slow_scan(tmp_path):
+    """ST 过滤长循环必须有心跳：2026-10-14 两进程僵死 70 分钟零输出才被发现。
+
+    FakeDateTime 每次 now() 步进 10s：4 只候选中第 3 只处触发一次心跳。
+    """
+    ns: dict = {}
+    _load_fns(ns, "l0_filter_st_paused_stock")
+    ticks = {"t": datetime.datetime(2026, 10, 14, 9, 26, 1)}
+
+    class FakeDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            ticks["t"] += datetime.timedelta(seconds=10)
+            return ticks["t"]
+
+    log_lines: list = []
+    ns["datetime"] = FakeDateTime
+    ns["log"] = SimpleNamespace(
+        info=lambda msg, *a, **k: log_lines.append(("info", msg)),
+        warning=lambda msg, *a, **k: log_lines.append(("warning", msg)),
+    )
+
+    def mk(paused=False, name="平安银行"):
+        return SimpleNamespace(paused=paused, name=name, is_st=False)
+
+    ns["get_current_data"] = lambda: {
+        "AAA": mk(), "ST*BBB": mk(name="*ST康美"),
+        "CCC": mk(paused=True), "DDD": mk(name="退市股"),
+    }
+    out = ns["l0_filter_st_paused_stock"](
+        ["AAA", "ST*BBB", "CCC", "DDD"], datetime.date(2026, 10, 14))
+
+    assert out == ["AAA"]
+    beats = [m for lv, m in log_lines if "选股心跳" in m]
+    assert len(beats) == 1, log_lines
+    assert "3/4" in beats[0] and "CCC" in beats[0], beats

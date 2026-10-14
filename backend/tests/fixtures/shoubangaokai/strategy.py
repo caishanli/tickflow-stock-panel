@@ -626,7 +626,13 @@ def l0_get_stock_list(context):
         fields=['time', 'volume', 'current'],
     ) if target_list else None
 
-    for s in target_list:
+    total_candidates = len(target_list)
+    _hb_last = datetime.now()
+
+    for i, s in enumerate(target_list):
+        if (datetime.now() - _hb_last).total_seconds() >= 30:
+            log.info('【选股心跳】候选过滤 {}/{} 当前{}'.format(i + 1, total_candidates, s))
+            _hb_last = datetime.now()
 
         # --------------------------------------------------
         # 条件一：原均价 / 成交额
@@ -1044,11 +1050,17 @@ def l0_filter_st_paused_stock(initial_list, date):
     """
     current_data = get_current_data()
     result = []
+    total = len(initial_list)
+    _hb_last = datetime.now()
 
-    for stock in initial_list:
+    for i, stock in enumerate(initial_list):
         data = current_data[stock]
         name = data.name if data.name is not None else ''
         upper_name = name.upper()
+
+        if (datetime.now() - _hb_last).total_seconds() >= 30:
+            log.info('【选股心跳】ST过滤 {}/{} 当前{}'.format(i + 1, total, stock))
+            _hb_last = datetime.now()
 
         if data.paused:
             continue
