@@ -22,6 +22,12 @@ def main():
     # 转储文件按账户分文件落 runtime 目录，与 sim 日志同处、多账户互不覆盖。
     import faulthandler
     import signal as _sig
+    import warnings as _warnings
+    # pandas 整数下标回退 FutureWarning：引擎/策略历史代码大量 [0]/[-1] 取值，
+    # 每天刷上千行文件日志且无可执行信息；精确匹配该文案，只屏蔽这一种。
+    # 其他 FutureWarning（如 fillna 下沉）照常输出，未来升级 pandas 的依据保留。
+    _warnings.filterwarnings(
+        "ignore", message=".*treating keys as positions.*", category=FutureWarning)
     try:
         import os as _os
 

@@ -12,6 +12,22 @@ import pandas as pd
 
 log = logging.getLogger("app.quant.simulate.live_feed")
 
+_miss_day: str | None = None
+_miss_warned: set[str] = set()
+
+
+def _warn_miss_once(code: str, day: str, msg: str, *args: object) -> None:
+    """同标的同日缺数只告警一次：指数等无分钟源标的每 tick 都缺，
+    不节流会刷屏（2026-10-15 实测 4 指数×861 tick=3444 行）。"""
+    global _miss_day
+    if _miss_day != day:
+        _miss_day = day
+        _miss_warned.clear()
+    if code in _miss_warned:
+        return
+    _miss_warned.add(code)
+    log.warning(msg, *args)
+
 
 def _load_recent_via_client(dm, codes, now):
     client = getattr(dm, "client", None)
@@ -61,7 +77,8 @@ def refresh(dm, codes, now=None, fresh_acc=None, loader=None, enabled=False):
             if fresh_acc is not None:
                 fresh_acc[code] = fresh
         except Exception as e:
-            log.warning("[live_feed] %s 实时分钟刷新失败，沿用旧帧: %s", code, e)
+            _warn_miss_once(code, now.date().isoformat(),
+                            "[live_feed] %s 实时分钟刷新失败，沿用旧帧: %s", code, e)
             merged = dm._minute_mem.get(code)
         if merged is None or (hasattr(merged, "empty") and merged.empty):
             continue

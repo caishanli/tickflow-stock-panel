@@ -144,7 +144,7 @@ def test_refresh_no_data_returns_none_bar_dt():
 
 
 def test_persist_real_is_noop():
-    """落盘归 stock data 服务：persist_real 不再写本地缓存。"""
+    """persist_real 是空操作"""
     dm = _DM(_FakeClient())
     dm.cache.store["real_510300.XSHG"] = _frame(["2026-07-17 09:31"], [10.0])
     fresh = _frame(["2026-07-17 09:31", "2026-07-17 15:00"], [10.1, 10.5])
@@ -167,8 +167,24 @@ def test_refresh_rejects_stale_prev_day_price_in_session():
     assert prices == {} and bar_dt is None
 
     # 同样的旧帧，非交易时段（周末）→ 维持旧行为照常发布（估值用）
-    prices2, bar_dt2, price_ts2 = live_feed.refresh(
+    prices2, bar_dt2, _price_ts2 = live_feed.refresh(
         dm, ["513030.XSHG"],
         pd.Timestamp(datetime.datetime(2026, 8, 16, 10, 0)))
     assert prices2 == {"513030.XSHG": 1.94}
     assert bar_dt2 == pd.Timestamp("2026-08-14 15:00")
+
+
+def test_index_miss_warns_once_per_day(caplog):
+    """无分钟源标的（如指数）缺数只告警一次/天：2026-10-15 实测 4 指数×861 tick
+    刷屏 3444 行。RED：现在每 tick 都 warn。"""
+    import logging
+
+    dm = _DM(_FakeClient(frames={"000300.XSHG": None}))
+    dm._minute_mem = {}
+    day = "2026-10-15"
+    with caplog.at_level(logging.WARNING, logger="app.quant.simulate.live_feed"):
+        live_feed.refresh(dm, ["000300.XSHG"], pd.Timestamp(f"{day} 10:00:00"))
+        live_feed.refresh(dm, ["000300.XSHG"], pd.Timestamp(f"{day} 10:01:00"))
+    recs = [r for r in caplog.records if "实时分钟刷新失败" in r.message]
+    assert len(recs) == 1, [r.message for r in recs]
+    assert "000300.XSHG" in recs[0].message

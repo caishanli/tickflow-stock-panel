@@ -149,7 +149,6 @@ def l0_buy(context):
     qualified_stocks = l0_get_stock_list(context)
 
     if not qualified_stocks:
-        log.info('【买入结束】今日无最终候选，不下单；筛选与数据缺失数量见选股汇总')
         return
 
     # 仍按原思路：把当前可用资金在最终Top1/Top2之间均分
@@ -685,7 +684,7 @@ def l0_get_stock_list(context):
             excluded['估值缺失'] += 1
             continue
 
-        turnover_ratio = turnover_ratio_data['turnover_ratio'][0]
+        turnover_ratio = turnover_ratio_data['turnover_ratio'].iloc[0]
 
         if (
             pd.isna(turnover_ratio)
@@ -706,8 +705,8 @@ def l0_get_stock_list(context):
             continue
 
         if (
-            turnover_ratio_data['market_cap'][0] < 70
-            or turnover_ratio_data['circulating_market_cap'][0] > 520
+            turnover_ratio_data['market_cap'].iloc[0] < 70
+            or turnover_ratio_data['circulating_market_cap'].iloc[0] > 520
         ):
             excluded['市值不符'] += 1
             continue
@@ -886,7 +885,6 @@ def l0_get_stock_list(context):
             g.l0.max_buy_num,
             qualified_stocks
         ))
-        log.info('首板高开：' + str(qualified_stocks))
 
     log.info('【选股筛选汇总】首板候选{}只 | 通过全部条件{}只 | {}'.format(
         len(target_list), len(scored_candidates),
@@ -907,13 +905,14 @@ def l0_prepare_stock_list(context):
     yesterday = context.previous_date
 
     initial_list = l0_set_stockpool(context)
-    log.info('【基础股票池】全市场{}只'.format(len(initial_list)))
+    n_all = len(initial_list)
     initial_list = l0_filter_kcbj_stock(initial_list)
-    log.info('【基础股票池】板块过滤后{}只'.format(len(initial_list)))
+    n_kcbj = len(initial_list)
     initial_list = l0_filter_st_paused_stock(initial_list, today)
-    log.info('【基础股票池】ST及停牌过滤后{}只'.format(len(initial_list)))
+    n_st = len(initial_list)
     initial_list = l0_filter_new_stock(initial_list, today)
-    log.info('【基础股票池】新股过滤后{}只'.format(len(initial_list)))
+    log.info('【基础股票池】全市场{}只 → 板块{}只 → ST停牌{}只 → 新股{}只'.format(
+        n_all, n_kcbj, n_st, len(initial_list)))
 
     # 首次运行：一次 count=3 拉齐 seed 2 天 + 昨日，逐日切分，
     # 替代 3 次全市场 batch 取数（见 _hl_from_frame）。

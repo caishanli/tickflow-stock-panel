@@ -113,7 +113,8 @@ def test_repeat_yesterday_does_not_evict_window():
     assert window_after_repeats == window_after_first
     assert len(g.l0.n_days_limit_up_list) == 2
     # 基础股票池分阶段统计走 log 通道（页面日志可见），而非 print（文件缓冲、
-    # SIGTERM 可丢——2026-10-12 sb_gaokai_sim 盘前无输出误判的根因之一）
+    # SIGTERM 可丢——2026-10-12 sb_gaokai_sim 盘前无输出误判的根因之一）。
+    # 四阶段合并为一行，避免每天刷 4 条。
     stages = [m for lv, m in log_lines if lv == "info" and m.startswith("【基础股票池】")]
-    assert len(stages) == 4 * 3
-    assert stages[0] == "【基础股票池】全市场4只"
+    assert len(stages) == 3, stages
+    assert stages[0] == "【基础股票池】全市场4只 → 板块4只 → ST停牌4只 → 新股4只"
