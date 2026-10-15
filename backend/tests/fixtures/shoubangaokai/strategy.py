@@ -619,12 +619,11 @@ def l0_get_stock_list(context):
         panel=False,
         fq='pre',
     ) if target_list else None
-    auction_frame = get_call_auction(
-        target_list,
-        start_date=start,
-        end_date=end,
-        fields=['time', 'volume', 'current'],
-    ) if target_list else None
+    # 竞价 batch 改为惰性：首个走到条件二的候选才拉一次。提前全量拉会让
+    # get_call_auction 对未被消费的缺缓存标的置 preopen_auction_missing，
+    # 触发盘前重试把整轮选股每分钟重跑一遍（2026-10-15 实测 09:26 回调连跑 7 次）。
+    auction_frame = None
+    auction_loaded = False
 
     total_candidates = len(target_list)
     _hb_last = datetime.now()
@@ -734,8 +733,16 @@ def l0_get_stock_list(context):
             continue
 
         # --------------------------------------------------
-        # 条件二：原竞价量 + 高开
+        # 条件二：原竞价量 + 高开（batch 惰性：首个走到这里的候选触发一次全量拉取）
         # --------------------------------------------------
+        if not auction_loaded:
+            auction_frame = get_call_auction(
+                target_list,
+                start_date=start,
+                end_date=end,
+                fields=['time', 'volume', 'current'],
+            )
+            auction_loaded = True
         auction_data = _rows_for_code(auction_frame, s)
 
         if auction_data is None or auction_data.empty:

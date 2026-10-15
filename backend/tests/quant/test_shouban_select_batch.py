@@ -110,7 +110,7 @@ def test_prepare_seed_fetches_three_days_once(tmp_path):
     assert len(calls) == 1, calls
 
 
-def _select_ns(calls):
+def _select_ns(calls, a_money=8e8):
     """l0_get_stock_list 全链路 harness：3 候选（A 全过 / B 均价额挂 / C 行情缺失）。"""
     g = SimpleNamespace(l0=SimpleNamespace(turnover_min=3, turnover_max=25.0,
                                             max_buy_num=2))
@@ -121,7 +121,7 @@ def _select_ns(calls):
     )
     day = pd.Timestamp("2026-10-09")
     prev_rows = [
-        {"code": "A", "time": day, "close": 10.0, "volume": 1_000_000.0, "money": 8e8},
+        {"code": "A", "time": day, "close": 10.0, "volume": 1_000_000.0, "money": a_money},
         {"code": "B", "time": day, "close": 10.0, "volume": 1_000_000.0, "money": 1e8},
     ]
     hist_rows = [{"code": "A", "time": day - pd.Timedelta(days=100 - i),
@@ -241,3 +241,17 @@ def test_st_filter_emits_heartbeat_on_slow_scan(tmp_path):
     beats = [m for lv, m in log_lines if "选股心跳" in m]
     assert len(beats) == 1, log_lines
     assert "3/4" in beats[0] and "CCC" in beats[0], beats
+
+
+def test_no_survivor_never_touches_auction(tmp_path):
+    """零通过者不得拉竞价：否则未被消费的缺缓存标的会置
+    preopen_auction_missing，触发盘前重试把整轮选股每分钟重跑
+    （2026-10-15 实测 09:26 回调连跑 7 次，RED：提前 batch 必拉一次）。"""
+    calls: list = []
+    ns, ctx, _ = _select_ns(calls, a_money=1e7)
+    _load_fns(ns, "l0_get_stock_list", "l0_calculate_quality_score",
+              "l0_time_to_minutes", "_rows_for_code")
+    qualified = ns["l0_get_stock_list"](ctx)
+
+    assert qualified == []
+    assert [c for c in calls if c[0] == "get_call_auction"] == [], calls
