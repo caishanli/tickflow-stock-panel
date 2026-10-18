@@ -17,7 +17,12 @@ for a in "$@"; do printf '\\t%s' "$a" >> "$STUB_RCLONE_CALLS"; done
 printf '\\n' >> "$STUB_RCLONE_CALLS"
 case "$sub" in
   version) echo "rclone v1.71.0-stub"; exit 0 ;;
-  about) [ "${STUB_ABOUT_FAIL:-0}" = "1" ] && exit 1; echo "Total: 15 GiB"; exit 0 ;;
+  about) if [ "${STUB_ABOUT_FAIL:-0}" = "1" ]; then echo "stub-about-failed" >&2; exit 1; fi
+         case "${1:-}" in
+           *:) ;;
+           *) echo "about: not a remote: ${1:-}" >&2; exit 1 ;;
+         esac
+         echo "Total: 15 GiB"; exit 0 ;;
 esac
 logfile=""; prev=""
 for a in "$@"; do [ "$prev" = "--log-file" ] && logfile="$a"; prev="$a"; done
@@ -100,6 +105,22 @@ def test_lock_busy_skips_and_does_not_touch_rclone(tmp_path):
     assert r["calls"] == ""
     # 跳过不是成功：什么都没传，last_success_at 必须停在上一轮
     assert r["status"]["last_success_at"] == "2026-10-17T23:31:00+08:00"
+
+
+def test_about_probe_uses_remote_with_colon(tmp_path):
+    """预检必须探测 `remote:`（带冒号）；裸名字会被真实 rclone 当本地路径，报 not a remote。"""
+    r = run_sync(tmp_path)
+    abouts = [l.split("\t") for l in r["calls"].splitlines() if l.split("\t")[0] == "about"]
+    assert abouts, "没有发起 about 预检"
+    assert abouts[0][1].endswith(":")
+    assert r["status"]["exit_code"] == 0
+
+
+def test_about_failure_records_underlying_error(tmp_path):
+    r = run_sync(tmp_path, env={"STUB_ABOUT_FAIL": "1"})
+    assert r["status"]["exit_code"] == 4
+    assert "stub-about-failed" in r["status"]["error_tail"]
+    assert "stub-about-failed" in r["log"]
 
 
 def test_full_success_copies_all_units_with_arg_discipline(tmp_path):

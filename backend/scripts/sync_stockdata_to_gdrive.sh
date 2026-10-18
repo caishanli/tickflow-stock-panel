@@ -246,15 +246,17 @@ main() {
   _log "rclone: $RCLONE_VERSION"
 
   # ---- 授权/连通预检 ----
-  local host="${GDRIVE_REMOTE%%:*}"
-  if ! "$RCLONE_BIN" about "$host" >/dev/null 2>&1; then
+  # 必须带冒号：裸名字会被 rclone 当成本地路径（not a remote）
+  local host="${GDRIVE_REMOTE%%:*}" about_out about_tail
+  if ! about_out="$("$RCLONE_BIN" about "$host:" 2>&1)"; then
+    about_tail="$(printf '%s\n' "$about_out" | tail -n 3 | paste -sd ' | ' - | cut -c1-400)"
     STATUS_EXIT=4
-    STATUS_ERROR_TAIL="about 探测失败: $host"
-    _log "授权/连通预检失败，退出 4: rclone about $host"
+    STATUS_ERROR_TAIL="about 探测失败: $host: | $about_tail"
+    _log "授权/连通预检失败，退出 4: rclone about $host: → $about_tail"
     _write_status
     exit 4
   fi
-  _log "授权预检通过（rclone about $host）"
+  _log "授权预检通过（rclone about $host:）"
 
   # ---- 白名单增量复制：单个单元失败不中断整体 ----
   local rel rc
