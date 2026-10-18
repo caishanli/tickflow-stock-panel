@@ -87,7 +87,7 @@ Google 侧对上传有明显限流（TCP 层 `rwnd_limited` 80%、连接大段�
 | `trigger` | `cron` / `manual` / `first-full` |
 | `skipped` | `lock_busy`（已有实例在跑）或 `null` |
 | `dirs_ok` / `dirs_failed` | 成功 / 失败的单元（最大 17 = 16 目录 + 1 文件） |
-| `transferred_files` / `transferred_bytes` | 本轮上传量（逐单元累加；解析失败为 `null`） |
+| `transferred_files` / `transferred_bytes` | 本轮上传量（逐单元累加；解析失败为 `null`）。字节数是 **rclone 自己的计数器**：被限流重传时会偏大（实测同一 2 KB 文件在限流下报 4 KB） |
 | `elapsed_s` / `rclone_version` / `remote` | 耗时、rclone 版本、远端根 |
 | `error_tail` | 本轮日志里的错误摘要（≤500 字符） |
 
