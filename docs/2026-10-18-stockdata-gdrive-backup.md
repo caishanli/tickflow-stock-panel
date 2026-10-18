@@ -45,11 +45,33 @@ GDRIVE_TRIGGER=manual backend/scripts/sync_stockdata_to_gdrive.sh; echo "rc=$?"
 | `GDRIVE_REMOTE` | `gdrive:tickflow-stockdata/data` | 远端根（换盘/换账号改这里） |
 | `RCLONE_BIN` | `~/.local/bin/rclone` | rclone 二进制 |
 | `RCLONE_BWLIMIT` | 空（不限速） | 设了才追加 `--bwlimit`，如 `8M` |
+| `RCLONE_TRANSFERS` / `RCLONE_CHECKERS` | `4` / `8` | 并发传输/校验路数。首轮全量建议 `16`/`16`（见下「首轮耗时与调优」） |
 | `GDRIVE_MIN_AGE` | `15m` | 跳过刚被写过的文件（防空传半写的 parquet） |
 | `GDRIVE_TRIGGER` | `cron` | 只写进状态文件的来源标记 |
 | `GDRIVE_LOG` / `GDRIVE_STATUS` / `GDRIVE_LOCK` | `data/gdrive_sync.log` / `data/gdrive_sync_status.json` / `data/.gdrive_sync.lock` | 运行态文件 |
 
 脚本可安全重复运行（增量比对 size+mtime），中断后重跑即续传。
+
+## 首轮耗时与调优（实测 2026-10-18）
+
+本地白名单约 4.15 GiB / 7519 文件（`kline_minute` 565 文件占 4153 MiB；`kline_etf_daily` 5260 个碎文件占 47 MiB）。
+Google 侧对上传有明显限流（TCP 层 `rwnd_limited` 80%、连接大段空转、`bytes_sent` 远超实际落盘量 = 重传），
+所以**瓶颈是 Drive 侧的延迟/限流，不是上行带宽**（实测本机仍有余量 ~4 MB/s）。据此调优：
+
+| 配置 | 实测速率 |
+|---|---|
+| `--transfers 4`（旧默认）+ 目录 mtime 同步 | ~94 KiB/s |
+| `--transfers 16` + `--no-update-dir-modtime` | **~577 KiB/s** |
+| `--transfers 32` | ~338 KiB/s（更差——并发越高被限得越狠） |
+
+两个关键点：
+
+1. **`--no-update-dir-modtime`（脚本已默认带上）**：rclone 会逐目录串行调用 Drive 的目录 mtime 接口，
+   `kline_minute` 的 565 个 `date=` 分区就要 ~10 分钟且期间**零字节吞吐**。备份不需要目录 mtime（恢复只关心文件），关掉。
+2. **并发度 16 是甜点**：首轮全量用 `RCLONE_TRANSFERS=16 RCLONE_CHECKERS=16`；
+   日常增量只有 ~19 MB / 十几文件，用默认 4/8 即可。
+
+按此配置首轮全量预计 2 小时左右。彻底解限流的办法是**换成自己的 OAuth client_id**（见下「已知风险」）。
 
 ## 状态与日志
 
@@ -132,6 +154,9 @@ GDRIVE_TRIGGER=manual backend/scripts/sync_stockdata_to_gdrive.sh; echo "rc=$?"
 本项目按设计没有失败告警，届时备份会**静默停摆**（唯一信号是 `last_success_at` 停滞）。彻底修法：
 在 GCP 建自己的 OAuth client（https://rclone.org/drive/#making-your-own-client-id），
 把 `client_id` / `client_secret` 写进 `~/.config/rclone/rclone.conf` 后重新授权，约 10 分钟。
+
+另外，2026-10-18 首轮实测显示共享 client_id **当前就已经在被重度限流**（~577 KiB/s，见上节；上行带宽本身有余量），
+换自己的 client_id 通常同时解决限速与退役两件事。
 
 **备份没跟上 / 没触发**
 
