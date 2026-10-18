@@ -102,6 +102,58 @@ def test_lock_busy_skips_and_does_not_touch_rclone(tmp_path):
     assert r["status"]["last_success_at"] == "2026-10-17T23:31:00+08:00"
 
 
+def test_full_success_copies_all_units_with_arg_discipline(tmp_path):
+    r = run_sync(tmp_path)
+    assert r["proc"].returncode == 0
+    assert r["status"]["exit_code"] == 0
+    assert r["status"]["dirs_ok"] == 17 and r["status"]["dirs_failed"] == []
+    assert r["status"]["trigger"] == "cron"
+    assert r["status"]["remote"] == "gdrive:tickflow-stockdata/data"
+    assert r["status"]["last_success_at"] is not None
+    lines = [l.split("\t") for l in r["calls"].splitlines()]
+    copies = [l for l in lines if l[0] in ("copy", "copyto")]
+    assert len(copies) == 17                                  # 16 目录 + 1 文件
+    assert [l[0] for l in lines if l[0] == "copyto"] == ["copyto"]
+    for l in copies:
+        assert "--min-age" in l and "15m" in l
+        assert "--transfers" in l and "--checkers" in l and "--retries" in l
+        assert "--bwlimit" not in l                            # 未设 RCLONE_BWLIMIT 时不加
+        assert not any(a.startswith("--delete") for a in l)
+        assert l[0] not in ("sync", "move", "delete", "purge")  # 只看子命令，别匹配到 .../gdrive_sync.log
+    srcs = {l[1] for l in copies if l[0] == "copy"}
+    assert srcs == {str(tmp_path / "data" / d) for d in WHITELIST_DIRS}
+    assert not any("quant.db" in a for l in copies for a in l)
+
+
+def test_per_unit_failure_continues_and_does_not_advance_last_success(tmp_path):
+    st = tmp_path / "prev.json"
+    st.write_text(json.dumps({"last_success_at": "2026-10-17T23:31:00+08:00"}))
+    r = run_sync(tmp_path, env={"STUB_FAIL_IN": "kline_index_daily", "GDRIVE_STATUS": str(st)})
+    assert r["proc"].returncode == 5
+    assert r["status"]["exit_code"] == 5
+    assert r["status"]["dirs_failed"] == ["kline_index_daily"]
+    assert r["status"]["dirs_ok"] == 16
+    assert r["status"]["last_success_at"] == "2026-10-17T23:31:00+08:00"
+    assert "etf_nav" in r["calls"]          # 失败单元之后的单元仍然跑
+    assert "ERROR" in r["status"]["error_tail"]
+
+
+def test_remote_override_with_trailing_slash_and_custom_host(tmp_path):
+    r = run_sync(tmp_path, env={"GDRIVE_REMOTE": "gdrive:my-backup/"})
+    dests = {l[2] for l in [x.split("\t") for x in r["calls"].splitlines()]
+             if l[0] in ("copy", "copyto")}
+    assert dests == {f"gdrive:my-backup/{d}" for d in WHITELIST_DIRS} | {"gdrive:my-backup/trade_calendar.json"}
+    assert not any("//" in d for d in dests)
+
+
+def test_missing_whitelisted_dir_is_skipped_not_failed(tmp_path):
+    r = run_sync(tmp_path, dirs=[d for d in WHITELIST_DIRS if d != "financials"])
+    assert r["proc"].returncode == 0
+    assert r["status"]["exit_code"] == 0
+    assert r["status"]["dirs_ok"] == 16 and r["status"]["dirs_failed"] == []
+    assert "financials" in r["log"] and "跳过" in r["log"]
+
+
 def test_log_rotation_keeps_old_in_dot1_and_writes_run_lines_to_new_log(tmp_path):
     log = tmp_path / "data" / "gdrive_sync.log"
     log.parent.mkdir(parents=True, exist_ok=True)

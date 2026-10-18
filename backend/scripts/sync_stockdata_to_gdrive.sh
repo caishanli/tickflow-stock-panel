@@ -41,6 +41,15 @@ if [ -n "$RCLONE_BWLIMIT" ]; then
   RCLONE_ARGS+=(--bwlimit "$RCLONE_BWLIMIT")
 fi
 
+# ---- 同步白名单（顺序即上传顺序；新增数据类型必须显式加进来）----
+DIRS=(
+  kline_minute kline_etf_minute kline_daily kline_etf_daily kline_index_daily
+  kline_daily_enriched kline_etf_enriched kline_index_enriched
+  adj_factor adj_factor_etf instruments instruments_etf instruments_index
+  financials industries_sw etf_nav
+)
+FILES=(trade_calendar.json)
+
 # ---- 状态 ----
 STATUS_EXIT=0
 STATUS_SKIPPED=""
@@ -66,6 +75,23 @@ _dirs_failed_json() {
     return 0
   fi
   printf '%s\n' "${DIRS_FAILED[@]}" | jq -R . | jq -sc .
+}
+
+# 单个白名单单元：copy 目录 / copyto 单文件。返回值即 rclone 退出码。
+# 绝不用 sync、绝不带 --delete*（远端只增不减）。
+_copy_unit() {
+  local rel="$1" mode="${2:-dir}"
+  if [ "$mode" = "file" ]; then
+    "$RCLONE_BIN" copyto "$GDRIVE_DATA_DIR/$rel" "$REMOTE_ROOT/$rel" "${RCLONE_ARGS[@]}"
+  else
+    "$RCLONE_BIN" copy "$GDRIVE_DATA_DIR/$rel" "$REMOTE_ROOT/$rel" "${RCLONE_ARGS[@]}"
+  fi
+}
+
+# 本轮日志里的错误摘要（取本轮新增行，不看历史）
+_compute_error_tail() {
+  awk -v start="${LOG_START_LINES:-0}" 'NR>start' "$GDRIVE_LOG" 2>/dev/null \
+    | grep -iE 'error|failed' | tail -n 5 | paste -sd ' | ' - | cut -c1-500
 }
 
 # 原子写状态：先读旧状态沿用 last_success_at，再写 .tmp 后 mv
@@ -170,10 +196,51 @@ main() {
   fi
   _log "授权预检通过（rclone about $host）"
 
-  # ---- 复制循环见 Task 2 ----
+  # ---- 白名单增量复制：单个单元失败不中断整体 ----
+  local rel rc
+  for rel in "${DIRS[@]}"; do
+    if [ ! -d "$GDRIVE_DATA_DIR/$rel" ]; then
+      _log "跳过（本地不存在）: $rel"
+      continue
+    fi
+    rc=0
+    _copy_unit "$rel" dir || rc=$?
+    if [ "$rc" = "0" ]; then
+      DIRS_OK=$((DIRS_OK + 1))
+      _log "单元完成: $rel"
+    else
+      DIRS_FAILED+=("$rel")
+      _log "单元失败: $rel rc=$rc"
+    fi
+  done
+  for rel in "${FILES[@]}"; do
+    if [ ! -f "$GDRIVE_DATA_DIR/$rel" ]; then
+      _log "跳过（本地不存在）: $rel"
+      continue
+    fi
+    rc=0
+    _copy_unit "$rel" file || rc=$?
+    if [ "$rc" = "0" ]; then
+      DIRS_OK=$((DIRS_OK + 1))
+      _log "单元完成: $rel"
+    else
+      DIRS_FAILED+=("$rel")
+      _log "单元失败: $rel rc=$rc"
+    fi
+  done
+
+  if [ "${#DIRS_FAILED[@]}" -gt 0 ]; then
+    STATUS_EXIT=5
+  fi
+  # 错误摘要取本轮日志（预检阶段已显式写入的摘要优先保留）
+  local tail_out
+  tail_out="$(_compute_error_tail)"
+  if [ -n "$tail_out" ]; then
+    STATUS_ERROR_TAIL="$tail_out"
+  fi
 
   _write_status
-  _log "结束 exit=$STATUS_EXIT elapsed=${SECONDS}s"
+  _log "结束 exit=$STATUS_EXIT dirs_ok=$DIRS_OK dirs_failed=${#DIRS_FAILED[@]} elapsed=${SECONDS}s"
   exit "$STATUS_EXIT"
 }
 
