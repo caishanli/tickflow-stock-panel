@@ -33,7 +33,6 @@ RCLONE_ARGS=(
   --low-level-retries 10
   --drive-chunk-size 32M
   --stats 60s
-  --stats-one-line
   --log-level INFO
   --log-file "$GDRIVE_LOG"
 )
@@ -58,6 +57,7 @@ DIRS_OK=0
 DIRS_FAILED=()
 TRANSFERRED_FILES=0
 TRANSFERRED_BYTES=0
+STATS_PARSED=1
 RCLONE_VERSION="unknown"
 LOG_START_LINES=0
 SECONDS=0
@@ -94,13 +94,68 @@ _compute_error_tail() {
     | grep -iE 'error|failed' | tail -n 5 | paste -sd ' | ' - | cut -c1-500
 }
 
+# 解析本轮最后一个 rclone 结尾统计块 → stdout "files bytes"；无法解析 → "null null"。
+# 依据本机真实 rclone 输出（backend/tests/fixtures/rclone_stats_block.txt）：
+# 只有完整统计块同时含「字节对」与「文件数对」；无传输时文件数对整行不出现。
+_parse_stats() {
+  python3 - "$GDRIVE_LOG" "${LOG_START_LINES:-0}" <<'PY'
+import re
+import sys
+
+path, start = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()[start:]
+except OSError:
+    print("null null")
+    raise SystemExit(0)
+
+sizes = re.compile(r"^\s*Transferred:\s+([0-9.]+)\s*([KMGTP]i?B|B)\s*/", re.IGNORECASE)
+counts = re.compile(r"^\s*Transferred:\s+([0-9]+)\s*/\s*([0-9]+)")
+units = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4, "pib": 1024**5}
+
+block = None
+for i, line in enumerate(lines):
+    if sizes.match(line):
+        block = i          # 最后一个字节对行 = 最后一个统计块的起点
+
+if block is None:
+    print("null null")
+    raise SystemExit(0)
+
+m = sizes.match(lines[block])
+total = int(round(float(m.group(1)) * units[m.group(2).lower()]))
+files = 0
+for line in lines[block:block + 4]:
+    mc = counts.match(line)
+    if mc:
+        files = int(mc.group(1))
+        break
+print(files, total)
+PY
+}
+
+# 每个单元复制完立即累加该单元的收尾统计（串行执行，所以「最后一个块」就是本单元的）
+_accumulate_stats() {
+  local out files bytes
+  out="$(_parse_stats)"
+  files="${out%% *}"
+  bytes="${out##* }"
+  if [ "$files" = "null" ] || [ "$bytes" = "null" ]; then
+    STATS_PARSED=0
+    return 0
+  fi
+  TRANSFERRED_FILES=$((TRANSFERRED_FILES + files))
+  TRANSFERRED_BYTES=$((TRANSFERRED_BYTES + bytes))
+}
+
 # 原子写状态：先读旧状态沿用 last_success_at，再写 .tmp 后 mv
 _write_status() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '[%s] [sync] jq 不可用，无法写状态文件 %s\n' "$(_ts)" "$GDRIVE_STATUS" >&2
     return 0
   fi
-  local now prev_success success tmp skipped_arg
+  local now prev_success success tmp skipped_arg stats_args
   now="$(_ts)"
   prev_success=""
   if [ -f "$GDRIVE_STATUS" ]; then
@@ -117,6 +172,12 @@ _write_status() {
   else
     skipped_arg=(--argjson skipped null)
   fi
+  # 本轮统计解析失败（rclone 输出形态变了？）写 null，而不是写一个错值
+  if [ "$STATS_PARSED" = "1" ]; then
+    stats_args=(--argjson transferred_files "$TRANSFERRED_FILES" --argjson transferred_bytes "$TRANSFERRED_BYTES")
+  else
+    stats_args=(--argjson transferred_files null --argjson transferred_bytes null)
+  fi
   tmp="$GDRIVE_STATUS.tmp"
   if jq -n \
       --arg last_run_at "$now" \
@@ -126,8 +187,7 @@ _write_status() {
       "${skipped_arg[@]}" \
       --argjson dirs_ok "$DIRS_OK" \
       --argjson dirs_failed "$(_dirs_failed_json)" \
-      --argjson transferred_files "$TRANSFERRED_FILES" \
-      --argjson transferred_bytes "$TRANSFERRED_BYTES" \
+      "${stats_args[@]}" \
       --argjson elapsed_s "$SECONDS" \
       --arg rclone_version "$RCLONE_VERSION" \
       --arg remote "$GDRIVE_REMOTE" \
@@ -205,6 +265,7 @@ main() {
     fi
     rc=0
     _copy_unit "$rel" dir || rc=$?
+    _accumulate_stats
     if [ "$rc" = "0" ]; then
       DIRS_OK=$((DIRS_OK + 1))
       _log "单元完成: $rel"
@@ -220,6 +281,7 @@ main() {
     fi
     rc=0
     _copy_unit "$rel" file || rc=$?
+    _accumulate_stats
     if [ "$rc" = "0" ]; then
       DIRS_OK=$((DIRS_OK + 1))
       _log "单元完成: $rel"

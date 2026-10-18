@@ -1,0 +1,16 @@
+# 由本机真实 rclone 实跑抓取（本地后端，无需 Google 授权）
+# rclone version: rclone v1.75.2
+# 抓取: rclone copy src dst --stats 60s --log-level INFO ；下面每个块是该次运行的结尾统计块（原文）
+# 有传输
+2026/10/18 13:14:02 INFO  : 
+Transferred:   	  198.242 KiB / 198.242 KiB, 100%, 0 B/s, ETA -
+Checks:                 0 / 0, -, Listed 4
+Transferred:            4 / 4, 100%
+Elapsed time:         0.0s
+
+# 无传输
+2026/10/18 13:14:02 INFO  : There was nothing to transfer
+2026/10/18 13:14:02 INFO  : 
+Transferred:   	          0 B / 0 B, -, 0 B/s, ETA -
+Checks:                 4 / 4, 100%, Listed 8
+Elapsed time:         0.0s

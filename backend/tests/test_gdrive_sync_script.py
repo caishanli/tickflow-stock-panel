@@ -32,7 +32,7 @@ exit 0
 
 def run_sync(tmp_path, env=None, dirs=WHITELIST_DIRS, files=("trade_calendar.json",)):
     data = tmp_path / "data"
-    data.mkdir(exist_ok=True)
+    data.mkdir(parents=True, exist_ok=True)
     for d in dirs:
         (data / d).mkdir(exist_ok=True)
         (data / d / "part.parquet").write_bytes(b"x" * 10)
@@ -50,7 +50,7 @@ def run_sync(tmp_path, env=None, dirs=WHITELIST_DIRS, files=("trade_calendar.jso
         "GDRIVE_STATUS": str(data / "gdrive_sync_status.json"),
         "GDRIVE_LOCK": str(data / ".gdrive_sync.lock"),
         "STUB_RCLONE_CALLS": str(calls),
-        "STUB_STATS_LINE": "2026/10/18 23:30:01 INFO  : Transferred:   2 / 2, 100%, 18.5 MiB, 1.2 MiB/s, ETA 0s",
+        "STUB_STATS_LINE": _stats_samples()["有传输"],
     }
     full_env.update(env or {})
     proc = subprocess.run(["bash", str(SCRIPT)], env=full_env, capture_output=True, text=True, timeout=90)
@@ -152,6 +152,72 @@ def test_missing_whitelisted_dir_is_skipped_not_failed(tmp_path):
     assert r["status"]["exit_code"] == 0
     assert r["status"]["dirs_ok"] == 16 and r["status"]["dirs_failed"] == []
     assert "financials" in r["log"] and "跳过" in r["log"]
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _stats_samples():
+    """把 fixtures 里按 `# 名字` 分块的原文块读成 {名字: 块文本}。"""
+    out, key = {}, None
+    for line in (FIXTURES / "rclone_stats_block.txt").read_text().splitlines():
+        if line.startswith("# "):
+            key = line[2:].strip()
+            out[key] = []
+        elif key and line.strip():
+            out[key].append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def test_stats_parsed_from_real_rclone_samples(tmp_path):
+    samples = _stats_samples()
+    r = run_sync(tmp_path, env={"STUB_STATS_LINE": samples["有传输"]})
+    assert r["status"]["exit_code"] == 0
+    assert r["status"]["transferred_files"] >= 1
+    assert r["status"]["transferred_bytes"] > 0
+    r2 = run_sync(tmp_path / "second", env={"STUB_STATS_LINE": samples["无传输"]})
+    assert r2["status"]["transferred_files"] == 0
+    assert r2["status"]["transferred_bytes"] == 0
+    assert r2["status"]["exit_code"] == 0
+
+
+def test_stats_accumulate_across_units(tmp_path):
+    """每个单元的收尾统计块都要累加——不能只算最后一个单元。"""
+    samples = _stats_samples()
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    one = run_sync(tmp_path / "one", dirs=["kline_minute"], files=(),
+                   env={"STUB_STATS_LINE": samples["有传输"]})
+    two = run_sync(tmp_path / "two", dirs=["kline_minute", "etf_nav"], files=(),
+                   env={"STUB_STATS_LINE": samples["有传输"]})
+    assert one["status"]["transferred_files"] == 4
+    assert two["status"]["transferred_files"] == 8
+    assert one["status"]["transferred_bytes"] > 0
+    assert two["status"]["transferred_bytes"] == 2 * one["status"]["transferred_bytes"]
+
+
+def test_unparsable_or_missing_stats_is_null_not_crash(tmp_path):
+    r = run_sync(tmp_path, env={"STUB_STATS_LINE": "INFO  : nothing useful here"})
+    assert r["proc"].returncode == 0
+    assert r["status"]["transferred_files"] is None
+    assert r["status"]["transferred_bytes"] is None
+
+
+def test_corrupt_previous_status_does_not_crash(tmp_path):
+    st = tmp_path / "prev.json"
+    st.write_text("{not json")
+    r = run_sync(tmp_path, env={"GDRIVE_STATUS": str(st)})
+    assert r["proc"].returncode == 0
+    assert r["status"]["last_success_at"] is not None
+
+
+def test_error_tail_collects_this_run_errors_only(tmp_path):
+    st = tmp_path / "prev.json"
+    st.write_text(json.dumps({"last_success_at": "2026-10-17T23:31:00+08:00"}))
+    r = run_sync(tmp_path, env={"STUB_FAIL_IN": "financials", "GDRIVE_STATUS": str(st)})
+    assert r["status"]["exit_code"] == 5
+    assert "financials" in r["status"]["error_tail"]
+    assert len(r["status"]["error_tail"]) <= 500
 
 
 def test_log_rotation_keeps_old_in_dot1_and_writes_run_lines_to_new_log(tmp_path):
