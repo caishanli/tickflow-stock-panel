@@ -14,6 +14,7 @@ A 股「选股 + 监控 + 回测」量化工作台。后端 FastAPI + Polars/Duc
 - 后端 reload 已关闭：dev.sh 默认 **不用 `--reload`** 直接起 uvicorn（2026-09-07 起：`backend/*.py` 被频繁改写时 watchfiles 会 reload 风暴，每 1~3 分钟重启后端 + stockdata 冷重启，实盘抖动；改后端代码后手动重启）。`backend/scripts/run_backend_reloader.py` 包装层保留备用，诊断同前：`kill -USR1 <child_pid>` 全线程栈转储到 `data/backend_fault_dump.txt`。
 - 首次启动需 `cp .env.example .env`（留空 `TICKFLOW_API_KEY` = None/Free 模式，仅历史日 K）。`AUTH_PASSWORD` 仅首次初始化生效，改密码用页面 UI。
 - 模拟盘交易时段触发偏移：根 `.env` 设 `SIM_TICK_OFFSET=N`（默认 8，每分钟第 N 秒后触发，等快照跨分钟边界）；设 3 可提速（实测 13:10:03~05 完成 vs 原 13:10:10~11）。**改值需重启 main backend**（uvicorn 启动时读一次）。stockdata 服务不受影响。
+- 行情数据备份：`backend/scripts/sync_stockdata_to_gdrive.sh` 增量同步到 Google Drive（`gdrive:tickflow-stockdata/data`，单向、远端只增不减），用户 crontab 每天 17:30 / 23:30 触发。**独立于 stockdata 服务与主后端**（备份不该依赖被备份者存活）；状态 `data/gdrive_sync_status.json`（看 `last_success_at`）、日志 `data/gdrive_sync.log`。范围/恢复/排障见 `docs/2026-10-18-stockdata-gdrive-backup.md`。恢复命令：`~/.local/bin/rclone copy gdrive:tickflow-stockdata/data/<相对路径> ./data/<相对路径>`。
 
 ## 验证命令（易踩坑）
 
