@@ -108,7 +108,7 @@ gdrive:tickflow-stockdata/data/
      --transfers 4 --checkers 8 \
      --retries 3 --low-level-retries 10 \
      --drive-chunk-size 32M \
-     --log-file "$LOG" --log-level INFO --stats 60s --stats-one-line
+     --log-file "$LOG" --log-level INFO --stats 60s
    ```
    - **`copy` 而非 `sync`，且不带任何 `--delete*`**：远端只增不减，脚本永远不可能删除云端备份。
    - **`--min-age 15m`**：跳过 15 分钟内被修改的文件——收盘批量回源正在落盘的 parquet 不会被半路传走。
@@ -131,7 +131,7 @@ gdrive:tickflow-stockdata/data/
      "error_tail": ""
    }
    ```
-   - `transferred_files/bytes` 从 rclone `--stats-one-line` 的最后一行汇总（形如 `Transferred: 4 / 4, 100%, 18.9 MiB`）解析；解析失败则该字段为 `null`（不影响退出码）。`rclone_version` 写运行时的真实值，示例中的版本仅为格式示意。
+   - `transferred_files/bytes` 从 rclone 多行 `--stats 60s` 的最后一块（`Transferred:` 字节对 + 文件数对）汇总解析；无传输时文件数对整行省略，故 bytes 可能有值而 files 为 0；解析失败则该字段为 `null`（不影响退出码）。`rclone_version` 写运行时的真实值，示例中的版本仅为格式示意。 fixture：`backend/tests/fixtures/rclone_stats_block.txt`（真实 rclone v1.75.2 输出）。
    - **`last_success_at` 仅在整体退出码为 0 时推进**——它才是「数据最后一次真正上云成功」的依据；失败运行只更新 `last_run_at` 与 `error_tail`。
 7. **首次全量**：同一脚本、同样参数直接跑（`--min-age 15m` 对历史分区无影响）。为避免阻塞会话，用 `setsid` 后台执行，`tail -f data/gdrive_sync.log` 看进度。默认**不限速**；若上行被占满影响上网，脚本支持 `RCLONE_BWLIMIT`（设置后追加 `--bwlimit`，如 `8M`）。
 

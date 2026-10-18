@@ -187,7 +187,7 @@ set -uo pipefail   # 故意不用 -e：按设计单个单元失败不中断整�
 
 - `ROOT="$(cd "$(dirname "$0")/../.." && pwd)"`；上面 Interfaces 列的 10 个环境变量全部支持覆盖，默认值按 Interfaces 写。
 - `_log()` 用 `>>` **每次重新打开**日志文件追加 `[ts] [sync] msg`（不持有长驻 fd——轮转后新的日志行必须落进新文件），同时 `echo` 到 stdout。
-- 脚本内**不做** `--delete`/`sync`（Task 2 落实），本任务只需把参数数组 `RCLONE_ARGS` 建好：`--min-age "$GDRIVE_MIN_AGE"`、`--exclude '*.lock'`、`--exclude '.raw_partition_locks/**'`、`--transfers 4`、`--checkers 8`、`--retries 3`、`--low-level-retries 10`、`--drive-chunk-size 32M`、`--stats 60s`、`--stats-one-line`、`--log-level INFO`、`--log-file "$GDRIVE_LOG"`，`RCLONE_BWLIMIT` 非空时追加 `--bwlimit "$RCLONE_BWLIMIT"`。
+- 脚本内**不做** `--delete`/`sync`（Task 2 落实），本任务只需把参数数组 `RCLONE_ARGS` 建好：`--min-age "$GDRIVE_MIN_AGE"`、`--exclude '*.lock'`、`--exclude '.raw_partition_locks/**'`、`--transfers 4`、`--checkers 8`、`--retries 3`、`--low-level-retries 10`、`--drive-chunk-size 32M`、`--stats 60s`、`--log-level INFO`、`--log-file "$GDRIVE_LOG"`，`RCLONE_BWLIMIT` 非空时追加 `--bwlimit "$RCLONE_BWLIMIT"`。
 - 主流程顺序：`exec 9>"$GDRIVE_LOCK"; flock -n 9` 失败 → 写状态（`skipped=lock_busy`、`exit_code=0`、沿用上次 `last_success_at`）→ exit 0。拿到锁后：日志轮转（`[ -f "$GDRIVE_LOG" ] && [ "$(stat -c%s "$GDRIVE_LOG")" -gt "$GDRIVE_LOG_MAX_BYTES" ] && mv -f "$GDRIVE_LOG" "$GDRIVE_LOG.1"`）→ 记录 `LOG_START_LINES=$(wc -l < "$GDRIVE_LOG" 2>/dev/null || echo 0)` → 预检 → （Task 2 的复制循环）→ 写状态 → 按汇总退出。
 - 预检：`command -v jq`、`command -v python3` 与 `[ -x "$RCLONE_BIN" ]` 任一不满足 → `_log` 说明 + 写状态（`exit_code=3`）+ exit 3；`"$RCLONE_BIN" version | head -1` 捕获 `RCLONE_VERSION`（失败记 `unknown`）；`"$RCLONE_BIN" about "${GDRIVE_REMOTE%%:*}"` 非 0 → 写状态（`exit_code=4`，`error_tail` 记 `about 探测失败`）+ exit 4。
 - `_write_status()`：先读旧状态取 `prev_success`（`jq -r '.last_success_at // empty'`，文件缺失或解析失败都当空，**不得因此崩**），再 `jq -n` 生成完整 JSON 写到 `$GDRIVE_STATUS.tmp` 后 `mv -f` 覆盖。`last_success_at` = 本轮 `exit_code==0` 时取当前时间戳，否则取 `prev_success`（为空写 `null`）；`skipped`、`error_tail` 无值写 `null`/空串；`dirs_failed` 写 JSON 数组；`transferred_files`/`transferred_bytes`/`elapsed_s` 本任务先写 `0`（Task 3 落实真实值）；`elapsed_s` 用 bash `SECONDS` 内置变量。
@@ -310,7 +310,7 @@ git commit -m "feat(ops): 备份脚本白名单增量复制（单单元失败不
 **Files:**
 - Modify: `backend/scripts/sync_stockdata_to_gdrive.sh`
 - Test: `backend/tests/test_gdrive_sync_script.py`
-- Create: `backend/tests/fixtures/rclone_stats_one_line.txt`
+- Create: `backend/tests/fixtures/rclone_stats_block.txt`
 
 **Interfaces:**
 - Consumes: Task 1/2 的 `GDRIVE_LOG`、`LOG_START_LINES`、`_write_status()`
@@ -330,7 +330,7 @@ $R copy /tmp/rclone-stats-probe/src /tmp/rclone-stats-probe/dst --stats 1s --sta
 $R copy /tmp/rclone-stats-probe/src /tmp/rclone-stats-probe/dst --stats 1s --stats-one-line --log-level INFO 2>&1 | tail -5   # 无传输
 ```
 
-把抓到的两行（尤其 `Transferred:` 所在行）原样写入 `backend/tests/fixtures/rclone_stats_one_line.txt`，每行一条，并加注释行 `# 有传输` / `# 无传输`。这两条是解析器的**唯一契约来源**——不要凭记忆猜 rclone 格式。
+把抓到的两行（尤其 `Transferred:` 所在行）原样写入 `backend/tests/fixtures/rclone_stats_block.txt`，每行一条，并加注释行 `# 有传输` / `# 无传输`。这两条是解析器的**唯一契约来源**——不要凭记忆猜 rclone 格式。
 
 - [ ] **Step 2: 写失败测试**
 
@@ -342,7 +342,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 def _stats_samples():
     out = {}
-    for line in (FIXTURES / "rclone_stats_one_line.txt").read_text().splitlines():
+    for line in (FIXTURES / "rclone_stats_block.txt").read_text().splitlines():
         if line.startswith("# "):
             key = line[2:].strip()
         elif line.strip():
@@ -407,7 +407,7 @@ Expected: 12 passed
 - [ ] **Step 6: 提交**
 
 ```bash
-git add backend/scripts/sync_stockdata_to_gdrive.sh backend/tests/test_gdrive_sync_script.py backend/tests/fixtures/rclone_stats_one_line.txt
+git add backend/scripts/sync_stockdata_to_gdrive.sh backend/tests/test_gdrive_sync_script.py backend/tests/fixtures/rclone_stats_block.txt
 git commit -m "feat(ops): 备份脚本汇总统计解析与错误摘要"
 ```
 
