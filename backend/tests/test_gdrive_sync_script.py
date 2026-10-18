@@ -1,7 +1,10 @@
+import hashlib
 import json
 import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "sync_stockdata_to_gdrive.sh"
 WHITELIST_DIRS = [
@@ -138,12 +141,30 @@ def test_full_success_copies_all_units_with_arg_discipline(tmp_path):
     for l in copies:
         assert "--min-age" in l and "15m" in l
         assert "--transfers" in l and "--checkers" in l and "--retries" in l
+        # 节省：Drive 目录 mtime 同步是逐目录串行 API 调用（数百个分区 = 数分钟零吞吐），备份不需要
+        assert "--no-update-dir-modtime" in l
         assert "--bwlimit" not in l                            # 未设 RCLONE_BWLIMIT 时不加
         assert not any(a.startswith("--delete") for a in l)
         assert l[0] not in ("sync", "move", "delete", "purge")  # 只看子命令，别匹配到 .../gdrive_sync.log
     srcs = {l[1] for l in copies if l[0] == "copy"}
     assert srcs == {str(tmp_path / "data" / d) for d in WHITELIST_DIRS}
     assert not any("quant.db" in a for l in copies for a in l)
+
+
+def test_parallelism_env_overrides_reach_rclone_args(tmp_path):
+    """并发度必须可调：Drive 侧限流时 4 并发是延迟瓶颈，靠提高并发把上行带宽用起来。"""
+    r = run_sync(tmp_path, env={"RCLONE_TRANSFERS": "16", "RCLONE_CHECKERS": "24"})
+    lines = [l.split("\t") for l in r["calls"].splitlines()]
+    copies = [l for l in lines if l[0] in ("copy", "copyto")]
+    assert copies
+    for l in copies:
+        assert l[l.index("--transfers") + 1] == "16"
+        assert l[l.index("--checkers") + 1] == "24"
+    # 默认值不变（用独立 tmp 目录：calls.log 在同一个 tmp_path 下是追加写的）
+    r2 = run_sync(tmp_path / "d2")
+    l2 = [l.split("\t") for l in r2["calls"].splitlines() if l.split("\t")[0] == "copy"][0]
+    assert l2[l2.index("--transfers") + 1] == "4"
+    assert l2[l2.index("--checkers") + 1] == "8"
 
 
 def test_per_unit_failure_continues_and_does_not_advance_last_success(tmp_path):
@@ -249,3 +270,29 @@ def test_log_rotation_keeps_old_in_dot1_and_writes_run_lines_to_new_log(tmp_path
     assert (log.parent / "gdrive_sync.log.1").read_text().count("OLD-MARKER") == 500
     assert "OLD-MARKER" not in r["log"]
     assert "[sync]" in r["log"]
+
+
+@pytest.mark.integration
+def test_e2e_remote_matches_local_and_restore_md5():
+    """真实远端校验（需已授权 gdrive + 已完成首轮全量）。默认 -m integration 才跑。"""
+    rclone = Path.home() / ".local/bin/rclone"
+    if not rclone.exists():
+        pytest.skip("rclone 未安装")
+    data = Path(__file__).resolve().parents[2] / "data"
+    remote = "gdrive:tickflow-stockdata/data"
+    probe = subprocess.run([str(rclone), "about", "gdrive:"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("gdrive remote 未授权")
+    newest = sorted((data / "kline_minute").glob("date=*"))[-1]
+    rel = f"kline_minute/{newest.name}/part.parquet"
+    src = data / rel
+    if not src.exists():
+        pytest.skip(f"本地缺少 {rel}")
+    local_md5 = hashlib.md5(src.read_bytes()).hexdigest()
+    out = Path("/tmp/opencode/gdrive_restore_probe.parquet")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run([str(rclone), "copyto", f"{remote}/{rel}", str(out)],
+                          capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, proc.stderr
+    assert out.stat().st_size == src.stat().st_size
+    assert hashlib.md5(out.read_bytes()).hexdigest() == local_md5

@@ -14,6 +14,8 @@ GDRIVE_DATA_DIR="${GDRIVE_DATA_DIR:-$ROOT/data}"
 GDRIVE_REMOTE="${GDRIVE_REMOTE:-gdrive:tickflow-stockdata/data}"
 RCLONE_BIN="${RCLONE_BIN:-$HOME/.local/bin/rclone}"
 RCLONE_BWLIMIT="${RCLONE_BWLIMIT:-}"
+RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-4}"
+RCLONE_CHECKERS="${RCLONE_CHECKERS:-8}"
 GDRIVE_MIN_AGE="${GDRIVE_MIN_AGE:-15m}"
 GDRIVE_LOG="${GDRIVE_LOG:-$GDRIVE_DATA_DIR/gdrive_sync.log}"
 GDRIVE_STATUS="${GDRIVE_STATUS:-$GDRIVE_DATA_DIR/gdrive_sync_status.json}"
@@ -27,8 +29,9 @@ RCLONE_ARGS=(
   --min-age "$GDRIVE_MIN_AGE"
   --exclude '*.lock'
   --exclude '.raw_partition_locks/**'
-  --transfers 4
-  --checkers 8
+  --transfers "$RCLONE_TRANSFERS"
+  --checkers "$RCLONE_CHECKERS"
+  --no-update-dir-modtime
   --retries 3
   --low-level-retries 10
   --drive-chunk-size 32M
