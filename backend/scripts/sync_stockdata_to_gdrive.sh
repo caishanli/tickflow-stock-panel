@@ -25,7 +25,11 @@ GDRIVE_LOG_MAX_BYTES="${GDRIVE_LOG_MAX_BYTES:-10485760}"
 
 REMOTE_ROOT="${GDRIVE_REMOTE%/}"   # 去尾斜杠，避免拼接出双斜杠
 
-RCLONE_ARGS=(
+# ---- 白名单单元的 rclone 参数 ----
+# 目录: 用完整参数（含 --min-age / --exclude）。
+# 单文件 copyto: **不能**带 --min-age/--exclude，否则 rclone 判
+#   CRITICAL: "can't limit to single files when using filters"。
+RCLONE_DIR_ARGS=(
   --min-age "$GDRIVE_MIN_AGE"
   --exclude '*.lock'
   --exclude '.raw_partition_locks/**'
@@ -39,8 +43,21 @@ RCLONE_ARGS=(
   --log-level INFO
   --log-file "$GDRIVE_LOG"
 )
+# 单文件 copyto 复用除过滤器外的所有参数（并发/重试/分片/日志一致）
+RCLONE_FILE_ARGS=(
+  --transfers "$RCLONE_TRANSFERS"
+  --checkers "$RCLONE_CHECKERS"
+  --no-update-dir-modtime
+  --retries 3
+  --low-level-retries 10
+  --drive-chunk-size 32M
+  --stats 60s
+  --log-level INFO
+  --log-file "$GDRIVE_LOG"
+)
 if [ -n "$RCLONE_BWLIMIT" ]; then
-  RCLONE_ARGS+=(--bwlimit "$RCLONE_BWLIMIT")
+  RCLONE_DIR_ARGS+=(--bwlimit "$RCLONE_BWLIMIT")
+  RCLONE_FILE_ARGS+=(--bwlimit "$RCLONE_BWLIMIT")
 fi
 
 # ---- 同步白名单（顺序即上传顺序；新增数据类型必须显式加进来）----
@@ -82,12 +99,14 @@ _dirs_failed_json() {
 
 # 单个白名单单元：copy 目录 / copyto 单文件。返回值即 rclone 退出码。
 # 绝不用 sync、绝不带 --delete*（远端只增不减）。
+# 单文件 copyto 不能带 --min-age/--exclude（rclone: "can't limit to single files
+# when using filters"），故用独立的参数数组 RCLONE_FILE_ARGS。
 _copy_unit() {
   local rel="$1" mode="${2:-dir}"
   if [ "$mode" = "file" ]; then
-    "$RCLONE_BIN" copyto "$GDRIVE_DATA_DIR/$rel" "$REMOTE_ROOT/$rel" "${RCLONE_ARGS[@]}"
+    "$RCLONE_BIN" copyto "$GDRIVE_DATA_DIR/$rel" "$REMOTE_ROOT/$rel" "${RCLONE_FILE_ARGS[@]}"
   else
-    "$RCLONE_BIN" copy "$GDRIVE_DATA_DIR/$rel" "$REMOTE_ROOT/$rel" "${RCLONE_ARGS[@]}"
+    "$RCLONE_BIN" copy "$GDRIVE_DATA_DIR/$rel" "$REMOTE_ROOT/$rel" "${RCLONE_DIR_ARGS[@]}"
   fi
 }
 

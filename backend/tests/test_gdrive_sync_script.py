@@ -139,16 +139,38 @@ def test_full_success_copies_all_units_with_arg_discipline(tmp_path):
     assert len(copies) == 17                                  # 16 目录 + 1 文件
     assert [l[0] for l in lines if l[0] == "copyto"] == ["copyto"]
     for l in copies:
-        assert "--min-age" in l and "15m" in l
         assert "--transfers" in l and "--checkers" in l and "--retries" in l
         # 节省：Drive 目录 mtime 同步是逐目录串行 API 调用（数百个分区 = 数分钟零吞吐），备份不需要
         assert "--no-update-dir-modtime" in l
         assert "--bwlimit" not in l                            # 未设 RCLONE_BWLIMIT 时不加
         assert not any(a.startswith("--delete") for a in l)
         assert l[0] not in ("sync", "move", "delete", "purge")  # 只看子命令，别匹配到 .../gdrive_sync.log
+    # 目录 copy 带完整过滤器；单文件 copyto 不能带 --min-age/--exclude（rclone 拒绝）
+    for l in [l for l in copies if l[0] == "copy"]:
+        assert "--min-age" in l and "15m" in l
+        assert any(a.startswith("--exclude") for a in l)
+    for l in [l for l in copies if l[0] == "copyto"]:
+        assert "--min-age" not in l
+        assert not any(a.startswith("--exclude") for a in l)
     srcs = {l[1] for l in copies if l[0] == "copy"}
     assert srcs == {str(tmp_path / "data" / d) for d in WHITELIST_DIRS}
     assert not any("quant.db" in a for l in copies for a in l)
+
+
+def test_single_file_copyto_does_not_carry_filters(tmp_path):
+    """rclone 对单文件 copyto 加 --min-age/--exclude 会 CRITICAL 报错
+    'can't limit to single files when using filters'——所以单文件必须去掉过滤器类参数。
+    这个缺陷导致首轮全量时 trade_calendar.json 永远无法上传（exit 1）。"""
+    r = run_sync(tmp_path)
+    lines = [l.split("\t") for l in r["calls"].splitlines()]
+    copytos = [l for l in lines if l[0] == "copyto"]
+    assert len(copytos) == 1 and "trade_calendar.json" in copytos[0][2]
+    file_args = copytos[0]
+    # 单文件 copyto 绝不能带目录过滤器；这些 flag 作用于目录 copy 是合理的
+    assert "--min-age" not in file_args, file_args
+    assert not any(a.startswith("--exclude") for a in file_args), file_args
+    assert r["status"]["exit_code"] == 0
+    assert "trade_calendar.json" not in r["status"]["dirs_failed"]
 
 
 def test_parallelism_env_overrides_reach_rclone_args(tmp_path):
