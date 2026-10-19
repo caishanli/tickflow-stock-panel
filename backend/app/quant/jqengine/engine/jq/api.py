@@ -1343,6 +1343,7 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
 
         ctx = _state.get("ctx")
         strategy_dt = getattr(ctx, "current_dt", None) if ctx is not None else None
+        _state["_preopen_auction_had_miss"] = False
         for day in days:
             _d = pd.Timestamp(day).date()
             wall_now = _auc._now()
@@ -1376,11 +1377,18 @@ def get_call_auction(security, start_date=None, end_date=None, fields=None,
                                                               datetime.time(9, 25)),
                                  "volume": _auc_vol, "current": _auc_px})
                     continue
+                if _day_date == live_preopen:
+                    _state["_preopen_auction_had_miss"] = True
             except Exception:
                 pass
             if _day_date == live_preopen:
                 # 盘前没有可用快照就明确缺数，不使用未来 09:30/09:31 bar 估计。
-                _state["preopen_auction_missing"] = True
+                # 但只有当 *至少有一个* 本轮候选真正需要竞价（lookup miss）时才
+                # 置位——零通过者（如今天 23 只全卡在均价/成交额）从不消费竞价，
+                # 置位只会让盘前回调白重跑整轮（2026-10-15 实测 09:26→09:30
+                # 连跑 8 次）。
+                if _state.get("_preopen_auction_had_miss"):
+                    _state["preopen_auction_missing"] = True
                 continue
             sl = _minute_day_slice(code, day_ts)
             if sl is None:
