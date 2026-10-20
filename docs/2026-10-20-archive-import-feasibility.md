@@ -166,3 +166,60 @@ uv run --extra dev python -m app.quant.archive_fill \
 uv run --extra dev python -m app.quant.archive_fill \
     --target-root ../data/kline_daily --kind daily --from-year 2016 --to-year 2026
 ```
+
+---
+
+# 追加：baostock 复权因子回源（2026-10-21）
+
+## 结论：baostock 有更新的因子，且是归档的同源超集
+
+| | 归档 `4.21更新` 的 adj_factor | baostock `query_adjust_factor` |
+|---|---|---|
+| 覆盖到 | 2026-04-17（快照边界） | **2026-09-24**（000001.SZ 最新事件日） |
+| 事件史 | 2016 起 | **1991-04-03 起**（完整 42 个事件） |
+| 数值形态 | 后复权累计因子（需归一化） | `foreAdjustFactor` **已是最新锚定**（末事件 = 1.000000） |
+
+**同源性验证**：两源的事件乘数逐个比对 —— 000001.SZ 的 166 个共同事件日 **0 不一致**
+（如 2016-06-16 归档 0.820882 vs baostock 0.820881；2025-10-15 两者皆 0.979257）。
+
+## 口径
+
+- `foreAdjustFactor` 已是本机契约格式（`adj_factor_etf` / `apply_qfq_daily`：
+  最新=1.0、越往前越小），**不需要归一化换算**。
+- 事件日当天起生效（step function），与归档因子表实测一致。
+- 回源起点必须早于表起点（默认 1990-01-01）—— fore 是累计因子，缺早期事件会算错起始段。
+
+## 全量回源结果（2026-10-21 04:07）
+
+| 项 | 值 |
+|---|---|
+| 标的 | 5536 只（`stock_universe()`，**不含北交所**） |
+| 成功 / 无事件 / 失败 | **5531 / 5 / 0** |
+| 耗时 | 21.7 分钟（4.2 只/秒） |
+| 产物 | `data/adj_factor/all.parquet`，2222 万行 / 5531 只 / 2016-01-01 → 2026-12-31 / 3.4 MB |
+| 契约校验 | 5530/5531 只的末值 = 1.0 ✅ |
+| 质量审计 | 全量 5742 只标的（20%/25% 跳变门槛）→ **真缺口 0** |
+
+**比归档版多出的覆盖**：2026-04-18 之后 **143 万行**因子（归档完全空白期）+ 2016 年前的历史事件。
+
+## 端到端验证
+
+服务端 `apply_qfq_daily` 对 000001.SZ 2026 年复权后：
+- 除权日 2026-06-12：10.7042 → 10.9978（+2.74%，无跳空 ✅）
+- 除权日 2026-09-24：11.3500 → 11.3000 ✅
+- 全期最大单日涨跌幅 **+4.11%**（复权生效）
+
+## 限制
+
+- **北交所（920xxx.BJ）baostock 不支持**（error 10004011）→ 351 只无因子（与 mootdx 同样限制）。
+- 回源走 baostock 公开接口，速度约 4.2 只/秒；全量约 22 分钟。
+- 归档版备份在 `/tmp/opencode/adj_factor_archive_backup.parquet`（可回滚）。
+
+## 复现
+
+```bash
+cd /home/caisl/tickflow-stock-panel/backend
+uv run --extra dev python -m app.quant.baostock_factor_sync --out ../data/adj_factor/all.parquet
+# 质量审计
+uv run --extra dev python -m app.quant.adj_factor_build --dry-run --audit --daily-dir ../data/kline_daily
+```
