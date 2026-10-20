@@ -223,3 +223,52 @@ uv run --extra dev python -m app.quant.baostock_factor_sync --out ../data/adj_fa
 # 质量审计
 uv run --extra dev python -m app.quant.adj_factor_build --dry-run --audit --daily-dir ../data/kline_daily
 ```
+
+---
+
+# 追加：复权口径统一（2026-10-21，commit cabcb3a）
+
+## 问题
+
+回测桥（`jqcompat._apply_qfq_bars` → `DataManager._adj_events`）与服务端
+（`sources.apply_qfq_daily` 直查因子表）复权口径不一致：
+`_adj_events` 用 **10% 阈值**过滤"除权事件"，而股票现金分红常在 1%~5%
+（实测 baostock 全市场因子表 59197 个事件里 **13153 个落在 1%~10%**）→ 被当噪声滤掉。
+
+## 根因与修复
+
+1. **阈值 10% → 0.01%（|f-1| > 1e-4）**
+   - 旧阈值是给「聚宽 pre/none 价格比值」设计的（那种源含 ±0.1% 价格精度噪声）；
+     当前因子表存的是**精确因子**（baostock foreAdjustFactor / mootdx xdxr 重建），
+     噪声底只有 ~1e-6（baostock 股票表）/~1e-5（mootdx ETF 表，震荡型）。
+   - 1e-4 阈值高于两者噪声底，低于全部真实分红事件。
+
+2. **因子表改存事件行**（step function 稀疏表示）
+   - 逐日表 22 235 558 行（每个自然日一行）→ 事件行表 **42 113 行**（基准行 + 变点）
+   - 服务端 `apply_qfq_daily` 改 **as-of backward join**（对逐日表等价、对事件表正确）
+   - 服务端 `_load_adj_factors` 增加 `adj_factor_baostock` 目录
+
+## 实测
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 客户端 `_adj_factor_map()` | 69.4 s / 10 196 MB | **6.7 s / 982 MB** |
+| 因子表条目 | 22 317 659 | 1 177 928（ETF 逐日 + 股票事件） |
+| 回测桥 vs 服务端 最大相对差 | 漏 22% 分红事件 | **0.0041%**（4 位小数价格精度噪声级） |
+
+## 更正：先前"5.32% 偏差"的测量是错的
+
+`manager._apply_qfq` **没有生产调用方**，且它要求 DatetimeIndex；先前用
+`df.to_pandas()`（RangeIndex）调用 → 直接原样返回（根本没复权），
+测到的"5.32%" 实际是「服务端复权价 vs 原始价」，不是桥与服务端的差。
+真实回测路径是 `jqcompat._apply_qfq_bars`（numpy recarray），
+用 `app/quant/qfq_bars_consistency_check.py` 复刻后实测差异 0.0041%。
+
+## 遗留
+
+- **ETF 逐日表 114 万行**仍占客户端 ~900 MB / ~6 s（mootdx 造的，既有问题）。
+  可同样转事件行进一步压缩（未做）。
+- **北交所 351 只**无因子（baostock 不支持 `.BJ`，error 10004011）。
+- `data/adj_factor/all.parquet`（逐日表）已移除，备份在
+  `/tmp/opencode/adj_factor_daily_backup.parquet`；股票因子现位于
+  `data/adj_factor_baostock/all.parquet`（事件行，42 113 行 / 318 KB）。
