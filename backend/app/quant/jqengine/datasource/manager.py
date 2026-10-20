@@ -466,8 +466,16 @@ class DataManager:
         因子跳变即暴露事件：f = ex_factor(prev) / ex_factor(curr)，事件日 =
         curr。示例：159667 6/9=0.333, 6/10=1.0 → 事件 (6/10, 0.333/1.0)。
 
-        聚宽 pre/none 比值含 4 位价格精度噪声（±0.1% 级微小波动），需过滤：
-        仅保留因子明显偏离 1 的真实除权事件（阈值 10%），忽略噪声。
+        噪声过滤阈值 **0.01%（|f-1| > 1e-4）**：
+        - 旧阈值 10%（0.1<f<0.9 或 f>1.1）是给「聚宽 pre/none 价格比值」设计的，
+          但当前因子表存的是**精确因子**（baostock foreAdjustFactor / mootdx xdxr
+          重建），不再含 ±0.1% 级价格精度噪声。
+        - 股票现金分红常在 1%~5%（实测 baostock 全市场因子表 59197 个事件里
+          13153 个落在 1%~10%），旧阈值会把它们全滤掉 → 回测桥漏掉分红，
+          与服务端 apply_qfq_daily（直查因子表、无阈值）口径不一致。
+        - 噪声底：baostock 股票表 ~1e-6、mootdx ETF 表 ~1e-5（震荡型，
+          如 159357 的 0.99276349↔0.99276450）。1e-4 阈值高于两者、
+          低于全部真实分红事件。
         """
         if self._adj_events_cache is not None and self._adj_fresh():
             return self._adj_events_cache
@@ -486,9 +494,9 @@ class DataManager:
                 cur_dt, cur_f = items[i]
                 if cur_f != prev_f:
                     f = prev_f / cur_f if cur_f else 0.0
-                    # 阈值：除权事件因子偏离 1 至少 10%（0.1 < f < 0.9 或
-                    # f > 1.1），过滤聚宽价格精度噪声产生的伪事件
-                    if (f < 0.9 or f > 1.1) and 0.0 < f < 10.0:
+                    # 阈值：因子偏离 1 超过 0.01% 视为真实除权事件，
+                    # 滤掉因子表的舍入/震荡噪声（~1e-5 量级）
+                    if 0.0 < f < 10.0 and abs(f - 1.0) > 1e-4:
                         events.append((cur_dt, f))
             if events:
                 out[jq] = events
@@ -819,7 +827,7 @@ class DataManager:
                         kwargs["fq"] = self._default_fq
                     df = getattr(self.sources["network"], method)(*_fetch_args, **kwargs)
                     if df is None or (hasattr(df, "empty") and df.empty):
-                        raise DataSourceError(f"network 空数据")
+                        raise DataSourceError("network 空数据")
                     # 与旧分区路径同口径：网络帧补 money/volume 列（幂等，列在则跳过）
                     df = _ensure_money_yuan(df, "network")
                     df = _ensure_volume_shares(df, "network")

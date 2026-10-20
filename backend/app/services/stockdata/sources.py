@@ -681,6 +681,12 @@ class DataSources:
         仅日线调用（分钟/当前价保持真实成交价）。
         注意 symbol 口径：日线分区为 tushare 码（561980.SH），因子表为
         聚宽码（561980.XSHG），join 前归一到 tushare 码。
+
+        **as-of backward join**（而非精确 join）：因子表的两种表示都能用 ——
+        逐日表（adj_factor_etf）与**事件行表**（adj_factor_baostock，step
+        function 的稀疏表示：基准行 + 变点）。as-of 取「date 之前最近一条
+        事件」的因子，对逐日表等价于精确 join（该日自身那行），
+        对事件表则正确展开 step function。
         """
         if df.is_empty() or "symbol" not in df.columns or "date" not in df.columns:
             return df
@@ -694,15 +700,18 @@ class DataSources:
             pl.col("ex_factor"),
         ).unique(subset=["symbol", "date"], keep="last").sort(
             ["symbol", "date"])
-        out = df.with_columns(pl.col("date").cast(pl.Date).alias("date")).join(
-            fdf, on=["symbol", "date"], how="left").with_columns(
-            pl.col("ex_factor").fill_null(1.0))
+        out = df.with_columns(pl.col("date").cast(pl.Date).alias("date"))
+        # join_asof 要求 asof 键有序；用行号占位，join 后恢复原序（精确 join 保持左序）
+        out = out.with_row_index("__ord").sort("date")
+        out = out.join_asof(
+            fdf.sort("date"), on="date", by="symbol", strategy="backward"
+        ).with_columns(pl.col("ex_factor").fill_null(1.0))
         for col in ("open", "high", "low", "close"):
             if col in out.columns and out.schema[col] in (pl.Float64, pl.Float32,
                                                           pl.Int64, pl.Int32):
                 out = out.with_columns(
                     (pl.col(col).cast(pl.Float64) * pl.col("ex_factor")).alias(col))
-        return out.drop("ex_factor")
+        return out.drop("ex_factor").sort("__ord").drop("__ord")
 
     def get_etf_nav(self, codes: list[str], date: str | None = None) -> pl.DataFrame:
         """读 etf_nav 分区（date 给定用该日，None 用最新分区）。"""
@@ -1191,13 +1200,18 @@ class DataSources:
 
     def _load_adj_factors(self) -> pl.DataFrame:
         """因子表 = ETF（adj_factor_etf，mootdx xdxr 重建）+ 股票（adj_factor，
-        mootdx 扩展段 / TickFlow ex_factors 同目录），两者 schema 相同直接拼接。
+        mootdx 扩展段 / TickFlow ex_factors 同目录）+ 股票（adj_factor_baostock，
+        baostock 回源产出），三者 schema 相同直接拼接。
 
+        因子表有两种表示（都能用）：
+        - **逐日表**（adj_factor_etf）：每个交易日一行 ex_factor。
+        - **事件行表**（adj_factor_baostock）：step function 的稀疏表示，
+          每个除权事件一行（基准行 + 变点）。见 ``apply_qfq_daily`` 的 as-of 展开。
         股票目录缺失/为空不报错（未跑过股票回源的部署因子只有 ETF 段）；
         排除 xdxr 事件表（同目录不同 schema，混入 scan 会炸掉整次加载）。"""
         import glob as _glob
         frames = []
-        for subdir in ("adj_factor_etf", "adj_factor"):
+        for subdir in ("adj_factor_etf", "adj_factor", "adj_factor_baostock"):
             root = os.path.join(self.data_root, subdir)
             if not os.path.isdir(root):
                 continue
