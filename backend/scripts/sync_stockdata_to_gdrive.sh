@@ -33,6 +33,12 @@ RCLONE_DIR_ARGS=(
   --min-age "$GDRIVE_MIN_AGE"
   --exclude '*.lock'
   --exclude '.raw_partition_locks/**'
+  # 写入方的临时文件（part.tmp / all.tmp.parquet …）——中断残留会永久留在
+  # 单向远端（远端只增不减），必须排除
+  --exclude '*.tmp'
+  --exclude '*.tmp.parquet'
+  --exclude '*.part'
+  --exclude '*.crdownload'
   --transfers "$RCLONE_TRANSFERS"
   --checkers "$RCLONE_CHECKERS"
   --no-update-dir-modtime
@@ -71,6 +77,7 @@ FILES=(trade_calendar.json)
 
 # ---- 状态 ----
 STATUS_EXIT=0
+STATUS_FAILED_RECORDS=()   # 脚本自己的失败记录（error_tail 的第一来源）
 STATUS_SKIPPED=""
 STATUS_ERROR_TAIL=""
 DIRS_OK=0
@@ -112,8 +119,18 @@ _copy_unit() {
 
 # 本轮日志里的错误摘要（取本轮新增行，不看历史）
 _compute_error_tail() {
-  awk -v start="${LOG_START_LINES:-0}" 'NR>start' "$GDRIVE_LOG" 2>/dev/null \
-    | grep -iE 'error|failed' | tail -n 5 | paste -sd ' | ' - | cut -c1-500
+  # 先用**脚本自己的失败记录**（中文），再补日志里的英文 error 行：
+  # 被 SIGTERM 的 rclone 不会写 ERROR 行，只 grep 日志会得到空串。
+  local own tail_out
+  own="$(printf '%s\n' "${STATUS_FAILED_RECORDS[@]:-}" | grep -v '^$' \
+    | paste -sd ' | ' - | cut -c1-500)"
+  tail_out="$(awk -v start="${LOG_START_LINES:-0}" 'NR>start' "$GDRIVE_LOG" 2>/dev/null \
+    | grep -iE 'error|failed|失败' | tail -n 5 | paste -sd ' | ' - | cut -c1-500)"
+  if [ -n "$own" ]; then
+    if [ -n "$tail_out" ]; then printf '%s | %s' "$own" "$tail_out"; else printf '%s' "$own"; fi
+  else
+    printf '%s' "$tail_out"
+  fi
 }
 
 # 解析本轮最后一个 rclone 结尾统计块 → stdout "files bytes"；无法解析 → "null null"。
@@ -295,6 +312,7 @@ main() {
       _log "单元完成: $rel"
     else
       DIRS_FAILED+=("$rel")
+      STATUS_FAILED_RECORDS+=("unit_failed:$rel rc=$rc")
       _log "单元失败: $rel rc=$rc"
     fi
   done
@@ -311,6 +329,7 @@ main() {
       _log "单元完成: $rel"
     else
       DIRS_FAILED+=("$rel")
+      STATUS_FAILED_RECORDS+=("unit_failed:$rel rc=$rc")
       _log "单元失败: $rel rc=$rc"
     fi
   done

@@ -32,6 +32,11 @@ GDRIVE_LOG_MAX_BYTES="${GDRIVE_LOG_MAX_BYTES:-10485760}"
 RCLONE_ARGS=(
   --min-age "$GDRIVE_MIN_AGE"
   --exclude '*.lock'
+  --exclude '*.tmp'
+  --exclude '*.tmp.parquet'
+  --exclude '*.part'
+  --exclude '*.crdownload'
+  --exclude '*.swp'
   --transfers "$RCLONE_TRANSFERS"
   --checkers "$RCLONE_CHECKERS"
   --no-update-dir-modtime
@@ -50,6 +55,7 @@ fi
 STATUS_EXIT=0
 STATUS_SKIPPED=""
 STATUS_ERROR_TAIL=""
+STATUS_FAILED_RECORDS=()   # 脚本自己的失败记录（中文），error_tail 的第一来源
 DIRS_OK=0
 DIRS_FAILED=()
 TRANSFERRED_FILES=0
@@ -151,11 +157,18 @@ _write_status() {
   else
     stats_args=(--argjson transferred_files null --argjson transferred_bytes null)
   fi
+  # exit_code 空 = 「已开始、未结束」（写状态发生在运行中途）
+  local exit_arg
+  if [ -z "$STATUS_EXIT" ]; then
+    exit_arg=(--argjson exit_code null)
+  else
+    exit_arg=(--argjson exit_code "$STATUS_EXIT")
+  fi
   tmp="$GDRIVE_STATUS.tmp"
   if jq -n \
       --arg last_run_at "$now" \
       --arg last_success_at "$success" \
-      --argjson exit_code "$STATUS_EXIT" \
+      "${exit_arg[@]}" \
       --arg trigger "$GDRIVE_TRIGGER" \
       "${skipped_arg[@]}" \
       --argjson dirs_ok "$DIRS_OK" \
@@ -178,6 +191,22 @@ _write_status() {
   fi
 }
 
+# ---- 信号处理：被中断也要落状态 ----
+# 一次性备份不挂 cron（没有自愈兜底），中断后若不留状态，运维无法区分
+# 「从没跑」与「死在 1%」（实测 2026-10-20 那轮就是这么丢的）。
+_on_signal() {
+  local sig="$1"
+  STATUS_EXIT=143
+  STATUS_ERROR_TAIL="被信号中断: SIG$sig"
+  STATUS_FAILED_RECORDS+=("interrupted:SIG$sig")
+  _write_status
+  _log "被信号中断（SIG$sig），已写状态"
+  exit 143
+}
+trap '_on_signal TERM' TERM
+trap '_on_signal INT' INT
+trap '_on_signal HUP' HUP
+
 main() {
   mkdir -p "$(dirname "$GDRIVE_LOG")" "$(dirname "$GDRIVE_STATUS")" 2>/dev/null || true
 
@@ -190,6 +219,10 @@ main() {
     _log "已有实例在跑，跳过本轮（lock_busy）"
     exit 0
   fi
+
+  # ---- 开跑即写状态（exit_code=null 表示「已开始未结束」）----
+  STATUS_EXIT=""
+  _write_status
 
   # ---- 日志轮转 ----
   if [ -f "$GDRIVE_LOG" ] && [ "$(stat -c%s "$GDRIVE_LOG" 2>/dev/null || echo 0)" -gt "$GDRIVE_LOG_MAX_BYTES" ]; then
@@ -239,6 +272,7 @@ main() {
       # 源缺失 = 失败（磁盘未挂载 / 路径笔误）。一次性备份没有 cron 兜底，
       # 若当成功处理会被监控成"备份成功"→ last_success_at 照常推进。
       DIRS_FAILED+=("$(basename "$src"):missing")
+      STATUS_FAILED_RECORDS+=("missing_source:$src")
       _log "归档失败（本地源不存在）: $src"
       continue
     fi
@@ -252,18 +286,30 @@ main() {
       _log "归档完成: $name"
     else
       DIRS_FAILED+=("$name")
+      STATUS_FAILED_RECORDS+=("copy_failed:$name rc=$rc")
       _log "归档失败: $name rc=$rc"
     fi
   done <<< "$(printf '%s\n' "$ARCHIVE_SOURCES" | tr ',;' '\n\n')"
 
   if [ "${#DIRS_FAILED[@]}" -gt 0 ]; then
     STATUS_EXIT=5
+  elif [ -z "$STATUS_EXIT" ]; then
+    STATUS_EXIT=0        # 开跑时置空（表示「运行中」），无失败即成功
   fi
 
-  local tail_out
+  # error_tail：先放**脚本自己的失败记录**（中文），再补日志里的英文 error 行
+  # （被 SIGTERM 的 rclone 不会写 ERROR 行，只 grep 日志会得到空串）
+  local tail_out own_out=""
+  own_out="$(printf '%s\n' "${STATUS_FAILED_RECORDS[@]:-}" | grep -v '^$' \
+    | paste -sd ' | ' - | cut -c1-500)"
   tail_out="$(awk -v start="${LOG_START_LINES:-0}" 'NR>start' "$GDRIVE_LOG" 2>/dev/null \
-    | grep -iE 'error|failed' | tail -n 5 | paste -sd ' | ' - | cut -c1-500)"
-  if [ -n "$tail_out" ]; then
+    | grep -iE 'error|failed|失败' | tail -n 5 | paste -sd ' | ' - | cut -c1-500)"
+  if [ -n "$own_out" ]; then
+    STATUS_ERROR_TAIL="$own_out"
+    if [ -n "$tail_out" ]; then
+      STATUS_ERROR_TAIL="$STATUS_ERROR_TAIL | $tail_out"
+    fi
+  elif [ -n "$tail_out" ]; then
     STATUS_ERROR_TAIL="$tail_out"
   fi
 

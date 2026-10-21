@@ -7,12 +7,27 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "sync_stockdata_to_gdrive.sh"
-WHITELIST_DIRS = [
-    "kline_minute", "kline_etf_minute", "kline_daily", "kline_etf_daily", "kline_index_daily",
-    "kline_daily_enriched", "kline_etf_enriched", "kline_index_enriched",
-    "adj_factor", "adj_factor_etf", "instruments", "instruments_etf", "instruments_index",
-    "financials", "industries_sw", "etf_nav",
-]
+
+
+def _script_units():
+    """**从脚本本身**解析备份白名单（DIRS / FILES）。
+
+    早先测试里抄了一份常量（16 项），脚本加到 17 项后两边漂移——断言
+    ``dirs_ok == 17`` 只是因为本机恰好缺一个目录才凑巧成立。
+    单一事实源 = 脚本。
+    """
+    import re
+    text = SCRIPT.read_text()
+    m = re.search(r"(?m)^DIRS=\(\s*(.*?)\)", text, re.S)
+    assert m, "未找到 DIRS 白名单"
+    dirs = m.group(1).split()
+    m2 = re.search(r"(?m)^FILES=\((.*?)\)", text, re.S)
+    assert m2, "未找到 FILES 白名单"
+    files = m2.group(1).split()
+    return dirs, files
+
+
+WHITELIST_DIRS, WHITELIST_FILES = _script_units()
 STUB_SRC = """#!/bin/bash
 sub="$1"; shift
 printf '%s' "$sub" >> "$STUB_RCLONE_CALLS"
@@ -38,7 +53,9 @@ exit 0
 """
 
 
-def run_sync(tmp_path, env=None, dirs=WHITELIST_DIRS, files=("trade_calendar.json",)):
+def run_sync(tmp_path, env=None, dirs=None, files=None):
+    dirs = WHITELIST_DIRS if dirs is None else dirs
+    files = WHITELIST_FILES if files is None else files
     data = tmp_path / "data"
     data.mkdir(parents=True, exist_ok=True)
     for d in dirs:
@@ -130,13 +147,15 @@ def test_full_success_copies_all_units_with_arg_discipline(tmp_path):
     r = run_sync(tmp_path)
     assert r["proc"].returncode == 0
     assert r["status"]["exit_code"] == 0
-    assert r["status"]["dirs_ok"] == 17 and r["status"]["dirs_failed"] == []
+    # dirs_ok 统计**单元**（目录 + 文件），与状态文件语义一致
+    assert r["status"]["dirs_ok"] == len(WHITELIST_DIRS) + len(WHITELIST_FILES)
+    assert r["status"]["dirs_failed"] == []
     assert r["status"]["trigger"] == "cron"
     assert r["status"]["remote"] == "gdrive:tickflow-stockdata/data"
     assert r["status"]["last_success_at"] is not None
     lines = [l.split("\t") for l in r["calls"].splitlines()]
     copies = [l for l in lines if l[0] in ("copy", "copyto")]
-    assert len(copies) == 17                                  # 16 目录 + 1 文件
+    assert len(copies) == len(WHITELIST_DIRS) + len(WHITELIST_FILES)
     assert [l[0] for l in lines if l[0] == "copyto"] == ["copyto"]
     for l in copies:
         assert "--transfers" in l and "--checkers" in l and "--retries" in l
@@ -187,7 +206,7 @@ def test_whitelist_covers_every_data_directory():
     if not data_root.is_dir():
         pytest.skip("data/ 不存在")
     script = (repo / "backend/scripts/sync_stockdata_to_gdrive.sh").read_text()
-    m = re.search(r"DIRS=\(\s*(.*?)\)", script, re.S)
+    m = re.search(r"(?m)^DIRS=\(\s*(.*?)\)", script, re.S)
     assert m, "未找到 DIRS 白名单"
     listed = set(m.group(1).split())
     # data/ 下的一级目录 = 数据目录（运行态/缓存目录除外，那些本就不该备份）
@@ -227,7 +246,7 @@ def test_per_unit_failure_continues_and_does_not_advance_last_success(tmp_path):
     assert r["proc"].returncode == 5
     assert r["status"]["exit_code"] == 5
     assert r["status"]["dirs_failed"] == ["kline_index_daily"]
-    assert r["status"]["dirs_ok"] == 16
+    assert r["status"]["dirs_ok"] == len(WHITELIST_DIRS) + len(WHITELIST_FILES) - 1
     assert r["status"]["last_success_at"] == "2026-10-17T23:31:00+08:00"
     assert "etf_nav" in r["calls"]          # 失败单元之后的单元仍然跑
     assert "ERROR" in r["status"]["error_tail"]
@@ -245,7 +264,8 @@ def test_missing_whitelisted_dir_is_skipped_not_failed(tmp_path):
     r = run_sync(tmp_path, dirs=[d for d in WHITELIST_DIRS if d != "financials"])
     assert r["proc"].returncode == 0
     assert r["status"]["exit_code"] == 0
-    assert r["status"]["dirs_ok"] == 16 and r["status"]["dirs_failed"] == []
+    assert r["status"]["dirs_ok"] == len(WHITELIST_DIRS) - 1 + len(WHITELIST_FILES)
+    assert r["status"]["dirs_failed"] == []
     assert "financials" in r["log"] and "跳过" in r["log"]
 
 

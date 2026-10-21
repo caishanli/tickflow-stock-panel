@@ -29,8 +29,12 @@ backend/scripts/sync_archive_to_gdrive.sh; echo "rc=$?"
 ```
 
 可覆盖 env：`ARCHIVE_SOURCES`（每行一个源目录）、`GDRIVE_REMOTE`、`RCLONE_BIN`、
-`RCLONE_TRANSFERS`/`RCLONE_CHECKERS`（默认 16）、`RCLONE_BWLIMIT`、`GDRIVE_MIN_AGE`（默认 15m）、
+`RCLONE_TRANSFERS`/`RCLONE_CHECKERS`（默认 16）、`RCLONE_BWLIMIT`、`GDRIVE_MIN_AGE`（默认 **0**）、
 `GDRIVE_LOG`/`GDRIVE_STATUS`/`GDRIVE_LOCK`、`GDRIVE_TRIGGER`、`GDRIVE_LOG_MAX_BYTES`。
+
+> `GDRIVE_MIN_AGE` 默认 0：归档源是**静态**目录（最后改动 2026-10-03），没有
+> "边写边读"的半写风险；留 15m 会静默漏传 mtime 很新的文件。若把
+> `ARCHIVE_SOURCES` 指向**活动目录**，请手动设 `GDRIVE_MIN_AGE=15m`。
 
 **不挂 cron**：源数据静态（最后改动 2026-10-03），一次性传完即可；以后要补传手动跑（增量、幂等、可续传）。
 锁文件独立（`data/.gdrive_archive_sync.lock`），**不影响**每天 17:30/23:30 的行情增量备份。
@@ -45,6 +49,23 @@ backend/scripts/sync_archive_to_gdrive.sh; echo "rc=$?"
 | 5 | 部分源失败（其余已传） |
 
 `last_success_at` 只有整轮 exit=0 且未跳过才推进。
+
+**状态文件在开跑时就会写一次**（`exit_code: null` = 「已开始、未结束」），并在
+收到 SIGTERM/SIGINT/SIGHUP 时再写一次（`exit_code: 143` + `error_tail`）。一次性
+备份**不挂 cron**（没有自愈兜底），中断后若不留痕迹，运维无法区分「从没跑」
+与「死在 1%」——2026-10-20 那轮就是这样丢的（410/31 086 个文件后被 SIGTERM，
+既没有状态文件也没有失败原因）。
+
+`error_tail` 第一来源是**脚本自己的失败记录**（如 `copy_failed:<源> rc=143`），
+其次才是日志里的 `error/failed/失败` 行——被 SIGTERM 的 rclone 不会写 `ERROR :`
+行，只 grep 日志会得到空串。
+
+## 一致性（为什么不会备份到半个文件）
+
+写入方（`mootdx_service`、`trade_calendar`）都是 **tmp 文件 + rename 原子替换**
+（`part.tmp` → `part.parquet`），因此 `part.parquet` 永远不会是"写了一半"的状态；
+备份脚本另外排除 `*.tmp`/`*.tmp.parquet`/`*.part`/`*.crdownload`/`*.lock`
+（写入中断的残留不会进单向远端——远端只增不减，进去就永远留在那）。
 
 ## 恢复
 

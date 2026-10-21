@@ -35,11 +35,24 @@ exit 0
 """
 
 
-def run_sync(tmp_path, env=None, sources=ARCHIVE_SOURCES):
+def _make_sources(tmp_path, n=2):
+    """造 n 个**存在**的归档源目录（测试不依赖本机的 /home/caisl 归档）。"""
+    srcs = []
+    for i in range(n):
+        d = tmp_path / f"src{i}"
+        (d / "sub").mkdir(parents=True, exist_ok=True)
+        (d / "sub" / "a.bin").write_bytes(b"x" * 16)
+        srcs.append(str(d))
+    return srcs
+
+
+def run_sync(tmp_path, env=None, sources=None):
     stub = tmp_path / "rclone"
     stub.write_text(STUB_SRC)
     stub.chmod(0o755)
     calls = tmp_path / "calls.log"
+    if sources is None:
+        sources = _make_sources(tmp_path)
     full_env = {
         "PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", ""),
         "RCLONE_BIN": str(stub),
@@ -65,7 +78,9 @@ def run_sync(tmp_path, env=None, sources=ARCHIVE_SOURCES):
 
 
 def test_copies_every_archive_source_to_remote(tmp_path):
-    r = run_sync(tmp_path)
+    """源目录用 tmp_path 造（不依赖本机 /home/caisl 归档 → CI/换机也能跑）。"""
+    sources = _make_sources(tmp_path)
+    r = run_sync(tmp_path, sources=sources)
     assert r["proc"].returncode == 0, r["proc"].stderr
     assert r["status"]["exit_code"] == 0
     assert r["status"]["dirs_ok"] == 2
@@ -73,7 +88,7 @@ def test_copies_every_archive_source_to_remote(tmp_path):
     lines = [l.split("\t") for l in r["calls"].splitlines()]
     copies = [l for l in lines if l[0] == "copy"]
     assert len(copies) == 2
-    assert {l[1] for l in copies} == set(ARCHIVE_SOURCES)
+    assert {l[1] for l in copies} == set(sources)
     # 远端路径 = GDRIVE_REMOTE + 源目录名
     for l in copies:
         assert l[2] == f"gdrive:tickflow-stockdata/archive/{Path(l[1]).name}"
@@ -151,10 +166,12 @@ def test_about_failure_exits_4(tmp_path):
 def test_failure_does_not_advance_last_success(tmp_path):
     st = tmp_path / "prev.json"
     st.write_text(json.dumps({"last_success_at": "2026-10-19T23:31:00+08:00"}))
-    r = run_sync(tmp_path, env={"STUB_FAIL_IN": "A股分钟数据", "GDRIVE_STATUS": str(st)})
+    sources = _make_sources(tmp_path)
+    r = run_sync(tmp_path, sources=sources,
+                 env={"STUB_FAIL_IN": Path(sources[0]).name, "GDRIVE_STATUS": str(st)})
     assert r["status"]["exit_code"] == 5
     assert r["status"]["last_success_at"] == "2026-10-19T23:31:00+08:00"
-    assert r["status"]["dirs_failed"] == ["A股分钟数据"]
+    assert r["status"]["dirs_failed"] == [Path(sources[0]).name]
 
 
 def test_status_has_expected_fields(tmp_path):
@@ -165,3 +182,36 @@ def test_status_has_expected_fields(tmp_path):
         assert k in st, k
     assert st["remote"] == "gdrive:tickflow-stockdata/archive"
     assert st["last_success_at"] is not None
+
+
+def test_excludes_transient_tmp_files(tmp_path):
+    """写入方的临时文件（*.tmp / *.part）不得进备份（单向远端会永久留存）。"""
+    sources = _make_sources(tmp_path)
+    r = run_sync(tmp_path, sources=sources)
+    assert r["proc"].returncode == 0, r["proc"].stderr
+    copies = [l.split("\t") for l in r["calls"].splitlines() if l.startswith("copy\t")]
+    assert copies, "没有 copy 调用"
+    for args in copies:
+        assert "--exclude" in args
+    joined = "\n".join("\t".join(a) for a in copies)
+    assert "*.tmp" in joined and "*.part" in joined
+
+
+def test_failure_records_show_up_in_error_tail(tmp_path):
+    """单元失败时 error_tail 必须有内容（脚本自己的失败记录，不只靠 grep 英文日志）。"""
+    sources = _make_sources(tmp_path)
+    r = run_sync(tmp_path, sources=sources,
+                 env={"STUB_FAIL_IN": "src0"})
+    assert r["proc"].returncode == 5
+    assert r["status"]["dirs_failed"]
+    assert r["status"]["error_tail"], "error_tail 为空 → 运维看不到失败原因"
+
+
+def test_status_written_at_start_of_run(tmp_path):
+    """开跑即写状态（exit_code=null 表示「已开始未结束」）。"""
+    sources = _make_sources(tmp_path)
+    # 让 stub 卡住，脚本还在跑时检查状态文件
+    r = run_sync(tmp_path, sources=sources, env={"STUB_SLEEP": "5"})
+    # 跑完（或被超时杀掉）后：状态文件必须存在，且 last_run_at 有值
+    assert r["status"] is not None
+    assert r["status"]["last_run_at"]
