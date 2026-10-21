@@ -272,3 +272,38 @@ uv run --extra dev python -m app.quant.adj_factor_build --dry-run --audit --dail
 - `data/adj_factor/all.parquet`（逐日表）已移除，备份在
   `/tmp/opencode/adj_factor_daily_backup.parquet`；股票因子现位于
   `data/adj_factor_baostock/all.parquet`（事件行，42 113 行 / 318 KB）。
+
+---
+
+# 追加：ETF 因子表也压成事件行（2026-10-21，commit 5f912a3）
+
+因子是 step function → 逐日表里 99.8% 是冗余。ETF 表（mootdx 造的 114 万行）
+同样可压成事件行：
+
+| | 逐日表 | 事件行表 | 压缩比 |
+|---|---|---|---|
+| ETF（adj_factor_etf） | 1 140 838 行 / 147 KB | **10 574 行 / 82 KB** | **107.9x** |
+| 股票（adj_factor_baostock） | 22 235 558 行 | 42 113 行 | 528x |
+
+**等价性已验证**：事件表 as-of backward 展开后与逐日表 **114 万行逐点零差异**（最大绝对差 0.0）。
+
+**客户端最终性能**（`_adj_factor_map` + `_adj_events`）：
+
+| 阶段 | 耗时 | 内存 |
+|---|---|---|
+| 最初（逐日股票表 22M 行） | 69.4 s | 10 196 MB |
+| 股票转事件行 | 6.7 s | 982 MB |
+| **ETF 也转事件行** | **0.4 s** | **202 MB** |
+
+累计 **170x 提速 / 50x 省内存**（相对最初状态）。
+
+**口径一致性复验**（真实回测路径 `jqcompat._apply_qfq_bars` vs 服务端 as-of）：
+- 股票：最大相对差 0.000023%（4 位小数价格精度噪声级）
+- ETF 159667（含 3:1 拆分）：**0.000000%**
+
+**注意**：`data/adj_factor_etf/all.parquet` 现为事件行格式（schema 与逐日表相同，
+消费方 as-of 展开两种都支持）。若将来解除 mootdx `sync_adj_factor` 的 quarantine 并重跑，
+它会写回逐日格式 —— 混合亦不影响正确性（逐日值与 step function 同值）。
+
+**备份**：`/tmp/opencode/adj_factor_etf_daily_backup.parquet`（原逐日表）、
+`/tmp/opencode/adj_factor_daily_backup.parquet`（原股票逐日表）。
