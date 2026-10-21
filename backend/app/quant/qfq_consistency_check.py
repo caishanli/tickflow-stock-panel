@@ -1,4 +1,7 @@
-"""回测桥 vs 服务端 复权口径一致性实测（真实数据）。
+"""回测桥 vs 服务端 复权口径一致性实测（真实数据，**离线诊断脚本**）。
+
+注：本脚本用 pandas 只为做逐点对比（离线诊断，非生产路径）；生产链路的
+pandas 边界仍限定在回测（vectorbt）内。
 
 对比两条路径：
   服务端   : apply_qfq_daily  = close × ex_factor(date)      （直查因子表，无阈值）
@@ -57,8 +60,11 @@ def check(sym: str, ds: DataSources, dm: DataManager,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", nargs="+", default=[
+        # 股票（权威源 baostock）
         "000001.SZ", "600000.SH", "000002.SZ", "300750.SZ", "601318.SH",
         "000651.SZ", "600036.SH",
+        # ETF（mootdx 源）——历史伪跳变高发区，不能只抽样股票
+        "159934.SZ", "159971.SZ", "159207.SZ", "510300.SH", "588000.SH",
     ])
     ap.add_argument("--start", default="2024-01-01")
     ap.add_argument("--end", default="2026-10-20")

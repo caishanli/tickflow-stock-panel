@@ -122,6 +122,99 @@ def test_source_priority_baostock_wins_over_mootdx(tmp_path, monkeypatch):
     assert vals == [0.9], f"来源优先级失效：{vals}"
 
 
+def test_same_symbol_string_baostock_wins_over_legacy(tmp_path, monkeypatch):
+    """**同一个 symbol 字符串**时，权威源（baostock）仍须胜出。
+
+    回归：旧实现按 concat 顺序 + ``unique(keep="last")`` 取值 → 低优先级的旧表
+    （adj_factor）会覆盖权威源，实测服务端复权价直接取到旧表的 0.5（应为 0.9）。
+    """
+    baostock = pl.DataFrame({
+        "symbol": ["600000.SH"] * 2,
+        "trade_date": [_d("2025-01-02"), _d("2025-01-03")],
+        "ex_factor": [0.9, 0.9],
+    }, schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    legacy = pl.DataFrame({
+        "symbol": ["600000.SH"] * 2,
+        "trade_date": [_d("2025-01-02"), _d("2025-01-03")],
+        "ex_factor": [0.5, 0.5],
+    }, schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    _write_factors(tmp_path, "adj_factor_baostock", baostock)
+    _write_factors(tmp_path, "adj_factor", legacy)
+    src = _src(tmp_path, monkeypatch)
+    fac = src.get_adj_factors()
+    vals = fac.filter(pl.col("symbol") == "600000.SH")["ex_factor"].unique().to_list()
+    assert vals == [0.9], f"旧表覆盖了权威源：{vals}"
+    df = _daily_frame([("600000.SH", d, 10.0) for d in ("2025-01-02", "2025-01-03")])
+    out = src.apply_qfq_daily(df)
+    assert out["close"].to_list() == pytest.approx([9.0, 9.0])
+
+
+def test_dates_before_factor_start_use_first_factor_not_one(tmp_path, monkeypatch):
+    """因子表起始日**之前**的 bar 回填首个因子值（不是 1.0）。
+
+    因子是累计量，首行值已含全部历史事件；填 1.0 会在因子表覆盖首日凭空出现
+    一次跳变（实测 ETF 159971.SZ 2025-06-30 单日 −49.2%）。
+    """
+    factors = pl.DataFrame({
+        "symbol": ["159971.SZ"],
+        "trade_date": [_d("2025-06-30")],
+        "ex_factor": [0.5],
+    }, schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    _write_factors(tmp_path, "adj_factor_etf", factors)
+    src = _src(tmp_path, monkeypatch)
+    days = ["2025-06-26", "2025-06-27", "2025-06-30", "2025-07-01"]
+    df = _daily_frame([("159971.SZ", d, 10.0) for d in days])
+    out = src.apply_qfq_daily(df)
+    assert out["close"].to_list() == pytest.approx([5.0, 5.0, 5.0, 5.0])
+
+
+def test_no_fake_jump_at_factor_table_start(tmp_path, monkeypatch):
+    """回归：因子表覆盖首日不得出现复权价跳变（收益序列必须连续）。"""
+    factors = pl.DataFrame({
+        "symbol": ["159971.SZ", "159971.SZ"],
+        "trade_date": [_d("2025-06-30"), _d("2025-08-04")],
+        "ex_factor": [0.5, 0.6],
+    }, schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    _write_factors(tmp_path, "adj_factor_etf", factors)
+    src = _src(tmp_path, monkeypatch)
+    days = ["2025-06-26", "2025-06-27", "2025-06-30", "2025-07-01"]
+    df = _daily_frame([("159971.SZ", d, 10.0) for d in days])
+    out = src.apply_qfq_daily(df)
+    closes = out["close"].to_list()
+    rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+    assert all(abs(r) < 1e-9 for r in rets), f"覆盖首日出现假跳变：{rets}"
+
+
+def test_gross_factor_drop_is_quarantined(tmp_path, monkeypatch):
+    """因子序列出现 >10% 下降（源数据伪跳变）→ 整段隔离，按原始价计算。"""
+    factors = pl.DataFrame({
+        "symbol": ["159971.SZ", "159971.SZ"],
+        "trade_date": [_d("2025-06-30"), _d("2026-06-15")],
+        "ex_factor": [1.2, 1.0],
+    }, schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    _write_factors(tmp_path, "adj_factor_etf", factors)
+    src = _src(tmp_path, monkeypatch)
+    fac = src.get_adj_factors()
+    assert fac.is_empty() or "159971.SZ" not in fac["symbol"].unique().to_list()
+    df = _daily_frame([("159971.SZ", d, 10.0)
+                       for d in ("2025-06-30", "2026-06-15")])
+    out = src.apply_qfq_daily(df)
+    assert out["close"].to_list() == pytest.approx([10.0, 10.0])
+
+
+def test_small_factor_wiggle_is_kept(tmp_path, monkeypatch):
+    """小幅震荡（<10%）不隔离（只是噪声，不是伪跳变）。"""
+    factors = pl.DataFrame({
+        "symbol": ["159207.SZ", "159207.SZ"],
+        "trade_date": [_d("2025-07-01"), _d("2025-07-21")],
+        "ex_factor": [0.953807, 0.951639],
+    }, schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64})
+    _write_factors(tmp_path, "adj_factor_etf", factors)
+    src = _src(tmp_path, monkeypatch)
+    fac = src.get_adj_factors()
+    assert "159207.SZ" in fac["symbol"].unique().to_list()
+
+
 def test_loaded_factor_series_is_monotone_and_bounded(tmp_path, monkeypatch):
     """不变量：每个标的的因子序列单调不减且 ≤ 1.0（最新锚定）。"""
     events = pl.DataFrame({

@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from . import adj_factor_quality as _adjq
 from . import rt_sources as _rt
 from .single_flight import DedupCache, SingleFlight
 
@@ -38,30 +39,26 @@ def _now() -> _dt.datetime:
     return _dt.datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
 
 
-def _tf_symbol(code: str) -> str:
-    """平台代码(.XSHG/.XSHE/.SH/.SZ) -> 分区符号(.SH/.SZ)。"""
-    pure, _, suf = code.rpartition(".")
-    if not pure:
-        return code
-    return pure + (".SH" if suf in ("XSHG", "SH") else ".SZ")
-
-
 def _to_jq(code: str) -> str:
+    """平台代码(.SH/.SS/.XSHG/.SZ/.XSHE) → 聚宽码(.XSHG/.XSHE)。"""
     pure, _, suf = code.rpartition(".")
     if not pure:
         return code
     return pure + (".XSHG" if suf in ("SH", "SS", "XSHG") else ".XSHE")
 
 
+def _tf_symbol(code: str) -> str:
+    """平台代码 → 分区符号（.SH/.SZ/.BJ）；实现见共享模块（服务端/客户端同源）。"""
+    return _adjq.normalize_symbol(code)
+
+
 def _normalized_symbols(df: pl.DataFrame) -> set[str]:
-    """因子表里的标的集合（归一化为 tushare 码 .SH/.SZ）。
+    """因子表里的标的集合（**归一化为 tushare 码** .SH/.SZ/.BJ）。
 
     不同来源的 symbol 口径不同（mootdx 表用聚宽码 .XSHG/.XSHE，baostock 表用
     .SH/.SZ），来源比较时必须先归一，否则匹配全不中（分离规则静默失效）。
     """
-    if df is None or df.is_empty():
-        return set()
-    return {str(s) for s in df["symbol"].unique().to_list()}
+    return _adjq.normalized_symbols(df)
 
 
 def _is_index(code: str) -> bool:
@@ -685,44 +682,19 @@ class DataSources:
     def apply_qfq_daily(self, df: pl.DataFrame) -> pl.DataFrame:
         """对日线帧应用**最新锚定前复权**（price × ex_factor(date)）。
 
-        因子表 adj_factor_etf 逐日行即"锚定最新的累计因子"（最新日=1.0），
-        直接按 (symbol, date) 左连乘到 OHLC；无因子记录的标的原样（×1.0）。
-        最新锚定与请求区间无关 → 服务端对同一标的数据口径恒定，客户端
-        （模拟盘 manager 日线缓存）跨请求无陈旧因子问题。
-        仅日线调用（分钟/当前价保持真实成交价）。
-        注意 symbol 口径：日线分区为 tushare 码（561980.SH），因子表为
-        聚宽码（561980.XSHG），join 前归一到 tushare 码。
-
-        **as-of backward join**（而非精确 join）：因子表的两种表示都能用 ——
-        逐日表（adj_factor_etf）与**事件行表**（adj_factor_baostock，step
-        function 的稀疏表示：基准行 + 变点）。as-of 取「date 之前最近一条
-        事件」的因子，对逐日表等价于精确 join（该日自身那行），
-        对事件表则正确展开 step function。
+        口径实现见 ``adj_factor_quality.apply_qfq``（服务端与离线审计共用，
+        避免两侧算法漂移）。要点：
+        - 因子表已按来源优先级合并（权威源胜出）+ 质量闸门隔离伪跳变序列；
+        - **as-of backward join**：逐日表与事件行表两种表示都能用；
+        - 因子表起始日之前回填该标的**首个**因子值（不是 1.0）——否则覆盖首日
+          会出现假跳变（实测 ETF 159971.SZ 2025-06-30 单日 −49.2%）。
         """
         if df.is_empty() or "symbol" not in df.columns or "date" not in df.columns:
             return df
         fac = self.get_adj_factors()
         if fac.is_empty():
             return df
-        fdf = fac.select(
-            pl.col("symbol").str.replace(".XSHG", ".SH", literal=True)
-            .str.replace(".XSHE", ".SZ", literal=True).alias("symbol"),
-            pl.col("trade_date").cast(pl.Date).alias("date"),
-            pl.col("ex_factor"),
-        ).unique(subset=["symbol", "date"], keep="last").sort(
-            ["symbol", "date"])
-        out = df.with_columns(pl.col("date").cast(pl.Date).alias("date"))
-        # join_asof 要求 asof 键有序；用行号占位，join 后恢复原序（精确 join 保持左序）
-        out = out.with_row_index("__ord").sort("date")
-        out = out.join_asof(
-            fdf.sort("date"), on="date", by="symbol", strategy="backward"
-        ).with_columns(pl.col("ex_factor").fill_null(1.0))
-        for col in ("open", "high", "low", "close"):
-            if col in out.columns and out.schema[col] in (pl.Float64, pl.Float32,
-                                                          pl.Int64, pl.Int32):
-                out = out.with_columns(
-                    (pl.col(col).cast(pl.Float64) * pl.col("ex_factor")).alias(col))
-        return out.drop("ex_factor").sort("__ord").drop("__ord")
+        return _adjq.apply_qfq(fac, df)
 
     def get_etf_nav(self, codes: list[str], date: str | None = None) -> pl.DataFrame:
         """读 etf_nav 分区（date 给定用该日，None 用最新分区）。"""
@@ -1209,7 +1181,7 @@ class DataSources:
         from ..tdx_financials import load_financials
         return load_financials()
 
-    def _load_adj_factors(self) -> pl.DataFrame:
+    def _load_adj_factors(self, quarantine: bool = True) -> pl.DataFrame:
         """加载前复权因子表（**按标的来源分离，不同来源不混用**）。
 
         为什么必须分离：各来源的因子**归一化锚点不同**（同一标的同一日期，
@@ -1224,18 +1196,24 @@ class DataSources:
           ``mootdx_service._ADJ_FACTOR_QUARANTINED`` 禁用（"未达质量口径"）——
           实测其**股票行**有 555/4128 只因子 >1.0（悬崖合成）、19% 标的不单调，
           故**只用于非股票标的（ETF）**，其股票行整段丢弃。
-        - **adj_factor**：旧部署兼容（优先级最低）。
+        - **adj_factor**：旧部署兼容（**优先级最低**）。
+
+        **优先级是显式的**：同一 (symbol, date) 有多源时取优先级最高者
+        （``_adjq.SOURCE_PRIORITY`` 顺序），而不是靠 concat 顺序 +
+        ``unique(keep="last")``——那会让低优先级的旧表覆盖权威源，实测服务端
+        复权价直接取到旧表的 0.5（应为权威源的 0.9）。
 
         因子表有两种表示（都能用）：
         - **逐日表**（adj_factor_etf 旧版）：每个交易日一行 ex_factor。
         - **事件行表**（adj_factor_baostock）：step function 的稀疏表示，
           每个除权事件一行（基准行 + 变点）。见 ``apply_qfq_daily`` 的 as-of 展开。
 
-        股票目录缺失/为空不报错（未跑过股票回源的部署因子只有 ETF 段）；
+        股票目录缺失/为空不报错（未跑过股票回源的部署因子只有 ETF 段），
+        但会 WARNING（来源分离依赖它，静默降级 = 伪跳变防护失效）；
         排除 xdxr 事件表（同目录不同 schema，混入 scan 会炸掉整次加载）。"""
         import glob as _glob
         by_source: dict[str, pl.DataFrame] = {}
-        for subdir in ("adj_factor_baostock", "adj_factor", "adj_factor_etf"):
+        for subdir in _adjq.SOURCE_PRIORITY:
             root = os.path.join(self.data_root, subdir)
             if not os.path.isdir(root):
                 continue
@@ -1245,53 +1223,92 @@ class DataSources:
                      if not os.path.basename(p).startswith("xdxr_events")]
             if not paths:
                 continue
-            lf = pl.scan_parquet(paths, hive_partitioning=True)
-            cols = lf.columns
-            if "symbol" not in cols:
-                lf = lf.with_columns(pl.lit("").alias("symbol"))
-            lf = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
-            by_source[subdir] = lf
+            try:
+                lf = pl.scan_parquet(paths, hive_partitioning=True)
+                cols = lf.collect_schema().names()
+                if "symbol" not in cols:
+                    lf = lf.with_columns(pl.lit("").alias("symbol"))
+                df = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[stockdata] adj_factor 加载失败(%s): %s", subdir, e)
+                continue
+            if df.is_empty():
+                continue
+            # 统一归一到 tushare 码（.SH/.SZ/.BJ）：不同来源的 symbol 口径不同
+            # （mootdx 表是聚宽码 .XSHG/.XSHE），不归一则下面的优先级比较/去重
+            # 全都匹配不上（分离规则静默失效）。
+            df = df.with_columns(
+                pl.col("symbol").map_elements(_tf_symbol, return_dtype=pl.String)
+                .alias("symbol")
+            )
+            by_source[subdir] = df
         if not by_source:
             return pl.DataFrame()
-        frames = []
-        # 1) baostock（股票权威源）+ 2) adj_factor（旧部署兼容）
-        for key in ("adj_factor_baostock", "adj_factor"):
-            df = by_source.get(key)
-            if df is not None and not df.is_empty():
-                frames.append(df)
-        etf = by_source.get("adj_factor_etf")
-        if etf is not None and not etf.is_empty():
-            # mootdx 源：① baostock 已覆盖的标的整体丢弃（两表锚点不同，混用会产生伪跳变）
-            #    ② 股票 universe 里的标的也丢弃（mootdx 源是 cliff 合成的低质量因子，
-            #       实测 555/4128 只因子 >1.0、19% 标的不单调）
-            # 比较时用**归一化副本**（mootdx 表是聚宽码 .XSHG/.XSHE，universe 是 tushare 码
-            # .SH/.SZ，不归一则匹配全不中）；但**行内 symbol 保持原格式**（下游
-            # apply_qfq_daily 在 join 前自己归一，这里提前改会破坏 _to_jq_code 契约）。
-            drop = set()
-            for df in frames:
-                drop |= _normalized_symbols(df)
-            stock_syms = self._stock_symbol_set()
-            if stock_syms:
-                drop |= stock_syms
-            if drop:
-                etf = etf.filter(~pl.col("symbol").map_elements(
-                    _tf_symbol, return_dtype=pl.String).is_in(drop))
-            if not etf.is_empty():
-                frames.append(etf)
+        frames: list[tuple[str, pl.DataFrame]] = []
+        for name in _adjq.SOURCE_PRIORITY:
+            src_df = by_source.get(name)
+            if src_df is None or src_df.is_empty():
+                continue
+            if name == "adj_factor_etf":
+                # mootdx 源：① 权威源已覆盖的标的整体丢弃（两表锚点不同，混用会
+                #    产生伪跳变）② 股票 universe 里的标的也丢弃（mootdx 源是
+                #    cliff 合成的低质量因子，实测 555/4128 只因子 >1.0、19% 不单调）
+                drop: set[str] = set()
+                for _other_name, other in frames:
+                    drop |= _normalized_symbols(other)
+                drop |= self._stock_symbol_set()
+                if drop:
+                    src_df = src_df.filter(~pl.col("symbol").is_in(drop))
+                if src_df.is_empty():
+                    continue
+            frames.append((name, src_df))
         if not frames:
             return pl.DataFrame()
-        return pl.concat(frames, how="vertical_relaxed")
+        # 同一 (symbol, date) 多源共存 → 取**优先级最高**者（权威源），
+        # 不靠 concat 顺序 + unique(keep="last")——那会让旧表覆盖权威源。
+        out = _adjq.merge_sources(frames)
+        if not quarantine:
+            # 离线审计用：保留全部候选（含伪跳变序列），否则审计「自己盖自己的章」
+            return out
+        out, report = _adjq.quarantine_bad_series(out)
+        if report["quarantined"]:
+            logger.warning(
+                "[stockdata] adj_factor 质量闸门：%d 只标的因子序列存在 >%.0f%% 下降"
+                "（源数据伪跳变），整段隔离、按原始价计算。样本: %s",
+                len(report["quarantined"]), _adjq.JUMP_QUARANTINE * 100,
+                report["quarantined"][:10])
+        if report["not_anchored"]:
+            logger.warning(
+                "[stockdata] adj_factor：%d 只标的未最新锚定（末值 != 1.0），"
+                "回测桥已按锚点对齐（收益率口径一致）", report["not_anchored"])
+        # 离线审计产出的隔离名单（伪跳变只能靠比价判定，见 adj_factor_audit）
+        banned = _adjq.load_quarantine(self.data_root)
+        if banned:
+            before = out["symbol"].n_unique() if not out.is_empty() else 0
+            out = _adjq.apply_quarantine(out, banned)
+            after = out["symbol"].n_unique() if not out.is_empty() else 0
+            if after != before:
+                logger.warning(
+                    "[stockdata] adj_factor：按隔离名单剔除 %d 只标的"
+                    "（复权后单日涨跌超涨跌停 → 伪跳变，按原始价计算）", before - after)
+        return out
 
     def _stock_symbol_set(self) -> set[str]:
-        """本机股票 universe（tushare 码）；读不到则返回空集（不启用来源分离）。"""
+        """本机股票 universe（tushare 码）；读不到则返回空集（不启用来源分离）。
+
+        读不到会**静默降级**（来源分离失效 → 伪跳变防护失效），故 WARNING。
+        """
         path = os.path.join(self.data_root, "instruments", "instruments.parquet")
-        try:
-            if not os.path.exists(path):
-                return set()
-            df = pl.read_parquet(path, columns=["symbol"])
-            return {str(s) for s in df["symbol"].to_list()}
-        except Exception:  # noqa: BLE001
+        if not os.path.exists(path):
+            logger.warning("[stockdata] 股票目录缺失(%s)：无法启用因子来源分离，"
+                           "mootdx 低质量因子行将混入", path)
             return set()
+        try:
+            df = pl.read_parquet(path, columns=["symbol"])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[stockdata] 股票目录读取失败(%s): %s", path, e)
+            return set()
+        return {_tf_symbol(str(s)) for s in df["symbol"].to_list()}
 
 
 def pd_to_ts(x):

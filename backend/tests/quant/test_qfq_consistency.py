@@ -113,3 +113,53 @@ def test_apply_qfq_cutoff_ignores_future_events(monkeypatch):
     got = dm._apply_qfq(pdf.copy(), "000001.XSHE", cutoff=pd.Timestamp("2025-06-10"))
     # cutoff 早于事件日 → 不折算
     assert (got["close"] == pdf["close"]).all()
+
+
+def test_static_bridge_matches_server_when_table_not_latest_anchored(monkeypatch):
+    """因子表**未最新锚定**（末行 != 1.0）时，静态桥仍须与服务端逐点相等。
+
+    服务端口径 = price × ex_factor(d)；事件乘数连乘得到的是 ex_factor(d) /
+    ex_factor(末行) → 静态桥必须再乘回末行因子（锚点），否则两条路径差一个
+    常数比例（实测 ETF 510300.SH 差 2.58%）。
+    """
+    days = pd.date_range("2025-06-05", periods=20, freq="B")
+    raw = [11.0 + i * 0.1 for i in range(20)]
+    # 末行 0.95（未锚定），中间 0.9
+    factor = {}
+    for d in days:
+        if d < pd.Timestamp("2025-06-12"):
+            factor[pd.Timestamp(d)] = 0.90
+        elif d < pd.Timestamp("2025-07-01"):
+            factor[pd.Timestamp(d)] = 0.93
+        else:
+            factor[pd.Timestamp(d)] = 0.95
+    dm = _dm_with_factor_map(monkeypatch, {"000001.XSHE": factor})
+    pdf = _daily("000001.XSHE", [(str(d.date()), c) for d, c in zip(days, raw, strict=True)])
+    got = dm._apply_qfq(pdf.copy(), "000001.XSHE")
+    for d, c in zip(days, raw, strict=True):
+        exp = c * factor[pd.Timestamp(d)]      # 服务端口径
+        assert got.loc[pd.Timestamp(d), "close"] == pytest.approx(exp), d
+
+
+def test_static_bridge_applies_single_row_factor(monkeypatch):
+    """只有一行因子的标的（无事件）：静态桥仍须乘上该因子（= 服务端口径）。"""
+    days = pd.date_range("2025-06-05", periods=5, freq="B")
+    raw = [10.0 + i for i in range(5)]
+    factor = {pd.Timestamp("2025-06-10"): 0.5}
+    dm = _dm_with_factor_map(monkeypatch, {"159971.XSHE": factor})
+    pdf = _daily("159971.XSHE", [(str(d.date()), c) for d, c in zip(days, raw, strict=True)])
+    got = dm._apply_qfq(pdf.copy(), "159971.XSHE")
+    # 首行之前 → 回填首个因子值；之后 → 同一个值
+    for d, c in zip(days, raw, strict=True):
+        assert got.loc[pd.Timestamp(d), "close"] == pytest.approx(c * 0.5), d
+
+
+def test_anchor_is_the_last_factor_of_the_series(monkeypatch):
+    """锚点 = 序列末行因子（最新日期那行），不是最大值。"""
+    fmap = {"000001.XSHE": {
+        pd.Timestamp("2025-06-11"): 0.979507,
+        pd.Timestamp("2025-06-12"): 0.979257,
+        pd.Timestamp("2025-10-15"): 0.971821,
+    }}
+    dm = _dm_with_factor_map(monkeypatch, fmap)
+    assert dm._adj_anchor("000001.XSHE") == pytest.approx(0.971821)

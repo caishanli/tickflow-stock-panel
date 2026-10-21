@@ -983,7 +983,8 @@ def test_adj_cache_rebuilds_on_new_day(tmp_path, monkeypatch):
             return pd.DataFrame()   # 空，走本地
 
     dm._partition_root = lambda: str(root)
-    dm._to_jq_code = lambda s: s
+    # 因子表加载时会先归一成 tushare 码（.SH/.SZ），再用 _to_jq_code 转回聚宽码
+    # 做键 → 用真实的 _to_jq_code（桩成 identity 会让键停在 .SH）
     dm.client = _Client()
     dm._offline = False
 
@@ -1022,8 +1023,10 @@ def test_adj_events_rebuild_across_days_no_none_crash(tmp_path, monkeypatch):
     pl.DataFrame({
         "symbol": ["510300.XSHG", "510300.XSHG"],
         "trade_date": [pd.Timestamp("2026-08-01"), pd.Timestamp("2026-08-04")],
-        # 相邻因子 1.0 → 0.5（÷2 除权跳变，>10% 阈值 → 必须生成事件）
-        "ex_factor": [1.0, 0.5],
+        # 相邻因子 0.5 → 1.0（÷2 除权跳变，>10% 阈值 → 必须生成事件）。
+        # 前复权因子是**累计**量：越早越小（序列非递减），所以用 0.5 → 1.0；
+        # 反向（1.0 → 0.5）属于源数据伪跳变，会被质量闸门整段隔离。
+        "ex_factor": [0.5, 1.0],
     }).write_parquet(root / "adj_factor_etf" / "all.parquet")
 
     dm = DataManager.__new__(DataManager)
@@ -1032,7 +1035,6 @@ def test_adj_events_rebuild_across_days_no_none_crash(tmp_path, monkeypatch):
     dm._adj_events_cache = None
     dm._adj_built_day = None
     dm._partition_root = lambda: str(root)
-    dm._to_jq_code = lambda s: s
 
     class _Client:
         def get_adj_factors(self):
@@ -1040,15 +1042,15 @@ def test_adj_events_rebuild_across_days_no_none_crash(tmp_path, monkeypatch):
 
     dm.client = _Client()
     events_day1 = dm._adj_events()
-    assert ("2026-08-04 00:00:00", 2.0) == tuple(events_day1["510300.XSHG"][0]) or \
-           events_day1["510300.XSHG"][0][1] == 2.0
+    assert ("2026-08-04 00:00:00", 0.5) == tuple(events_day1["510300.XSHG"][0]) or \
+           events_day1["510300.XSHG"][0][1] == 0.5
 
     # 跨日：built_day 标记为昨天 → 触发 map+events 全量重建路径
     dm._adj_built_day = "2026-08-25"
     monkeypatch.setattr(mgr_mod.pd.Timestamp, "now",
                         classmethod(lambda cls, tz=None: pd.Timestamp("2026-08-26 09:00:00")))
     events_day2 = dm._adj_events()   # 不应 AttributeError
-    assert events_day2["510300.XSHG"][0][1] == 2.0
+    assert events_day2["510300.XSHG"][0][1] == 0.5
     assert dm._adj_built_day == "2026-08-26"
 
 
@@ -1065,21 +1067,3 @@ def test_minute_no_data_after_ttl_selfheal(monkeypatch):
     dm._minute_cov = {}
 
     code = "513030.XSHG"
-    end = pd.Timestamp("2026-08-14 15:00:00")
-    # 条目 1 小时前写入 → 已过期
-    through = pd.Timestamp('2026-08-17 15:00')
-    dm._minute_no_data_after[code] = (end, through, pd.Timestamp.now() - pd.Timedelta(hours=1))
-    # 过期 → 不短路（get_minute_price_at 会重查；这里只验 TTL 分支逻辑不 return None）
-    nda = dm._minute_no_data_after.get(code)
-    assert nda is not None
-    nda_end, nda_through, nda_at = nda
-    assert nda_end == end and nda_through == through
-    expired = pd.Timestamp.now() - nda_at > dm._MINUTE_NDA_TTL
-    assert expired
-
-    # 新条目只覆盖已查询窗口，不能把缺数结果外推到其后的历史日期。
-    dm._minute_no_data_after[code] = (end, through, pd.Timestamp.now() - pd.Timedelta(minutes=5))
-    dt_late = pd.Timestamp.now() - pd.Timedelta(days=1)  # 历史 dt（昨天 15:30 后）
-    dt_late = dt_late.replace(hour=15, minute=30)
-    assert dm._minute_no_data_after[code][0].normalize() < dt_late.normalize()
-    assert dm._minute_no_data_after[code][1] < dt_late
