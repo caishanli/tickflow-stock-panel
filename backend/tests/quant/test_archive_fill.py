@@ -85,3 +85,28 @@ def test_atomic_write_replaces_and_leaves_no_tmp(tmp_path):
     assert out.exists()
     assert not list(out.parent.glob("*.tmp"))
     assert pl.read_parquet(out).height == 1
+
+
+def test_disjoint_symbols_are_not_complete(tmp_path):
+    """本机标的与归档**完全不重叠** → 不是「完整」（否则归档数据永远导不进来）。
+
+    回归：早先的实现比的是**标的数**（不是交集）→ 100 vs 100 判「完整」。
+    """
+    f = _partition(tmp_path, "2025-01-02", [f"L{i}" for i in range(100)])
+    assert not is_complete(f, {f"S{i}" for i in range(100)}, "daily")
+
+
+def test_missing_ten_percent_is_not_complete(tmp_path):
+    """缺 10% 标的 → 不完整（那 10 只必须补上，不能按「标的数够多」跳过）。"""
+    f = _partition(tmp_path, "2025-01-02", [f"S{i}" for i in range(90)])
+    assert not is_complete(f, {f"S{i}" for i in range(100)}, "daily")
+
+
+def test_unreadable_partition_is_not_complete(tmp_path):
+    """分区损坏/读不出来 → 不能判「完整」，更不能当空壳覆盖（读失败要上报）。"""
+    from app.quant.archive_fill import _existing_symbols
+    bad = tmp_path / "date=2025-01-02"
+    bad.mkdir(parents=True)
+    (bad / "part.parquet").write_bytes(b"not a parquet file")
+    assert _existing_symbols(bad / "part.parquet") is None
+    assert not is_complete(bad / "part.parquet", {"A", "B"}, "daily")

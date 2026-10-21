@@ -116,13 +116,18 @@ def _audit_breakpoints(daily_dir: Path, table: pl.DataFrame, threshold: float = 
     for key, grp in allrows.group_by("symbol"):
         sym = key[0] if isinstance(key, tuple) else key
         s = grp.sort("date")
-        closes = s["close"].drop_nulls()
+        closes = s["close"]
         if len(closes) < 2:
             continue
         checked += 1
         frows = fmap.get(sym) or {}
         fac = pl.Series([frows.get(d, 1.0) for d in s["date"].to_list()])
-        adj = closes.to_numpy() * fac.to_numpy()
+        # close 有缺失时不能 drop_nulls（长度会与日期序列错位 → 广播失败）；
+        # 缺失的 bar 直接跳过（复权收益率本来就无法计算）。
+        mask = ~closes.is_null()
+        if int(mask.sum()) < 2:
+            continue
+        adj = closes.to_numpy()[mask.to_numpy()] * fac.to_numpy()[mask.to_numpy()]
         ret = (adj[1:] / adj[:-1]) - 1.0
         if not (abs(ret) > threshold).any():
             continue
@@ -152,12 +157,16 @@ def main() -> int:
                     help="输出路径。**不要**用 data/adj_factor/ —— 该目录会被服务端"
                          "因子加载扫描到，与 adj_factor_baostock 混源（不同锚点）会产生伪跳变")
     ap.add_argument("--daily-dir", default="/home/caisl/tickflow-stock-panel/data/kline_daily")
-    ap.add_argument("--audit", action="store_true", help="用 20%% 跳变门槛审计因子质量")
+    ap.add_argument("--archive-root", default=ARCHIVE_ROOT,
+                    help=f"归档根目录（默认 {ARCHIVE_ROOT}）")
+    ap.add_argument("--audit", action="store_true",
+                    help="审计因子质量（阈值 0.25：股票创业板/科创板 ±20%% 涨跌幅，"
+                         "0.2 会把大量合法涨停误报为缺口）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     years = list(range(args.from_year, args.to_year + 1))
-    raw = collect_raw_factors(years)
+    raw = collect_raw_factors(years, archive_root=Path(args.archive_root))
     if raw.is_empty():
         print(json.dumps({"error": "归档无数据", "years": years}, ensure_ascii=False))
         return 1

@@ -42,15 +42,26 @@ def main() -> int:
     ap.add_argument("--in", dest="src", required=True, help="逐日因子表路径")
     ap.add_argument("--out", dest="dst", default="", help="输出路径（默认原地覆盖）")
     ap.add_argument("--table-start", default="", help="表起始日 YYYY-MM-DD（补全局基准行）")
-    ap.add_argument("--min-change", type=float, default=0.0,
+    ap.add_argument("--min-change", type=float, default=1e-4,
                     help="噪声过滤阈值（相对变化 |F(t)/F(t-1)-1|）："
-                         "mootdx ETF 表用 1e-3（其噪声底），baostock 表用 1e-4")
+                         "mootdx ETF 表用 1e-3（其噪声底），baostock 表用 1e-4"
+                         "（默认取 baostock 的口径；压 mootdx 表请显式传 1e-3，"
+                         "否则 1e-3 量级的震荡会被当成事件行 → 压缩失效）")
     ap.add_argument("--backup", default="", help="覆盖前备份到该路径")
+    ap.add_argument("--in-place", action="store_true",
+                    help="**原地覆盖**输入文件（默认只写 --out；原地覆盖必须显式指定，"
+                         "并自动备份到 <输入>.bak）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     src = Path(args.src)
-    dst = Path(args.dst) if args.dst else src
+    if args.dst:
+        dst = Path(args.dst)
+    elif args.in_place:
+        dst = src
+    else:
+        # 默认**不覆盖**输入：原地覆盖会把唯一一份逐日表换成事件表（不可逆）
+        dst = src.with_name(src.stem + ".events.parquet")
     daily = pl.read_parquet(src)
     start = _date.fromisoformat(args.table_start) if args.table_start else None
     out = compact(daily, start, args.min_change)
@@ -61,13 +72,22 @@ def main() -> int:
         "compression": round(daily.height / max(out.height, 1), 1),
     }
     if not args.dry_run:
-        if args.backup and dst.exists():
+        if dst.exists() and dst.resolve() == src.resolve():
+            # 原地覆盖：强制备份（.bak），避免唯一一份逐日表不可逆地丢失
+            import shutil
+            bak = src.with_name(src.name + ".bak")
+            shutil.copy2(dst, bak)
+            stats["backup"] = str(bak)
+        elif args.backup and dst.exists():
             Path(args.backup).parent.mkdir(parents=True, exist_ok=True)
             # 跨设备不能 rename（EXDEV），用 copy2
             import shutil
             shutil.copy2(dst, args.backup)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        out.write_parquet(dst, compression="zstd")
+        tmp = dst.with_name(dst.name + ".tmp")
+        out.write_parquet(tmp, compression="zstd")
+        import os
+        os.replace(tmp, dst)
         stats["bytes"] = dst.stat().st_size
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     return 0

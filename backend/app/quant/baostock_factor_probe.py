@@ -14,18 +14,9 @@ from __future__ import annotations
 import argparse
 import json
 
-import baostock as bs
-
-BAOSTOCK_CODES = {
-    ".SZ": "sz.",
-    ".SH": "sh.",
-    ".BJ": "bj.",
-}
-
-
-def to_bs_code(symbol: str) -> str:
-    pure, suffix = symbol.split(".", 1)
-    return BAOSTOCK_CODES.get("." + suffix.upper(), "sh.") + pure
+# 代码转换统一走 baostock_factor_sync.to_bs_code（避免三份实现漂移）
+from app.quant.baostock_factor_sync import to_bs_code
+from app.services.baostock_backfill import _guarded, query_adjust_factor_rows
 
 
 def main() -> int:
@@ -35,22 +26,31 @@ def main() -> int:
     ap.add_argument("--end", default="2026-12-31")
     args = ap.parse_args()
 
-    lg = bs.login()
+    # 墙钟守护：baostock 的 socket 挂起会**永久阻塞**这个 CLI（仓库其它入口
+    # 都走 _guarded）
+    try:
+        _guarded(lambda: _probe(args.symbols, args.start, args.end), timeout=300)
+    except Exception as exc:
+        print(json.dumps({"error": type(exc).__name__, "msg": str(exc)[:300]},
+                         ensure_ascii=False))
+        return 1
+    return 0
+
+
+def _probe(symbols, start, end) -> None:
+    import baostock as bs
+
+    lg = _guarded(bs.login, timeout=30)
     if lg.error_code != "0":
         print(json.dumps({"error": "login failed", "msg": lg.error_msg}, ensure_ascii=False))
-        return 1
+        return
     try:
         out = []
-        for sym in args.symbols:
+        for sym in symbols:
             code = to_bs_code(sym)
-            rs = bs.query_adjust_factor(code=code, start_date=args.start, end_date=args.end)
-            if rs is None or rs.error_code != "0":
-                out.append({"symbol": sym, "error": getattr(rs, "error_code", None),
-                            "msg": getattr(rs, "error_msg", "")})
-                continue
-            rows = []
-            while rs.error_code == "0" and rs.next():
-                rows.append(rs.get_row_data())
+            rows = _guarded(
+                lambda c=code: query_adjust_factor_rows(c, start, end, timeout=60, retries=1),
+                timeout=90)
             out.append({
                 "symbol": sym,
                 "code": code,
@@ -60,8 +60,7 @@ def main() -> int:
             })
         print(json.dumps(out, ensure_ascii=False, indent=2))
     finally:
-        bs.logout()
-    return 0
+        _guarded(bs.logout, timeout=30)
 
 
 if __name__ == "__main__":
