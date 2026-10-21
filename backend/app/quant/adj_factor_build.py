@@ -1,4 +1,10 @@
-"""从归档日线重建股票前复权因子表（data/adj_factor/all.parquet）。
+"""从归档日线重建股票前复权因子表（归档版，**非权威源**）。
+
+用途：归档（2026-04-18 快照）里的 `adj_factor` 列也能重建因子表，锚点是
+归档末日（2026-04-17）。**生产加载不用它** —— 权威源是
+`data/adj_factor_baostock/`（baostock 回源，锚点更新、无舍入噪声）。
+本脚本产物落 `data/adj_factor_archive/`（该目录**不被**服务端因子加载扫描），
+避免与权威源混源（不同锚点混用会产生伪跳变，见 sources._load_adj_factors）。
 
 ## 口径（2026-10-20 实测确认，见 docs/2026-10-20-archive-import-feasibility.md）
 
@@ -14,7 +20,7 @@
 
 ## 产物
 
-`data/adj_factor/all.parquet`，schema 与 ETF 表一致：`symbol, trade_date(date), ex_factor(f64)`。
+`data/adj_factor_archive/all.parquet`，schema 与 ETF 表一致：`symbol, trade_date(date), ex_factor(f64)`。
 symbol 用 tushare 口径（`000001.SZ`）；读取侧 `apply_qfq_daily` 会把因子表的聚宽码
 （`.XSHG/.XSHE`）归一成 tushare 码再 join，故本表用 tushare 码亦可（join key 归一后一致）。
 """
@@ -142,7 +148,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--from-year", type=int, default=2016)
     ap.add_argument("--to-year", type=int, default=2026)
-    ap.add_argument("--out", default="/home/caisl/tickflow-stock-panel/data/adj_factor/all.parquet")
+    ap.add_argument("--out", default="/home/caisl/tickflow-stock-panel/data/adj_factor_archive/all.parquet",
+                    help="输出路径。**不要**用 data/adj_factor/ —— 该目录会被服务端"
+                         "因子加载扫描到，与 adj_factor_baostock 混源（不同锚点）会产生伪跳变")
     ap.add_argument("--daily-dir", default="/home/caisl/tickflow-stock-panel/data/kline_daily")
     ap.add_argument("--audit", action="store_true", help="用 20%% 跳变门槛审计因子质量")
     ap.add_argument("--dry-run", action="store_true")

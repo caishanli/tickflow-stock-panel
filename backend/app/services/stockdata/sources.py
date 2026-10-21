@@ -53,6 +53,17 @@ def _to_jq(code: str) -> str:
     return pure + (".XSHG" if suf in ("SH", "SS", "XSHG") else ".XSHE")
 
 
+def _normalized_symbols(df: pl.DataFrame) -> set[str]:
+    """因子表里的标的集合（归一化为 tushare 码 .SH/.SZ）。
+
+    不同来源的 symbol 口径不同（mootdx 表用聚宽码 .XSHG/.XSHE，baostock 表用
+    .SH/.SZ），来源比较时必须先归一，否则匹配全不中（分离规则静默失效）。
+    """
+    if df is None or df.is_empty():
+        return set()
+    return {str(s) for s in df["symbol"].unique().to_list()}
+
+
 def _is_index(code: str) -> bool:
     """指数判定：399 开头任意市场；000xxx 仅沪市（SH/SS/XSHG）是指数。
 
@@ -1199,19 +1210,32 @@ class DataSources:
         return load_financials()
 
     def _load_adj_factors(self) -> pl.DataFrame:
-        """因子表 = ETF（adj_factor_etf，mootdx xdxr 重建）+ 股票（adj_factor，
-        mootdx 扩展段 / TickFlow ex_factors 同目录）+ 股票（adj_factor_baostock，
-        baostock 回源产出），三者 schema 相同直接拼接。
+        """加载前复权因子表（**按标的来源分离，不同来源不混用**）。
+
+        为什么必须分离：各来源的因子**归一化锚点不同**（同一标的同一日期，
+        两个来源的 ex_factor 可以差 0.7）。若把多来源直接 concat，as-of
+        backward 展开会在两个尺度之间来回跳 → 复权价出现 ±20%~134% 的伪跳变
+        （实测 300795.SZ 单日 +72.89%）。故规则是：
+
+        - **adj_factor_baostock**（baostock foreAdjustFactor 回源）：**股票因子的
+          唯一权威源**。最新锚定（末事件=1.0）、单调递增、已审计（20%/25% 跳变
+          门槛下 0 缺口）。
+        - **adj_factor_etf**（mootdx xdxr 重建）：该源已被
+          ``mootdx_service._ADJ_FACTOR_QUARANTINED`` 禁用（"未达质量口径"）——
+          实测其**股票行**有 555/4128 只因子 >1.0（悬崖合成）、19% 标的不单调，
+          故**只用于非股票标的（ETF）**，其股票行整段丢弃。
+        - **adj_factor**：旧部署兼容（优先级最低）。
 
         因子表有两种表示（都能用）：
-        - **逐日表**（adj_factor_etf）：每个交易日一行 ex_factor。
+        - **逐日表**（adj_factor_etf 旧版）：每个交易日一行 ex_factor。
         - **事件行表**（adj_factor_baostock）：step function 的稀疏表示，
           每个除权事件一行（基准行 + 变点）。见 ``apply_qfq_daily`` 的 as-of 展开。
+
         股票目录缺失/为空不报错（未跑过股票回源的部署因子只有 ETF 段）；
         排除 xdxr 事件表（同目录不同 schema，混入 scan 会炸掉整次加载）。"""
         import glob as _glob
-        frames = []
-        for subdir in ("adj_factor_etf", "adj_factor", "adj_factor_baostock"):
+        by_source: dict[str, pl.DataFrame] = {}
+        for subdir in ("adj_factor_baostock", "adj_factor", "adj_factor_etf"):
             root = os.path.join(self.data_root, subdir)
             if not os.path.isdir(root):
                 continue
@@ -1225,10 +1249,49 @@ class DataSources:
             cols = lf.columns
             if "symbol" not in cols:
                 lf = lf.with_columns(pl.lit("").alias("symbol"))
-            frames.append(lf.select(["symbol", "trade_date", "ex_factor"]).collect())
+            lf = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
+            by_source[subdir] = lf
+        if not by_source:
+            return pl.DataFrame()
+        frames = []
+        # 1) baostock（股票权威源）+ 2) adj_factor（旧部署兼容）
+        for key in ("adj_factor_baostock", "adj_factor"):
+            df = by_source.get(key)
+            if df is not None and not df.is_empty():
+                frames.append(df)
+        etf = by_source.get("adj_factor_etf")
+        if etf is not None and not etf.is_empty():
+            # mootdx 源：① baostock 已覆盖的标的整体丢弃（两表锚点不同，混用会产生伪跳变）
+            #    ② 股票 universe 里的标的也丢弃（mootdx 源是 cliff 合成的低质量因子，
+            #       实测 555/4128 只因子 >1.0、19% 标的不单调）
+            # 比较时用**归一化副本**（mootdx 表是聚宽码 .XSHG/.XSHE，universe 是 tushare 码
+            # .SH/.SZ，不归一则匹配全不中）；但**行内 symbol 保持原格式**（下游
+            # apply_qfq_daily 在 join 前自己归一，这里提前改会破坏 _to_jq_code 契约）。
+            drop = set()
+            for df in frames:
+                drop |= _normalized_symbols(df)
+            stock_syms = self._stock_symbol_set()
+            if stock_syms:
+                drop |= stock_syms
+            if drop:
+                etf = etf.filter(~pl.col("symbol").map_elements(
+                    _tf_symbol, return_dtype=pl.String).is_in(drop))
+            if not etf.is_empty():
+                frames.append(etf)
         if not frames:
             return pl.DataFrame()
         return pl.concat(frames, how="vertical_relaxed")
+
+    def _stock_symbol_set(self) -> set[str]:
+        """本机股票 universe（tushare 码）；读不到则返回空集（不启用来源分离）。"""
+        path = os.path.join(self.data_root, "instruments", "instruments.parquet")
+        try:
+            if not os.path.exists(path):
+                return set()
+            df = pl.read_parquet(path, columns=["symbol"])
+            return {str(s) for s in df["symbol"].to_list()}
+        except Exception:  # noqa: BLE001
+            return set()
 
 
 def pd_to_ts(x):

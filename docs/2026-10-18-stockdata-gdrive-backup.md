@@ -19,7 +19,7 @@
 | `kline_etf_minute` | ETF 分钟线 |
 | `kline_daily` / `kline_etf_daily` / `kline_index_daily` | 股票 / ETF / 指数日线 |
 | `kline_daily_enriched` / `kline_etf_enriched` / `kline_index_enriched` | 派生 enriched（可重算，但一并备份做到「取到即用」） |
-| `adj_factor` / `adj_factor_etf` | 复权因子 |
+| `adj_factor_baostock` / `adj_factor_etf` | 复权因子（股票=baostock 回源、ETF=mootdx 重建） |
 | `instruments` / `instruments_etf` / `instruments_index` | 标的表 |
 | `financials` / `industries_sw` / `etf_nav` | 财务、申万行业、ETF 净值 |
 | `trade_calendar.json` | 权威交易日历 |

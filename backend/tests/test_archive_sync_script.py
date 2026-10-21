@@ -96,15 +96,22 @@ def test_uses_measured_best_params(tmp_path):
     for l in copies:
         assert l[l.index("--transfers") + 1] == "16"
         assert "--no-update-dir-modtime" in l
-        assert l[l.index("--min-age") + 1] == "15m"
+        # 静态归档不需要 min-age（默认 0）——留着会静默漏传 mtime 很新的文件
+        assert l[l.index("--min-age") + 1] == "0"
 
 
-def test_missing_source_is_skipped_not_failed(tmp_path):
+def test_missing_source_is_failure_not_silent_success(tmp_path):
+    """源缺失（磁盘未挂载/路径笔误）必须判失败。
+
+    一次性备份没有 cron 兜底，若当成功处理会被监控成"备份成功"，
+    last_success_at 照常推进 → 数据其实没备份。故必须 exit 5 且不推进。
+    """
     r = run_sync(tmp_path, sources=["/nonexistent/dir"])
-    assert r["proc"].returncode == 0
-    assert r["status"]["exit_code"] == 0
+    assert r["proc"].returncode == 5
+    assert r["status"]["exit_code"] == 5
     assert r["status"]["dirs_ok"] == 0
-    assert "跳过" in r["log"]
+    assert r["status"]["last_success_at"] is None
+    assert "本地源不存在" in r["log"]
 
 
 def test_lock_busy_skips_without_touching_remote(tmp_path):

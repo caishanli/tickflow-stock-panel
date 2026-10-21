@@ -173,6 +173,37 @@ def test_single_file_copyto_does_not_carry_filters(tmp_path):
     assert "trade_calendar.json" not in r["status"]["dirs_failed"]
 
 
+def test_whitelist_covers_every_data_directory():
+    """守卫：data/ 下每个**数据目录**都必须在备份白名单里。
+
+    新增数据目录（如 adj_factor_baostock）若漏加白名单 → 该数据永远不上云，
+    且无法从别处重建（baostock 是外部依赖）。故用测试锁住。
+    """
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    data_root = repo / "data"
+    if not data_root.is_dir():
+        pytest.skip("data/ 不存在")
+    script = (repo / "backend/scripts/sync_stockdata_to_gdrive.sh").read_text()
+    m = re.search(r"DIRS=\(\s*(.*?)\)", script, re.S)
+    assert m, "未找到 DIRS 白名单"
+    listed = set(m.group(1).split())
+    # data/ 下的一级目录 = 数据目录（运行态/缓存目录除外，那些本就不该备份）
+    runtime_dirs = {
+        "ai_cache", "auction_cache", "backtest_results", "cache", "data_sources",
+        "depth5", "ext_data", "instruments_ext", "job_store", "pools", "quant_cache",
+        "quant_kline", "quant_sim", "quant_strategies", "research", "screener_results",
+        "user_data", "kline_ext", "adj_factor",  # adj_factor：归档版因子表（已废弃，见文档）
+        # 隐藏的运行时目录
+        ".backtest_matrix_cache", ".raw_partition_locks",
+    }
+    data_dirs = {p.name for p in data_root.iterdir() if p.is_dir()}
+    missing = data_dirs - listed - runtime_dirs
+    assert not missing, f"data/ 下这些目录不在备份白名单里：{sorted(missing)}"
+
+
 def test_parallelism_env_overrides_reach_rclone_args(tmp_path):
     """并发度必须可调：Drive 侧限流时 4 并发是延迟瓶颈，靠提高并发把上行带宽用起来。"""
     r = run_sync(tmp_path, env={"RCLONE_TRANSFERS": "16", "RCLONE_CHECKERS": "24"})

@@ -22,7 +22,7 @@ RCLONE_BIN="${RCLONE_BIN:-$HOME/.local/bin/rclone}"
 RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-16}"
 RCLONE_CHECKERS="${RCLONE_CHECKERS:-16}"
 RCLONE_BWLIMIT="${RCLONE_BWLIMIT:-}"
-GDRIVE_MIN_AGE="${GDRIVE_MIN_AGE:-15m}"
+GDRIVE_MIN_AGE="${GDRIVE_MIN_AGE:-0}"     # 静态归档无需 min-age（防半写文件）；留着会静默漏传 mtime 很新的文件
 GDRIVE_LOG="${GDRIVE_LOG:-$ROOT/data/gdrive_archive_sync.log}"
 GDRIVE_STATUS="${GDRIVE_STATUS:-$ROOT/data/gdrive_archive_sync_status.json}"
 GDRIVE_LOCK="${GDRIVE_LOCK:-$ROOT/data/.gdrive_archive_sync.lock}"
@@ -236,7 +236,10 @@ main() {
   while IFS= read -r src; do
     [ -z "$src" ] && continue
     if [ ! -d "$src" ]; then
-      _log "跳过（本地不存在）: $src"
+      # 源缺失 = 失败（磁盘未挂载 / 路径笔误）。一次性备份没有 cron 兜底，
+      # 若当成功处理会被监控成"备份成功"→ last_success_at 照常推进。
+      DIRS_FAILED+=("$(basename "$src"):missing")
+      _log "归档失败（本地源不存在）: $src"
       continue
     fi
     name="$(basename "$src")"

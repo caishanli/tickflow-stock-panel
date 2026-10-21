@@ -23,8 +23,13 @@ baostock `query_adjust_factor` 返回事件行：
 因子在两个事件日之间恒定 → 对每只标的，事件行 fore 值向前填充到上一个事件日，
 最后补到「最后事件日之后的所有交易日」（值 = 1.0，因为最后事件日 fore=1.0）。
 
+产物：**事件行表**（step function 稀疏表示：基准行 + 变点），落
+``data/adj_factor_baostock/all.parquet`` —— 股票复权因子的权威源。
+（不要写进 ``data/adj_factor/``：该目录会被服务端因子加载扫到，与权威源
+混源会因归一化锚点不同而产生复权伪跳变，见 ``sources._load_adj_factors``。）
+
 用法:
-    uv run python -m app.quant.baostock_factor_sync --out ../data/adj_factor/all.parquet
+    uv run python -m app.quant.baostock_factor_sync            # 写事件行表到 adj_factor_baostock/
     uv run python -m app.quant.baostock_factor_sync --limit 50 --dry-run
 """
 
@@ -170,7 +175,8 @@ def build_table(symbols: list[str], query_start: _date, end: _date,
     return table, stats
 
 
-def daily_to_events(daily: pl.DataFrame, table_start: pl.date) -> pl.DataFrame:
+def daily_to_events(daily: pl.DataFrame, table_start: _date,
+                    min_change: float = 0.0) -> pl.DataFrame:
     """逐日因子表 → 事件行表（step function 的稀疏表示）。
 
     因子是 step function：事件之间恒定 → 只需存「基准行 + 变点」。
@@ -179,12 +185,18 @@ def daily_to_events(daily: pl.DataFrame, table_start: pl.date) -> pl.DataFrame:
     服务端 ``apply_qfq_daily`` 用 as-of backward join 展开 step function ✓。
 
     22M 行逐日表 → 3.6 万行事件表（600x），客户端加载从 10 GB/70 s 降到 ~5 MB/<1 s。
+
+    min_change：**噪声过滤阈值**（相对变化 |F(t)/F(t-1) - 1|）。按来源分别取：
+    - baostock 表（精确因子）噪声底 ~1e-6 → 用 1e-4（保留 0.01% 以上的小额分红）
+    - mootdx ETF 表噪声底 ~1e-3（分布断点：296 个 <1e-3，之后直跳 2517）
+      → 用 1e-3，否则压缩后相邻行比值 ~4e-4 会被消费端的 1e-4 阈值误判成假事件。
     """
     if daily.is_empty():
         return daily
     srt = daily.sort(["symbol", "trade_date"])
     prev = pl.col("ex_factor").shift(1).over("symbol")
-    is_change = (pl.col("ex_factor") != prev) & prev.is_not_null()
+    rel = (pl.col("ex_factor") / prev) - 1.0
+    is_change = (rel.abs() > min_change) & prev.is_not_null()
     is_first = prev.is_null()
     changes = srt.filter(is_change | is_first).select(["symbol", "trade_date", "ex_factor"])
     # 基准行：表起始日当天的因子（若起始日恰是变点，其行已在 changes 里）

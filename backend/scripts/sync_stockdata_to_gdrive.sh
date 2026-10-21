@@ -64,7 +64,7 @@ fi
 DIRS=(
   kline_minute kline_etf_minute kline_daily kline_etf_daily kline_index_daily
   kline_daily_enriched kline_etf_enriched kline_index_enriched
-  adj_factor adj_factor_etf instruments instruments_etf instruments_index
+  adj_factor adj_factor_baostock adj_factor_etf instruments instruments_etf instruments_index
   financials industries_sw etf_nav
 )
 FILES=(trade_calendar.json)

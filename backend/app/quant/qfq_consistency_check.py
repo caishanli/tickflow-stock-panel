@@ -73,7 +73,7 @@ def main() -> int:
             sym, rel, n, err = check(sym, ds, dm, args.start, args.end)
             worst = max(worst, rel)
             print(f"{sym:<14}{rel:>12.6%}   {n}" + (f"  ({err})" if err else ""))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"{sym:<14} ERROR {type(exc).__name__}: {str(exc)[:70]}")
     print(f"\n最大相对差合计: {worst:.6%}")
     return 0

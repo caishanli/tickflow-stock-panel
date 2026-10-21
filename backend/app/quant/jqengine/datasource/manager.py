@@ -377,10 +377,13 @@ class DataManager:
     def _adj_factor_map(self) -> dict[str, dict]:
         """加载前复权因子表: {jq_code: {trade_date(date): ex_factor}}。
 
-        合并两处来源: 本地 parquet (adj_factor_etf ETF 因子 +
-        adj_factor_baostock 股票因子, baostock 回源脚本产出) 与
-        stockdata 网络服务因子表 (服务端读同一 adj_factor_etf 目录);
-        任一来源不可用/离线时另一来源兜底。
+        **按来源分离**（与 ``sources._load_adj_factors`` 同一规则）：不同来源的
+        因子归一化锚点不同（同一标的同一日期可差 0.7），混用会让因子序列在两个
+        尺度间跳变 → 复权价出现伪跳变（实测单日 +72.89%）。
+        - adj_factor_baostock：股票因子唯一权威源（baostock 回源，最新锚定、单调、已审计）
+        - adj_factor_etf：mootdx 源（已 quarantine），**只用于非股票标的（ETF）**，
+          其股票行是悬崖合成的低质量因子，整段丢弃
+        - adj_factor：旧部署兼容（优先级最低）
         """
         if self._adj_factor is not None and self._adj_fresh():
             return self._adj_factor
@@ -388,19 +391,21 @@ class DataManager:
         self._adj_events_cache = None  # 因子表重建 → 事件表一并失效
         import glob as _glob
         roots = [
-            os.path.join(self._partition_root(), "adj_factor_etf"),
-            os.path.join(self._partition_root(), "adj_factor_baostock"),
+            ("adj_factor_baostock", os.path.join(self._partition_root(), "adj_factor_baostock")),
+            ("adj_factor", os.path.join(self._partition_root(), "adj_factor")),
+            ("adj_factor_etf", os.path.join(self._partition_root(), "adj_factor_etf")),
         ]
-        paths = []
-        for r in roots:
-            if os.path.isdir(r):
-                paths.extend(_glob.glob(
-                    os.path.join(r, "**", "*.parquet"), recursive=True))
-        # 排除 xdxr 事件表（mootdx_service 写在 adj_factor_etf/ 下，schema 为
-        # 事件字段而非 trade_date/ex_factor，混入 scan 会炸掉整次因子加载）
-        paths = [p for p in paths
-                 if not os.path.basename(p).startswith("xdxr_events")]
-        if paths:
+        by_source: dict[str, pl.DataFrame] = {}
+        for name, root in roots:
+            if not os.path.isdir(root):
+                continue
+            paths = _glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True)
+            # 排除 xdxr 事件表（mootdx_service 写在 adj_factor_etf/ 下，schema 为
+            # 事件字段而非 trade_date/ex_factor，混入 scan 会炸掉整次因子加载）
+            paths = [p for p in paths
+                     if not os.path.basename(p).startswith("xdxr_events")]
+            if not paths:
+                continue
             try:
                 import polars as pl
                 lf = pl.scan_parquet(paths, hive_partitioning=True)
@@ -408,12 +413,36 @@ class DataManager:
                         if isinstance(lf, pl.LazyFrame) else [])
                 if "symbol" not in cols:
                     lf = lf.with_columns(pl.lit("").alias("symbol"))
-                df = lf.select(["symbol", "trade_date", "ex_factor"]).collect()
-                for row in df.iter_rows():
-                    jq = self._to_jq_code(row[0])
-                    self._adj_factor.setdefault(jq, {})[pd.Timestamp(row[1])] = float(row[2])
+                by_source[name] = lf.select(
+                    ["symbol", "trade_date", "ex_factor"]).collect()
             except Exception as e:
-                logger.warning("[DataManager] adj_factor 本地加载失败: %s", e)
+                logger.warning("[DataManager] adj_factor 本地加载失败(%s): %s", name, e)
+        for name in ("adj_factor_baostock", "adj_factor"):
+            df = by_source.get(name)
+            if df is None or df.is_empty():
+                continue
+            for row in df.iter_rows():
+                jq = self._to_jq_code(row[0])
+                self._adj_factor.setdefault(jq, {})[pd.Timestamp(row[1])] = float(row[2])
+        etf = by_source.get("adj_factor_etf")
+        if etf is not None and not etf.is_empty():
+            import polars as pl
+            # mootdx 源：① baostock 已覆盖的标的整体丢弃（两表锚点不同，混用会产生伪跳变）
+            #    ② 股票 universe 里的标的也丢弃（mootdx 源是 cliff 合成的低质量因子）
+            # 比较用**归一化副本**（mootdx 表是聚宽码，universe 是 tushare 码），
+            # 但行内 symbol 保持原格式（下游 _to_jq_code 契约）。
+            drop: set[str] = set()
+            for name in ("adj_factor_baostock", "adj_factor"):
+                d2 = by_source.get(name)
+                if d2 is not None and not d2.is_empty():
+                    drop |= {self._to_tushare_code(str(s)) for s in d2["symbol"].unique().to_list()}
+            drop |= self._stock_symbol_set()
+            if drop:
+                etf = etf.filter(~pl.col("symbol").map_elements(
+                    self._to_tushare_code, return_dtype=pl.String).is_in(drop))
+            for row in etf.iter_rows():
+                jq = self._to_jq_code(row[0])
+                self._adj_factor.setdefault(jq, {})[pd.Timestamp(row[1])] = float(row[2])
         try:
             df = self.client.get_adj_factors()
             if df is not None and not df.empty:
@@ -424,6 +453,27 @@ class DataManager:
             logger.warning("[DataManager] adj_factor 网络加载失败: %s", e)
         self._adj_built_day = pd.Timestamp.now().normalize().date().isoformat()
         return self._adj_factor
+
+    def _stock_symbol_set(self) -> set[str]:
+        """本机股票 universe（tushare 码）；读不到则返回空集（不启用来源分离）。"""
+        import os
+        path = os.path.join(self._partition_root(), "instruments", "instruments.parquet")
+        try:
+            if not os.path.exists(path):
+                return set()
+            import polars as pl
+            df = pl.read_parquet(path, columns=["symbol"])
+            return {str(s) for s in df["symbol"].to_list()}
+        except Exception:  # noqa: BLE001
+            return set()
+
+    @staticmethod
+    def _to_tushare_code(code: str) -> str:
+        """聚宽码(.XSHG/.XSHE) → tushare 码(.SH/.SZ)；其它原样返回。"""
+        pure, _, suf = code.rpartition(".")
+        if not pure:
+            return code
+        return pure + (".SH" if suf.upper() in ("XSHG", "SH", "SS") else ".SZ")
 
     def _apply_qfq(self, pdf: pd.DataFrame, jq: str, cutoff=None) -> pd.DataFrame:
         """对日线帧价格列应用前复权因子（有拆分/分红的标的）。

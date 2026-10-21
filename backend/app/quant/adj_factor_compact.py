@@ -23,21 +23,28 @@ import polars as pl
 from app.quant.baostock_factor_sync import daily_to_events
 
 
-def compact(daily: pl.DataFrame, table_start: _date | None = None) -> pl.DataFrame:
+def compact(daily: pl.DataFrame, table_start: _date | None = None,
+            min_change: float = 0.0) -> pl.DataFrame:
     """逐日因子表 → 事件行表。
 
     table_start 给定时额外补一行该日的基准（全局起始日）；为 None 时
     每只标的以其自身首行为基准（事件行表天然含 is_first 行）。
+    min_change：噪声过滤阈值（相对变化），按来源分别取（见 daily_to_events）。
     """
-    out = daily_to_events(daily, table_start or daily["trade_date"].min())
+    start = table_start or daily["trade_date"].min()
+    if not isinstance(start, _date):
+        start = _date.fromisoformat(str(start))
+    out = daily_to_events(daily, start, min_change)
     return out.sort(["symbol", "trade_date"])
-
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="src", required=True, help="逐日因子表路径")
     ap.add_argument("--out", dest="dst", default="", help="输出路径（默认原地覆盖）")
     ap.add_argument("--table-start", default="", help="表起始日 YYYY-MM-DD（补全局基准行）")
+    ap.add_argument("--min-change", type=float, default=0.0,
+                    help="噪声过滤阈值（相对变化 |F(t)/F(t-1)-1|）："
+                         "mootdx ETF 表用 1e-3（其噪声底），baostock 表用 1e-4")
     ap.add_argument("--backup", default="", help="覆盖前备份到该路径")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -46,7 +53,7 @@ def main() -> int:
     dst = Path(args.dst) if args.dst else src
     daily = pl.read_parquet(src)
     start = _date.fromisoformat(args.table_start) if args.table_start else None
-    out = compact(daily, start)
+    out = compact(daily, start, args.min_change)
     stats = {
         "in": str(src), "out": str(dst),
         "daily_rows": daily.height, "event_rows": out.height,

@@ -2,12 +2,17 @@
 
 安全规则（关键）：
   1. 目标分区已存在且**内容完整** → **跳过**（绝不覆盖本机更新的数据）
-  2. 目标分区已存在但**空壳/残缺**（行数 < threshold）→ 用归档覆盖（修复）
+  2. 目标分区已存在但**空壳/残缺** → 用归档覆盖（修复）
   3. 目标分区不存在 → 写入（补洞）
   4. 归档里没有该日期 → 跳过
 
-"完整"的判定用行数（比文件大小可靠）：分钟线一天约 80~130 万行；
-取 threshold=100000 行作为"完整"门槛（远低于任何正常交易日，又高于所有空壳/残缺）。
+"完整"的判定用**标的数覆盖比**（不是绝对行数）：绝对行数门槛不可靠 ——
+2016/2017 年的日线分区只有 ~2592 行（当年上市数少），若用 3000 行门槛，
+这 307 个完整分区每次重跑都会被覆盖（本机数据可能已被更新）。
+判定改为「本机该日标的数 ≥ 归档该日标的数 × 95%」→ 视为完整、跳过。
+
+写入走**原子写**（.tmp + rename）并持有 **daily_partition_lock**：
+与收盘回源等其它写入方互斥，且进程中断不会留下损坏的 parquet。
 """
 
 from __future__ import annotations
@@ -26,18 +31,54 @@ from app.quant.archive_import import (
     iter_zip_days,
     read_day_from_zip,
 )
+from app.raw_partition_lock import daily_partition_lock
 
 KIND_MAP = {"minute": convert_minute, "daily": convert_daily}
-# 各 kind 的"完整"行数门槛
-COMPLETE_ROWS = {"minute": 100_000, "daily": 3_000}
+# 标的数覆盖比：本机该日标的数 ≥ 归档该日标的数 × 该比例 → 视为"完整"、跳过
+SYMBOL_COVERAGE = 0.95
+# 兜底：归档该日标的数取不到时，用行数下限判断（分钟线一天 ~80~130 万行）
+MIN_ROWS_FALLBACK = {"minute": 100_000, "daily": 500}
 
 
 def _existing_rows(path: Path) -> int:
     """读现有分区的行数；读不了按 0（视为空壳）。"""
     try:
         return pl.scan_parquet(path).select(pl.len()).collect().item()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 0
+
+
+def _existing_symbols(path: Path) -> set[str]:
+    """读现有分区的标的集合；读不了返回空集。"""
+    try:
+        df = pl.scan_parquet(path).select("symbol").collect()
+        return {str(s) for s in df["symbol"].to_list()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def is_complete(existing: Path, archived_symbols: set[str], kind: str) -> bool:
+    """本机分区是否已完整覆盖该交易日的数据。
+
+    判定：标的数覆盖比 ≥ SYMBOL_COVERAGE → 完整（跳过）。
+    归档该日标的数取不到时退化为行数下限（MIN_ROWS_FALLBACK）。
+    """
+    if not existing.exists():
+        return False
+    if archived_symbols:
+        have = _existing_symbols(existing)
+        if have:
+            return len(have) >= len(archived_symbols) * SYMBOL_COVERAGE
+    return _existing_rows(existing) >= MIN_ROWS_FALLBACK[kind]
+
+
+def _write_partition_atomic(out_file: Path, df: pl.DataFrame) -> None:
+    """原子写分区（.tmp + rename），并持有 daily_partition_lock 与其它写入方互斥。"""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with daily_partition_lock(out_file):
+        tmp = out_file.with_name(out_file.name + ".tmp")
+        df.write_parquet(tmp)
+        tmp.replace(out_file)
 
 
 def plan_target(years: list[int], kind: str) -> list[tuple[Path, str]]:
@@ -73,7 +114,6 @@ def main() -> int:
     years = list(range(args.from_year, args.to_year + 1))
     target_root = Path(args.target_root)
     conv = KIND_MAP[args.kind]
-    complete_rows = COMPLETE_ROWS[args.kind]
 
     items = plan_target(years, args.kind)
     stats = {
@@ -95,10 +135,17 @@ def main() -> int:
         part = day_to_partition(member)
         out_file = target_root / f"date={part}" / "part.parquet"
         if out_file.exists():
-            rows = _existing_rows(out_file)
-            if rows >= complete_rows:
+            # 完整性判定：需要归档该日的标的集合（先读归档再判，避免无谓解压）
+            try:
+                archived = conv(read_day_from_zip(zip_path, member))
+            except Exception as exc:  # noqa: BLE001
+                stats["errors"].append(f"{part}: {exc}")
+                continue
+            archived_symbols = {str(s) for s in archived["symbol"].unique().to_list()}
+            if is_complete(out_file, archived_symbols, args.kind):
                 stats["skipped_complete"] += 1
-                decisions.append({"date": part, "action": "skip_complete", "existing_rows": rows})
+                decisions.append({"date": part, "action": "skip_complete",
+                                  "existing_rows": _existing_rows(out_file)})
                 continue
             action = "overwrite_shell"
         else:
@@ -113,7 +160,7 @@ def main() -> int:
             stats["errors"].append(f"{part}: {exc}")
             continue
         out_file.parent.mkdir(parents=True, exist_ok=True)
-        df.write_parquet(out_file, compression="zstd")
+        _write_partition_atomic(out_file, df)
         stats["written"] += 1
         stats["rows_written"] += df.height
         stats["bytes_written"] += out_file.stat().st_size

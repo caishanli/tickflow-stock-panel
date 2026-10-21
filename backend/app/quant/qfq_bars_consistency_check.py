@@ -54,7 +54,6 @@ def main() -> int:
         s = {str(r["date"]): r["close"] for r in srv.iter_rows(named=True)}
 
         rows = [(str(r["date"]), r["close"]) for r in df.sort("date").iter_rows(named=True)]
-        raw = {d: c for d, c in rows}
         bars = bars_from_daily(sym, rows)
         jq = dm._to_jq_code(sym)
         # 决策日取最后一天 → 无未来事件参与

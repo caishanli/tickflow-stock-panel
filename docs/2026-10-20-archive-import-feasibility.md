@@ -305,5 +305,14 @@ uv run --extra dev python -m app.quant.adj_factor_build --dry-run --audit --dail
 消费方 as-of 展开两种都支持）。若将来解除 mootdx `sync_adj_factor` 的 quarantine 并重跑，
 它会写回逐日格式 —— 混合亦不影响正确性（逐日值与 step function 同值）。
 
+**⚠️ 不同来源的因子表不能混用**（本分支实测踩过）：
+各来源的归一化锚点不同（同一标的同一日期，两源 ex_factor 可差 0.7），
+混用后 as-of 展开会在两个尺度间跳变 → 复权价出现 ±20%~134% 伪跳变
+（实测 300795.SZ 单日 +72.89%）。故服务端 `sources._load_adj_factors` 与客户端
+`manager._adj_factor_map` 均按**来源优先级 + 标的分离**加载：
+baostock 表（股票权威源）覆盖的标的整体丢弃 mootdx 行；mootdx 源只用于非股票标的（ETF），
+其股票行是 cliff 合成的低质量因子（实测 555/4128 只因子 >1.0、19% 标的不单调）→ 整段丢弃。
+校验工具：`app/quant/adj_factor_audit.py`（复权伪跳变审计，判据独立于因子表自身口径）。
+
 **备份**：`/tmp/opencode/adj_factor_etf_daily_backup.parquet`（原逐日表）、
 `/tmp/opencode/adj_factor_daily_backup.parquet`（原股票逐日表）。
