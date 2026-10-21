@@ -1,4 +1,5 @@
 import os, tempfile, sqlite3
+import pytest
 from app.quant import db
 
 def _fresh():
@@ -153,3 +154,32 @@ def test_compile_run_lifecycle(tmp_path, monkeypatch):
             assert n == 0, f"主库 {t} 应零残留"
     db.delete_run(rid)
     assert db.get_run(rid) is None
+
+
+def test_get_conn_closes_on_exit():
+    """``with get_conn()`` 退出必须关闭连接（RED：sqlite3 上下文只管事务）。
+
+    2026-10-21 实测 sb_gaokai_sim 单进程累积 847 个 quant.db fd：每次日志/
+    配置读取都新建连接且从不释放。长驻模拟盘跑几天就会把 fd 表吃满。
+    """
+    p = _fresh()
+    with db.get_conn() as c:
+        assert c.execute("SELECT 1").fetchone()[0] == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        c.execute("SELECT 1")
+    os.unlink(p)
+
+
+def test_get_conn_does_not_leak_fds():
+    """连续 N 次 DB 调用后 fd 数不增长（泄漏回归的度量口径）。"""
+    p = _fresh()
+    fd_dir = "/proc/self/fd"
+    if not os.path.isdir(fd_dir):
+        pytest.skip("需要 /proc")
+    before = len(os.listdir(fd_dir))
+    for i in range(50):
+        db.set_quant_setting("fd_probe", str(i))
+        assert db.get_quant_setting("fd_probe") == str(i)
+    after = len(os.listdir(fd_dir))
+    assert after - before <= 3, f"fd 泄漏: {before} -> {after}"
+    os.unlink(p)

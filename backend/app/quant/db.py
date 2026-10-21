@@ -151,6 +151,35 @@ def _ensure_compile_db(path: str) -> None:
         conn.close()
 
 
+class _ClosingConn:
+    """``get_conn()`` 的上下文管理器：退出提交/回滚后**关闭**连接。
+
+    ``with sqlite3.connect(...) as c`` 只做 commit/rollback，**不关闭**连接；
+    长驻模拟盘每次 DB 调用（每条日志、每次读 quant_settings）都新建连接且
+    从不释放，2026-10-21 sb_gaokai_sim 单进程累积 847 个 quant.db fd（另有多
+    个账户 700~1200 个），既吃 fd 又让每次查询多付一次 open/PRAGMA。所有
+    56 处调用点都是 ``with get_conn() as c:``，故由本包装器统一收口。
+    """
+
+    __slots__ = ("conn",)
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+        finally:
+            self.conn.close()
+        return False
+
+
 def get_conn(run_id: str | None = None):
     if is_compile_run(run_id):
         path = compile_db_path(run_id)
@@ -165,7 +194,7 @@ def get_conn(run_id: str | None = None):
     # 回测/模拟盘日志逐条 insert_log 各自 commit，默认 FULL 时每次 ~4ms
     # fsync，单场回测 4600+ 条 ≈ 18s（cProfile 实测）。
     conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    return _ClosingConn(conn)
 
 
 # ---- 回测 ----
@@ -474,32 +503,35 @@ def list_sim_accounts():
             "ORDER BY a.created_at"
         ).fetchall()
     out = []
-    for r in rows:
-        d = dict(r)
-        d["day_pnl"] = None
-        d["day_pnl_pct"] = None
-        nv = d.get("net_value")
-        if isinstance(nv, (int, float)) and nv > 0:
-            # 先取最新快照日，再定向查前一日末净值：不限行数，盘中 mark-to-market
-            # 一分钟写多行时 LIMIT N 取最新 N 行可能全是当天（前一日被挤掉，
-            # 当日收益置 None，前端空白——2026-09-04 d092ad90/781c7d63 实锤）。
-            latest = c.execute(
-                "SELECT substr(dt,1,10) AS d FROM sim_equity_snapshots "
-                "WHERE account_id=? ORDER BY dt DESC LIMIT 1",
-                (d["id"],),
-            ).fetchone()
-            if latest:
-                prev = c.execute(
-                    "SELECT net_value FROM sim_equity_snapshots "
-                    "WHERE account_id=? AND substr(dt,1,10) < ? "
-                    "ORDER BY dt DESC LIMIT 1",
-                    (d["id"], latest["d"]),
+    # 逐账户补当日收益要用连接：get_conn 退出即 close（不再泄漏 fd），
+    # 故这里再开一次，而不是沿用上一个 with 块里已关闭的 c。
+    with get_conn() as c:
+        for r in rows:
+            d = dict(r)
+            d["day_pnl"] = None
+            d["day_pnl_pct"] = None
+            nv = d.get("net_value")
+            if isinstance(nv, (int, float)) and nv > 0:
+                # 先取最新快照日，再定向查前一日末净值：不限行数，盘中 mark-to-market
+                # 一分钟写多行时 LIMIT N 取最新 N 行可能全是当天（前一日被挤掉，
+                # 当日收益置 None，前端空白——2026-09-04 d092ad90/781c7d63 实锤）。
+                latest = c.execute(
+                    "SELECT substr(dt,1,10) AS d FROM sim_equity_snapshots "
+                    "WHERE account_id=? ORDER BY dt DESC LIMIT 1",
+                    (d["id"],),
                 ).fetchone()
-                prev_nv = prev["net_value"] if prev else None
-                if isinstance(prev_nv, (int, float)) and prev_nv > 0:
-                    d["day_pnl_pct"] = nv / prev_nv - 1
-                    d["day_pnl"] = nv - prev_nv
-        out.append(d)
+                if latest:
+                    prev = c.execute(
+                        "SELECT net_value FROM sim_equity_snapshots "
+                        "WHERE account_id=? AND substr(dt,1,10) < ? "
+                        "ORDER BY dt DESC LIMIT 1",
+                        (d["id"], latest["d"]),
+                    ).fetchone()
+                    prev_nv = prev["net_value"] if prev else None
+                    if isinstance(prev_nv, (int, float)) and prev_nv > 0:
+                        d["day_pnl_pct"] = nv / prev_nv - 1
+                        d["day_pnl"] = nv - prev_nv
+            out.append(d)
     return out
 
 

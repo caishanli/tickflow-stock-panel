@@ -200,3 +200,45 @@ def test_preopen_task_retries_missing_auction_only_before_any_fill(monkeypatch):
     runner._fire_preopen_daily("test", bundle, ctx, {}, aux, now)
     assert fired == {(id(task), "09:26")}
     assert calls == [1, 1]
+
+
+def test_preopen_task_overrunning_auction_window_is_not_retried(monkeypatch):
+    """09:26 选股跑过 09:30 后不得重跑（RED：2026-10-21 当日日志两段选股）。
+
+    真实事故：09:26 的盘前回调因数据服务抖动跑到 09:44:05 才结束，期间策略
+    置了 preopen_auction_missing，旧逻辑无条件 discard fired → 09:44:06 又
+    完整选了一遍（日志重复），并被 09:26 run_daily 的 _daily_due 在盘中 tick
+    再触发。竞价窗口已过，重跑既补不到竞价数据、也无谓地重复整轮选股。
+    """
+    calls = []
+    api = SimpleNamespace(_state={"trades": [], "preopen_auction_missing": False})
+    ctx = SimpleNamespace(current_dt=None)
+    clock = {"now": dt.datetime(2026, 10, 12, 9, 26, 0)}
+
+    def task(_ctx):
+        calls.append(1)
+        api._state["preopen_auction_missing"] = True
+        clock["now"] += dt.timedelta(minutes=18)   # 回调 09:44 才结束
+
+    fake_dt = SimpleNamespace(
+        datetime=SimpleNamespace(now=lambda: clock["now"]),
+        time=dt.time, timedelta=dt.timedelta, date=dt.date)
+    logs = []
+    monkeypatch.setattr(runner, "datetime", fake_dt)
+    monkeypatch.setattr(runner, "_seed_universe", lambda *_: None)
+    monkeypatch.setattr(runner, "_persist", lambda *_: None)
+    monkeypatch.setattr(runner, "_emit_log",
+                        lambda aid, lvl, msg, *a, **k: logs.append((lvl, msg)))
+    bundle = SimpleNamespace(daily=[(task, "09:26")])
+    fired = set()
+    aux = {"jq_api": api, "fired": fired}
+
+    runner._fire_preopen_daily("test", bundle, ctx, {}, aux, clock["now"])
+    assert fired == {(id(task), "09:26")}
+    assert calls == [1]
+    assert any("已过 09:30 竞价窗口" in msg for _lvl, msg in logs)
+
+    # 盘中 tick 的 _daily_due 仍会看到 fired 已占用，不会第二次触发
+    runner._fire_preopen_daily("test", bundle, ctx, {}, aux,
+                              dt.datetime(2026, 10, 12, 9, 46))
+    assert calls == [1]

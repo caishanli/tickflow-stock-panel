@@ -114,6 +114,15 @@ def _default_snapshot(code):
 
 _LISTING_DATES = None   # {6位代码: listing_date}，get_security_info 惰性加载
 _STOCK_NAMES: dict = {}   # {日期ISO: {6位代码: 名称}}，整表日级缓存（见 _bulk_stock_names）
+# 名称整表拉取失败时刻（日期ISO → datetime）：负缓存，见 _bulk_stock_names。
+_STOCK_NAMES_FAILED_AT: dict = {}
+# 名称整表失败后的重试间隔（秒）：避免全市场逐只扫描把一次失败放大成数千次回源。
+_NAMES_FAIL_TTL = 30.0
+# ETF 名录日级缓存（{日期ISO: list}）：见 _bulk_etf_list。
+# 原实现每个缺名标的都 mgr.fetch("get_etf_list")——服务端全表扫描实测 0.5s/次
+# 且无缓存，全市场扫描里每个"名称表未收录"的标的要付 1~2 次；2026-10-21
+# 首板高开 09:26 选股因此从 ~1 分钟拖到 18 分钟（详见 docs 中的排障记录）。
+_ETF_LIST: dict = {}
 
 
 def _limit_rate(code, is_st=False):
@@ -1894,14 +1903,24 @@ def _bulk_stock_names(mgr):
     背景（2026-10-13 实测）：首板高开 09:26 选股中新股过滤 4415×get_security_info
     （每只 2 次 get_security_name、每次全量传输 ~5k 名称表）占 36s，ST 过滤同理。
     名称是 point-in-time 口径（回放/补跑本来拿的也是当日最新名），日级缓存不改语义；
-    拉取失败返回空（与原来一致）、不污染缓存，下次调用重试。与 _LISTING_DATES
-    同类无锁缓存：竞态最多重复拉一次，结果都是同一日整表。
+    拉取失败返回空（与原来一致）、不污染名称缓存。与 _LISTING_DATES 同类无锁
+    缓存：竞态最多重复拉一次，结果都是同一日整表。
+
+    失败负缓存（2026-10-21 事故）：原先失败不做任何标记，全市场逐只扫描时
+    每一次名称解析都会重拉整表——服务端不稳的早晨（09:26 首板高开 ST 过滤
+    4853 只 + 新股过滤 4650 只）把一次 65ms 的失败放大成数千次，选股从 ~1
+    分钟拖到 18 分钟。现拉取失败后 30s 内直接返回空，交给 _jq_names/代码
+    兜底，过期再试。
     """
     global _STOCK_NAMES
     key = datetime.date.today().isoformat()
     hit = _STOCK_NAMES.get(key)
     if hit is not None:
         return hit
+    failed_at = _STOCK_NAMES_FAILED_AT.get(key)
+    if failed_at is not None and (
+            datetime.datetime.now() - failed_at).total_seconds() < _NAMES_FAIL_TTL:
+        return {}
     names: dict = {}
     try:
         sources = getattr(mgr, "sources", None) or {}
@@ -1912,7 +1931,34 @@ def _bulk_stock_names(mgr):
     if names:
         _STOCK_NAMES.clear()
         _STOCK_NAMES[key] = names
+        _STOCK_NAMES_FAILED_AT.pop(key, None)
+    else:
+        _STOCK_NAMES_FAILED_AT.clear()
+        _STOCK_NAMES_FAILED_AT[key] = datetime.datetime.now()
     return names
+
+
+def _bulk_etf_list(mgr):
+    """ETF 名录（日级进程缓存）：缺名兜底用，避免每次 get_security_name 全表回源。
+
+    2026-10-21 实测：``mgr.fetch("get_etf_list")`` 服务端全表扫描 0.5s/次且
+    无缓存；名称表未收录的 347 只标的（退市/长期停牌）在全市场扫描里各付
+    1~2 次，ST 过滤 6 分钟 + 新股过滤 10 分钟，09:26 选股拖到 09:44 才结束。
+    名录是纯展示元数据、日级口径足够，失败不缓存（下次重试）。
+    """
+    key = datetime.date.today().isoformat()
+    hit = _ETF_LIST.get(key)
+    if hit is not None:
+        return hit
+    etfs = None
+    try:
+        etfs = mgr.fetch("get_etf_list")
+    except Exception:
+        etfs = None
+    if etfs:
+        _ETF_LIST.clear()
+        _ETF_LIST[key] = etfs
+    return etfs or []
 
 
 def get_security_name(code):
@@ -1940,7 +1986,7 @@ def get_security_name(code):
             _state["sec_names"] = names
             return base_name
         try:
-            etfs = mgr.fetch("get_etf_list")
+            etfs = _bulk_etf_list(mgr)
             if etfs:
                 if names is None:
                     names = {}

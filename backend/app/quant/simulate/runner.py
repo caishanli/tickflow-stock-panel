@@ -815,13 +815,30 @@ def _fire_preopen_daily(account_id, bundle, ctx, state, aux, now) -> None:
         trades = jq_api._state.get("trades") or []
         before_trades = len(trades)
         jq_api._state["preopen_auction_missing"] = False
+        started = datetime.datetime.now()
         _safe_call(account_id, func, ctx, tag)
         # A strategy may query a live auction snapshot before it is published.
         # Retry that task on the next poll only when it made no fills; replaying
         # a callback after an order would duplicate its side effects.
+        #
+        # 但重试只在 09:30 竞价窗口内有意义：回调一旦跑过 09:30，竞价
+        # 快照已不可能再补（09:25 撮合价/量是唯一来源），重跑只会把整轮
+        # 选股原样再执行一遍。2026-10-21 sb_gaokai_sim 是活例：09:26 选股
+        # 因数据服务抖动跑到 09:44:05 才结束，preopen_auction_missing 触发
+        # 重跑，09:44:06 又完整选了一遍（当日日志里两段一模一样的
+        # 【选股开始】…【选股结束】），并由 09:26 run_daily 的 _daily_due
+        # 在盘中 tick 再触发。窗口判定用「now + 本次实际耗时」——生产里
+        # now 就是墙钟，等于结束时刻；测试/补跑注入合成时钟时也不会误判。
+        elapsed = datetime.datetime.now() - started
+        finished = now + elapsed
         if (jq_api._state.pop("preopen_auction_missing", False)
-                and len(jq_api._state.get("trades") or []) == before_trades):
+                and len(jq_api._state.get("trades") or []) == before_trades
+                and finished.time() < datetime.time(9, 30)):
             aux["fired"].discard(key)
+        if finished.time() >= datetime.time(9, 30):
+            _emit_log(account_id, "warn",
+                      f"盘前任务 {tag} 耗时 {elapsed.total_seconds():.0f}s，"
+                      f"{finished:%H:%M:%S} 才结束、已过 09:30 竞价窗口，不再重试")
     _seed_universe(ctx)
     _persist(account_id, ctx, state, now, jq_api, aux)
     _emit_log(account_id, "info",

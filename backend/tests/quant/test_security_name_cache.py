@@ -16,8 +16,13 @@ from app.quant.jqengine.engine.jq import api
 def _api_state():
     saved_state = dict(api._state)
     saved_names = dict(api._STOCK_NAMES)
+    saved_etfs = dict(api._ETF_LIST)
+    saved_failed = dict(api._STOCK_NAMES_FAILED_AT)
     api._state["sec_names"] = {}
     api._STOCK_NAMES.clear()
+    api._ETF_LIST.clear()
+    api._STOCK_NAMES_FAILED_AT.clear()
+    api._RATE_CACHE.clear()
     try:
         yield
     finally:
@@ -25,6 +30,11 @@ def _api_state():
         api._state.update(saved_state)
         api._STOCK_NAMES.clear()
         api._STOCK_NAMES.update(saved_names)
+        api._ETF_LIST.clear()
+        api._ETF_LIST.update(saved_etfs)
+        api._STOCK_NAMES_FAILED_AT.clear()
+        api._STOCK_NAMES_FAILED_AT.update(saved_failed)
+        api._RATE_CACHE.clear()
 
 
 class _CountingNetwork:
@@ -86,3 +96,54 @@ def test_bulk_failure_does_not_poison_cache(monkeypatch, _api_state):
     assert isinstance(out, str) and out
     assert api._STOCK_NAMES == {}
     assert net.calls == 1
+
+
+def test_bulk_name_failure_is_negatively_cached(monkeypatch, _api_state):
+    """整表失败后短时间内不得逐只重试（RED：全市场扫描把 1 次失败放大成数千次）。
+
+    2026-10-21 sb_gaokai_sim：09:26 选股期间名称整表拉取失败，ST 过滤
+    4853 只 + 新股过滤 4650 只每一只都重拉整表（65ms/次），选股从 ~1 分钟
+    拖到 18 分钟、拖过 09:30 竞价窗口。失败负缓存后同一窗口只付 1 次。
+    """
+    net = _CountingNetwork(TABLE, fail=True)
+    _stub_manager(monkeypatch, net)
+    out = [api.get_security_name(c) for c in
+           ("600000.XSHG", "000001.XSHE", "603906.XSHG", "999999.XSHG")]
+    assert out == ["600000.XSHG", "000001.XSHE", "603906.XSHG", "999999.XSHG"]
+    assert net.calls == 1
+    # TTL 过期后允许重试（恢复不被永久封印）
+    key = datetime.date.today().isoformat()
+    api._STOCK_NAMES_FAILED_AT[key] = (
+        datetime.datetime.now() - datetime.timedelta(seconds=api._NAMES_FAIL_TTL + 1))
+    net.fail = False
+    assert api.get_security_name("600000.XSHG") == "浦发银行"
+    assert net.calls == 2
+
+
+def test_etf_fallback_list_fetched_once_per_day(monkeypatch, _api_state):
+    """名称表未收录的标的不得每次 get_security_name 都全量拉 ETF 名录。
+
+    RED（2026-10-21）：``mgr.fetch("get_etf_list")`` 服务端全表扫描 0.5s/次
+    且无缓存；334 只退市/停牌标的在 ST 过滤 + 新股过滤里各付 1~2 次，
+    合计 ~12 分钟。ETF 名录是纯展示元数据，日级缓存足够。
+    """
+    net = _CountingNetwork(TABLE)
+    api._state["manager"] = _FakeMgrWithFetch(net)
+    monkeypatch.setattr(api, "_name_source", lambda: "service")
+    for _ in range(3):
+        assert api.get_security_name("888888.XSHG") == "888888.XSHG"
+    assert api._state["manager"].etf_calls == 1
+    # 名称表里已有的标的不该触发任何名录回源
+    assert api.get_security_name("600000.XSHG") == "浦发银行"
+    assert api._state["manager"].etf_calls == 1
+
+
+class _FakeMgrWithFetch:
+    def __init__(self, net):
+        self.sources = {"network": net}
+        self.etf_calls = 0
+
+    def fetch(self, method, *args, **kwargs):
+        assert method == "get_etf_list"
+        self.etf_calls += 1
+        return [{"ts_code": "510300.SH", "name": "沪深300ETF"}]
