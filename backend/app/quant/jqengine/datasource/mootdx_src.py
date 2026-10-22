@@ -351,13 +351,25 @@ class MootdxSource(DataSource):
             kline_record_fail()
         return None, "mootdx 所有服务器均超时/无数据"
 
-    def get_daily(self, code, start, end):
+    def get_daily(self, code, start, end, *, qfq: bool = True):
         """通达信日线：原始价取数后尝试用 xdxr 除权除息因子换算前复权。
 
         返回帧 ``attrs`` 标注口径元数据：``source="mootdx"``，
         ``adj="qfq"``（前复权换算成功）或 ``"raw"``（指数无复权概念 /
         xdxr 无记录 / 换算失败，保持通达信原始不复权价）。raw 帧由
         manager 混源防护（_pick_daily_frame）让位给其他源的前复权帧。
+
+        ``qfq=False`` 时**不做**换算、直接返回通达信原始价 ——
+        **落盘方（``mootdx_service.sync_daily``）必须用这个**：
+        ``data/kline_daily`` 的存储契约是**不复权原始价**，读侧
+        ``DataSources.apply_qfq_daily`` 才乘 ``ex_factor``。
+
+        历史事故（2026-10-22 定位）：回源写盘复用了本方法的默认
+        ``qfq=True``，而 ``_to_qfq`` 用**帧内前一收盘价**推算除权因子 ——
+        当日增量写（帧内无未来事件）恰好等于原始价，**事后批量回补**
+        （帧内有未来事件）却写成前复权 → 2023-04-19..2023-12-20 共 165 个
+        分区的价格被多复权一次（读侧再乘因子 → 688032.SH 2023-05-04
+        偏 58%、000001.SZ 偏 18%）。
         """
         sym = _to_symbol(code)
         def _fn(c):
@@ -380,10 +392,10 @@ class MootdxSource(DataSource):
             df["volume"] = df["volume"] * 100
         df.attrs["source"] = "mootdx"
         df.attrs["adj"] = "raw"
-        if not _is_index(code):
-            qfq = self._to_qfq(df, sym)
-            if qfq is not None:
-                df = qfq
+        if qfq and not _is_index(code):
+            converted = self._to_qfq(df, sym)
+            if converted is not None:
+                df = converted
         return df
 
     def _xdxr_rows(self, sym):

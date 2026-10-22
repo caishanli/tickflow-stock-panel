@@ -1994,12 +1994,15 @@ def _jq_to_tf_symbol(sym: str) -> str:
 
 
 def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
-                       timeout: float = 20.0) -> pd.DataFrame | None:
+                       timeout: float = 20.0, *, qfq: bool = True) -> pd.DataFrame | None:
     """带墙钟超时的 mootdx 日线取数，防长批回源时单只卡死整批。
 
     mootdx 底层 socket 在服务器劣化时可能永久阻塞（`_with_server_retry` 的
     线程 join 有 10s 超时，但 `_probe`/`_make_client` 等路径仍可能挂起）。
     这里在调用外再包一层线程守护，超时则弃帧不阻断整批。
+
+    ``qfq=False`` 透传给 ``src.get_daily``：**落盘路径必须用**，
+    存储契约是不复权原始价（见 ``MootdxSource.get_daily`` 的历史事故说明）。
     """
     import threading as _th
     from app.quant.jqengine.datasource.mootdx_src import _daily_observation
@@ -2007,7 +2010,7 @@ def _guarded_get_daily(src: MootdxSource, sym: str, start: str, end: str,
 
     def _run() -> None:
         try:
-            box["df"] = src.get_daily(sym, start, end)
+            box["df"] = src.get_daily(sym, start, end, qfq=qfq)
         except Exception as e:
             box["err"] = e
 
@@ -2102,7 +2105,10 @@ def sync_daily(day: _date, *, create_only: bool = False) -> dict:
 
     def _fetch_one(src, sym):
         try:
-            df = _guarded_get_daily(src, sym, day_str, day_str)
+            # 落盘契约 = **不复权原始价**：禁掉 get_daily 的前复权换算，
+            # 否则回补的历史日会被写成前复权价，读侧 apply_qfq_daily 再乘
+            # 一次因子 = 重复复权（2026-10-22 修复的 165 分区事故）。
+            df = _guarded_get_daily(src, sym, day_str, day_str, qfq=False)
         except Exception as e:
             raise _QueryFailedError(sym) from e
         if df is None:

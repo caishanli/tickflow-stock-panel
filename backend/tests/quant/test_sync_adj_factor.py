@@ -225,7 +225,7 @@ def test_sync_daily_query_failed_and_retry(monkeypatch):
     calls = {"n": 0}
 
     class _FlakySrc:
-        def get_daily(self, code, start, end):
+        def get_daily(self, code, start, end, *, qfq: bool = True):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise TimeoutError("socket down")

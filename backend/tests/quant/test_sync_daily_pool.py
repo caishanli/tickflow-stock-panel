@@ -10,7 +10,7 @@ from app.services import mootdx_service as ms
 
 
 class _FakeDailySrc:
-    def get_daily(self, code, start, end):
+    def get_daily(self, code, start, end, *, qfq: bool = True):
         ts = pd.Timestamp(f"{end[:4]}-{end[4:6]}-{end[6:]} 15:00:00")
         return pd.DataFrame({"open": [1.0], "high": [2.0], "low": [0.5],
                              "close": [1.5], "volume": [100.0],

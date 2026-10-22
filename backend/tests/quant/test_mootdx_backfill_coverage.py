@@ -54,7 +54,7 @@ class _FakeSrc:
     def __init__(self, day: _dt.date):
         self.day = day
 
-    def get_daily(self, code, start, end):
+    def get_daily(self, code, start, end, *, qfq: bool = True):
         ts = pd.Timestamp(f"{self.day} 15:00:00")
         return pd.DataFrame(
             {"open": [1.0], "high": [2.0], "low": [0.5], "close": [1.5],
@@ -86,7 +86,7 @@ def test_trade_days_in_range(monkeypatch):
     """8ceacc2 起 _trade_days_in_range 走有界 2026 权威日历（数据行不再作为
     完整性证据）：08-01~08-06 全为交易日（含 08-06），且不依赖行情源。"""
     class _BoomSrc:
-        def get_daily(self, code, start, end):
+        def get_daily(self, code, start, end, *, qfq: bool = True):
             raise RuntimeError("数据行不得作为交易日证据")
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _BoomSrc())
@@ -107,7 +107,7 @@ def test_trade_days_in_range_filters_lower_bound(monkeypatch):
     目录触发 2023-04-20 起连续数日回源）。
     """
     class _FullHistSrc:
-        def get_daily(self, code, start, end):
+        def get_daily(self, code, start, end, *, qfq: bool = True):
             idx = pd.DatetimeIndex(pd.date_range("2023-04-20", "2026-08-06", freq="B"))
             return pd.DataFrame({"open": [1.0] * len(idx)}, index=idx)
 
@@ -119,7 +119,7 @@ def test_trade_days_in_range_filters_lower_bound(monkeypatch):
 def test_trade_days_up_to_filters_lower_bound(monkeypatch):
     """_trade_days_up_to 窗口下界过滤：get_daily 返回全历史时只取最近窗口。"""
     class _FullHistSrc:
-        def get_daily(self, code, start, end):
+        def get_daily(self, code, start, end, *, qfq: bool = True):
             idx = pd.DatetimeIndex(pd.date_range("2023-04-20", "2026-08-06", freq="B"))
             return pd.DataFrame({"open": [1.0] * len(idx)}, index=idx)
 
@@ -139,7 +139,7 @@ def test_trade_days_up_to_filters_lower_bound(monkeypatch):
 
 def test_trade_days_in_range_fallback_weekday(monkeypatch):
     class _FailSrc:
-        def get_daily(self, code, start, end):
+        def get_daily(self, code, start, end, *, qfq: bool = True):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _FailSrc())
@@ -664,7 +664,7 @@ def test_sync_daily_warns_when_etf_zero(caplog, monkeypatch, tmp_path):
     monkeypatch.setattr(ms, "ETF_DAILY_ROOT", tmp_path / "kline_etf_daily")
 
     class _EmptySrc:
-        def get_daily(self, code, start, end):
+        def get_daily(self, code, start, end, *, qfq: bool = True):
             return None
 
     monkeypatch.setattr(ms, "MootdxSource", lambda: _EmptySrc())
