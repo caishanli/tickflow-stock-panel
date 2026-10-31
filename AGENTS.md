@@ -81,8 +81,15 @@ uv run --extra dev mypy app               # 类型检查
     读侧再乘一次因子 = 重复复权。2026-10-22 实测事故：股票 `2023-04-19..2023-12-20`
     165 个分区 + 部分 ETF 日线被污染（`get_price(fq='pre')` 偏 18%~58%）。
     守卫测试 `tests/quant/test_daily_basis_contract.py`（含 AST 静态扫描）；
-    修复/检测工具 `app/quant/daily_basis_repair.py`（`--detect/--repair/--etf-detect/--etf-repair`，
+    修复/检测工具 `app/quant/daily_basis_repair.py`（`--detect/--repair/--etf-detect/--etf-repair/--baostock-repair`，
     默认 dry-run、带备份）。详见 `docs/2026-10-22-daily-basis-repair.md`。
+  - **ETF 复权因子源 = xdxr 事件**（`app/quant/etf_factor_build.py`，2005→今，
+    `python -m app.quant.etf_factor_build --apply` 重建，275 只/1259 事件行）。
+    **不要用 baostock 的 ETF 前复权序列反推因子** —— 它的 qfq 会在原始价无跳空的日期
+    凭空跳变（510880.SH 2009-03-24 原始价 −0.15% / qfq −44%）。TickFlow `ex_factors`
+    是权威源但 Free 档无权限，且旧快照漏记真实份额折算。详见
+    `docs/2026-10-24-etf-factor-table.md`。隔离名单 `data/adj_factor_quarantine.txt`
+    里的 ETF 条目已按新表清理（只剩 3 只股票）。
   - `sync_stock_minute(limit=None)`：回源 **4/1 起全市场 A 股分钟** → `data/kline_minute/date=*/`。每只拉一次全量（~3 个月 22560 bar），按交易日分组后**每攒满 100 只批量写分区**（避免逐只逐分区 IO）；北交所跳过。全市场 ~5200 只约 2.2 小时。`limit=N` 只处理前 N 只缺口（增量慢跑：resume 按**最新分区**跳过已覆盖，多轮后自动补齐）；调度场景传 `STOCK_MINUTE_BATCH_LIMIT`（20 只/批）。**收盘后最新分区覆盖率 < `STOCK_MINUTE_RESUME_COVERAGE`（默认 0.95）时忽略 limit 直接全量补齐**——15:35 全量回源被重启打断留下的残缺最新日（如 08-19 只写 3600/5209）靠这个自愈，否则增量 20 只/轮 + 残片检测跳过最新分区会让当天永久缺失。
   - `backfill_to_now()`：补齐到当前时间缺失的 ETF 分钟 + 全市场日线 + **一批股票分钟**（幂等，只补最新分区之后的交易日）。
 - 触发：

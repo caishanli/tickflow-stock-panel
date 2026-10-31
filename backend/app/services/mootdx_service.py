@@ -1188,15 +1188,20 @@ def _audit_uncovered_breakpoints(daily, factor_df, threshold: float = 0.2) -> li
 
 
 def _symbol_factor_frame(jq: str, closes: pd.Series,
-                         rows: list[dict] | None) -> pl.DataFrame | None:
+                         rows: list[dict] | None,
+                         since_year: int | None = None) -> pl.DataFrame | None:
     """单标的: 本地事件 rows x 日线 close -> 逐日因子帧; 无有效事件返回 None. 
     数学与历史版本完全一致(cat==11: 1/suogu; cat==1 含红利/配股摊薄). 
+
+    ``since_year`` 默认沿用 :data:`_SINCE_YEAR`（股票口径，过滤上古脏事件）；
+    ETF 因子重建（``app.quant.etf_factor_build``）传更早的年份以覆盖全历史。
     """
+    floor = _SINCE_YEAR if since_year is None else since_year
     events = []
     for r in (rows or []):
         cat = r.get("category")
         year = r.get("year")
-        if not year or int(year) < _SINCE_YEAR:
+        if not year or int(year) < floor:
             continue
         try:
             ex_dt = pd.Timestamp(int(r["year"]), int(r["month"]), int(r["day"]))
@@ -1241,7 +1246,8 @@ def _symbol_factor_frame(jq: str, closes: pd.Series,
 
 def _merge_cliff_factors(jq: str, closes: pd.Series,
                          base_fr: pl.DataFrame | None,
-                         threshold: float = 0.2) -> pl.DataFrame | None:
+                         threshold: float = 0.2,
+                         max_gap_days: int = 15) -> pl.DataFrame | None:
     """根修：在 xdxr 因子之上检测残余价格悬崖，合成份额折算/分拆合并因子。
 
     xdxr 事件只覆盖分红/送转/缩股，**不含 ETF 份额折算类事件**（561980 案例：
@@ -1259,18 +1265,36 @@ def _merge_cliff_factors(jq: str, closes: pd.Series,
     if base_fr is not None and not base_fr.is_empty():
         fmap = dict(zip(base_fr["trade_date"].to_list(),
                         base_fr["ex_factor"].to_list(), strict=False))
-        factors = pd.Series([float(fmap.get(d.isoformat(), 1.0))
-                             for d in closes.index], index=closes.index)
+        # 注意：索引可能是 Timestamp（isoformat 带 "T00:00:00"），与表里的
+        # "YYYY-MM-DD" 对不上 → 基准因子会被整体忽略（等于全 1.0），
+        # 于是把已经调好的历史价又合成一次悬崖（重复折算）。故统一取日期部分。
+        factors = pd.Series(
+            [float(fmap.get((d.date() if hasattr(d, "date") else d).isoformat(), 1.0))
+             for d in closes.index],
+            index=closes.index,
+        )
     adj = closes * factors
     ret = adj.pct_change().dropna()
     cliffs = ret[ret.abs() > threshold]
     if cliffs.empty:
         return base_fr
+    # 数据空洞护栏：跨越大段无数据的"跳变"不是份额折算（etf 512750.SH 缺
+    # 2024~2025 两年，2023-12-20 → 2026-04-01 被当成 +36.7%"折算"）。
+    pos = {d: i for i, d in enumerate(closes.index)}
+    gaps = [d for d in cliffs.index
+            if pos[d] > 0
+            and (d - closes.index[pos[d] - 1]).days > max_gap_days]
+    if gaps:
+        logger.warning(
+            "mootdx_service: %s 跳过 %d 个跨数据空洞的悬崖（间隔 >%d 天）: %s",
+            jq, len(gaps), max_gap_days, [str(d.date()) for d in gaps][:5])
+        cliffs = cliffs.drop(labels=gaps)
+        if cliffs.empty:
+            return base_fr
     logger.warning(
         "mootdx_service: %s 合成份额折算因子 %d 个悬崖: %s",
         jq, len(cliffs),
         [(str(d.date()), f"{r:+.1%}") for d, r in cliffs.items()][:5])
-    pos = {d: i for i, d in enumerate(closes.index)}
     extra = pd.Series(1.0, index=closes.index)
     for dt, r in cliffs.items():
         f = float(r) + 1.0

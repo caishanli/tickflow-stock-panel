@@ -74,7 +74,10 @@ def test_cat11_suogu_factor(monkeypatch, tmp_path):
                         tmp_path / "adj_factor_etf" / "all.parquet")
     sym = "159667.XSHE"
     days = pd.date_range("2026-05-25", "2026-06-15", freq="B")
-    closes = [1.0] * len(days)  # 简化为常数,验证因子是 1/3
+    # 价格在拆分当日真的降到 1/3（真实数据形态）。若用常数价格，"事件说拆分、
+    # 价格却没动"会被 _merge_cliff_factors 判为假事件并抵消掉，测不到 xdxr 因子。
+    split_day = pd.Timestamp("2026-06-10")
+    closes = [3.0 if d < split_day else 1.0 for d in days]
     daily = {sym: pd.DataFrame({"close": closes}, index=pd.to_datetime(days))}
     ev = {sym: [_xdxr(11, 2026, 6, 10, suogu=3.0)]}
     result = _run_sync_adj_factor(monkeypatch, ev, daily, [sym])
