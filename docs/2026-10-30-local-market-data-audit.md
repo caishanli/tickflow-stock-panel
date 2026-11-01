@@ -631,3 +631,56 @@ cp -r data/.audit_backup_20261030/auction_cache_2026-10-01 data/auction_cache/da
 | P5 / P6 / P2 | 需外网回源，当前不可用 |
 | P13（quote_ts 全空） | 被 `data_providers/normalizer.py` 消费且属可选字段（"缺失则置 null"），补值需上游提供时间戳 |
 | P15–P17（退市遗留 / 日期类型） | 低危，且日期类型改动会波及读取方，收益不匹配风险 |
+
+---
+
+# 第二轮修复（2026-11-01 16:xx）—— P6 财务数据已补全
+
+## ✅ P6 已修复 — 2026Q2 财务数据从 41% 补到 100%
+
+网络恢复（TDX 可达）后回源重取 `gpcw20260630.zip`：
+
+| 项目 | 修复前 | 修复后 |
+|---|---|---|
+| 行数 | 2,277 | **5,559** |
+| 标的数 | 2,276 | **5,559** |
+| 关键列空值 | — | 0 个（net_profit / roe / total_assets / operating_revenue） |
+
+对照其他季度（5,348–5,549 只）确认此前是**该季度单独残缺**，非系统性问题。
+
+schema 与 `stat=20260331` 逐列一致，`stat_date=20260630`、`visible_from=2026-08-31`。
+
+备份：`data/.audit_backup_20261030/tdx_stat20260630/part.parquet`
+
+### 回源踩到的坑（已记录，供后续复用）
+
+`mootdx` 的财务文件下载走 `tdxpy`，`BaseFinancial.__init__` 里：
+
+```python
+default = config.get('SERVER').get('GP')[0][1:]      # ['120.76.152.87', 7709]
+self.bestip = config.get('BESTIP').get('GP', default)
+```
+
+`~/.mootdx/config.json` 里 `BESTIP.GP` 是**空字符串**，而 `dict.get(k, default)`
+只在 key **缺失**时才用 default——空串被当成有效值，导致 `api.connect('')`
+抛 `ValidationException: IP Address bad.`（报错信息指向 IP 格式，实际是空值）。
+
+绕过方式（不改用户配置文件）：
+
+```python
+import mootdx.financial.base as _base
+_oi = _base.BaseFinancial.__init__
+def _patched(self, mode='content'):
+    _oi(self, mode)
+    if not (self.bestip and self.bestip[0]):
+        self.bestip = ('120.76.152.87', 7709)
+_base.BaseFinancial.__init__ = _patched
+```
+
+## 仍未处理
+
+| 项 | 原因 |
+|---|---|
+| P2（24 只 LOF 缺 834 天） | baostock 仍不可达（TCP 超时）；TDX 只能补近期日线 |
+| P5（ETF 增强表仅 28 分区） | 需 TickFlow API 权限，当前 Free 档无该能力 |
+| P1（25,220 行成交字段） | 已定性不可恢复，需产品决策：标记缺失 or 保持原样 |

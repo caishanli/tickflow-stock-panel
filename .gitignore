@@ -127,3 +127,6 @@ reports/cursor_tickflow_pro_rate_limit_p0.bundle
 
 # ===== git worktrees（本地隔离工作区，不入库）=====
 .worktrees/
+
+# ===== 工具配置（本地） =====
+.commandcode/
