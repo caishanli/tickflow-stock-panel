@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import polars as pl
 
 from app.indicators.pipeline import compute_enriched
+from app.quant.volume_units import normalize_etf_daily_volume
 from app.services import kline_sync, preferences
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
@@ -333,6 +334,12 @@ def sync_and_persist_etf_daily(
         )
         if raw.is_empty():
             continue
+
+        # 落盘前把 volume 归一到「股」：kline_etf_daily 的契约是股，读侧不换算。
+        # 跨源补齐是独立入口（mootdx 熔断时才会走到），源方量纲不保证，写错会让
+        # 策略 volume_ratio 放大 100 倍、被成交量过滤器静默踢掉（2026-10 事故）。
+        raw, _unit = normalize_etf_daily_volume(
+            raw, source=f"tickflow:{i + 1}/{len(chunks)}")
 
         repo.append_etf_daily(raw)
         batch_factors = factors.filter(pl.col("symbol").is_in(chunk)) if not factors.is_empty() else factors

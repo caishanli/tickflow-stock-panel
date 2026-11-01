@@ -95,9 +95,18 @@ def convert_minute(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def convert_daily(df: pl.DataFrame) -> pl.DataFrame:
-    """归档 1d → 本机 kline_daily 格式。归档 vol 是「股」，本机存「手」→ ÷100。"""
+    """归档 1d → 本机 kline_daily 格式。归档 vol 是「股」，本机存「手」→ ÷100。
+
+    注意这是**股票**口径。ETF 目标表（kline_etf_daily）必须走
+    :func:`convert_daily_etf`：ETF 存盘即「股」，再 ÷100 就会写坏。
+    """
     out = _rename_and_cast(df, DAILY_COLUMNS, DAILY_SCHEMA)
     return out.with_columns((pl.col("volume") / 100).alias("volume"))
+
+
+def convert_daily_etf(df: pl.DataFrame) -> pl.DataFrame:
+    """归档 1d → 本机 kline_etf_daily 格式。归档 vol 是「股」，ETF 存盘也是「股」→ 不换算。"""
+    return _rename_and_cast(df, DAILY_COLUMNS, DAILY_SCHEMA)
 
 
 def iter_zip_days(zip_path: Path) -> list[str]:

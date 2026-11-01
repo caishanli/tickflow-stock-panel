@@ -27,14 +27,29 @@ import polars as pl
 
 from app.quant.archive_import import (
     convert_daily,
+    convert_daily_etf,
     convert_minute,
     day_to_partition,
     iter_zip_days,
     read_day_from_zip,
 )
+from app.quant.volume_units import normalize_etf_daily_volume
 from app.raw_partition_lock import daily_partition_lock
 
+# 股票日线本机存「手」（归档是「股」，故 ÷100）；ETF 日线存「股」，不能套用。
 KIND_MAP = {"minute": convert_minute, "daily": convert_daily}
+KIND_MAP_ETF = {"minute": convert_minute, "daily": convert_daily_etf}
+
+
+def pick_converter(kind: str, target_root: Path):
+    """按**目标表**选转换器：ETF 目标（…/kline_etf_daily）不做股票口径的 ÷100。
+
+    2026-10 事故：KIND_MAP 只按 --kind 选转换器、不看目标表，用
+    ``--target-root data/kline_etf_daily --kind daily`` 跑一次，ETF 的 volume
+    就被写成「手」，策略 volume_ratio 放大 100 倍、被成交量过滤器静默踢掉。
+    """
+    maps = KIND_MAP_ETF if "etf" in Path(target_root).name else KIND_MAP
+    return maps[kind]
 # 标的数覆盖比：本机该日标的数 ≥ 归档该日标的数 × 该比例 → 视为"完整"、跳过
 SYMBOL_COVERAGE = 0.95
 # 兜底：归档该日标的数取不到时，用行数下限判断（分钟线一天 ~80~130 万行）
@@ -142,7 +157,9 @@ def main() -> int:
 
     years = list(range(args.from_year, args.to_year + 1))
     target_root = Path(args.target_root)
-    conv = KIND_MAP[args.kind]
+    # 按目标表选转换器（ETF 日线存「股」，不能套股票口径的 ÷100）
+    conv = pick_converter(args.kind, target_root)
+    is_etf_daily = args.kind == "daily" and "etf" in target_root.name
 
     items = plan_target(years, args.kind, archive_root=Path(args.archive_root))
     missing = [y for y in years
@@ -205,6 +222,9 @@ def main() -> int:
         except Exception as exc:
             stats["errors"].append(f"{part}: {exc}")
             continue
+        if is_etf_daily:
+            # 兜底：落盘前按 amount/(volume×close) 复核，单位不是「股」就归一
+            df, _unit = normalize_etf_daily_volume(df, source=f"archive:{part}")
         try:
             out_file.parent.mkdir(parents=True, exist_ok=True)
             _write_partition_atomic(out_file, df)
