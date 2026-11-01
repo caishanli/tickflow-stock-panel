@@ -1790,7 +1790,9 @@ def run_loop(account_id: str, provider: QuantDataProvider | None = None,
             return
         # 进程入口即落一条日志：策略编译/数据预载耗时较长，先给用户可见反馈
         _emit_log(account_id, "info", "模拟盘进程已启动，正在加载引擎与策略数据…")
-        stop = acct.get("stop_loss") or 0.03
+        # 注意不能用 `or`：stop_loss=0.0 是合法值（关闭账户级止损），会被 falsy 吞成 3%
+        _sl = acct.get("stop_loss")
+        stop = 0.03 if _sl is None else float(_sl)
         def _notify_stop_loss(rec):
             _emit_log(account_id, "notify", _build_stop_loss_notify(stop, rec),
                       ts=str(rec["dt"]))

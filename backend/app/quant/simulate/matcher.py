@@ -54,6 +54,11 @@ class Matcher:
     def step(self, state: dict, prices: dict, fee: float | None = None,
              stamp_tax: float | None = None, slippage: float | None = None,
              no_sell: set | None = None, min_commission: float | None = None) -> dict:
+        # stop_loss<=0 = 关闭账户级止损（与回测桥 _jq_account_stop_source 语义一致）。
+        # 历史行为是直接参与 `pnl_pct > -stop_loss` 比较，stop_loss==0 时退化成
+        # 「任何浮亏立刻止损」，会让关闭止损的账户被每笔微小浮亏反复砍仓。
+        if self.stop_loss <= 0:
+            return state
         fee = CONFIG.fee_rate if fee is None else float(fee)
         min_commission = 0.0 if min_commission is None else float(min_commission)
         stamp_tax = DEFAULT_STAMP_TAX if stamp_tax is None else float(stamp_tax)

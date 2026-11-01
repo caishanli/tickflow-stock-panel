@@ -758,6 +758,10 @@ def compute_limit_signals(
     _adj_today = pl.col("close") / pl.col("raw_close")
     _adj_yesterday = pl.col("close").shift(1).over("symbol") / pl.col("raw_close").shift(1).over("symbol")
     _adj_changed = (_adj_today - _adj_yesterday).abs() > 1e-6
+    # 比较基准必须与 _prev_raw_close 同源：除权日 _prev_raw_close 是**复权**昨收，
+    # 此时当日价格也要用复权 close；否则拿未复权 raw_close 去比复权基准，
+    # 会在大比例除权日产生虚假涨停（2026-10-30 审计修复时暴露，2,653 处误判）。
+    _cmp_close = pl.when(_adj_changed).then(pl.col("close")).otherwise(pl.col("raw_close"))
     df = df.with_columns(
         pl.when(_adj_changed)
         .then(pl.col("close").shift(1).over("symbol"))   # 除权: 使用前复权昨收
@@ -823,7 +827,7 @@ def compute_limit_signals(
             & (pl.col("_prev_raw_close") > 0)
             & (pl.col("raw_close") > 0)
         ).then(
-            pl.col("raw_close") >= (pl.col("_effective_limit_up") - 0.005)
+            _cmp_close >= (pl.col("_effective_limit_up") - 0.005)
         ).otherwise(None).cast(pl.Boolean)
         .alias("signal_limit_up")
         )
@@ -859,7 +863,7 @@ def compute_limit_signals(
             & (pl.col("_prev_raw_close") > 0)
             & (pl.col("raw_close") > 0)
         ).then(
-            pl.col("raw_close") <= (pl.col("_effective_limit_down") + 0.005)
+            _cmp_close <= (pl.col("_effective_limit_down") + 0.005)
         ).otherwise(None).cast(pl.Boolean)
         .alias("signal_limit_down")
         )
@@ -1311,7 +1315,7 @@ def run_pipeline(data_dir: Path | None = None,
     publication = EnrichedPublication(d, "stock", recover=True)
     daily_dir = d / "kline_daily"
     enriched_base = d / "kline_daily_enriched"
-    factor_path = d / "adj_factor" / "all.parquet"
+    factor_path, factor_cumulative = _resolve_factor_source(d)
     inst_glob = str(d / "instruments" / "**" / "*.parquet")
 
     if not daily_dir.exists() or not any(daily_dir.rglob("*.parquet")):
@@ -1347,7 +1351,7 @@ def run_pipeline(data_dir: Path | None = None,
             return 0
 
         # 加载复权因子 (全量,因为所有标的都可能需要)
-        factors = _load_factors(factor_path)
+        factors = _load_factors(factor_path, cumulative=factor_cumulative)
 
         # 2. 为新日期计算 enriched (所有标的)
         if new_date_dirs:
@@ -1444,7 +1448,7 @@ def run_pipeline(data_dir: Path | None = None,
     base = d / "kline_daily_enriched"
 
     # 加载复权因子 (全量加载一次,每批复用)
-    factors = _load_factors(factor_path)
+    factors = _load_factors(factor_path, cumulative=factor_cumulative)
 
     # 局部模式: 过滤 instruments
     inst_use = instruments
@@ -1602,15 +1606,71 @@ def run_pipeline(data_dir: Path | None = None,
     return written
 
 
-def _load_factors(factor_path: Path) -> pl.DataFrame:
-    """加载复权因子文件。"""
+def _cumulative_to_events(df: pl.DataFrame) -> pl.DataFrame:
+    """把「累计后复权因子表」归一化成管线期望的「逐次事件比值表」。
+
+    ``adj_factor_baostock`` 存的是**累计后复权因子**（raw × factor 即得连续
+    序列，最新一日锚定为 1.0），而 ``_apply_adj_factor`` 的算法是
+    ``ratio = cumprod(事件比值) / cumprod(全部事件比值)``，要求输入是**逐次事件**。
+
+    转换方式: ``m_i = f_i / f_{i-1}``（首行按 ``f_0 / 1.0`` 处理）。累乘后
+    telescoping 到 ``f(d)``，除以 ``f(最新)`` 正好得到前复权比例
+    ``f(d) / f_latest``，与 ``DataManager._apply_qfq`` 口径一致。
+
+    只保留 ``|m - 1| > 1e-4`` 的行（与 manager 的事件噪声阈值一致）。
+    """
+    if df.is_empty() or not {"symbol", "trade_date", "ex_factor"}.issubset(df.columns):
+        return df
+    d = (
+        df.with_columns(
+            pl.col("trade_date").cast(pl.Date, strict=False),
+            pl.col("ex_factor").cast(pl.Float64, strict=False),
+        )
+        .select("symbol", "trade_date", "ex_factor")
+        .drop_nulls()
+        .sort(["symbol", "trade_date"])
+    )
+    d = d.with_columns(
+        pl.col("ex_factor").shift(1).over("symbol").fill_null(1.0).alias("_f_prev")
+    )
+    d = d.with_columns((pl.col("ex_factor") / pl.col("_f_prev")).alias("_m"))
+    return d.filter((pl.col("_m") - 1).abs() > 1e-4).select(
+        pl.col("symbol"), pl.col("trade_date"), pl.col("_m").alias("ex_factor")
+    )
+
+
+def _load_factors(factor_path: Path, cumulative: bool = False) -> pl.DataFrame:
+    """加载复权因子文件。
+
+    ``cumulative=True`` 表示该表是累计后复权因子（如 adj_factor_baostock），
+    需先转成逐次事件比值再交给 ``_apply_adj_factor``。
+    """
     if not factor_path.exists():
         return pl.DataFrame()
     try:
-        return pl.read_parquet(factor_path)
+        df = pl.read_parquet(factor_path)
     except Exception as e:
         logger.warning("复权因子读取失败: %s", e)
         return pl.DataFrame()
+    return _cumulative_to_events(df) if cumulative else df
+
+
+def _resolve_factor_source(d: Path) -> tuple[Path, bool]:
+    """确定股票复权因子来源，返回 (路径, 是否为累计因子表)。
+
+    优先级对齐 ``DataManager._adj_factor_map``：``adj_factor_baostock`` 是股票
+    因子的**唯一权威源**；``adj_factor`` 为旧部署兼容（低优先级）。
+
+    历史教训：只读 ``adj_factor`` 而该目录为空时，复权会被静默跳过，导致
+    enriched 表 ``close`` 恒等于 ``raw_close``（2026-10-30 数据审计发现）。
+    """
+    legacy = d / "adj_factor" / "all.parquet"
+    authoritative = d / "adj_factor_baostock" / "all.parquet"
+    if authoritative.exists():
+        return authoritative, True
+    if legacy.exists():
+        return legacy, False
+    return legacy, False
 
 
 def _load_recent_history(enriched_base: Path, symbols: list[str], days: int) -> pl.DataFrame:
