@@ -18,7 +18,10 @@
    ETF 分钟不在修复范围（它的量本来就是股）；且只修已收盘交易日
    （``day < today``，design §6.4）——当日分区可能还在被收盘链路重写。
 4. **断点**：每完成一天原子写 ``data_verify_state.json``；
-   ``resume=True`` 从状态里的 ``last_day_done`` 之**后**继续。
+   ``resume=True`` 从状态里的 ``last_day_done`` 之**后**继续。断点**绑定 stage**：
+   状态里的 ``stage`` 与本次不一致时忽略断点并 warning（否则先跑
+   ``--stage structure`` 会把日子推进到末尾，再 ``--stage internal --resume``
+   就会静默跳过这些日子的 L1 核验）。
 
 口径：
 
@@ -140,12 +143,24 @@ def _partition_days(data_root: Path) -> list[date]:
     return sorted(days)
 
 
+def _as_day(value: date) -> date:
+    """把 ``date`` / ``datetime`` / ISO 字符串统一成 ``date``（截掉时间分量）。
+
+    ``datetime`` 是 ``date`` 的子类，``isinstance`` 判断会让带时间戳的值混进
+    分区日集合、与 ``date(2026, 11, 6)`` 比对失败（``datetime != date``），
+    所以这里用 ``type(...) is date`` 精确判断。
+    """
+    if type(value) is date:
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
 def _select_days(data_root: Path, days: Sequence[date] | None) -> list[date]:
     """``days=None``（或空）取全部已有分区，否则只取显式给定且存在的日期。"""
     available = _partition_days(data_root)
     if not days:
         return available
-    explicit = {day if isinstance(day, date) else date.fromisoformat(str(day)) for day in days}
+    explicit = {_as_day(day) for day in days}
     missing = sorted(explicit - set(available))
     if missing:
         logger.warning("以下日期没有分钟分区，已跳过: %s",
@@ -188,13 +203,18 @@ def _write_state(path: Path, payload: dict[str, Any]) -> None:
             tmp.unlink()
 
 
-def _last_day_done(state_path: Path) -> date | None:
-    """读断点：状态文件缺失/损坏/字段非法一律当作「没有断点」。"""
+def _read_state(state_path: Path) -> dict[str, Any] | None:
+    """读状态文件；缺失/损坏/不是 JSON 对象一律当作「没有断点」。"""
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    value = raw.get("last_day_done") if isinstance(raw, dict) else None
+    return raw if isinstance(raw, dict) else None
+
+
+def _state_day(state: dict[str, Any] | None) -> date | None:
+    """状态里的 ``last_day_done``；缺失/非法一律当作「没有断点」。"""
+    value = state.get("last_day_done") if state else None
     if not value:
         return None
     try:
@@ -370,8 +390,15 @@ def run_verify(
 
     selected = _select_days(root, days)
     if resume:
-        last = _last_day_done(state_path)
-        if last is not None:
+        state = _read_state(state_path)
+        last = _state_day(state)
+        state_stage = state.get("stage") if state else None
+        if last is not None and state_stage != stage:
+            # 断点只在同一 stage 内有效：structure 跑出来的 last_day_done 不能让
+            # internal 跳过这些日子（否则内部一致性核验被静默漏掉）。
+            logger.warning("断点来自 stage=%s，与本次 stage=%s 不匹配，忽略断点从头跑",
+                           state_stage, stage)
+        elif last is not None:
             selected = [day for day in selected if day > last]
 
     run_id = _run_id()

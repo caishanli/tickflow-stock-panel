@@ -193,6 +193,28 @@ def test_runner_rejects_unknown_stage(tmp_path):
         run_verify("external", days=None, data_root=tmp_path)
 
 
+def test_runner_resume_ignores_state_from_other_stage(tmp_path, caplog):
+    """断点绑 stage：structure 跑出来的 last_day_done 不能拿来跳过 internal。"""
+    _write_day(tmp_path, "2026-11-05", stars_bad=False)
+    _write_day(tmp_path, "2026-11-06", stars_bad=True)
+    (tmp_path / "data_verify_state.json").write_text(
+        json.dumps({"last_run_at": "2026-11-07T00:00:00", "stage": "structure",
+                    "last_day_done": "2026-11-06", "applied": 0}))
+    with caplog.at_level("WARNING"):
+        rep = run_verify("internal", apply=True, days=None, data_root=tmp_path, resume=True)
+    assert rep["days"] == 2                      # 断点作废，两天都要跑
+    assert rep["repaired"] == 1
+    assert _minute_volume(tmp_path) == 8_630_559.0
+    assert "structure" in caplog.text
+
+
+def test_runner_accepts_datetime_in_days(tmp_path):
+    """``datetime`` 是 ``date`` 的子类，必须按「日期」而不是带时间戳比对分区。"""
+    _write_day(tmp_path, "2026-11-06")
+    rep = run_verify("internal", days=[datetime(2026, 11, 6, 15, 0)], data_root=tmp_path)
+    assert rep["days"] == 1
+
+
 def test_runner_progress_callback_reaches_100(tmp_path):
     _write_day(tmp_path, "2026-11-05", stars_bad=False)
     _write_day(tmp_path, "2026-11-06", stars_bad=True)
