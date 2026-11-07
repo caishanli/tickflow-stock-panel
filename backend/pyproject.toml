@@ -72,6 +72,12 @@ desktop = [
     "pywebview>=5.0",
 ]
 
+# 数据核验的近 94 交易日 1m 第三方源（可选）。启用:`uv sync --extra verify`
+# 不进主取数链路；未安装时 external_minute 自动降级到腾讯/新浪。
+verify = [
+    "eltdx>=3.3",
+]
+
 # 量化回测/模拟盘依赖 (RQAlpha)。启用: uv sync --extra quant
 # （mootdx/pytdx/requests 已提为基础依赖——stockdata 服务常驻进程必需，见 dependencies 注释）
 quant = [

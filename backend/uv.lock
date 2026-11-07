@@ -650,6 +650,19 @@ wheels = [
 ]
 
 [[package]]
+name = "eltdx"
+version = "3.3.5"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/64/df/95a2386d40520894ba4dcad381ff79abadd0b11fc79c5cca9204eb62ea5e/eltdx-3.3.5.tar.gz", hash = "sha256:e3abc37d22326fd65a212016d6fa279b38969bc1361cf3b4407db0a609dd1a74" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/cf/70/362e0d2fe98cb36ce222a5ba4dd9a6a4e1b919557bfd73c766552d14994b/eltdx-3.3.5-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:94889b3f12c7f2d14d55f014a07cdd536bfd780bfbc53a042f5d5726370b3e10" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/c2/d5/5c4d81b6d6383c7c901ca9ad97f59e6eca846e35df732be3f20842e48b5d/eltdx-3.3.5-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:71d579e56c0736d71e947f0ceb2649e0ec9d2f070fa9c0440593d0686285c1c5" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/8f/34/bc6e883e04c1cca3658bd98821e8a5ed69370095cf5c8460ff02c0191434/eltdx-3.3.5-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4e49201fec19bf3792f23af3347deebbcd47e9a95d92d98ee4c57dd53888ac21" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/a5/b7/4f3c5969793f5e96011643e35ca3748ee2a92f4db4357badcea5cecb422d/eltdx-3.3.5-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:108bdf709d981339627f36b444725b18aba447a28a872440304639fa2da97731" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/67/fc/5becadd33a7df7df184fc4c877a7a8001added0074941549052fe38e19fc/eltdx-3.3.5-cp310-abi3-win_amd64.whl", hash = "sha256:78e73a22fd6a369e2945f42406687e2b7a43b0bb651f039d79b5193554fe3d57" },
+]
+
+[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -3417,6 +3430,9 @@ legacy-cpu = [
 quant = [
     { name = "rqalpha" },
 ]
+verify = [
+    { name = "eltdx" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -3424,6 +3440,7 @@ requires-dist = [
     { name = "apscheduler", specifier = ">=3.10" },
     { name = "baostock", specifier = ">=0.9" },
     { name = "duckdb", specifier = ">=1.0" },
+    { name = "eltdx", marker = "extra == 'verify'", specifier = ">=3.3" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastexcel", specifier = ">=0.10" },
     { name = "httpx", specifier = ">=0.27" },
@@ -3460,7 +3477,7 @@ requires-dist = [
     { name = "vectorbt", marker = "extra == 'backtest'", specifier = ">=0.26" },
     { name = "winotify", marker = "sys_platform == 'win32'", specifier = ">=1.1" },
 ]
-provides-extras = ["legacy-cpu", "backtest", "desktop", "quant", "dev"]
+provides-extras = ["legacy-cpu", "backtest", "desktop", "verify", "quant", "dev"]
 
 [[package]]
 name = "tqdm"

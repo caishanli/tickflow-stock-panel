@@ -22,6 +22,13 @@
    状态里的 ``stage`` 与本次不一致时忽略断点并 warning（否则先跑
    ``--stage structure`` 会把日子推进到末尾，再 ``--stage internal --resume``
    就会静默跳过这些日子的 L1 核验）。
+5. **分钟外部源**（``stage=external_minute``，``all`` 也包含）：对最近
+   ``lookback_days``（默认 94，eltdx 深度）个交易日、每天按 symbol 排序等距抽
+   ``sample``（默认 100）只，用 eltdx（可选）/ 腾讯 / 新浪重拉 1m，按
+   ``datetime`` 逐 bar 比对（缺 bar / close / volume）。修复严格按 design §5.4
+   仲裁：两个外部源一致 → ``confirmed``；唯一外部源且本地无佐证 →
+   ``single_source``；外源与本地对峙 → 冲突不修。外源全部不可用时该 stage
+   直接跳过并在报告里记 ``{"skipped": "no_source"}``，**绝不因网络失败报错**。
 
 口径：
 
@@ -42,6 +49,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Final
@@ -67,11 +75,17 @@ from app.raw_partition_lock import daily_partition_lock
 
 logger = logging.getLogger(__name__)
 
-#: 支持的核验层。``all`` = L0 + L1（后续里程碑再扩展 external / factors）。
+#: 支持的核验层。``all`` = L0 + L1 + L2 分钟外部源。
 STAGE_STRUCTURE: Final = "structure"
 STAGE_INTERNAL: Final = "internal"
+STAGE_EXTERNAL_MINUTE: Final = "external_minute"
 STAGE_ALL: Final = "all"
-STAGES: Final[tuple[str, ...]] = (STAGE_STRUCTURE, STAGE_INTERNAL, STAGE_ALL)
+STAGES: Final[tuple[str, ...]] = (
+    STAGE_STRUCTURE,
+    STAGE_INTERNAL,
+    STAGE_EXTERNAL_MINUTE,
+    STAGE_ALL,
+)
 
 #: 参与枚举的分钟表（也是 L1 比对的主体）。顺序固定便于日志可读。
 MINUTE_TABLES: Final[tuple[str, ...]] = ("kline_minute", "kline_etf_minute")
@@ -95,6 +109,389 @@ PARTITION_UNREADABLE: Final = "PARTITION_UNREADABLE"
 
 #: ``progress(stage, pct, msg)``：``pct`` 为 0..100 的整数。
 ProgressCallback = Callable[[str, int, str], None]
+
+#: 外部小时源比对错误码（只在本模块产生；amount 不参与跨源比对/修复）。
+EXTERNAL_BAR_MISSING: Final = "EXTERNAL_BAR_MISSING"
+EXTERNAL_CLOSE_MISMATCH: Final = "EXTERNAL_CLOSE_MISMATCH"
+EXTERNAL_VOLUME_MISMATCH: Final = "EXTERNAL_VOLUME_MISMATCH"
+
+#: 容差与 L1 一致（design §5.2）：价格 1 tick+0.1%，量相对 0.5%。
+EXTERNAL_PRICE_ABS_TOL: Final = 0.011
+EXTERNAL_PRICE_REL_TOL: Final = 0.001
+EXTERNAL_VOLUME_REL_TOL: Final = 0.005
+
+#: ``external_minute`` 默认每天最多抽 100 只、回看 94 个交易日（eltdx 深度）。
+DEFAULT_SAMPLE: Final = 100
+DEFAULT_LOOKBACK_DAYS: Final = 94
+
+#: 三源优先级（design §5.4）：eltdx（TDX 协议）> 腾讯 > 新浪。
+SOURCE_PRIORITY: Final[dict[str, int]] = {"eltdx": 5, "tencent": 3, "sina": 2}
+
+
+@dataclass(frozen=True)
+class _MinuteSource:
+    """一个分钟外部源：``fetch(symbol)`` 返回全量 bar（由 runner 按日切）。
+
+    ``fetch`` 失败应抛异常（网络/未安装/HTTP 错误），runner 捕获后把该源本轮
+    视为不可用——空帧表示「源能连上但该标的没有数据」，不算不可用。
+    """
+
+    name: str
+    fetch: Callable[[str], pl.DataFrame]
+    priority: int
+
+
+def _configured_sources() -> list[_MinuteSource]:
+    """探测可用的分钟源；``eltdx`` 未安装时自动缺席（不 import 它）。"""
+    from app.quant.data_verify.probes import eltdx_m1, sina_m1, tencent_m1
+
+    modules = {"eltdx": eltdx_m1, "tencent": tencent_m1, "sina": sina_m1}
+    fetchers: dict[str, Callable[[str], pl.DataFrame]] = {
+        "eltdx": eltdx_m1.fetch_eltdx_m1,
+        "tencent": tencent_m1.fetch_tencent_m1,
+        "sina": sina_m1.fetch_sina_m1,
+    }
+    sources = [
+        _MinuteSource(name, fetchers[name], SOURCE_PRIORITY[name])
+        for name in ("eltdx", "tencent", "sina")
+        if modules[name].available_sources()
+    ]
+    return sorted(sources, key=lambda source: (-source.priority, source.name))
+
+
+def _sample_symbols(symbols: Sequence[str], sample: int) -> list[str]:
+    """按 symbol 排序后等距抽样（确定性：同一分区每次抽到同一批标的）。
+
+    ``sample<=0`` 或标的数不超过 ``sample`` 时返回全部。
+    """
+    ordered = sorted(set(symbols))
+    if sample <= 0 or len(ordered) <= sample:
+        return ordered
+    stride = len(ordered) / sample
+    return [ordered[int(index * stride)] for index in range(sample)]
+
+
+def _empty_bars() -> pl.DataFrame:
+    return pl.DataFrame(schema={
+        "symbol": pl.String,
+        "datetime": pl.Datetime("us"),
+        "open": pl.Float64,
+        "high": pl.Float64,
+        "low": pl.Float64,
+        "close": pl.Float64,
+        "volume": pl.Float64,
+        "amount": pl.Float64,
+    })
+
+
+def _fetch_for_day(
+    source: _MinuteSource, symbol: str, day: date
+) -> pl.DataFrame | None:
+    """取一个源某标的的当日 bar；``None`` = 该源本次调用失败（不可用）。
+
+    空帧 = 源可用但该标的当日无数据（停牌、超过源深度等）。
+    """
+    try:
+        frame = source.fetch(symbol)
+    except Exception as exc:       # ImportError / 网络 / 解析错误：该源本轮跳过
+        logger.debug("分钟源 %s 拉取 %s 失败: %s: %s",
+                     source.name, symbol, type(exc).__name__, exc)
+        return None
+    if frame is None or frame.is_empty():
+        return _empty_bars()
+    required = {"symbol", "datetime", "close", "volume"}
+    absent = sorted(required - set(frame.columns))
+    if absent:
+        logger.warning("分钟源 %s 返回缺列 %s（%s）", source.name, absent, symbol)
+        return _empty_bars()
+    return frame.filter(
+        (pl.col("symbol") == symbol) & (pl.col("datetime").dt.date() == day)
+    )
+
+
+def _first_symbol(data_root: Path, day: date) -> str | None:
+    """取某日任一分钟分区的第一个 symbol（用于「源是否可达」探测）。"""
+    for table in MINUTE_TABLES:
+        part = data_root / table / f"{DAY_PREFIX}{day.isoformat()}" / PARTITION_FILENAME
+        if not part.is_file():
+            continue
+        try:
+            symbols = pl.read_parquet(part, columns=["symbol"])["symbol"].unique().to_list()
+        except Exception:
+            continue
+        if symbols:
+            return sorted(str(symbol) for symbol in symbols)[0]
+    return None
+
+
+def _sources_reachable(
+    sources: Sequence[_MinuteSource], data_root: Path, day: date
+) -> bool:
+    """用最新分区的一只标的探一次源，全部失败则整轮跳过（不逐标的硬刷超时）。"""
+    symbol = _first_symbol(data_root, day)
+    if symbol is None:
+        return True
+    return any(
+        _fetch_for_day(source, symbol, day) is not None for source in sources
+    )
+
+
+def _is_auction_bar(value: datetime) -> bool:
+    """09:30/09:31 是竞价撮合+首分钟，跨源分桶口径不同，不参与逐 bar 数值比对。
+
+    本地把 09:25 竞价量记为 09:30 一根、09:31 是首分钟；新浪把竞价并进 09:31。
+    设计 §5.3 明确「集合竞价 09:30 bar 不单独校验」，这里把 09:31 也一并放过。
+    """
+    return value.hour == 9 and value.minute < 32
+
+
+def _diff_stats(local: pl.DataFrame, external: pl.DataFrame) -> dict[str, Any]:
+    """逐 bar 对齐后的差异计数（按 datetime join，不猜单位）。
+
+    跨源 1m 的**分桶边界**并不可比：同一笔成交在 A 源记 11:19、B 源可能记
+    11:20，逐 bar 相对差会大面积误报（实测新浪 vs 本地 238 根里 195 根超
+    0.5%）。所以量的容差按**当日总量**的 0.5% 计（design §5.2 的相对容差在
+    跨源场景只剩「总量」可比）；价格仍按 L1 的每 bar 容差。
+    """
+    left = local.select([
+        pl.col("datetime"),
+        pl.col("close").cast(pl.Float64).alias("l_close"),
+        pl.col("volume").cast(pl.Float64).alias("l_volume"),
+    ])
+    right = external.select([
+        pl.col("datetime"),
+        pl.col("close").cast(pl.Float64).alias("e_close"),
+        pl.col("volume").cast(pl.Float64).alias("e_volume"),
+    ])
+    matched = left.join(right, on="datetime", how="inner")
+    external_only = right.join(left.select("datetime"), on="datetime", how="anti")
+    local_only = left.join(right.select("datetime"), on="datetime", how="anti")
+    daily_volume = float(left["l_volume"].sum() or 0.0)
+    volume_tolerance = EXTERNAL_VOLUME_REL_TOL * daily_volume
+
+    close_bad = 0
+    volume_bad = 0
+    examples: list[dict[str, Any]] = []
+    for row in matched.iter_rows(named=True):
+        if _is_auction_bar(row["datetime"]):
+            continue
+        l_close = row["l_close"]
+        e_close = row["e_close"]
+        l_volume = row["l_volume"]
+        e_volume = row["e_volume"]
+        if None in (l_close, e_close, l_volume, e_volume):
+            continue
+        tolerance = max(EXTERNAL_PRICE_ABS_TOL, EXTERNAL_PRICE_REL_TOL * abs(l_close))
+        if abs(e_close - l_close) > tolerance:
+            close_bad += 1
+            if len(examples) < 3:
+                examples.append({"datetime": row["datetime"].isoformat(),
+                                 "local_close": l_close, "external_close": e_close})
+        diff = abs(e_volume - l_volume)
+        bad_volume = diff > volume_tolerance
+        if not bad_volume and l_volume == 0:
+            bad_volume = e_volume != 0
+        if bad_volume:
+            volume_bad += 1
+            if len(examples) < 3:
+                examples.append({"datetime": row["datetime"].isoformat(),
+                                 "local_volume": l_volume, "external_volume": e_volume})
+    return {
+        "matched": matched.height,
+        "local_only": local_only.height,
+        "external_only": external_only.height,
+        "close_mismatch": close_bad,
+        "volume_mismatch": volume_bad,
+        "volume_tolerance": volume_tolerance,
+        "examples": examples,
+        "external_only_times": [
+            value.isoformat()
+            for value in external_only["datetime"].sort().head(3).to_list()
+        ],
+    }
+
+
+def _disagrees(stats: dict[str, Any]) -> bool:
+    """该源是否支持「本地有错」：缺 bar 或价/量不一致。"""
+    return bool(
+        stats["external_only"] or stats["close_mismatch"] or stats["volume_mismatch"]
+    )
+
+
+def _frames_agree(left: pl.DataFrame, right: pl.DataFrame) -> bool:
+    """两个外部源在共同 bar 上是否一致（价格 + 量，容差同 L1）。"""
+    stats = _diff_stats(left, right)
+    return stats["matched"] > 0 and stats["close_mismatch"] == 0 \
+        and stats["volume_mismatch"] == 0
+
+
+def _source_findings(
+    local: pl.DataFrame, external: pl.DataFrame, *, table: str, day: date,
+    symbol: str, source: str,
+) -> list[Finding]:
+    """一个源 vs 本地的逐 bar 结论（每类一条，detail 里带计数与示例）。"""
+    stats = _diff_stats(local, external)
+    findings: list[Finding] = []
+    base = {"source": source, **stats}
+    if stats["external_only"]:
+        findings.append(Finding(
+            table=table, day=day, symbol=symbol, code=EXTERNAL_BAR_MISSING,
+            severity=SEVERITY_HARD,
+            detail={**base, "side": "local", "missing_bars": stats["external_only"]},
+        ))
+    if stats["close_mismatch"]:
+        findings.append(Finding(
+            table=table, day=day, symbol=symbol, code=EXTERNAL_CLOSE_MISMATCH,
+            severity=SEVERITY_HARD, detail=dict(base),
+        ))
+    if stats["volume_mismatch"]:
+        findings.append(Finding(
+            table=table, day=day, symbol=symbol, code=EXTERNAL_VOLUME_MISMATCH,
+            severity=SEVERITY_HARD, detail=dict(base),
+        ))
+    # 外部源少 bar（腾讯 800 根上限 / 新浪把收盘竞价并进 15:00）只是覆盖度
+    # 差异，不产出 finding（design §6.3：不删数据、不因此改本地）。
+    return findings
+
+
+def _merge_replacements(
+    external: dict[str, pl.DataFrame], group: Sequence[str], priorities: dict[str, int]
+) -> pl.DataFrame:
+    """按来源优先级合并多个外部源：高优先级先占位，低优先级只补缺口。"""
+    ranked = sorted(group, key=lambda name: (-priorities.get(name, 0), name))
+    merged = pl.concat([external[name] for name in ranked], how="vertical_relaxed")
+    return (
+        merged.unique(subset=["datetime"], keep="first", maintain_order=True)
+        .sort("datetime")
+    )
+
+
+def _resolve_replacement(
+    local: pl.DataFrame,
+    external: dict[str, pl.DataFrame],
+    *,
+    priorities: dict[str, int] | None = None,
+) -> tuple[pl.DataFrame | None, dict[str, Any]]:
+    """按 design §5.4 仲裁：外源多数/单源修复，外源与本地对峙则冲突不修。
+
+    返回 ``(replacement | None, decision)``。``replacement`` 只含外部 bar，
+    runner 再按 ``(symbol, datetime)`` 覆盖本地分区。
+    """
+    priorities = priorities or SOURCE_PRIORITY
+    usable = {
+        name: frame for name, frame in external.items()
+        if frame is not None and not frame.is_empty()
+    }
+    disagree = [name for name, frame in usable.items() if _disagrees(_diff_stats(local, frame))]
+    agree_local = [name for name in usable if name not in disagree]
+
+    clusters: list[list[str]] = []
+    for name in sorted(disagree, key=lambda item: (-priorities.get(item, 0), item)):
+        for cluster in clusters:
+            if all(_frames_agree(usable[name], usable[other]) for other in cluster):
+                cluster.append(name)
+                break
+        else:
+            clusters.append([name])
+    clusters.sort(key=lambda cluster: (-len(cluster), cluster))
+    group = clusters[0] if clusters else []
+
+    decision: dict[str, Any] = {
+        "action": "keep_local",
+        "external_sources": list(group),
+        "local_sources": sorted(agree_local),
+        "confirmed": False,
+        "single_source": False,
+        "conflict": False,
+    }
+    if len(group) >= 2:
+        decision["action"] = "repair"
+        decision["confirmed"] = True
+    elif len(group) == 1 and not agree_local:
+        decision["action"] = "repair"
+        decision["single_source"] = True
+    elif group:
+        decision["action"] = "quarantine"
+        decision["conflict"] = True
+    if decision["action"] != "repair":
+        return None, decision
+    replacement = _merge_replacements(usable, group, priorities)
+    return replacement, decision
+
+
+def _cast_to_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    """按分区 schema 补齐缺列 / 对齐 dtype（外部多带的列丢弃）。"""
+    exprs = [
+        (pl.col(column).cast(dtype) if column in frame.columns
+         else pl.lit(None, dtype=dtype).alias(column))
+        for column, dtype in schema.items()
+    ]
+    return frame.select(exprs)
+
+
+def _merge_bars(
+    part: Path, df: pl.DataFrame, replacement: pl.DataFrame
+) -> tuple[pl.DataFrame, int]:
+    """按 ``(symbol, datetime)`` 覆盖/补入外部 bar，返回 (新帧, 重写 bar 数)。
+
+    本地独有的 bar **不删除**（外部源可能只是覆盖不全，design §6.3 不删数据）。
+    """
+    for key in ("symbol", "datetime"):
+        if key not in df.columns or key not in replacement.columns:
+            raise ValueError(f"{part}: 分钟替换需要 {key} 列")
+    staged = _cast_to_schema(replacement, df.schema)
+    new_bars = staged.join(
+        df.select(["symbol", "datetime"]), on=["symbol", "datetime"], how="anti"
+    )
+    renames = {
+        column: f"__dv_bar__{column}"
+        for column in df.columns
+        if column not in ("symbol", "datetime")
+    }
+    lookup = staged.rename(renames)
+    joined = df.join(lookup, on=["symbol", "datetime"], how="left")
+    exprs = [
+        (pl.coalesce([pl.col(renames[column]), pl.col(column)]).alias(column)
+         if column in renames else pl.col(column))
+        for column in df.columns
+    ]
+    updated = joined.select(exprs).select(
+        [pl.col(column).cast(dtype) for column, dtype in df.schema.items()]
+    )
+    if new_bars.height:
+        updated = pl.concat(
+            [updated, _cast_to_schema(new_bars, df.schema)], how="vertical_relaxed"
+        ).sort(["symbol", "datetime"])
+    return updated, staged.height
+
+
+def _replace_minute_bars(
+    part: Path,
+    replacement: pl.DataFrame,
+    *,
+    backup_root: Path,
+    run_id: str,
+    dry_run: bool,
+) -> int:
+    """按 ``(symbol, datetime)`` 覆盖分钟 bar（写前备份、持锁原子写）。
+
+    不复用日线语义的 :func:`~app.quant.data_verify.repair.replace_symbols`：
+    它要求「一个 symbol 一行」，而分钟分区是「一个 bar 一行」。
+    """
+    if replacement.is_empty():
+        return 0
+    if dry_run:
+        df = pl.read_parquet(part)
+        _, changed = _merge_bars(part, df, replacement)
+        return changed
+    with daily_partition_lock(part):
+        df = pl.read_parquet(part)
+        merged, changed = _merge_bars(part, df, replacement)
+        if changed == 0:               # 没有匹配/新增的 bar：不备份不写盘
+            return 0
+        backup_partition(part, backup_root, run_id)
+        _write_partition_unlocked(merged, part)
+    return changed
 
 
 def _default_data_root() -> Path:
@@ -311,6 +708,84 @@ def _repair_x100(
     )
 
 
+def _verify_external_table(
+    data_root: Path,
+    table: str,
+    day: date,
+    *,
+    apply: bool,
+    allow_repair: bool,
+    backup_root: Path,
+    run_id: str,
+    sample: int,
+    sources: Sequence[_MinuteSource],
+    minute: pl.DataFrame | None = None,
+) -> tuple[list[Finding], int, bool, bool, bool]:
+    """外部分钟源比对 + 仲裁修复一个分区。
+
+    返回 ``(findings, repaired, touched, attempted, reachable)``：
+    ``attempted`` = 是否真的发出过取数请求，``reachable`` = 是否有源正常返回。
+    """
+    part = data_root / table / f"{DAY_PREFIX}{day.isoformat()}" / PARTITION_FILENAME
+    findings: list[Finding] = []
+    touched = False
+    if minute is None:
+        minute, unreadable = _read_partition(part, table=table, day=day)
+        if unreadable is not None:
+            findings.append(unreadable)
+        if minute is None:
+            return findings, 0, False, False, False
+    touched = True
+    if minute.is_empty():
+        return findings, 0, touched, False, False
+
+    symbols = _sample_symbols(minute["symbol"].unique().to_list(), sample)
+    priorities = {source.name: source.priority for source in sources}
+    repaired = 0
+    attempted = False
+    reachable = False
+    for symbol in symbols:
+        local = minute.filter(pl.col("symbol") == symbol)
+        if local.is_empty():
+            continue
+        external: dict[str, pl.DataFrame] = {}
+        for source in sources:
+            attempted = True
+            frame = _fetch_for_day(source, symbol, day)
+            if frame is None:
+                continue
+            reachable = True
+            if frame.is_empty():
+                continue
+            external[source.name] = frame
+            findings.extend(_source_findings(
+                local, frame, table=table, day=day, symbol=symbol, source=source.name
+            ))
+        replacement, decision = _resolve_replacement(
+            local, external, priorities=priorities
+        )
+        if replacement is None:
+            if decision["conflict"]:
+                logger.info("%s %s %s 外源冲突（%s），保留本地",
+                            table, day, symbol, decision["external_sources"])
+            continue
+        if apply and allow_repair:
+            changed = _replace_minute_bars(
+                part, replacement, backup_root=backup_root, run_id=run_id, dry_run=False
+            )
+            repaired += 1 if changed else 0
+            logger.info("%s %s 用 %s 覆盖 %s（%d bar, %s）",
+                        table, day, decision["external_sources"], symbol, changed,
+                        "confirmed" if decision["confirmed"] else "single_source")
+        elif apply:
+            logger.warning("%s %s 是当日/未来分区，跳过外部修复", table, day)
+        else:
+            # dry-run：只报告「本可修复」，不读盘不写盘。
+            logger.debug("%s %s %s 本可用 %s 覆盖（dry-run）",
+                         table, day, symbol, decision["external_sources"])
+    return findings, repaired, touched, attempted, reachable
+
+
 def _verify_table(
     data_root: Path,
     table: str,
@@ -321,11 +796,14 @@ def _verify_table(
     allow_repair: bool,
     backup_root: Path,
     run_id: str,
-) -> tuple[list[Finding], int, bool]:
+    external_sources: Sequence[_MinuteSource] = (),
+    sample: int = DEFAULT_SAMPLE,
+) -> tuple[list[Finding], int, bool, bool, bool]:
     """核验单个分区（``<table>/date=<day>``）。
 
-    返回 ``(findings, repaired, touched)``：``repaired`` 是本次被缩放的 symbol
-    条数，``touched`` 表示该分区存在（当天算「已处理」）。
+    返回 ``(findings, repaired, touched, attempted, reachable)``：``repaired``
+    是本次修复的 symbol 条数，``touched`` 表示该分区存在（当天算「已处理」），
+    后两项只服务 ``external_minute`` 的「无源跳过」判定。
     """
     part = data_root / table / f"{DAY_PREFIX}{day.isoformat()}" / PARTITION_FILENAME
     minute, unreadable = _read_partition(part, table=table, day=day)
@@ -333,7 +811,7 @@ def _verify_table(
     if unreadable is not None:
         findings.append(unreadable)
     if minute is None:
-        return findings, 0, False
+        return findings, 0, False, False, False
 
     if stage in (STAGE_STRUCTURE, STAGE_ALL):
         findings.extend(check_structure(minute, table=table, day=day))
@@ -365,7 +843,26 @@ def _verify_table(
             )
             if repaired:
                 logger.info("修复 %s %s: %d 个 symbol ×100", table, day, repaired)
-    return findings, repaired, True
+
+    attempted = False
+    reachable = False
+    if external_sources:
+        ext_findings, ext_repaired, _, attempted, reachable = _verify_external_table(
+            data_root,
+            table,
+            day,
+            apply=apply,
+            allow_repair=allow_repair,
+            backup_root=backup_root,
+            run_id=run_id,
+            sample=sample,
+            sources=external_sources,
+            minute=minute,
+        )
+        findings.extend(ext_findings)
+        repaired += ext_repaired
+
+    return findings, repaired, True, attempted, reachable
 
 
 def run_verify(
@@ -376,17 +873,30 @@ def run_verify(
     data_root: Path | None = None,
     resume: bool = False,
     progress: ProgressCallback | None = None,
+    sample: int = DEFAULT_SAMPLE,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
 ) -> dict:
-    """跑一遍 ``stage`` 核验层，返回 ``{"findings","repaired","days","state_path"}``。
+    """跑一遍 ``stage`` 核验层，返回核验摘要。
 
-    ``stage`` ∈ ``{"structure","internal","all"}``；``days=None`` = 全部已有分区；
-    ``apply=False``（默认）只读不写，``resume=True`` 从状态文件的
-    ``last_day_done`` 之后继续。``progress(stage, pct, msg)`` 可选，用于 UI 进度。
+    返回 ``{"findings","repaired","days","state_path","sources"}``；外部小时源
+    不可用时额外带 ``"skipped": "no_source"``（该 stage 跳过，绝不抛错）。
+
+    ``stage`` ∈ ``{"structure","internal","external_minute","all"}``；
+    ``days=None`` = 全部已有分区；``apply=False``（默认）只读不写，
+    ``resume=True`` 从状态文件的 ``last_day_done`` 之后继续。
+    ``external_minute`` 默认只看最近 ``lookback_days`` 个交易日、每天按
+    symbol 等距抽 ``sample`` 只——外部 1m 源最深约 94 个交易日。
     """
     if stage not in STAGES:
         raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
+    if sample < 0:
+        raise ValueError(f"sample 必须为非负数，收到 {sample!r}")
+    if lookback_days < 0:
+        raise ValueError(f"lookback_days 必须为非负数，收到 {lookback_days!r}")
     root = Path(data_root) if data_root is not None else _default_data_root()
     state_path = root / STATE_FILENAME
+    external_stage = stage in (STAGE_EXTERNAL_MINUTE, STAGE_ALL)
+    sources = _configured_sources() if external_stage else []
 
     selected = _select_days(root, days)
     if resume:
@@ -401,6 +911,29 @@ def run_verify(
         elif last is not None:
             selected = [day for day in selected if day > last]
 
+    # 外部 1m 只有近 ~94 个交易日；``all`` 只在这个窗口内跑外部环节，
+    # structure/internal 仍然覆盖全部（显式 --days 时以调用方为准）。
+    if external_stage and days is None and lookback_days > 0:
+        external_days = set(selected[-lookback_days:])
+    else:
+        external_days = set(selected)
+    if stage == STAGE_EXTERNAL_MINUTE:
+        selected = [day for day in selected if day in external_days]
+
+    external_ready = external_stage and bool(sources)
+    if external_ready and selected:
+        external_ready = _sources_reachable(sources, root, selected[-1])
+    if stage == STAGE_EXTERNAL_MINUTE and not external_ready:
+        logger.warning("分钟外部源均不可用，跳过 external_minute")
+        return {
+            "findings": 0,
+            "repaired": 0,
+            "days": 0,
+            "state_path": str(state_path),
+            "sources": [source.name for source in sources],
+            "skipped": "no_source",
+        }
+
     run_id = _run_id()
     backup_root = root / BACKUP_DIRNAME
     today = _today()
@@ -408,16 +941,19 @@ def run_verify(
     findings_count = 0
     repaired_count = 0
     days_done = 0
+    external_attempted = False
+    external_reachable = False
 
-    logger.info("data_verify 开始: stage=%s days=%d apply=%s root=%s",
-                stage, total, apply, root)
+    logger.info("data_verify 开始: stage=%s days=%d apply=%s root=%s sources=%s",
+                stage, total, apply, root, [source.name for source in sources])
     _emit(progress, stage, 0, f"start: {total} day(s)")
 
     for index, day in enumerate(selected, start=1):
         day_findings = 0
         touched = False
+        run_external = external_ready and day in external_days
         for table in MINUTE_TABLES:
-            table_findings, repaired, table_touched = _verify_table(
+            table_findings, repaired, table_touched, attempted, reachable = _verify_table(
                 root,
                 table,
                 day,
@@ -426,10 +962,14 @@ def run_verify(
                 allow_repair=day < today,
                 backup_root=backup_root,
                 run_id=run_id,
+                external_sources=sources if run_external else (),
+                sample=sample,
             )
             day_findings += len(table_findings)
             repaired_count += repaired
             touched = touched or table_touched
+            external_attempted = external_attempted or attempted
+            external_reachable = external_reachable or reachable
 
         findings_count += day_findings
         if touched:
@@ -448,9 +988,20 @@ def run_verify(
 
     logger.info("data_verify 完成: findings=%d repaired=%d days=%d",
                 findings_count, repaired_count, days_done)
-    return {
+    report: dict[str, Any] = {
         "findings": findings_count,
         "repaired": repaired_count,
         "days": days_done,
         "state_path": str(state_path),
+        "sources": [source.name for source in sources],
     }
+    if (
+        external_stage
+        and not external_reachable
+        and (not external_ready or external_attempted)
+    ):
+        # 一个源都没连上：该 stage 跳过，由上层报告呈现（绝不因网络失败中断核验）。
+        logger.warning("分钟外部源均不可用（attempted=%s），跳过 external_minute",
+                       external_attempted)
+        report["skipped"] = "no_source"
+    return report
