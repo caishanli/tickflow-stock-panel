@@ -319,6 +319,12 @@ def test_amount_mismatch_is_soft():
     assert amt and amt[0].severity == "soft"
 
 
+def test_suspended_day_zero_daily_volume_no_finding():
+    m = _minute("600000.SH", [0.0, 0.0])
+    d = _daily("600000.SH", volume=0.0, amount=0.0)
+    assert compare_minute_to_daily(m, d, table="kline_minute") == []
+
+
 def test_minute_close_mismatch_is_soft():
     # 2016-01-04 600004：分钟最后一根有量 bar 收 13.27，日线收 13.04（提前收盘）
     m = _minute("600004.SH", [100.0, 0.0])
@@ -339,7 +345,8 @@ Expected: FAIL（模块不存在）
 `m_close` 用 `pl.col("close").filter(pl.col("volume") > 0).last()`，空则回退
 `pl.col("close").last()`。
 
-`compare_minute_to_daily`：inner join；先算 `ratio = m_volume / volume`，
+`compare_minute_to_daily`：inner join；日线 `volume == 0` 的标的直接跳过（停牌正常）。
+先算 `ratio = m_volume / volume`，
 `ratio ∈ [95,105]` → `MINUTE_VOLUME_X100`（hard）；否则按容差比较
 `minute_volume_to_daily(m_volume, table)` 与 `volume`。价格用
 `max(abs, rel)`；amount 只产出 `soft`。缺 symbol 的只在 `detail` 计数，不逐条报。
@@ -840,6 +847,9 @@ git commit -m "feat(data-verify): 外部覆盖修复 + enriched 重算"
   - `fetch_eltdx_m1(symbol: str, *, all_pages: bool = True) -> pl.DataFrame`；
     未安装 `eltdx` 时抛 `ImportError`（调用方捕获后跳过）
   - `available_sources() -> list[str]`
+  - 在 `runner.run_verify` 增加 `external_minute` stage：三方 probe → 按
+    `compare_minute_to_daily` 同口径比对本地分区 → `repair.replace_symbols` 修近 94 个交易日；
+    `"all"` 定义为 `structure + internal + external_minute`。
 
 - [ ] **Step 1: 写失败测试（离线 fixture）**
 
@@ -1000,8 +1010,10 @@ Expected: FAIL（`build_data_verify_trigger` 不存在）
 
 `build_data_verify_trigger(pipeline_sched)`：`CronTrigger(day_of_week="mon-fri",
 hour=..., minute=..., timezone="Asia/Shanghai")`，时间 = 管道时间 + 60 分钟（跨日则 +1 天）。
-`run_daily_incremental`：取最近 7 个交易日 → `run_verify("all", apply=True, days=...)`
-→ 对实际修过的日线日期调 `recompute_enriched` → `write_status`。
+`run_daily_incremental`：取最近 7 个交易日 → 日线族先走
+`fetch_daily_package` → `compare_daily_external` → `decide` → `replace_symbols`（只对
+`repair_local` 决策），再 `run_verify("all", apply=True, days=...)` → 对实际修过的日线日期调
+`recompute_enriched` → `write_status`。
 `scripts/verify_acceptance.py`：
 1. 打印科创板 ×100 检出/修复数（应 ≥600/日）；
 2. 对 2023-04-19..2023-12-20 抽样跑 Task 12 的 qfq 核验，与
