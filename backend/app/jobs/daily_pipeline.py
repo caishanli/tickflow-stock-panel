@@ -16,7 +16,7 @@ import os
 import tempfile
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1071,6 +1071,200 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
     )
 
 
+# ================================================================
+# 每日增量数据核验 (data_verify daily)
+# ================================================================
+
+#: 每日增量核验 job id（APScheduler add_job 的稳定 id，settings API 改时间时覆盖）。
+DATA_VERIFY_DAILY_JOB_ID = "data_verify_daily"
+
+#: 每日增量核验默认回看交易日数。
+DEFAULT_VERIFY_DAILY_DAYS = 7
+
+
+def build_data_verify_trigger(pipeline_sched: dict) -> CronTrigger:
+    """盘后管道时间 +60 分钟后的核验触发点（工作日，Asia/Shanghai）。
+
+    核验只处理已收盘分区（``day < today``），放在管道落盘之后留足缓冲；
+    跨日（管道 23:xx + 60min 落到次日 00:xx）时小时回绕、分钟不变。
+    """
+    hour = int(pipeline_sched.get("hour", 15))
+    minute = int(pipeline_sched.get("minute", 30))
+    total = (hour * 60 + minute + 60) % (24 * 60)
+    return CronTrigger(
+        day_of_week="mon-fri",
+        hour=total // 60,
+        minute=total % 60,
+        timezone="Asia/Shanghai",
+    )
+
+
+def _last_daily_days(data_root: Path, n: int, *, before: date | None = None) -> list[date]:
+    """``kline_daily`` 里已有的最近 N 个交易日（升序，可选只要 ``before`` 之前）。"""
+    base = Path(data_root) / "kline_daily"
+    if not base.is_dir():
+        return []
+    days: set[date] = set()
+    for pdir in base.glob("date=*"):
+        if not (pdir / "part.parquet").is_file():
+            continue
+        try:
+            day = date.fromisoformat(pdir.name[len("date="):])
+        except ValueError:
+            continue
+        if before is None or day < before:
+            days.add(day)
+    return sorted(days)[-n:]
+
+
+def _verify_run_id() -> str:
+    """本次增量核验的备份批次 id（复用 runner 的时间戳格式）。"""
+    return datetime.now().strftime("%Y%m%dT%H%M%S%f")
+
+
+def run_daily_incremental(
+    days: int = DEFAULT_VERIFY_DAILY_DAYS,
+    *,
+    data_root: Path | None = None,
+) -> dict:
+    """每日增量核验：最近 N 个交易日 → 日线外部覆盖 → 分钟 ×100 → 下游重算。
+
+    1. 取 ``kline_daily`` 里最近 N 个已收盘交易日；
+    2. 每天用通达信盘后包逐项比对，``repair_local`` 决策按 symbol 整行覆盖
+       ``kline_daily``（外部 volume 股→手 ×0.01，``amount`` 两侧同为元不换算）；
+       ETF/指数日线不在本任务范围（报告 ``notes`` 记明）；
+    3. ``run_verify("all", apply=True, days=...)`` 修分钟 ×100 与外部分钟覆盖；
+    4. 仅当日线族真的被写过时，prune ``kline_daily_enriched`` 并增量重算；
+    5. ``write_status`` + ``write_quarantine`` 落盘（固定 schema，面板读）。
+    """
+    from app.quant.data_verify.checks_external import (
+        SOURCE_VOLUME_FACTOR,
+        compare_daily_external,
+    )
+    from app.quant.data_verify.policy import (
+        ACTION_QUARANTINE,
+        ACTION_REPAIR_LOCAL,
+        decide,
+    )
+    from app.quant.data_verify.probes.tdx_package import fetch_daily_package
+    from app.quant.data_verify.recompute import recompute_enriched
+    from app.quant.data_verify.repair import replace_symbols
+    from app.quant.data_verify.report import write_quarantine, write_status
+    from app.quant.data_verify.runner import run_verify
+    from app.services.data_integrity import prune_enriched_partitions
+
+    root = Path(data_root) if data_root is not None else Path(settings.data_dir)
+    trading_days = _last_daily_days(root, days, before=date.today())
+
+    volume_factor = SOURCE_VOLUME_FACTOR["tdx"]
+    daily_findings = 0
+    daily_repaired = 0
+    repaired_days: list[date] = []
+    quarantine_entries: list[dict] = []
+
+    for day in trading_days:
+        part = root / "kline_daily" / f"date={day.isoformat()}" / "part.parquet"
+        if not part.is_file():
+            continue
+        local = pl.read_parquet(part)
+        try:
+            external = fetch_daily_package(day)
+        except Exception as exc:  # 网络/404/格式：单日失败不拖垮整轮
+            logger.warning("data_verify_daily: 通达信盘后包拉取失败 %s (%s)", day, exc)
+            continue
+        findings = compare_daily_external(
+            local, external, source="tdx", volume_factor=volume_factor
+        )
+        daily_findings += len(findings)
+        if not findings:
+            continue
+        repair_symbols: set[str] = set()
+        for decision in decide(findings, {"tdx": "agree_external"}):
+            symbol = decision.finding.symbol
+            if decision.action == ACTION_REPAIR_LOCAL and symbol:
+                repair_symbols.add(symbol)
+            elif decision.action == ACTION_QUARANTINE:
+                quarantine_entries.append({
+                    "table": decision.finding.table,
+                    "day": decision.finding.day.isoformat(),
+                    "symbol": symbol,
+                    "reason": "conflict",
+                    "detail": dict(decision.finding.detail),
+                })
+        if not repair_symbols:
+            continue
+        replacement = external.filter(pl.col("symbol").is_in(sorted(repair_symbols)))
+        if "volume" in replacement.columns:
+            replacement = replacement.with_columns(
+                (pl.col("volume").cast(pl.Float64) * volume_factor).alias("volume")
+            )
+        result = replace_symbols(
+            part,
+            replacement,
+            backup_root=root / "data_verify_backup",
+            run_id=_verify_run_id(),
+            dry_run=False,
+        )
+        if result.get("changed_rows"):
+            daily_repaired += int(result["changed_rows"])
+            repaired_days.append(day)
+            logger.info("data_verify_daily: %s 外部覆盖 %d 行",
+                        day, result["changed_rows"])
+
+    if trading_days:
+        verify_report = run_verify("all", apply=True, days=trading_days, data_root=root)
+    else:
+        verify_report = {"findings": 0, "repaired": 0, "days": 0, "sources": []}
+
+    recompute_result: dict | None = None
+    if repaired_days:
+        def _recompute_runner(_repo, _capset, _run_days):
+            # prune 已删掉修复日（及之后）的 enriched 分区，增量重算把它们当「新日期」。
+            return run_pipeline(data_dir=root, new_dates_only=True)
+
+        recompute_result = recompute_enriched(
+            repaired_days,
+            tables=["kline_daily_enriched"],
+            prune=prune_enriched_partitions,
+            runner=_recompute_runner,
+            data_dir=root,
+        )
+
+    sources = sorted({"tdx", *verify_report.get("sources", [])})
+    report = {
+        "stage": "daily",
+        "findings": daily_findings + int(verify_report.get("findings", 0)),
+        "repaired": daily_repaired + int(verify_report.get("repaired", 0)),
+        "quarantined": len(quarantine_entries),
+        "sources": sources,
+        "daily_days": len(trading_days),
+        "daily_repaired_days": [day.isoformat() for day in repaired_days],
+        "recompute": recompute_result,
+        "notes": "ETF/指数日线不在每日增量核验范围，本次仅覆盖 kline_daily",
+    }
+    write_quarantine(quarantine_entries, root)
+    write_status(report, root)
+    return report
+
+
+def _scheduled_data_verify() -> None:
+    """调度触发的每日增量核验：单飞 + JobStore 跟踪（无活跃任务才跑）。"""
+    from app.services.pipeline_jobs import job_store
+
+    job_id, is_new = job_store.create(long_running=True)
+    if not is_new:
+        logger.info("data_verify_daily skipped: 已有活跃任务在运行 (job_id=%s)", job_id)
+        return
+    try:
+        job_store.start(job_id)
+        report = run_daily_incremental()
+        job_store.succeed(job_id, report)
+        logger.info("data_verify_daily completed: job_id=%s", job_id)
+    except Exception as exc:
+        logger.exception("data_verify_daily failed: job_id=%s", job_id)
+        job_store.fail(job_id, str(exc))
+
+
 def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
     """启动调度器。
 
@@ -1145,6 +1339,16 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         misfire_grace_time=3600,
         replace_existing=True,
     )
+
+    # 每日增量数据核验: 盘后管道 +60 分钟后触发, 工作日。单飞(有活跃任务跳过)。
+    scheduler.add_job(
+        _scheduled_data_verify,
+        trigger=build_data_verify_trigger(sched),
+        id=DATA_VERIFY_DAILY_JOB_ID,
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
+    logger.info("data_verify_daily registered: mon-fri, pipeline+60min")
 
     # 周期性能力重探: 付费 Key 中途过期/续费无需重启即可被发现。
     # 只热更新 app.state.capabilities(API 端点、盘后管道 _pipeline_then_refresh 均读它);
