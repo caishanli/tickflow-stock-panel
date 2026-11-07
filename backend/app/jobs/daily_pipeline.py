@@ -1130,12 +1130,12 @@ def run_daily_incremental(
     """每日增量核验：最近 N 个交易日 → 日线外部覆盖 → 分钟 ×100 → 下游重算。
 
     1. 取 ``kline_daily`` 里最近 N 个已收盘交易日；
-    2. 每天用通达信盘后包逐项比对，``repair_local`` 决策按 symbol 整行覆盖
-       ``kline_daily``（外部 volume 股→手 ×0.01，``amount`` 两侧同为元不换算）；
+    2. 每天用通达信盘后包逐项比对；单源结论只报告，只有 ``confirmed`` 才按 symbol
+       覆盖 ``kline_daily``（volume 股→手 ×0.01，``amount`` 两侧同为元不换算）；
        ETF/指数日线不在本任务范围（报告 ``notes`` 记明）；
-    3. ``run_verify("all", apply=True, days=...)`` 修分钟 ×100 与外部分钟覆盖；
+    3. ``run_verify("all", apply=True, days=...)`` 修分钟 ×100 与 confirmed 外部覆盖；
     4. 仅当日线族真的被写过时，prune ``kline_daily_enriched`` 并增量重算；
-    5. ``write_status`` + ``write_quarantine`` 落盘（固定 schema，面板读）。
+    5. 状态、隔离清单与本轮 receipts 落盘（固定 schema，面板读）。
     """
     from app.quant.data_verify.checks_external import (
         SOURCE_VOLUME_FACTOR,
@@ -1149,18 +1149,21 @@ def run_daily_incremental(
     from app.quant.data_verify.probes.tdx_package import fetch_daily_package
     from app.quant.data_verify.recompute import recompute_enriched
     from app.quant.data_verify.repair import replace_symbols
-    from app.quant.data_verify.report import write_quarantine, write_status
+    from app.quant.data_verify.report import write_quarantine, write_receipts, write_status
     from app.quant.data_verify.runner import run_verify
     from app.services.data_integrity import prune_enriched_partitions
 
     root = Path(data_root) if data_root is not None else Path(settings.data_dir)
     trading_days = _last_daily_days(root, days, before=date.today())
+    run_id = _verify_run_id()
 
     volume_factor = SOURCE_VOLUME_FACTOR["tdx"]
     daily_findings = 0
     daily_repaired = 0
+    daily_single_source = 0
     repaired_days: list[date] = []
     quarantine_entries: list[dict] = []
+    receipt_entries: list[dict] = []
 
     for day in trading_days:
         part = root / "kline_daily" / f"date={day.isoformat()}" / "part.parquet"
@@ -1179,18 +1182,30 @@ def run_daily_incremental(
         if not findings:
             continue
         repair_symbols: set[str] = set()
-        for decision in decide(findings, {"tdx": "agree_external"}):
-            symbol = decision.finding.symbol
-            if decision.action == ACTION_REPAIR_LOCAL and symbol:
-                repair_symbols.add(symbol)
+        decisions = decide(findings, {"tdx": "agree_external"})
+        for decision in decisions:
+            finding = decision.finding
+            symbol = finding.symbol
+            if finding.code == "NON_FINITE":
+                quarantine_entries.append({
+                    "table": finding.table, "day": finding.day.isoformat(),
+                    "symbol": symbol, "reason": "non_finite",
+                    "detail": dict(finding.detail),
+                })
             elif decision.action == ACTION_QUARANTINE:
                 quarantine_entries.append({
-                    "table": decision.finding.table,
-                    "day": decision.finding.day.isoformat(),
+                    "table": finding.table,
+                    "day": finding.day.isoformat(),
                     "symbol": symbol,
                     "reason": "conflict",
-                    "detail": dict(decision.finding.detail),
+                    "detail": dict(finding.detail),
                 })
+            elif decision.action == ACTION_REPAIR_LOCAL and symbol:
+                # 定时链路只写多源 confirmed；TDX 单源结论仅报告。
+                if not finding.detail.get("confirmed"):
+                    daily_single_source += int(bool(finding.detail.get("single_source")))
+                    continue
+                repair_symbols.add(symbol)
         if not repair_symbols:
             continue
         replacement = external.filter(pl.col("symbol").is_in(sorted(repair_symbols)))
@@ -1202,19 +1217,63 @@ def run_daily_incremental(
             part,
             replacement,
             backup_root=root / "data_verify_backup",
-            run_id=_verify_run_id(),
+            run_id=run_id,
             dry_run=False,
         )
         if result.get("changed_rows"):
             daily_repaired += int(result["changed_rows"])
             repaired_days.append(day)
+            for decision in decisions:
+                finding = decision.finding
+                symbol = finding.symbol
+                if (
+                    decision.action != ACTION_REPAIR_LOCAL
+                    or not finding.detail.get("confirmed")
+                    or symbol not in repair_symbols
+                ):
+                    continue
+                field = finding.code.removeprefix("DAILY_").removesuffix("_MISMATCH").lower()
+                old_row = local.filter(pl.col("symbol") == symbol)
+                new_row = replacement.filter(pl.col("symbol") == symbol)
+                receipt_entries.append({
+                    "table": "kline_daily", "day": day.isoformat(), "symbol": symbol,
+                    "field": field,
+                    "old": old_row[field][0] if field in old_row.columns and old_row.height else None,
+                    "new": new_row[field][0] if field in new_row.columns and new_row.height else None,
+                    "source": decision.source, "run_id": run_id, "status": "applied",
+                    "backup": result.get("backup"), "code": finding.code,
+                })
             logger.info("data_verify_daily: %s 外部覆盖 %d 行",
                         day, result["changed_rows"])
 
+    if receipt_entries:
+        try:
+            from app.api.data import invalidate_storage_cache
+
+            invalidate_storage_cache()
+        except Exception as exc:
+            logger.warning("data_verify_daily 缓存失效失败（修复已落盘）: %s", exc)
+
     if trading_days:
-        verify_report = run_verify("all", apply=True, days=trading_days, data_root=root)
+        verify_report = run_verify(
+            "all", apply=True, days=trading_days, data_root=root,
+            allow_single_source=False, force=False,
+        )
     else:
         verify_report = {"findings": 0, "repaired": 0, "days": 0, "sources": []}
+    quarantine_entries.extend(verify_report.get("quarantine") or [])
+    verify_receipts = list(verify_report.get("receipts") or [])
+    receipt_entries.extend(verify_receipts)
+    for receipt in verify_receipts:
+        if receipt.get("table") != "kline_daily" or receipt.get("status") != "applied":
+            continue
+        try:
+            repaired_day = date.fromisoformat(str(receipt.get("day")))
+        except ValueError:
+            continue
+        if repaired_day not in repaired_days:
+            repaired_days.append(repaired_day)
+    repaired_days.sort()
 
     recompute_result: dict | None = None
     if repaired_days:
@@ -1233,9 +1292,14 @@ def run_daily_incremental(
     sources = sorted({"tdx", *verify_report.get("sources", [])})
     report = {
         "stage": "daily",
+        "run_id": run_id,
         "findings": daily_findings + int(verify_report.get("findings", 0)),
         "repaired": daily_repaired + int(verify_report.get("repaired", 0)),
         "quarantined": len(quarantine_entries),
+        "quarantine": quarantine_entries,
+        "receipts": receipt_entries,
+        "single_source": daily_single_source + int(verify_report.get("single_source", 0)),
+        "skipped": verify_report.get("skipped"),
         "sources": sources,
         "daily_days": len(trading_days),
         "daily_repaired_days": [day.isoformat() for day in repaired_days],
@@ -1243,6 +1307,7 @@ def run_daily_incremental(
         "notes": "ETF/指数日线不在每日增量核验范围，本次仅覆盖 kline_daily",
     }
     write_quarantine(quarantine_entries, root)
+    write_receipts(receipt_entries, root, run_id)
     write_status(report, root)
     return report
 

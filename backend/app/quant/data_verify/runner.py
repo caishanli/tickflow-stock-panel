@@ -29,6 +29,9 @@
    仲裁：两个外部源一致 → ``confirmed``；唯一外部源且本地无佐证 →
    ``single_source``；外源与本地对峙 → 冲突不修。外源全部不可用时该 stage
    直接跳过并在报告里记 ``{"skipped": "no_source"}``，**绝不因网络失败报错**。
+6. **股票日线 / 复权因子**（``daily`` / ``factors``，``all`` 也包含）：分别用
+   通达信盘后包、baostock 因子 + 腾讯 qfq 核验；两者都可注入 fetcher 离线测试。
+   日线单源写入必须显式 opt-in，因子阶段只报告。
 
 口径：
 
@@ -67,8 +70,10 @@ from app.quant.data_verify.findings import (
     Finding,
 )
 from app.quant.data_verify.repair import (
+    PARTITION_BLAST_RADIUS,
     SCALED_COLUMNS,
     backup_partition,
+    blast_radius_block,
     scale_minute_volume_amount,
 )
 from app.quant.data_verify.units import MINUTE_TABLE_TO_DAILY
@@ -76,15 +81,19 @@ from app.raw_partition_lock import daily_partition_lock
 
 logger = logging.getLogger(__name__)
 
-#: 支持的核验层。``all`` = L0 + L1 + L2 分钟外部源。
+#: 支持的核验层。``all`` = 结构 + 内部 + 外部分钟 + 股票日线 + 复权因子。
 STAGE_STRUCTURE: Final = "structure"
 STAGE_INTERNAL: Final = "internal"
 STAGE_EXTERNAL_MINUTE: Final = "external_minute"
+STAGE_DAILY: Final = "daily"
+STAGE_FACTORS: Final = "factors"
 STAGE_ALL: Final = "all"
 STAGES: Final[tuple[str, ...]] = (
     STAGE_STRUCTURE,
     STAGE_INTERNAL,
     STAGE_EXTERNAL_MINUTE,
+    STAGE_DAILY,
+    STAGE_FACTORS,
     STAGE_ALL,
 )
 
@@ -94,6 +103,8 @@ MINUTE_TABLES: Final[tuple[str, ...]] = ("kline_minute", "kline_etf_minute")
 #: 唯一允许的自动修复：单位归一后量比 ≈100 的分钟量额（科创板 ×100 事故）。
 REPAIR_CODE: Final = MINUTE_VOLUME_X100
 REPAIR_FACTOR: Final = 100.0
+STAR_PREFIXES: Final = ("688", "689")
+POSTCONDITION_FAILED: Final = "POSTCONDITION_FAILED"
 #: 只修 ``kline_minute``：ETF 分钟按「股」落盘，不存在这个 100 倍问题。
 REPAIR_TABLES: Final[tuple[str, ...]] = ("kline_minute",)
 
@@ -115,6 +126,7 @@ ProgressCallback = Callable[[str, int, str], None]
 EXTERNAL_BAR_MISSING: Final = "EXTERNAL_BAR_MISSING"
 EXTERNAL_CLOSE_MISMATCH: Final = "EXTERNAL_CLOSE_MISMATCH"
 EXTERNAL_VOLUME_MISMATCH: Final = "EXTERNAL_VOLUME_MISMATCH"
+REPLACEMENT_SOURCE_COLUMN: Final = "__data_verify_source"
 
 #: 容差与 L1 一致（design §5.2）：价格 1 tick+0.1%，量相对 0.5%。
 EXTERNAL_PRICE_ABS_TOL: Final = 0.011
@@ -140,6 +152,24 @@ class _MinuteSource:
     name: str
     fetch: Callable[[str], pl.DataFrame]
     priority: int
+
+
+@dataclass
+class _PartitionOutcome:
+    findings: list[Finding]
+    repaired: int = 0
+    touched: bool = False
+    attempted: bool = False
+    reachable: bool = False
+    quarantine: list[dict[str, Any]] | None = None
+    receipts: list[dict[str, Any]] | None = None
+    single_source: int = 0
+    repair_failures: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        self.quarantine = self.quarantine or []
+        self.receipts = self.receipts or []
+        self.repair_failures = self.repair_failures or []
 
 
 def _configured_sources() -> list[_MinuteSource]:
@@ -288,6 +318,20 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _nonfinite_bar_fields(frame: pl.DataFrame) -> dict[str, int]:
+    """NaN/Inf 计数（null 由结构检查负责），用于拒绝无效外部票。"""
+    result: dict[str, int] = {}
+    for field in ("close", "volume", "amount"):
+        if field not in frame.columns:
+            continue
+        count = frame.filter(
+            (~pl.col(field).cast(pl.Float64).is_finite()).fill_null(False)
+        ).height
+        if count:
+            result[field] = count
+    return result
+
+
 def _diff_stats(
     local: pl.DataFrame, external: pl.DataFrame, *, skip_0931: bool = False
 ) -> dict[str, Any]:
@@ -302,6 +346,8 @@ def _diff_stats(
     ``volume_total_mismatch``——共同 bar 的 Σ量差 > 0.5% × Σ本地量。
     竞价 bar（09:30 全部、09:31 仅新浪）不参与任何数值比对。
     """
+    local_nonfinite = _nonfinite_bar_fields(local)
+    external_nonfinite = _nonfinite_bar_fields(external)
     left = local.select([
         pl.col("datetime"),
         pl.col("close").cast(pl.Float64).alias("l_close"),
@@ -364,6 +410,8 @@ def _diff_stats(
         "volume_total_mismatch": matched_local_volume > 0
         and total_diff > total_tolerance,
         "volume_total_tolerance": total_tolerance,
+        "local_nonfinite": local_nonfinite,
+        "external_nonfinite": external_nonfinite,
         "examples": examples,
         "external_only_times": [
             value.isoformat()
@@ -409,6 +457,21 @@ def _source_findings(
     stats = _diff_stats(local, external, skip_0931=source == "sina")
     findings: list[Finding] = []
     base = {"source": source, **stats}
+    if stats["local_nonfinite"] or stats["external_nonfinite"]:
+        findings.append(Finding(
+            table=table, day=day, symbol=symbol, code="NON_FINITE",
+            severity=SEVERITY_HARD,
+            detail={
+                **base,
+                "side": "both" if stats["local_nonfinite"] and stats["external_nonfinite"]
+                else "local" if stats["local_nonfinite"] else "external",
+                "fields": {
+                    "local": stats["local_nonfinite"],
+                    "external": stats["external_nonfinite"],
+                },
+            },
+        ))
+        return findings
     if stats["external_only"]:
         findings.append(Finding(
             table=table, day=day, symbol=symbol, code=EXTERNAL_BAR_MISSING,
@@ -440,7 +503,10 @@ def _merge_replacements(
 ) -> pl.DataFrame:
     """按来源优先级合并多个外部源：高优先级先占位，低优先级只补缺口。"""
     ranked = sorted(group, key=lambda name: (-priorities.get(name, 0), name))
-    merged = pl.concat([external[name] for name in ranked], how="vertical_relaxed")
+    merged = pl.concat([
+        external[name].with_columns(pl.lit(name).alias(REPLACEMENT_SOURCE_COLUMN))
+        for name in ranked
+    ], how="vertical_relaxed")
     return (
         merged.unique(subset=["datetime"], keep="first", maintain_order=True)
         .sort("datetime")
@@ -459,9 +525,10 @@ def _resolve_replacement(
     runner 再按 ``(symbol, datetime)`` 覆盖本地分区。
     """
     priorities = priorities or SOURCE_PRIORITY
+    local_nonfinite = _nonfinite_bar_fields(local)
     usable = {
         name: frame for name, frame in external.items()
-        if frame is not None and not frame.is_empty()
+        if frame is not None and not frame.is_empty() and not _nonfinite_bar_fields(frame)
     }
     disagree = [
         name for name, frame in usable.items()
@@ -493,7 +560,11 @@ def _resolve_replacement(
         "confirmed": False,
         "single_source": False,
         "conflict": False,
+        "non_finite": bool(local_nonfinite),
     }
+    if local_nonfinite:
+        decision["action"] = "quarantine"
+        return None, decision
     if len(group) >= 2:
         decision["action"] = "repair"
         decision["confirmed"] = True
@@ -522,69 +593,76 @@ def _cast_to_schema(frame: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.D
 
 
 def _merge_bars(
-    part: Path, df: pl.DataFrame, replacement: pl.DataFrame
+    part: Path,
+    df: pl.DataFrame,
+    replacement: pl.DataFrame,
+    *,
+    source: str = "",
 ) -> tuple[pl.DataFrame, int]:
-    """按 ``(symbol, datetime)`` 覆盖/补入外部 bar，返回 (新帧, 重写 bar 数)。
+    """只覆盖已有 bar 的 ``close``/``volume``，不新增、不删除、不改 OHLC 其余字段。
 
-    本地独有的 bar **不删除**（外部源可能只是覆盖不全，design §6.3 不删数据）。
+    缺 bar 只报告：外部数据没有为新增行验证过完整的 OHLC，不能把它写成完整分钟 bar。
+    09:30 对所有源跳过，09:31 对新浪跳过（两者都是源特定竞价口径）。
     """
     for key in ("symbol", "datetime"):
         if key not in df.columns or key not in replacement.columns:
             raise ValueError(f"{part}: 分钟替换需要 {key} 列")
-    staged = _cast_to_schema(replacement, df.schema)
-    new_bars = staged.join(
-        df.select(["symbol", "datetime"]), on=["symbol", "datetime"], how="anti"
-    )
-    # 只覆盖真正不一致的已有 bar（容差内的 tick/浮点差异不动），避免「确认修复」
-    # 把整只标的 241 根 bar 全部重写一遍。
     value_columns = [
-        column for column in ("open", "high", "low", "close", "volume")
-        if column in df.columns and column in staged.columns
+        column for column in ("close", "volume")
+        if column in df.columns and column in replacement.columns
     ]
-    if value_columns:
-        compared = staged.select(["symbol", "datetime", *value_columns]).join(
-            df.select(["symbol", "datetime", *value_columns]),
-            on=["symbol", "datetime"], how="inner", suffix="_local",
-        )
-        mask = pl.lit(False)
-        for column in ("open", "high", "low", "close"):
-            if column in value_columns:
-                tolerance = pl.max_horizontal(
-                    pl.lit(EXTERNAL_PRICE_ABS_TOL),
-                    pl.lit(EXTERNAL_PRICE_REL_TOL) * pl.col(f"{column}_local").abs(),
-                )
-                mask = mask | (
-                    (pl.col(column) - pl.col(f"{column}_local")).abs() > tolerance
-                )
-        if "volume" in value_columns:
-            volume_tolerance = pl.lit(EXTERNAL_VOLUME_REL_TOL) * pl.max_horizontal(
+    if not value_columns:
+        return df, 0
+    sina_0931 = (
+        pl.col(REPLACEMENT_SOURCE_COLUMN) == "sina"
+        if REPLACEMENT_SOURCE_COLUMN in replacement.columns
+        else pl.lit(source == "sina")
+    )
+    auction = (pl.col("datetime").dt.hour() == 9) & (
+        (pl.col("datetime").dt.minute() == 30)
+        | ((pl.col("datetime").dt.minute() == 31) & sina_0931)
+    )
+    staged = _cast_to_schema(replacement.filter(~auction), df.schema).select(
+        ["symbol", "datetime", *value_columns]
+    )
+    compared = staged.join(
+        df.select(["symbol", "datetime", *value_columns]),
+        on=["symbol", "datetime"], how="inner", suffix="_local",
+    )
+    mask = pl.lit(False)
+    for column in value_columns:
+        tolerance = (
+            pl.max_horizontal(
+                pl.lit(EXTERNAL_PRICE_ABS_TOL),
+                pl.lit(EXTERNAL_PRICE_REL_TOL) * pl.col(f"{column}_local").abs(),
+            )
+            if column == "close"
+            else pl.lit(EXTERNAL_VOLUME_REL_TOL) * pl.max_horizontal(
                 pl.col("volume_local").abs(), pl.lit(1.0)
             )
-            mask = mask | (
-                (pl.col("volume") - pl.col("volume_local")).abs() > volume_tolerance
-            )
-        keys = compared.filter(mask.fill_null(False)).select(["symbol", "datetime"])
-        staged = staged.join(keys, on=["symbol", "datetime"], how="semi")
-    renames = {
-        column: f"__dv_bar__{column}"
-        for column in df.columns
-        if column not in ("symbol", "datetime")
-    }
+        )
+        finite = (
+            pl.col(column).is_finite() & pl.col(f"{column}_local").is_finite()
+        ).fill_null(False)
+        mask = mask | (
+            finite & ((pl.col(column) - pl.col(f"{column}_local")).abs() > tolerance)
+        )
+    keys = compared.filter(mask.fill_null(False)).select(["symbol", "datetime"])
+    staged = staged.join(keys, on=["symbol", "datetime"], how="semi")
+    if staged.is_empty():
+        return df, 0
+    renames = {column: f"__dv_bar__{column}" for column in value_columns}
     lookup = staged.rename(renames)
     joined = df.join(lookup, on=["symbol", "datetime"], how="left")
     exprs = [
-        (pl.coalesce([pl.col(renames[column]), pl.col(column)]).alias(column)
-         if column in renames else pl.col(column))
+        pl.coalesce([pl.col(renames[column]), pl.col(column)]).alias(column)
+        if column in renames else pl.col(column)
         for column in df.columns
     ]
     updated = joined.select(exprs).select(
         [pl.col(column).cast(dtype) for column, dtype in df.schema.items()]
     )
-    if new_bars.height:
-        updated = pl.concat(
-            [updated, _cast_to_schema(new_bars, df.schema)], how="vertical_relaxed"
-        ).sort(["symbol", "datetime"])
-    return updated, staged.height + new_bars.height
+    return updated, staged.height
 
 
 def _replace_minute_bars(
@@ -593,22 +671,24 @@ def _replace_minute_bars(
     *,
     backup_root: Path,
     run_id: str,
-) -> int:
-    """按 ``(symbol, datetime)`` 覆盖分钟 bar（写前备份、持锁原子写）。
-
-    不复用日线语义的 :func:`~app.quant.data_verify.repair.replace_symbols`：
-    它要求「一个 symbol 一行」，而分钟分区是「一个 bar 一行」。
-    """
+    source: str = "",
+    force: bool = False,
+    prior_changed: int = 0,
+) -> dict[str, Any]:
+    """覆盖已核验字段；``prior_changed`` 保证同分区逐 symbol 写入也共享 5% 上限。"""
     if replacement.is_empty():
-        return 0
+        return {"changed_rows": 0, "backup": None}
     with daily_partition_lock(part):
         df = pl.read_parquet(part)
-        merged, changed = _merge_bars(part, df, replacement)
-        if changed == 0:               # 没有匹配/新增的 bar：不备份不写盘
-            return 0
-        backup_partition(part, backup_root, run_id)
+        merged, changed = _merge_bars(part, df, replacement, source=source)
+        if changed == 0:
+            return {"changed_rows": 0, "backup": None}
+        blocked = blast_radius_block(prior_changed + changed, df.height, force=force)
+        if blocked is not None:
+            return blocked
+        backup = backup_partition(part, backup_root, run_id)
         _write_partition_unlocked(merged, part)
-    return changed
+    return {"changed_rows": changed, "backup": str(backup), "merged": merged}
 
 
 def _default_data_root() -> Path:
@@ -643,10 +723,12 @@ def _parse_day_dir(name: str) -> date | None:
         return None
 
 
-def _partition_days(data_root: Path) -> list[date]:
-    """枚举已有分钟分区的交易日（升序、去重）。"""
+def _partition_days(
+    data_root: Path, *, tables: Sequence[str] = MINUTE_TABLES
+) -> list[date]:
+    """枚举指定表的已有交易日分区（升序、去重）。"""
     days: set[date] = set()
-    for table in MINUTE_TABLES:
+    for table in tables:
         base = Path(data_root) / table
         if not base.is_dir():
             continue
@@ -669,9 +751,14 @@ def _as_day(value: date) -> date:
     return date.fromisoformat(str(value)[:10])
 
 
-def _select_days(data_root: Path, days: Sequence[date] | None) -> list[date]:
+def _select_days(
+    data_root: Path,
+    days: Sequence[date] | None,
+    *,
+    tables: Sequence[str] = MINUTE_TABLES,
+) -> list[date]:
     """``days=None``（或空）取全部已有分区，否则只取显式给定且存在的日期。"""
-    available = _partition_days(data_root)
+    available = _partition_days(data_root, tables=tables)
     if not days:
         return available
     explicit = {_as_day(day) for day in days}
@@ -773,23 +860,30 @@ def _scale_symbols(
     factor: float,
     backup_root: Path,
     run_id: str,
-) -> int:
-    """只把分区内 ``symbols`` 的 ``volume`` / ``amount`` 同除 ``factor``。
-
-    读、备份、写在同一把锁内完成；只改这两列，其余列与 dtype 一律不动。
-    """
+    force: bool = False,
+) -> dict[str, Any]:
+    """只缩放指定 symbol 的量额；所有分区写入共用 5% 防爆阈值。"""
     with daily_partition_lock(part):
         df = pl.read_parquet(part)
         absent = [col for col in SCALED_COLUMNS if col not in df.columns]
         if absent:
             raise ValueError(f"{part}: missing scaled columns {absent}")
         mask = pl.col("symbol").is_in(list(symbols))
+        nonzero = pl.any_horizontal([
+            pl.col(column).fill_null(0) != 0 for column in SCALED_COLUMNS
+        ])
+        affected = df.filter(mask & nonzero).height
+        if affected == 0:
+            return {"changed_rows": 0, "backup": None}
+        blocked = blast_radius_block(affected, df.height, force=force)
+        if blocked is not None:
+            return blocked
         scaled = df.with_columns([
             _scaled_expr(col, df.schema[col], factor, mask) for col in SCALED_COLUMNS
         ])
-        backup_partition(part, backup_root, run_id)
+        backup = backup_partition(part, backup_root, run_id)
         _write_partition_unlocked(scaled, part)
-    return len(symbols)
+    return {"changed_rows": affected, "backup": str(backup)}
 
 
 def _repair_x100(
@@ -800,16 +894,15 @@ def _repair_x100(
     partition_symbols: Sequence[str],
     backup_root: Path,
     run_id: str,
-) -> int:
-    """修一个分区里的 ×100 结论，返回被缩放的 symbol 条数。
-
-    分区里**只有**科创板那部分被放大（2026-11-06 实测：616 只 ×100，另外
-    4602 只 ratio≈1），所以默认按 symbol 圈定范围——整分区缩放会把正常标的
-    打成 1/100。仅当整个分区的 symbol 全在结论里时才走整分区缩放
-    （:func:`scale_minute_volume_amount` 的语义）。
-    """
+    force: bool = False,
+) -> dict[str, Any]:
+    """只修 688/689 的 ×100 结论，并返回备份/影响行数等审计信息。"""
+    symbols = sorted({
+        symbol for symbol in symbols
+        if str(symbol).startswith(STAR_PREFIXES)
+    })
     if not symbols:
-        return 0
+        return {"changed_rows": 0, "backup": None, "symbols": []}
     if set(symbols) >= set(partition_symbols):
         result = scale_minute_volume_amount(
             part,
@@ -818,11 +911,35 @@ def _repair_x100(
             backup_root=backup_root,
             run_id=run_id,
             dry_run=False,
+            force=force,
         )
-        return len(symbols) if result["changed_rows"] else 0
-    return _scale_symbols(
-        part, symbols, factor=REPAIR_FACTOR, backup_root=backup_root, run_id=run_id
+    else:
+        result = _scale_symbols(
+            part, symbols, factor=REPAIR_FACTOR, backup_root=backup_root,
+            run_id=run_id, force=force,
+        )
+    result["symbols"] = symbols
+    return result
+
+
+def _blast_finding(table: str, day: date, result: dict[str, Any]) -> Finding:
+    return Finding(
+        table=table, day=day, symbol=None, code=PARTITION_BLAST_RADIUS,
+        severity=SEVERITY_HARD, detail=dict(result),
     )
+
+
+def _audit_bars(frame: pl.DataFrame, keys: pl.DataFrame) -> list[dict[str, Any]]:
+    """receipt 中保留最多 50 根对应 bar 的旧/新值，避免审计文件无限膨胀。"""
+    columns = [name for name in ("datetime", "close", "volume") if name in frame.columns]
+    rows = frame.join(keys, on=["symbol", "datetime"], how="semi").select(columns).head(50)
+    output: list[dict[str, Any]] = []
+    for row in rows.iter_rows(named=True):
+        output.append({
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in row.items()
+        })
+    return output
 
 
 def _verify_external_table(
@@ -838,70 +955,99 @@ def _verify_external_table(
     sources: Sequence[_MinuteSource],
     minute: pl.DataFrame | None = None,
     cache: dict[tuple[str, str], pl.DataFrame | None] | None = None,
-) -> tuple[list[Finding], int, bool, bool, bool]:
-    """外部分钟源比对 + 仲裁修复一个分区。
-
-    返回 ``(findings, repaired, touched, attempted, reachable)``：
-    ``attempted`` = 是否真的发出过取数请求，``reachable`` = 是否有源正常返回。
-    """
+    allow_single_source: bool = False,
+    force: bool = False,
+) -> _PartitionOutcome:
+    """外部分钟源比对 + 仲裁；定时/默认路径绝不采用 single-source 写入。"""
     part = data_root / table / f"{DAY_PREFIX}{day.isoformat()}" / PARTITION_FILENAME
-    findings: list[Finding] = []
-    touched = False
+    outcome = _PartitionOutcome([])
     if minute is None:
         minute, unreadable = _read_partition(part, table=table, day=day)
         if unreadable is not None:
-            findings.append(unreadable)
+            outcome.findings.append(unreadable)
         if minute is None:
-            return findings, 0, False, False, False
-    touched = True
+            return outcome
+    outcome.touched = True
     if minute.is_empty():
-        return findings, 0, touched, False, False
+        return outcome
 
     symbols = _sample_symbols(minute["symbol"].unique().to_list(), sample)
     priorities = {source.name: source.priority for source in sources}
-    repaired = 0
-    attempted = False
-    reachable = False
+    partition_changed = 0
     for symbol in symbols:
         local = minute.filter(pl.col("symbol") == symbol)
         if local.is_empty():
             continue
         external: dict[str, pl.DataFrame] = {}
         for source in sources:
-            attempted = True
+            outcome.attempted = True
             frame = _fetch_for_day(source, symbol, day, cache)
             if frame is None:
                 continue
-            reachable = True
+            outcome.reachable = True
             if frame.is_empty():
                 continue
             external[source.name] = frame
-            findings.extend(_source_findings(
+            outcome.findings.extend(_source_findings(
                 local, frame, table=table, day=day, symbol=symbol, source=source.name
             ))
         replacement, decision = _resolve_replacement(
             local, external, priorities=priorities
         )
+        if decision["single_source"]:
+            outcome.single_source += 1
         if replacement is None:
-            if decision["conflict"]:
-                logger.info("%s %s %s 外源冲突（%s），保留本地",
-                            table, day, symbol, decision["external_sources"])
+            if decision["conflict"] or decision.get("non_finite"):
+                reason = "non_finite" if decision.get("non_finite") else "conflict"
+                outcome.quarantine.append({
+                    "table": table, "day": day.isoformat(), "symbol": symbol,
+                    "reason": reason, "detail": dict(decision),
+                })
+                logger.info("%s %s %s %s，保留本地", table, day, symbol, reason)
+            continue
+        if not decision["confirmed"] and not allow_single_source:
             continue
         if apply and allow_repair:
-            changed = _replace_minute_bars(
-                part, replacement, backup_root=backup_root, run_id=run_id
+            source_names = decision["external_sources"]
+            result = _replace_minute_bars(
+                part, replacement, backup_root=backup_root, run_id=run_id,
+                source="sina" if source_names == ["sina"] else "", force=force,
+                prior_changed=partition_changed,
             )
-            repaired += 1 if changed else 0
-            logger.info("%s %s 用 %s 覆盖 %s（%d bar, %s）",
-                        table, day, decision["external_sources"], symbol, changed,
-                        "confirmed" if decision["confirmed"] else "single_source")
+            if result.get("blocked"):
+                outcome.findings.append(_blast_finding(table, day, result))
+                continue
+            changed = int(result.get("changed_rows") or 0)
+            if changed:
+                partition_changed += changed
+                outcome.repaired += 1
+                after = pl.read_parquet(part).filter(pl.col("symbol") == symbol)
+                keys = replacement.select(["symbol", "datetime"])
+                outcome.receipts.append({
+                    "table": table, "day": day.isoformat(), "symbol": symbol,
+                    "field": "close,volume",
+                    "old": _audit_bars(local, keys), "new": _audit_bars(after, keys),
+                    "source": ",".join(source_names), "run_id": run_id,
+                    "status": "applied", "backup": result.get("backup"),
+                    "changed_bars": changed,
+                })
+                logger.info("%s %s 用 %s 覆盖 %s（%d bar, %s）",
+                            table, day, source_names, symbol, changed,
+                            "confirmed" if decision["confirmed"] else "single_source")
         elif apply:
             logger.warning("%s %s 是当日/未来分区，跳过外部修复", table, day)
         else:
-            # dry-run：只报告「本可修复」，不读盘不写盘。
             logger.debug("%s %s %s 本可用 %s 覆盖（dry-run）",
                          table, day, symbol, decision["external_sources"])
-    return findings, repaired, touched, attempted, reachable
+    return outcome
+
+
+def _volume_audit(frame: pl.DataFrame, symbol: str) -> dict[str, float | None]:
+    row = frame.filter(pl.col("symbol") == symbol).select([
+        pl.col("volume").cast(pl.Float64).sum().alias("volume"),
+        pl.col("amount").cast(pl.Float64).sum().alias("amount"),
+    ])
+    return row.to_dicts()[0] if row.height else {"volume": None, "amount": None}
 
 
 def _verify_table(
@@ -917,72 +1063,288 @@ def _verify_table(
     external_sources: Sequence[_MinuteSource] = (),
     sample: int = DEFAULT_SAMPLE,
     external_cache: dict[tuple[str, str], pl.DataFrame | None] | None = None,
-) -> tuple[list[Finding], int, bool, bool, bool]:
-    """核验单个分区（``<table>/date=<day>``）。
-
-    返回 ``(findings, repaired, touched, attempted, reachable)``：``repaired``
-    是本次修复的 symbol 条数，``touched`` 表示该分区存在（当天算「已处理」），
-    后两项只服务 ``external_minute`` 的「无源跳过」判定。
-    """
+    allow_single_source: bool = False,
+    force: bool = False,
+) -> _PartitionOutcome:
+    """核验单个分钟分区；X100 写后必须用 L1 复核，再把新帧交给外部检查。"""
     part = data_root / table / f"{DAY_PREFIX}{day.isoformat()}" / PARTITION_FILENAME
     minute, unreadable = _read_partition(part, table=table, day=day)
-    findings: list[Finding] = []
+    outcome = _PartitionOutcome([])
     if unreadable is not None:
-        findings.append(unreadable)
+        outcome.findings.append(unreadable)
     if minute is None:
-        return findings, 0, False, False, False
+        return outcome
+    outcome.touched = True
 
     if stage in (STAGE_STRUCTURE, STAGE_ALL):
-        findings.extend(check_structure(minute, table=table, day=day))
+        outcome.findings.extend(check_structure(minute, table=table, day=day))
 
+    daily: pl.DataFrame | None = None
     if stage in (STAGE_INTERNAL, STAGE_ALL):
         daily_table = MINUTE_TABLE_TO_DAILY[table]
         daily_part = data_root / daily_table / f"{DAY_PREFIX}{day.isoformat()}" / PARTITION_FILENAME
         daily, daily_unreadable = _read_partition(daily_part, table=daily_table, day=day)
         if daily_unreadable is not None:
-            findings.append(daily_unreadable)
+            outcome.findings.append(daily_unreadable)
         if daily is not None:
-            findings.extend(compare_minute_to_daily(minute, daily, table=table))
+            outcome.findings.extend(compare_minute_to_daily(minute, daily, table=table))
 
-    repaired = 0
-    x100 = [f for f in findings if f.code == REPAIR_CODE and f.severity == SEVERITY_HARD]
+    x100 = [
+        finding for finding in outcome.findings
+        if finding.code == REPAIR_CODE and finding.severity == SEVERITY_HARD
+        and finding.symbol and finding.symbol.startswith(STAR_PREFIXES)
+    ]
     if apply and table in REPAIR_TABLES and x100:
         if not allow_repair:
-            # 安全阀（design §6.4）：只修已收盘交易日——当日分区可能还在被
-            # 15:35 链路重写，此时缩量会被后续批次覆盖或写出混合口径。
             logger.warning("%s %s 是当日/未来分区，跳过修复（只修已收盘交易日）", table, day)
         else:
-            repaired = _repair_x100(
-                part,
-                table=table,
-                symbols=sorted({f.symbol for f in x100 if f.symbol}),
+            before = minute
+            result = _repair_x100(
+                part, table=table,
+                symbols=sorted({finding.symbol for finding in x100 if finding.symbol}),
                 partition_symbols=minute["symbol"].unique().to_list(),
-                backup_root=backup_root,
-                run_id=run_id,
+                backup_root=backup_root, run_id=run_id, force=force,
             )
-            if repaired:
-                logger.info("修复 %s %s: %d 个 symbol ×100", table, day, repaired)
+            if result.get("blocked"):
+                outcome.findings.append(_blast_finding(table, day, result))
+            elif result.get("changed_rows"):
+                # 无论复核成功与否，外部环节都必须使用写后的帧，不能拿旧帧继续仲裁。
+                minute = pl.read_parquet(part)
+                symbols = result.get("symbols") or []
+                post_findings = (
+                    compare_minute_to_daily(minute, daily, table=table)
+                    if daily is not None else []
+                )
+                failed = [
+                    finding for finding in post_findings
+                    if finding.symbol in symbols
+                    and finding.code in (REPAIR_CODE, "MINUTE_VOLUME_MISMATCH")
+                ]
+                if failed:
+                    failure = {
+                        "table": table, "day": day.isoformat(), "symbols": symbols,
+                        "code": POSTCONDITION_FAILED, "backup": result.get("backup"),
+                        "findings": [finding.to_dict() for finding in failed],
+                    }
+                    outcome.repair_failures.append(failure)
+                    outcome.findings.append(Finding(
+                        table=table, day=day, symbol=None, code=POSTCONDITION_FAILED,
+                        severity=SEVERITY_HARD, detail=dict(failure),
+                    ))
+                    for symbol in symbols:
+                        outcome.receipts.append({
+                            "table": table, "day": day.isoformat(), "symbol": symbol,
+                            "field": "volume,amount", "old": _volume_audit(before, symbol),
+                            "new": _volume_audit(minute, symbol), "source": "L1",
+                            "run_id": run_id, "status": "postcondition_failed",
+                            "backup": result.get("backup"), "code": POSTCONDITION_FAILED,
+                        })
+                else:
+                    outcome.repaired += len(symbols)
+                    for symbol in symbols:
+                        outcome.receipts.append({
+                            "table": table, "day": day.isoformat(), "symbol": symbol,
+                            "field": "volume,amount", "old": _volume_audit(before, symbol),
+                            "new": _volume_audit(minute, symbol), "source": "L1",
+                            "run_id": run_id, "status": "applied",
+                            "backup": result.get("backup"), "code": REPAIR_CODE,
+                        })
+                    logger.info("修复 %s %s: %d 个 symbol ×100", table, day, len(symbols))
 
-    attempted = False
-    reachable = False
     if external_sources:
-        ext_findings, ext_repaired, _, attempted, reachable = _verify_external_table(
-            data_root,
-            table,
-            day,
-            apply=apply,
-            allow_repair=allow_repair,
-            backup_root=backup_root,
-            run_id=run_id,
-            sample=sample,
-            sources=external_sources,
-            minute=minute,
-            cache=external_cache,
+        external = _verify_external_table(
+            data_root, table, day, apply=apply, allow_repair=allow_repair,
+            backup_root=backup_root, run_id=run_id, sample=sample,
+            sources=external_sources, minute=minute, cache=external_cache,
+            allow_single_source=allow_single_source, force=force,
         )
-        findings.extend(ext_findings)
-        repaired += ext_repaired
+        outcome.findings.extend(external.findings)
+        outcome.repaired += external.repaired
+        outcome.attempted = external.attempted
+        outcome.reachable = external.reachable
+        outcome.quarantine.extend(external.quarantine)
+        outcome.receipts.extend(external.receipts)
+        outcome.single_source += external.single_source
+        outcome.repair_failures.extend(external.repair_failures)
+    return outcome
 
-    return findings, repaired, True, attempted, reachable
+
+def _default_daily_fetcher(day: date) -> pl.DataFrame:
+    from app.quant.data_verify.probes.tdx_package import fetch_daily_package
+
+    return fetch_daily_package(day)
+
+
+def _verify_daily(
+    data_root: Path,
+    day: date,
+    *,
+    fetcher: Callable[[date], pl.DataFrame],
+    apply: bool,
+    allow_repair: bool,
+    allow_single_source: bool,
+    force: bool,
+    backup_root: Path,
+    run_id: str,
+) -> _PartitionOutcome:
+    """股票日线 vs 通达信盘后包；单源写入必须显式 opt-in。"""
+    from app.quant.data_verify.checks_external import (
+        SOURCE_VOLUME_FACTOR,
+        compare_daily_external,
+    )
+    from app.quant.data_verify.policy import (
+        ACTION_QUARANTINE,
+        ACTION_REPAIR_LOCAL,
+        decide,
+    )
+    from app.quant.data_verify.repair import replace_symbols
+
+    part = data_root / "kline_daily" / f"{DAY_PREFIX}{day}" / PARTITION_FILENAME
+    local, unreadable = _read_partition(part, table="kline_daily", day=day)
+    outcome = _PartitionOutcome([])
+    if unreadable is not None:
+        outcome.findings.append(unreadable)
+    if local is None:
+        return outcome
+    outcome.touched = True
+    try:
+        external = fetcher(day)
+        outcome.attempted = True
+    except Exception as exc:
+        logger.warning("data_verify daily 外部拉取失败 %s: %s", day, exc)
+        return outcome
+    if external is None or external.is_empty():
+        return outcome
+    outcome.reachable = True
+    volume_factor = SOURCE_VOLUME_FACTOR["tdx"]
+    outcome.findings.extend(compare_daily_external(
+        local, external, source="tdx", volume_factor=volume_factor
+    ))
+    if not outcome.findings:
+        return outcome
+    normalized = external.with_columns(
+        (pl.col("volume").cast(pl.Float64) * volume_factor).alias("volume")
+    ) if "volume" in external.columns else external
+    decisions = decide(outcome.findings, {"tdx": "agree_external"})
+    repair_symbols: set[str] = set()
+    for decision in decisions:
+        finding = decision.finding
+        if decision.action == ACTION_QUARANTINE:
+            outcome.quarantine.append({
+                "table": finding.table, "day": finding.day.isoformat(),
+                "symbol": finding.symbol, "reason": "conflict",
+                "detail": dict(finding.detail),
+            })
+        elif (
+            decision.action == ACTION_REPAIR_LOCAL
+            and finding.code != "NON_FINITE" and finding.symbol
+        ):
+            if finding.detail.get("single_source"):
+                outcome.single_source += 1
+                if not allow_single_source:
+                    continue
+            repair_symbols.add(finding.symbol)
+    if not repair_symbols or not apply:
+        return outcome
+    if not allow_repair:
+        logger.warning("kline_daily %s 是当日/未来分区，跳过外部修复", day)
+        return outcome
+    replacement = normalized.filter(pl.col("symbol").is_in(sorted(repair_symbols)))
+    result = replace_symbols(
+        part, replacement, backup_root=backup_root, run_id=run_id,
+        dry_run=False, force=force,
+    )
+    if result.get("blocked"):
+        outcome.findings.append(_blast_finding("kline_daily", day, result))
+        return outcome
+    if not result.get("changed_rows"):
+        return outcome
+    outcome.repaired = len(repair_symbols)
+    for decision in decisions:
+        finding = decision.finding
+        symbol = finding.symbol
+        if (
+            decision.action != ACTION_REPAIR_LOCAL or symbol not in repair_symbols
+            or finding.code == "NON_FINITE"
+        ):
+            continue
+        field = finding.code.removeprefix("DAILY_").removesuffix("_MISMATCH").lower()
+        old_row = local.filter(pl.col("symbol") == symbol)
+        new_row = normalized.filter(pl.col("symbol") == symbol)
+        outcome.receipts.append({
+            "table": "kline_daily", "day": day.isoformat(), "symbol": symbol,
+            "field": field,
+            "old": old_row[field][0] if field in old_row.columns and old_row.height else None,
+            "new": new_row[field][0] if field in new_row.columns and new_row.height else None,
+            "source": decision.source, "run_id": run_id, "status": "applied",
+            "backup": result.get("backup"), "code": finding.code,
+        })
+    return outcome
+
+
+def _default_factor_fetcher(symbol: str) -> pl.DataFrame:
+    """腾讯 qfq 日线探针；复用已有 15 秒超时与 vendor 代码归一。"""
+    import requests
+
+    from app.services.alt_daily import fetch_tencent_day, tf_to_vendor
+
+    vendor = tf_to_vendor(symbol)
+    schema = {"symbol": pl.String, "date": pl.Date, "qfq_close": pl.Float64}
+    if vendor is None:
+        return pl.DataFrame(schema=schema)
+    with requests.Session() as session:
+        rows = fetch_tencent_day(session, vendor, count=10000) or []
+    values = []
+    for row in rows:
+        try:
+            values.append((symbol, date.fromisoformat(str(row[0])[:10]), float(row[2])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return pl.DataFrame(values, schema=schema, orient="row")
+
+
+def _verify_factors(
+    data_root: Path,
+    days: Sequence[date],
+    *,
+    fetcher: Callable[[str], pl.DataFrame],
+    sample: int,
+) -> list[Finding]:
+    """本地 raw × baostock 因子 vs 腾讯 qfq；本 stage 只报告，不自动修。"""
+    from app.quant.data_verify.checks_factors import apply_local_qfq, compare_qfq
+
+    factor_path = data_root / "adj_factor_baostock" / "all.parquet"
+    if not factor_path.is_file():
+        logger.warning("data_verify factors 跳过：缺少 %s", factor_path)
+        return []
+    frames: list[pl.DataFrame] = []
+    for day in days:
+        part = data_root / "kline_daily" / f"{DAY_PREFIX}{day}" / PARTITION_FILENAME
+        if not part.is_file():
+            continue
+        try:
+            frames.append(pl.read_parquet(part, columns=["symbol", "date", "close"]))
+        except Exception as exc:
+            logger.warning("data_verify factors 日线不可读 %s: %s", part, exc)
+    if not frames:
+        return []
+    raw = pl.concat(frames, how="vertical_relaxed")
+    factors = pl.read_parquet(factor_path).rename({"trade_date": "date"})
+    findings: list[Finding] = []
+    for symbol in _sample_symbols(raw["symbol"].unique().to_list(), sample):
+        try:
+            external = fetcher(symbol)
+        except Exception as exc:
+            logger.warning("data_verify factors 腾讯拉取失败 %s: %s", symbol, exc)
+            continue
+        if external is None or external.is_empty():
+            continue
+        local_raw = raw.filter(pl.col("symbol") == symbol)
+        local = apply_local_qfq(
+            local_raw, factors.filter(pl.col("symbol") == symbol)
+        )
+        findings.extend(compare_qfq(local, external, symbol=symbol))
+    return findings
 
 
 def run_verify(
@@ -995,17 +1357,16 @@ def run_verify(
     progress: ProgressCallback | None = None,
     sample: int = DEFAULT_SAMPLE,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-) -> dict:
-    """跑一遍 ``stage`` 核验层，返回核验摘要。
+    force: bool = False,
+    allow_single_source: bool = False,
+    daily_fetcher: Callable[[date], pl.DataFrame] | None = None,
+    factor_fetcher: Callable[[str], pl.DataFrame] | None = None,
+) -> dict[str, Any]:
+    """运行核验层；只有 ``days is None`` 的全量运行推进 ``last_day_done``。
 
-    返回 ``{"findings","repaired","days","state_path","sources"}``；外部小时源
-    不可用时额外带 ``"skipped": "no_source"``（该 stage 跳过，绝不抛错）。
-
-    ``stage`` ∈ ``{"structure","internal","external_minute","all"}``；
-    ``days=None`` = 全部已有分区；``apply=False``（默认）只读不写，
-    ``resume=True`` 从状态文件的 ``last_day_done`` 之后继续。
-    ``external_minute`` 默认只看最近 ``lookback_days`` 个交易日、每天按
-    symbol 等距抽 ``sample`` 只——外部 1m 源最深约 94 个交易日。
+    ``daily_fetcher(day)`` 与 ``factor_fetcher(symbol)`` 可注入离线 fixture。
+    外部修复默认只接受多源 confirmed；``allow_single_source=True`` 是手动单源
+    写入的显式开关，``force=True`` 仅覆盖单分区 5% 防爆阈值。
     """
     if stage not in STAGES:
         raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
@@ -1015,118 +1376,171 @@ def run_verify(
         raise ValueError(f"lookback_days 必须为非负数，收到 {lookback_days!r}")
     root = Path(data_root) if data_root is not None else _default_data_root()
     state_path = root / STATE_FILENAME
+    run_id = _run_id()
     external_stage = stage in (STAGE_EXTERNAL_MINUTE, STAGE_ALL)
+    daily_stage = stage in (STAGE_DAILY, STAGE_ALL)
+    factor_stage = stage in (STAGE_FACTORS, STAGE_ALL)
+    minute_stage = stage in (
+        STAGE_STRUCTURE, STAGE_INTERNAL, STAGE_EXTERNAL_MINUTE, STAGE_ALL
+    )
     sources = _configured_sources() if external_stage else []
+    source_names = [source.name for source in sources]
+    if daily_stage:
+        source_names.append("tdx")
+    if factor_stage:
+        source_names.append("tencent")
+    source_names = sorted(set(source_names))
 
-    selected = _select_days(root, days)
+    selection_tables: Sequence[str]
+    if stage in (STAGE_DAILY, STAGE_FACTORS):
+        selection_tables = ("kline_daily",)
+    elif stage == STAGE_ALL:
+        selection_tables = (*MINUTE_TABLES, "kline_daily")
+    else:
+        selection_tables = MINUTE_TABLES
+    selected = _select_days(root, days, tables=selection_tables)
     if resume:
         state = _read_state(state_path)
         last = _state_day(state)
         state_stage = state.get("stage") if state else None
         if last is not None and state_stage != stage:
-            # 断点只在同一 stage 内有效：structure 跑出来的 last_day_done 不能让
-            # internal 跳过这些日子（否则内部一致性核验被静默漏掉）。
             logger.warning("断点来自 stage=%s，与本次 stage=%s 不匹配，忽略断点从头跑",
                            state_stage, stage)
         elif last is not None:
             selected = [day for day in selected if day > last]
 
-    # 外部 1m 只有近 ~94 个交易日；``all`` 只在这个窗口内跑外部环节，
-    # structure/internal 仍然覆盖全部（显式 --days 时以调用方为准）。
-    if external_stage and days is None and lookback_days > 0:
-        external_days = set(selected[-lookback_days:])
-    else:
-        external_days = set(selected)
+    external_days = (
+        set(selected[-lookback_days:])
+        if external_stage and days is None and lookback_days > 0
+        else set(selected)
+    )
     if stage == STAGE_EXTERNAL_MINUTE:
         selected = [day for day in selected if day in external_days]
-
-    # 全量历史按 (source, symbol) 每轮只拉一次，逐日循环只做内存切片。
     external_cache: dict[tuple[str, str], pl.DataFrame | None] = {}
     external_ready = external_stage and bool(sources)
     if external_ready and selected:
-        external_ready = _sources_reachable(
-            sources, root, selected[-1], external_cache
-        )
+        external_ready = _sources_reachable(sources, root, selected[-1], external_cache)
     if stage == STAGE_EXTERNAL_MINUTE and not external_ready:
         logger.warning("分钟外部源均不可用，跳过 external_minute")
         return {
-            "findings": 0,
-            "repaired": 0,
-            "days": 0,
-            "state_path": str(state_path),
-            "sources": [source.name for source in sources],
-            "skipped": "no_source",
+            "stage": stage, "run_id": run_id, "findings": 0, "finding_details": [],
+            "repaired": 0, "days": 0, "state_path": str(state_path),
+            "sources": source_names, "skipped": "no_source", "quarantine": [],
+            "quarantined": 0, "receipts": [], "single_source": 0,
+            "repair_failures": [],
         }
 
-    run_id = _run_id()
     backup_root = root / BACKUP_DIRNAME
     today = _today()
     total = len(selected)
-    findings_count = 0
+    all_findings: list[Finding] = []
+    all_quarantine: list[dict[str, Any]] = []
+    all_receipts: list[dict[str, Any]] = []
+    repair_failures: list[dict[str, Any]] = []
     repaired_count = 0
+    single_source_count = 0
     days_done = 0
     external_attempted = False
     external_reachable = False
 
     logger.info("data_verify 开始: stage=%s days=%d apply=%s root=%s sources=%s",
-                stage, total, apply, root, [source.name for source in sources])
+                stage, total, apply, root, source_names)
     _emit(progress, stage, 0, f"start: {total} day(s)")
+    if not selected:
+        _emit(progress, stage, 100, "no partitions")
 
     for index, day in enumerate(selected, start=1):
         day_findings = 0
-        touched = False
+        touched = stage == STAGE_FACTORS
         run_external = external_ready and day in external_days
-        for table in MINUTE_TABLES:
-            table_findings, repaired, table_touched, attempted, reachable = _verify_table(
-                root,
-                table,
-                day,
-                stage,
-                apply=apply,
-                allow_repair=day < today,
-                backup_root=backup_root,
-                run_id=run_id,
-                external_sources=sources if run_external else (),
-                sample=sample,
-                external_cache=external_cache,
+        if minute_stage:
+            for table in MINUTE_TABLES:
+                outcome = _verify_table(
+                    root, table, day, stage, apply=apply, allow_repair=day < today,
+                    backup_root=backup_root, run_id=run_id,
+                    external_sources=sources if run_external else (), sample=sample,
+                    external_cache=external_cache,
+                    allow_single_source=allow_single_source, force=force,
+                )
+                all_findings.extend(outcome.findings)
+                all_quarantine.extend(outcome.quarantine)
+                all_receipts.extend(outcome.receipts)
+                repair_failures.extend(outcome.repair_failures)
+                repaired_count += outcome.repaired
+                single_source_count += outcome.single_source
+                touched = touched or outcome.touched
+                external_attempted = external_attempted or outcome.attempted
+                external_reachable = external_reachable or outcome.reachable
+        if daily_stage:
+            outcome = _verify_daily(
+                root, day, fetcher=daily_fetcher or _default_daily_fetcher,
+                apply=apply, allow_repair=day < today,
+                allow_single_source=allow_single_source, force=force,
+                backup_root=backup_root, run_id=run_id,
             )
-            day_findings += len(table_findings)
-            repaired_count += repaired
-            touched = touched or table_touched
-            external_attempted = external_attempted or attempted
-            external_reachable = external_reachable or reachable
-
-        findings_count += day_findings
+            all_findings.extend(outcome.findings)
+            all_quarantine.extend(outcome.quarantine)
+            all_receipts.extend(outcome.receipts)
+            repair_failures.extend(outcome.repair_failures)
+            repaired_count += outcome.repaired
+            single_source_count += outcome.single_source
+            touched = touched or outcome.touched
+        day_findings = len(all_findings)  # 日志与进度均展示累计值
         if touched:
             days_done += 1
             if apply:
-                # 只在 apply 时落盘：干跑必须零写入（见模块 docstring）。
-                _write_state(state_path, {
-                    "last_run_at": _now_iso(),
-                    "stage": stage,
-                    "last_day_done": day.isoformat(),
+                previous = _read_state(state_path) if days is not None else None
+                keep_full_cursor = bool(previous and _state_day(previous) is not None)
+                state_stage = (
+                    str(previous.get("stage") or stage)
+                    if keep_full_cursor and previous is not None else stage
+                )
+                payload: dict[str, Any] = {
+                    **(previous or {}), "last_run_at": _now_iso(), "stage": state_stage,
                     "applied": repaired_count,
-                })
-        logger.info("%s: %d findings（累计 %d，已修 %d/%d 天）",
-                    day, day_findings, findings_count, repaired_count, days_done)
-        _emit(progress, stage, index * 100 // total, f"{day}: {day_findings} finding(s)")
+                }
+                if days is None:
+                    payload["last_day_done"] = day.isoformat()
+                    payload.pop("completed_days", None)
+                else:
+                    completed = set((previous or {}).get("completed_days") or [])
+                    completed.add(day.isoformat())
+                    payload["completed_days"] = sorted(completed)
+                _write_state(state_path, payload)
+        logger.info("%s: 累计 %d findings（已修 %d/%d 天）",
+                    day, len(all_findings), repaired_count, days_done)
+        _emit(progress, stage, index * 100 // total,
+              f"{day}: {day_findings} cumulative finding(s)")
 
-    logger.info("data_verify 完成: findings=%d repaired=%d days=%d",
-                findings_count, repaired_count, days_done)
+    if factor_stage and selected:
+        all_findings.extend(_verify_factors(
+            root, selected, fetcher=factor_fetcher or _default_factor_fetcher, sample=sample
+        ))
+
+    if apply:
+        from app.quant.data_verify.report import write_receipts
+
+        write_receipts(all_receipts, root, run_id)
+    if all_receipts:
+        try:
+            from app.api.data import invalidate_storage_cache
+
+            invalidate_storage_cache()
+        except Exception as exc:
+            logger.warning("data_verify 缓存失效失败（修复已落盘）: %s", exc)
+
     report: dict[str, Any] = {
-        "findings": findings_count,
-        "repaired": repaired_count,
-        "days": days_done,
-        "state_path": str(state_path),
-        "sources": [source.name for source in sources],
+        "stage": stage, "run_id": run_id, "findings": len(all_findings),
+        "finding_details": [finding.to_dict() for finding in all_findings],
+        "repaired": repaired_count, "days": days_done, "state_path": str(state_path),
+        "sources": source_names, "quarantine": all_quarantine,
+        "quarantined": len(all_quarantine), "receipts": all_receipts,
+        "single_source": single_source_count, "repair_failures": repair_failures,
     }
-    if (
-        external_stage
-        and not external_reachable
-        and (not external_ready or external_attempted)
-    ):
-        # 一个源都没连上：该 stage 跳过，由上层报告呈现（绝不因网络失败中断核验）。
+    if external_stage and not external_reachable and (not external_ready or external_attempted):
         logger.warning("分钟外部源均不可用（attempted=%s），跳过 external_minute",
                        external_attempted)
         report["skipped"] = "no_source"
+    logger.info("data_verify 完成: findings=%d repaired=%d days=%d",
+                len(all_findings), repaired_count, days_done)
     return report

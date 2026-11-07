@@ -88,3 +88,14 @@ def test_minute_close_mismatch_is_soft():
     findings = compare_minute_to_daily(m, d, table="kline_minute")
     close_f = [f for f in findings if f.code == "MINUTE_CLOSE_MISMATCH"]
     assert close_f and close_f[0].severity == "soft"
+
+
+def test_nan_minute_volume_is_hard_non_finite_and_skips_voting():
+    minute = _minute("600000.SH", [100.0, float("nan")]).with_columns(
+        pl.lit(1000.0).alias("amount")
+    )
+    daily = _daily("600000.SH", volume=1.0, amount=1000.0)
+    findings = compare_minute_to_daily(minute, daily, table="kline_minute")
+    assert [finding.code for finding in findings] == ["NON_FINITE"]
+    assert findings[0].severity == "hard"
+    assert findings[0].detail["fields"] == {"minute": ["volume"]}

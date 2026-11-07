@@ -4,7 +4,8 @@
 （``GET /api/settings/data-verify/status``）和人直接查看：
 
 - ``data_verify_status.json``：**只保留固定键** ``last_run_at`` / ``stage`` /
-  ``findings`` / ``repaired`` / ``quarantined`` / ``sources``。runner 的报告
+  ``findings`` / ``repaired`` / ``quarantined`` / ``single_source`` / ``skipped`` /
+  ``sources``。runner 的报告
   还带 ``days`` / ``state_path`` / ``skipped`` 之类的运行细节，那些属于 job
   结果（``job_store.succeed``），不进状态文件——状态文件是「面板一眼看
   上一轮核验结果」的稳定契约，键随 runner 演化而漂移会让前端跟着碎。
@@ -34,6 +35,9 @@ STATUS_FILENAME: Final = "data_verify_status.json"
 #: 隔离清单文件（数据根下）。
 QUARANTINE_FILENAME: Final = "data_verify_quarantine.json"
 
+#: 每次实际修复的 receipt 目录（文件名为 ``<run_id>.json``）。
+RECEIPTS_DIRNAME: Final = "data_verify_receipts"
+
 #: 状态文件的固定键（顺序即序列化顺序，便于人读 diff）。
 STATUS_KEYS: Final[tuple[str, ...]] = (
     "last_run_at",
@@ -41,6 +45,8 @@ STATUS_KEYS: Final[tuple[str, ...]] = (
     "findings",
     "repaired",
     "quarantined",
+    "single_source",
+    "skipped",
     "sources",
 )
 
@@ -97,6 +103,8 @@ def write_status(report: dict, data_root: Path) -> Path:
         "findings": _as_count(report.get("findings")),
         "repaired": _as_count(report.get("repaired")),
         "quarantined": _as_count(report.get("quarantined")),
+        "single_source": _as_count(report.get("single_source")),
+        "skipped": report.get("skipped"),
         "sources": [str(source) for source in (report.get("sources") or [])],
     }
     path = Path(data_root) / STATUS_FILENAME
@@ -170,12 +178,20 @@ def write_quarantine(entries: list[dict], data_root: Path) -> Path:
     return path
 
 
+def write_receipts(receipts: list[dict], data_root: Path, run_id: str) -> Path:
+    """把一轮实际写入的审计 receipt 原子落到 ``data_verify_receipts/<run_id>.json``。"""
+    path = Path(data_root) / RECEIPTS_DIRNAME / f"{run_id}.json"
+    return _atomic_write_json(path, [dict(receipt) for receipt in receipts])
+
+
 __all__ = [
     "QUARANTINE_FILENAME",
     "QUARANTINE_KEY_FIELDS",
+    "RECEIPTS_DIRNAME",
     "STATUS_FILENAME",
     "STATUS_KEYS",
     "read_status",
     "write_quarantine",
+    "write_receipts",
     "write_status",
 ]

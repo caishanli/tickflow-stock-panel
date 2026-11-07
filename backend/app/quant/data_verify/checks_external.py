@@ -42,6 +42,7 @@ from app.quant.data_verify.findings import (
 DAILY_CLOSE_MISMATCH: Final = "DAILY_CLOSE_MISMATCH"
 DAILY_VOLUME_MISMATCH: Final = "DAILY_VOLUME_MISMATCH"
 DAILY_AMOUNT_MISMATCH: Final = "DAILY_AMOUNT_MISMATCH"
+NON_FINITE: Final = "NON_FINITE"
 
 #: 比对目标表（修复动作发生在这里）。本任务只覆盖股票日线。
 DAILY_TABLE: Final = "kline_daily"
@@ -66,6 +67,16 @@ def _finite(value: Any) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _nonfinite_fields(row: dict[str, Any], prefix: str, *, with_amount: bool) -> list[str]:
+    fields = ["close", "volume"] + (["amount"] if with_amount else [])
+    bad = []
+    for field in fields:
+        value = row.get(f"{prefix}_{field}")
+        if value is not None and not math.isfinite(float(value)):
+            bad.append(field)
+    return bad
 
 
 def _single_day(df: pl.DataFrame, label: str) -> date | None:
@@ -178,6 +189,23 @@ def compare_daily_external(
     findings: list[Finding] = []
     for row in joined.sort("symbol").iter_rows(named=True):
         symbol = str(row["symbol"])
+        local_bad = _nonfinite_fields(row, "l", with_amount=with_amount)
+        external_bad = _nonfinite_fields(row, "e", with_amount=with_amount)
+        if local_bad or external_bad:
+            findings.append(Finding(
+                table=DAILY_TABLE,
+                day=day,
+                symbol=symbol,
+                code=NON_FINITE,
+                severity=SEVERITY_HARD,
+                detail={
+                    "source": source,
+                    "side": "both" if local_bad and external_bad
+                    else "local" if local_bad else "external",
+                    "fields": {"local": local_bad, "external": external_bad},
+                },
+            ))
+            continue
         local_close = _finite(row.get("l_close"))
         external_close = _finite(row.get("e_close"))
         local_volume = _finite(row.get("l_volume"))
@@ -283,6 +311,7 @@ __all__ = [
     "DAILY_CLOSE_MISMATCH",
     "DAILY_TABLE",
     "DAILY_VOLUME_MISMATCH",
+    "NON_FINITE",
     "SOURCE_VOLUME_FACTOR",
     "compare_daily_external",
 ]

@@ -54,7 +54,7 @@ def test_apply_scales_and_backs_up(tmp_path):
     part = tmp_path / "kline_minute" / "date=2026-11-06" / "part.parquet"
     _write(part)
     res = scale_minute_volume_amount(part, table="kline_minute", factor=100.0,
-                                     backup_root=tmp_path / "bk", run_id="r1", dry_run=False)
+                                     backup_root=tmp_path / "bk", run_id="r1", dry_run=False, force=True)
     df = pl.read_parquet(part)
     assert df["volume"][0] == 8630559.0 and df["amount"][0] == 3.13e8
     assert Path(res["backup"]).exists()
@@ -73,9 +73,9 @@ def test_repeated_apply_keeps_first_pristine_backup(tmp_path):
     part = tmp_path / "kline_minute" / "date=2026-11-06" / "part.parquet"
     _write(part)
     res = scale_minute_volume_amount(part, table="kline_minute", factor=100.0,
-                                     backup_root=tmp_path / "bk", run_id="r1", dry_run=False)
+                                     backup_root=tmp_path / "bk", run_id="r1", dry_run=False, force=True)
     scale_minute_volume_amount(part, table="kline_minute", factor=100.0,
-                               backup_root=tmp_path / "bk", run_id="r1", dry_run=False)
+                               backup_root=tmp_path / "bk", run_id="r1", dry_run=False, force=True)
     # 备份仍是被缩放前的原始值，重复执行不会把备份覆盖成已修的二手数据
     assert pl.read_parquet(res["backup"])["volume"][0] == 863055900.0
 
@@ -91,7 +91,7 @@ def test_only_volume_and_amount_change_and_schema_is_preserved(tmp_path):
     ).write_parquet(part)
     before = pl.read_parquet(part)
     scale_minute_volume_amount(part, table="kline_minute", factor=100.0,
-                               backup_root=tmp_path / "bk", run_id="r1", dry_run=False)
+                               backup_root=tmp_path / "bk", run_id="r1", dry_run=False, force=True)
     after = pl.read_parquet(part)
     assert after.schema == before.schema              # 列名/顺序/dtype 均不变
     assert after["volume"][0] == 8630559 and after["amount"][0] == 313000000
@@ -107,7 +107,7 @@ def test_all_zero_partition_is_noop_without_backup(tmp_path):
         orient="row",
     ).write_parquet(part)
     res = scale_minute_volume_amount(part, table="kline_minute", factor=100.0,
-                                     backup_root=tmp_path / "bk", run_id="r1", dry_run=False)
+                                     backup_root=tmp_path / "bk", run_id="r1", dry_run=False, force=True)
     assert res == {"changed_rows": 0, "backup": None}
     assert not (tmp_path / "bk").exists()
 

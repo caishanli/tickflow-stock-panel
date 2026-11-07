@@ -34,7 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--stage", required=True, choices=STAGES, help="核验层")
     parser.add_argument("--apply", action="store_true",
-                        help="执行修复（仅 MINUTE_VOLUME_X100，写前备份）")
+                        help="执行修复（写前备份；默认只接受确定性/多源确认结论）")
+    parser.add_argument("--force", action="store_true",
+                        help="手动覆盖单分区 5%% 改动上限（仍需 --apply）")
+    parser.add_argument("--allow-single-source", action="store_true",
+                        help="显式允许单外部源写入（定时任务永不启用）")
     parser.add_argument("--days", default=None,
                         help="逗号分隔的交易日（如 2026-11-06）；省略=全部已有分区")
     parser.add_argument("--resume", action="store_true",
@@ -63,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
         days=days,
         data_root=args.data_root,
         resume=args.resume,
+        force=args.force,
+        allow_single_source=args.allow_single_source,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0

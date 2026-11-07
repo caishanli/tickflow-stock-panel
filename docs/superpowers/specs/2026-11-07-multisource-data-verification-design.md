@@ -70,6 +70,10 @@
    `kline_daily`（2016-01-04 起，2633 分区）、`kline_etf_daily`（2005-02-23 起，5275 分区）、
    `kline_index_daily`（2025-07-31 起，307 分区）、`kline_minute`（2016-01-04 起，28GB）、
    `kline_etf_minute`（2026-04-01 起，441MB），外加复权因子表。
+
+   **本次 M1–M5 交付边界**：日线外部核验/写入只覆盖股票 `kline_daily`；分钟覆盖股票与 ETF；
+   复权核验使用 baostock 因子表 + 腾讯 qfq 抽样。ETF/指数日线的独立外部核验，以及 2021 年前
+   股票日线的逐只外部回补，留作后续扩展，不在本轮宣称完成。
 2. 多源交叉确认：每个结论至少两个独立来源，或明确标记 `single_source`。
 3. 能确定性修复的自动修，修不动的隔离并报告。
 4. 全流程可重入、断点续跑、可干跑（dry-run）。
@@ -186,7 +190,8 @@
 优先级（高→低）：`交易所官方 / TickFlow raw` > `通达信盘后包` > `baostock` > `腾讯` > `新浪` > `本地存量`。
 
 - 至少两个**外部**来源一致 → 按该结论修复，标记 `confirmed`；
-- 只有单来源 → 修复但标记 `single_source`，并在报告里单列；
+- 只有单来源 → 默认只报告并标记 `single_source`；手动 `--apply` 还必须显式加
+  `--allow-single-source` 才写，定时路径永不采用单源写入；
 - 来源互相矛盾（无多数）→ 不修，进隔离清单，标记 `conflict`。
 
 **关于 provenance**：分区没有来源列，也不打算新增（会破坏读侧 schema）。本设计里的
@@ -203,9 +208,10 @@
 
 ### 6.2 可由外部源覆盖
 
-- 日线：用盘后包整分区重写（原子替换，先备份）；
-- 分钟（近 94 交易日）：用 eltdx 按 symbol 重拉，按 `(symbol, datetime)` 覆盖；
-- 复权因子：用 xdxr 事件重建后整表替换，旧表备份。
+- 股票日线：用已确认外部行按 symbol 覆盖（原子替换，先备份）；
+- 分钟（近 94 交易日）：多源仲裁后按 `(symbol, datetime)` 只覆盖已有 bar 的
+  `close` / `volume`；09:30 与新浪 09:31 竞价口径不覆盖，缺 bar 只报告，不写入未核验 OHLC；
+- 复权因子：本轮只核验并报告，不自动替换因子表。
 
 ### 6.3 无法修复
 
@@ -221,7 +227,9 @@
 - **每日定时跑（自动）：只自动应用两类**
   1. 确定性类（单位换算、重复行、时间戳越界、OHLC 非法）；
   2. 近 7 个交易日内、`confirmed` 的外部覆盖；
-  其余一律只报告。任何单分区改动超过 5% 行的自动修复降级为报告，需 `--force`；
+  其余一律只报告。任何单分区改动超过 5% 行的自动修复降级为报告，需手动 `--force`；
+  科创板 2026-11-06 约 11.8% 的 ×100 修复因此只能显式 `--force`。`--force` 只覆盖
+  5% 防爆阈值，不会放开 single-source 限制；
 - 与实时写盘互斥：修复只碰已收盘分区，写入用原子替换（temp + `os.replace`）；
 - 修复期间不占用 `try_acquire_run_slot`（不阻塞回测/repair_daily），但要在状态里标明
   正在核验，并在结束时让 `invalidate_storage_cache()` 失效缓存。
@@ -254,7 +262,8 @@ backend/app/quant/data_verify/
   report.py            # 状态 JSON + 隔离清单
 ```
 
-CLI：`python -m app.quant.data_verify --stage structural|internal|external|factors|all [--apply] [--resume]`
+CLI：`python -m app.quant.data_verify --stage structure|internal|external_minute|daily|factors|all [--apply] [--resume] [--force] [--allow-single-source]`；
+`all = structure + internal + external_minute + daily + factors`。
 
 ### 7.2 调度与进程边界
 
@@ -284,7 +293,8 @@ CLI：`python -m app.quant.data_verify --stage structural|internal|external|fact
 ### 验收口径
 
 1. 能复现并修复 §2.1 的科创板 ×100（修复后 L1 ratio≈1）；
-2. 对 2026-10-22 历史事故区间（2023-04-19..2023-12-20）能报出异常并给出与 `daily_basis_repair` 一致的结论；
+2. 对 2023-04-19..2023-12-20 区间，`data_verify` 与 `daily_basis_repair` 的异常/干净结论一致；
+   两工具都报干净也通过（该区间旧污染修复后不得为了「检出异常」而误报）；
 3. 2016-01-04 / 2018-06-01 的收盘价差异被归为 `soft`，不触发自动覆盖；
 4. 全量结构扫描 0 崩溃，断点续跑不重复写；
 5. 修复全过程有备份，且 `--dry-run` 与 `--apply` 的判定结果一致。

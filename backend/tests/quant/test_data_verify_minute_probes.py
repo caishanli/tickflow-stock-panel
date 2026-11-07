@@ -183,6 +183,7 @@ def _run_external(root, monkeypatch, sources, *, apply=True, **kwargs):
     from app.quant.data_verify import runner
 
     monkeypatch.setattr(runner, "_configured_sources", lambda: sources)
+    kwargs.setdefault("force", True)
     return runner.run_verify(
         "external_minute",
         apply=apply,
@@ -211,8 +212,8 @@ def test_external_minute_repairs_when_two_sources_agree(tmp_path, monkeypatch):
     local = pl.read_parquet(
         tmp_path / "kline_minute" / f"date={DAY.isoformat()}" / "part.parquet"
     )
-    assert local["close"].to_list() == [10.5, 10.5, 10.5]
-    assert local["volume"].to_list() == [2000.0, 2000.0, 2000.0]
+    assert local["close"].to_list() == [10.0, 10.5, 10.5]
+    assert local["volume"].to_list() == [1000.0, 2000.0, 2000.0]
     assert len(list((tmp_path / "data_verify_backup").rglob("part.parquet"))) == 1
 
 
@@ -237,11 +238,25 @@ def test_external_minute_conflict_keeps_local(tmp_path, monkeypatch):
     assert not (tmp_path / "data_verify_backup").exists()
 
 
-def test_external_minute_single_source_repairs_with_flag(tmp_path, monkeypatch):
+def test_external_minute_single_source_requires_explicit_opt_in(tmp_path, monkeypatch):
     _write_minute_partition(tmp_path, DAY, _bars(SYMBOL, DAY, close=10.0))
     corrected = _bars(SYMBOL, DAY, close=10.5)
-    rep = _run_external(tmp_path, monkeypatch, [_source("tencent", corrected, 3)])
-    assert rep["repaired"] == 1
+    sources = [_source("tencent", corrected, 3)]
+
+    skipped = _run_external(
+        tmp_path, monkeypatch, sources, allow_single_source=False
+    )
+    assert skipped["repaired"] == 0
+    assert skipped["single_source"] == 1
+    assert pl.read_parquet(
+        tmp_path / "kline_minute" / f"date={DAY.isoformat()}" / "part.parquet"
+    )["close"].unique().to_list() == [10.0]
+
+    repaired = _run_external(
+        tmp_path, monkeypatch, sources, allow_single_source=True
+    )
+    assert repaired["repaired"] == 1
+    assert repaired["receipts"][0]["source"] == "tencent"
 
 
 def test_external_minute_dry_run_writes_nothing(tmp_path, monkeypatch):
@@ -312,11 +327,11 @@ def test_external_minute_missing_bar_is_detected(tmp_path, monkeypatch):
         monkeypatch,
         [_source("sina", extra, 2), _source("tencent", extra, 3)],
     )
-    assert rep["repaired"] == 1
+    assert rep["repaired"] == 0
     local = pl.read_parquet(
         tmp_path / "kline_minute" / f"date={DAY.isoformat()}" / "part.parquet"
     )
-    assert local.height == 4                       # 外部独有的 bar 被补进来
+    assert local.height == 3                       # 缺 bar 只报告，不写未核验 OHLC
 
 
 def test_configured_sources_excludes_missing_eltdx():
@@ -492,3 +507,94 @@ def test_external_minute_lookback_limits_days(tmp_path, monkeypatch):
         "external_minute", apply=False, days=None, data_root=tmp_path, lookback_days=1
     )
     assert rep["days"] == 1
+
+
+def test_merge_bars_writes_only_arbitrated_fields_and_skips_auction(tmp_path):
+    """普通 bar 只改 close/volume；09:30 与新浪 09:31 永远原样保留。"""
+    from app.quant.data_verify.runner import _merge_bars
+
+    local = _bars(SYMBOL, DAY, close=10.0, volume=1000.0)
+    replacement = local.with_columns([
+        (pl.col("open") + 2.0).alias("open"),
+        (pl.col("high") + 2.0).alias("high"),
+        (pl.col("low") + 2.0).alias("low"),
+        (pl.col("close") + 1.0).alias("close"),
+        (pl.col("volume") + 100.0).alias("volume"),
+    ])
+    merged, changed = _merge_bars(
+        tmp_path / "part.parquet", local, replacement, source="sina"
+    )
+
+    assert changed == 1                         # 仅 15:00 可修
+    assert merged["close"].to_list() == [10.0, 10.0, 11.0]
+    assert merged["volume"].to_list() == [1000.0, 1000.0, 1100.0]
+    assert merged["open"].to_list() == local["open"].to_list()
+    assert merged["high"].to_list() == local["high"].to_list()
+    assert merged["low"].to_list() == local["low"].to_list()
+
+
+def test_external_minute_non_finite_bar_is_finding_and_not_repaired(tmp_path, monkeypatch):
+    local = _bars(SYMBOL, DAY)
+    _write_minute_partition(tmp_path, DAY, local)
+    external = local.with_columns(
+        pl.when(pl.col("datetime").dt.hour() == 15)
+        .then(pl.lit(float("nan"))).otherwise(pl.col("close")).alias("close")
+    )
+    rep = _run_external(
+        tmp_path,
+        monkeypatch,
+        [_source("tencent", external, 3)],
+        allow_single_source=True,
+    )
+    assert rep["repaired"] == 0
+    assert any(
+        item["code"] == "NON_FINITE" for item in rep["finding_details"]
+    )
+
+
+def test_mixed_source_merge_never_writes_sina_0931_auction(tmp_path, monkeypatch):
+    """腾讯缺 09:31 时由新浪补位，也不能把新浪竞价量写进本地。"""
+    local = _bars(SYMBOL, DAY, close=10.0)
+    _write_minute_partition(tmp_path, DAY, local)
+    corrected = _bars(SYMBOL, DAY, close=10.5)
+    tencent = corrected.filter(
+        pl.col("datetime") != datetime(2026, 11, 5, 9, 31)
+    )
+
+    rep = _run_external(
+        tmp_path,
+        monkeypatch,
+        [_source("sina", corrected, 2), _source("tencent", tencent, 3)],
+    )
+
+    assert rep["repaired"] == 1
+    got = pl.read_parquet(
+        tmp_path / "kline_minute" / f"date={DAY.isoformat()}" / "part.parquet"
+    )
+    assert got.filter(pl.col("datetime").dt.hour() == 9)["close"].to_list() == [10.0, 10.0]
+    assert got.filter(pl.col("datetime").dt.hour() == 15)["close"].to_list() == [10.5]
+
+
+def test_external_minute_blast_radius_is_cumulative_per_partition(tmp_path, monkeypatch):
+    """逐 symbol 小写也不能合起来越过单分区 5% 上限。"""
+    symbols = [f"600{index:03d}.SH" for index in range(20)]
+    local = pl.concat([_bars(symbol, DAY, close=10.0) for symbol in symbols])
+    corrected = pl.concat([_bars(symbol, DAY, close=10.5) for symbol in symbols])
+    _write_minute_partition(tmp_path, DAY, local)
+
+    rep = _run_external(
+        tmp_path,
+        monkeypatch,
+        [_source("sina", corrected, 2), _source("tencent", corrected, 3)],
+        force=False,
+    )
+
+    assert rep["repaired"] == 1
+    assert any(
+        item["code"] == "PARTITION_BLAST_RADIUS" for item in rep["finding_details"]
+    )
+    got = pl.read_parquet(
+        tmp_path / "kline_minute" / f"date={DAY.isoformat()}" / "part.parquet"
+    )
+    changed_symbols = got.filter(pl.col("close") == 10.5)["symbol"].unique().to_list()
+    assert changed_symbols == [symbols[0]]

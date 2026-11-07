@@ -79,7 +79,7 @@ def _minute_volume(root, day="2026-11-06"):
 
 def test_runner_detects_and_repairs_star_x100(tmp_path):
     _write_day(tmp_path, "2026-11-06")
-    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path)
+    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path, force=True)
     assert rep["findings"] >= 1 and rep["repaired"] == 1
     assert _minute_volume(tmp_path) == 8_630_559.0
     state = json.loads((tmp_path / "data_verify_state.json").read_text())
@@ -95,7 +95,7 @@ def test_runner_dry_run_by_default(tmp_path):
 
 def test_runner_is_idempotent(tmp_path):
     _write_day(tmp_path, "2026-11-06")
-    run_verify("internal", apply=True, days=None, data_root=tmp_path)
+    run_verify("internal", apply=True, days=None, data_root=tmp_path, force=True)
     rep = run_verify("internal", apply=True, days=[date(2026, 11, 6)], data_root=tmp_path)
     assert rep["repaired"] == 0
     assert _minute_volume(tmp_path) == 8_630_559.0
@@ -107,7 +107,9 @@ def test_runner_resume_skips_done_days(tmp_path):
     (tmp_path / "data_verify_state.json").write_text(
         json.dumps({"last_run_at": "2026-11-07T00:00:00", "stage": "internal",
                     "last_day_done": "2026-11-05", "applied": 0}))
-    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path, resume=True)
+    rep = run_verify(
+        "internal", apply=True, days=None, data_root=tmp_path, resume=True, force=True
+    )
     assert rep["days"] == 1                      # 只处理 2026-11-06
     assert _minute_volume(tmp_path) == 8_630_559.0
 
@@ -156,7 +158,7 @@ def test_runner_repairs_only_x100_symbols_in_mixed_partition(tmp_path):
         schema=DAILY_SCHEMA,
         orient="row",
     ).write_parquet(daily)
-    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path)
+    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path, force=True)
     assert rep["repaired"] == 1
     df = pl.read_parquet(part)
     star = df.filter(pl.col("symbol") == "688001.SH")
@@ -168,7 +170,7 @@ def test_runner_repairs_only_x100_symbols_in_mixed_partition(tmp_path):
 def test_runner_apply_backs_up_beside_partitions(tmp_path):
     """备份落在 ``data_verify_backup`` 下，且不会被下一轮分区枚举当成待检分区。"""
     _write_day(tmp_path, "2026-11-06")
-    run_verify("internal", apply=True, days=None, data_root=tmp_path)
+    run_verify("internal", apply=True, days=None, data_root=tmp_path, force=True)
     backups = list((tmp_path / "data_verify_backup").rglob("part.parquet"))
     assert len(backups) == 1
     assert pl.read_parquet(backups[0])["volume"][0] == 863_055_900.0
@@ -182,7 +184,7 @@ def test_runner_apply_skips_unclosed_day(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "_today", lambda: date(2026, 11, 6))
     _write_day(tmp_path, "2026-11-06")
-    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path)
+    rep = run_verify("internal", apply=True, days=None, data_root=tmp_path, force=True)
     assert rep["findings"] >= 1 and rep["repaired"] == 0
     assert _minute_volume(tmp_path) == 863_055_900.0
     assert not (tmp_path / "data_verify_backup").exists()
@@ -201,7 +203,9 @@ def test_runner_resume_ignores_state_from_other_stage(tmp_path, caplog):
         json.dumps({"last_run_at": "2026-11-07T00:00:00", "stage": "structure",
                     "last_day_done": "2026-11-06", "applied": 0}))
     with caplog.at_level("WARNING"):
-        rep = run_verify("internal", apply=True, days=None, data_root=tmp_path, resume=True)
+        rep = run_verify(
+            "internal", apply=True, days=None, data_root=tmp_path, resume=True, force=True
+        )
     assert rep["days"] == 2                      # 断点作废，两天都要跑
     assert rep["repaired"] == 1
     assert _minute_volume(tmp_path) == 8_630_559.0

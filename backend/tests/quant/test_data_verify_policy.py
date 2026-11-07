@@ -194,3 +194,20 @@ def test_decide_one_decision_per_finding():
     d = decide(f, {"tdx": "agree_external", "baostock": "agree_external"})
     assert [x.finding.code for x in d] == [x.code for x in f]
     assert {x.action for x in d} == {"repair_local"}
+
+
+def test_nan_daily_close_is_non_finite_not_silent_skip():
+    findings = compare_daily_external(
+        _df(float("nan")), _df(10.0), source="tdx"
+    )
+    assert [finding.code for finding in findings] == ["NON_FINITE"]
+    assert findings[0].severity == "hard"
+    assert findings[0].detail["side"] == "local"
+
+
+def test_nan_external_close_is_non_finite_not_silent_skip():
+    findings = compare_daily_external(
+        _df(10.0), _df(float("inf")), source="tdx"
+    )
+    assert [finding.code for finding in findings] == ["NON_FINITE"]
+    assert findings[0].detail["side"] == "external"

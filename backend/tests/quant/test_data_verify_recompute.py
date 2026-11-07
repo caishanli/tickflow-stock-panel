@@ -31,7 +31,7 @@ def test_replace_symbols_preserves_etf_daily_without_date_column(tmp_path):
                  schema=schema, orient="row").write_parquet(part)
     repl = pl.DataFrame([("510300.SH", 4.0, 4.1, 3.9, 4.12, 1000.0, 4000.0)],
                         schema=schema, orient="row")
-    replace_symbols(part, repl, backup_root=tmp_path / "bk", run_id="r1", dry_run=False)
+    replace_symbols(part, repl, backup_root=tmp_path / "bk", run_id="r1", dry_run=False, force=True)
     out = pl.read_parquet(part)
     assert out["close"][0] == 4.12 and "date" not in out.columns
 
@@ -52,7 +52,7 @@ def test_replace_symbols_leaves_other_symbols_and_backs_up_original(tmp_path):
         schema=schema, orient="row",
     )
     res = replace_symbols(part, repl, backup_root=tmp_path / "bk", run_id="r1",
-                          dry_run=False)
+                          dry_run=False, force=True)
     out = pl.read_parquet(part)
     assert out.filter(pl.col("symbol") == "600000.SH").equals(
         pl.read_parquet(res["backup"]).filter(pl.col("symbol") == "600000.SH")

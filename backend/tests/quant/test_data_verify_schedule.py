@@ -14,6 +14,7 @@
 实现（Polars 纯计算 + 写临时分区）。
 """
 
+import json
 from datetime import date, datetime, timedelta
 
 import polars as pl
@@ -86,7 +87,7 @@ def test_trigger_wraps_past_midnight():
 # ── 编排 ──────────────────────────────────────────────────────────
 
 
-def test_run_daily_incremental_repairs_daily_and_recomputes(tmp_path, monkeypatch):
+def test_run_daily_incremental_tdx_single_source_never_writes(tmp_path, monkeypatch):
     from app.quant.data_verify import recompute as recompute_module
     from app.quant.data_verify import runner as runner_module
     from app.quant.data_verify.probes import tdx_package
@@ -100,10 +101,14 @@ def test_run_daily_incremental_repairs_daily_and_recomputes(tmp_path, monkeypatc
     def _fake_fetch(day, *, timeout=None):
         return _external(day.isoformat(), close=10.5, volume=100_000.0)
 
-    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None):
-        verify_calls.append((stage, apply, [str(d) for d in days], str(data_root)))
+    def _fake_run_verify(
+        stage, *, apply=False, days=None, data_root=None,
+        allow_single_source=False, force=False,
+    ):
+        verify_calls.append((stage, apply, [str(d) for d in days], str(data_root),
+                             allow_single_source, force))
         return {"findings": 0, "repaired": 0, "days": len(days),
-                "sources": [], "state_path": "x"}
+                "sources": [], "state_path": "x", "quarantine": [], "receipts": []}
 
     def _fake_recompute(days, *, tables, prune, runner, data_dir=None,
                         repo=None, capset=None):
@@ -116,22 +121,26 @@ def test_run_daily_incremental_repairs_daily_and_recomputes(tmp_path, monkeypatc
 
     result = run_daily_incremental(days=7, data_root=tmp_path)
 
-    # 日线被外部覆盖修复（close 10.0 → 10.5），volume 保持「手」（100_000 股 ×0.01）。
+    # 定时任务只有 TDX 一个外源：必须报告，不得写日线或触发重算。
     for day in ("2026-11-05", "2026-11-06"):
         out = pl.read_parquet(tmp_path / "kline_daily" / f"date={day}" / "part.parquet")
-        assert out["close"][0] == 10.5
+        assert out["close"][0] == 10.0
         assert out["volume"][0] == 1000.0
 
-    assert verify_calls == [("all", True, ["2026-11-05", "2026-11-06"], str(tmp_path))]
-    assert recompute_calls == [(["2026-11-05", "2026-11-06"], ["kline_daily_enriched"],
-                                str(tmp_path))]
-    assert result["repaired"] == 2
-    assert result["daily_repaired_days"] == ["2026-11-05", "2026-11-06"]
-    assert result["recompute"]["days"] == 2
+    assert verify_calls == [
+        ("all", True, ["2026-11-05", "2026-11-06"], str(tmp_path), False, False)
+    ]
+    assert recompute_calls == []
+    assert result["repaired"] == 0
+    assert result["single_source"] == 2
+    assert result["daily_repaired_days"] == []
+    assert result["recompute"] is None
     assert result["sources"] == ["tdx"]
-    # 状态与隔离清单已落盘
+    # 状态、隔离清单与本轮 receipt（可为空）均已落盘。
     assert (tmp_path / "data_verify_status.json").is_file()
     assert (tmp_path / "data_verify_quarantine.json").is_file()
+    receipt_path = tmp_path / "data_verify_receipts" / f"{result['run_id']}.json"
+    assert receipt_path.is_file()
 
 
 def test_run_daily_incremental_skips_recompute_without_daily_repair(tmp_path, monkeypatch):
@@ -147,7 +156,7 @@ def test_run_daily_incremental_skips_recompute_without_daily_repair(tmp_path, mo
         # 外部与本地一致（10.0），不产出 finding → 不触发日线修复。
         return _external(day.isoformat(), close=10.0, volume=100_000.0)
 
-    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None):
+    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None, **_kwargs):
         return {"findings": 0, "repaired": 0, "days": len(days),
                 "sources": [], "state_path": "x"}
 
@@ -178,7 +187,7 @@ def test_run_daily_incremental_writes_quarantine_for_conflicts(tmp_path, monkeyp
     def _fake_fetch(day, *, timeout=None):
         return _external(day.isoformat(), close=10.5, volume=100_000.0)
 
-    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None):
+    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None, **_kwargs):
         return {"findings": 0, "repaired": 0, "days": len(days),
                 "sources": [], "state_path": "x"}
 
@@ -225,7 +234,7 @@ def test_run_daily_incremental_excludes_today_before_selecting_last_n(tmp_path, 
     def _fake_fetch(day, *, timeout=None):
         return _external(day.isoformat(), close=10.0)
 
-    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None):
+    def _fake_run_verify(stage, *, apply=False, days=None, data_root=None, **_kwargs):
         verify_days.extend(days)
         return {"findings": 0, "repaired": 0, "days": len(days), "sources": []}
 
@@ -321,3 +330,60 @@ def test_start_scheduler_registers_replaceable_data_verify_job(monkeypatch):
     assert _field(job["trigger"], "hour") == "16"
     assert _field(job["trigger"], "minute") == "30"
     assert result is fake and fake.started
+
+
+def test_run_daily_incremental_combines_minute_quarantine_and_receipts(tmp_path, monkeypatch):
+    from app.quant.data_verify import runner as runner_module
+    from app.quant.data_verify.probes import tdx_package
+
+    _write_daily(tmp_path, "2026-11-05", close=10.0)
+    minute_conflict = {
+        "table": "kline_minute", "day": "2026-11-05", "symbol": "600000.SH",
+        "reason": "conflict",
+    }
+    minute_receipt = {
+        "table": "kline_minute", "day": "2026-11-05", "symbol": "600000.SH",
+        "field": "close,volume", "old": 10.0, "new": 10.5,
+        "source": "eltdx,tencent", "run_id": "minute-run",
+    }
+
+    monkeypatch.setattr(
+        tdx_package, "fetch_daily_package",
+        lambda day, *, timeout=None: _external(day.isoformat(), close=10.0),
+    )
+
+    def fake_verify(*_args, **_kwargs):
+        return {
+            "findings": 1, "repaired": 1, "days": 1, "sources": ["tencent"],
+            "quarantine": [minute_conflict], "receipts": [minute_receipt],
+        }
+
+    monkeypatch.setattr(runner_module, "run_verify", fake_verify)
+    result = run_daily_incremental(days=7, data_root=tmp_path)
+
+    quarantine = (tmp_path / "data_verify_quarantine.json").read_text()
+    assert "kline_minute" in quarantine and "conflict" in quarantine
+    receipts = json.loads(
+        (tmp_path / "data_verify_receipts" / f"{result['run_id']}.json").read_text()
+    )
+    assert receipts == [minute_receipt]
+    assert result["quarantined"] == 1
+
+
+def test_acceptance_qfq_agreement_allows_two_clean_tools():
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).parents[2] / "scripts" / "verify_acceptance.py"
+    spec = importlib.util.spec_from_file_location("verify_acceptance", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._basis_agrees(set(), {"qfq_days": 0, "worst": []}) is True
+    assert module._basis_agrees(
+        {"2023-04-19"}, {"qfq_days": 1, "worst": [{"date": "2023-04-19"}]}
+    ) is True
+    assert module._basis_agrees(set(), {"qfq_days": 1, "worst": []}) is False
+    assert module._basis_agrees(
+        {"2023-04-19"}, {"qfq_days": 1, "worst": [{"date": "2023-06-01"}]}
+    ) is False

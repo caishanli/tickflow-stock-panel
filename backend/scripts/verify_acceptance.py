@@ -77,7 +77,8 @@ def check_star_x100(
             from app.quant.data_verify.runner import run_verify
 
             run_verify(
-                "internal", apply=True, days=[date.fromisoformat(day)], data_root=data_root
+                "internal", apply=True, days=[date.fromisoformat(day)], data_root=data_root,
+                force=True,
             )
         after_findings = _star_findings(data_root, day) if apply and detected else []
         remaining = sum(f.code in (MINUTE_VOLUME_X100, MINUTE_VOLUME_MISMATCH)
@@ -238,6 +239,25 @@ def _run_qfq_child(
         return _result("FAIL", f"qfq 子进程结果无法解析: {exc}")
 
 
+def _basis_agrees(qfq_days: set[str], baseline: dict[str, Any]) -> bool:
+    """两工具结论一致即通过；双方都干净也算一致。
+
+    ``daily_basis_repair.detect`` 的 ``worst`` 只保留最严重的 5 天，因此有日期
+    明细时要求它是 data_verify 异常日集合的子集，而不是强求两边集合等长。
+    """
+    baseline_bad = int(baseline.get("qfq_days") or 0) > 0
+    if bool(qfq_days) != baseline_bad:
+        return False
+    if not qfq_days:
+        return True
+    baseline_days = {
+        str(item["date"])
+        for item in (baseline.get("worst") or [])
+        if isinstance(item, dict) and item.get("date")
+    }
+    return not baseline_days or baseline_days.issubset(qfq_days)
+
+
 def check_qfq_basis(
     data_root: Path,
     *,
@@ -245,7 +265,7 @@ def check_qfq_basis(
     seed: int = 42,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
-    """Task 12 qfq 核验与 daily_basis_repair.detect 必须同时判定异常。"""
+    """qfq 核验与 daily_basis_repair.detect 的异常/干净结论必须一致。"""
     try:
         from app.quant.data_verify.checks_factors import apply_local_qfq, compare_qfq
     except ModuleNotFoundError as exc:
@@ -267,6 +287,7 @@ def check_qfq_basis(
     external = pl.DataFrame(external_rows).with_columns(pl.col("date").str.to_date())
     raw, factors = _load_local_qfq_inputs(data_root, sampled, QFQ_START, QFQ_END)
     finding_counts: dict[str, int] = {}
+    qfq_days: set[str] = set()
     for symbol in sampled:
         local_raw = raw.filter(pl.col("symbol") == symbol)
         external_symbol = external.filter(pl.col("symbol") == symbol)
@@ -275,12 +296,13 @@ def check_qfq_basis(
         local = apply_local_qfq(
             local_raw, factors.filter(pl.col("symbol") == symbol)
         )
-        finding_counts[symbol] = len(compare_qfq(local, external_symbol, symbol=symbol))
-    qfq_bad = any(finding_counts.values())
-    baseline_bad = int(baseline.get("qfq_days") or 0) > 0
-    ok = qfq_bad and baseline_bad
+        findings = compare_qfq(local, external_symbol, symbol=symbol)
+        finding_counts[symbol] = len(findings)
+        qfq_days.update(finding.day.isoformat() for finding in findings)
+    ok = _basis_agrees(qfq_days, baseline)
     detail = (
         f"data_verify 异常标的={sum(bool(n) for n in finding_counts.values())}/{len(sampled)}，"
+        f"data_verify qfq_days={len(qfq_days)}，"
         f"daily_basis_repair qfq_days={baseline.get('qfq_days')}，"
         f"qfq_range={baseline.get('qfq_range')}"
     )

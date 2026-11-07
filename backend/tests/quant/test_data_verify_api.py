@@ -28,6 +28,8 @@ STATUS_KEYS = {
     "findings",
     "repaired",
     "quarantined",
+    "single_source",
+    "skipped",
     "sources",
 }
 
@@ -113,6 +115,8 @@ def test_write_status_atomic_fixed_keys(tmp_path):
     assert data["repaired"] == 3
     assert data["stage"] == "all"       # 未给 stage 时默认整轮
     assert data["quarantined"] == 0
+    assert data["single_source"] == 0
+    assert data["skipped"] is None
     assert data["sources"] == ["tencent", "sina"]
     datetime.fromisoformat(data["last_run_at"])      # ISO 可被解析
     assert not (tmp_path / (STATUS_FILENAME + ".tmp")).exists()
@@ -138,6 +142,13 @@ def test_write_status_counts_quarantine_entries(tmp_path):
     write_status({"quarantined": [{"table": "kline_daily"}, {"table": "kline_minute"}]},
                  tmp_path)
     assert read_status(tmp_path)["quarantined"] == 2
+
+
+def test_write_status_preserves_no_source_skip_and_single_source_count(tmp_path):
+    write_status({"skipped": "no_source", "single_source": 2}, tmp_path)
+    data = read_status(tmp_path)
+    assert data["skipped"] == "no_source"
+    assert data["single_source"] == 2
 
 
 def test_read_status_missing_or_corrupt_returns_none(tmp_path):

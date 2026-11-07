@@ -46,6 +46,7 @@ MINUTE_VOLUME_X100: Final = "MINUTE_VOLUME_X100"
 MINUTE_VOLUME_MISMATCH: Final = "MINUTE_VOLUME_MISMATCH"
 MINUTE_CLOSE_MISMATCH: Final = "MINUTE_CLOSE_MISMATCH"
 MINUTE_AMOUNT_MISMATCH: Final = "MINUTE_AMOUNT_MISMATCH"
+NON_FINITE: Final = "NON_FINITE"
 
 #: 「量被放大 100 倍」的判定区间（单位归一后的比值）。
 X100_RATIO_LOW: Final = 95.0
@@ -113,6 +114,55 @@ def aggregate_minute(minute: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _nonfinite_inputs(
+    minute: pl.DataFrame, daily: pl.DataFrame, daily_day: pl.Expr, *, table: str
+) -> tuple[list[Finding], pl.DataFrame | None]:
+    """先找输入侧的 NaN/Inf；这些 symbol 不再参与后续数值判定。"""
+    bad: dict[tuple[str, Any], dict[str, set[str]]] = {}
+    datasets = (
+        ("minute", minute, pl.col("datetime").dt.date()),
+        ("daily", daily, daily_day),
+    )
+    for side, frame, day_expr in datasets:
+        fields = [name for name in ("volume", "close", "amount") if name in frame.columns]
+        if not fields:
+            continue
+        selected = frame.select(
+            pl.col("symbol"),
+            day_expr.alias("_day"),
+            *[
+                (~pl.col(name).cast(pl.Float64).is_finite()).fill_null(False).alias(name)
+                for name in fields
+            ],
+        )
+        invalid = selected.filter(pl.any_horizontal([pl.col(name) for name in fields]))
+        for row in invalid.iter_rows(named=True):
+            key = (str(row["symbol"]), row["_day"])
+            entry = bad.setdefault(key, {side: set() for side in ("minute", "daily")})
+            entry[side].update(name for name in fields if row[name])
+
+    findings: list[Finding] = []
+    for (symbol, day), sides in sorted(bad.items(), key=lambda item: item[0][0]):
+        findings.append(Finding(
+            table=table,
+            day=day,
+            symbol=symbol,
+            code=NON_FINITE,
+            severity=SEVERITY_HARD,
+            detail={"fields": {
+                side: sorted(names) for side, names in sides.items() if names
+            }},
+        ))
+    if not bad:
+        return [], None
+    keys = pl.DataFrame(
+        [{"symbol": symbol, "_day": day} for symbol, day in bad],
+        schema={"symbol": pl.String, "_day": pl.Date},
+        orient="row",
+    )
+    return findings, keys
+
+
 def compare_minute_to_daily(
     minute: pl.DataFrame,
     daily: pl.DataFrame,
@@ -171,11 +221,12 @@ def compare_minute_to_daily(
     if unmatched_daily:
         unmatched["daily_only"] = unmatched_daily
 
-    joined = agg.join(daily.select(daily_exprs), on="symbol", how="inner").filter(
-        pl.col("d_volume").is_not_null() & (pl.col("d_volume") != 0)
-    )
+    findings, nonfinite_keys = _nonfinite_inputs(minute, daily, day_col, table=table)
+    joined = agg.join(daily.select(daily_exprs), on="symbol", how="inner")
+    if nonfinite_keys is not None:
+        joined = joined.join(nonfinite_keys, on=["symbol", "_day"], how="anti")
+    joined = joined.filter(pl.col("d_volume").is_not_null() & (pl.col("d_volume") != 0))
 
-    findings: list[Finding] = []
     for row in joined.sort("symbol").iter_rows(named=True):
         symbol = str(row["symbol"])
         day = row["_day"]

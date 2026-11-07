@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -28,8 +29,34 @@ import polars as pl
 
 from app.raw_partition_lock import daily_partition_lock
 
+logger = logging.getLogger(__name__)
+
 #: 需要缩放的列。其余列一律不碰（含 OHLC 与 symbol/datetime）。
 SCALED_COLUMNS: tuple[str, ...] = ("volume", "amount")
+
+PARTITION_BLAST_RADIUS = "PARTITION_BLAST_RADIUS"
+PARTITION_BLAST_RADIUS_LIMIT = 0.05
+
+
+def blast_radius_block(
+    affected_rows: int, partition_rows: int, *, force: bool = False
+) -> dict | None:
+    """超过单分区 5% 的自动写入降级为报告；``force=True`` 显式放行。"""
+    ratio = affected_rows / max(partition_rows, 1)
+    if force or ratio <= PARTITION_BLAST_RADIUS_LIMIT:
+        return None
+    logger.warning(
+        "%s: affected_rows=%d partition_rows=%d ratio=%.4f，跳过写入",
+        PARTITION_BLAST_RADIUS, affected_rows, partition_rows, ratio,
+    )
+    return {
+        "changed_rows": 0,
+        "backup": None,
+        "affected_rows": affected_rows,
+        "partition_rows": partition_rows,
+        "blast_radius": ratio,
+        "blocked": PARTITION_BLAST_RADIUS,
+    }
 
 
 def _backup_path(part: Path, backup_root: Path, run_id: str, table: str) -> Path:
@@ -112,6 +139,7 @@ def scale_minute_volume_amount(
     backup_root: Path,
     run_id: str,
     dry_run: bool,
+    force: bool = False,
 ) -> dict:
     """把分区的 ``volume`` / ``amount`` 同除 ``factor``（``factor=100`` 即还原 ×100）。
 
@@ -134,6 +162,9 @@ def scale_minute_volume_amount(
         changed_rows = df.filter(_nonzero_mask()).height
         if changed_rows == 0:               # 全 0 量/额：除下来还是 0，不写不备份
             return {"changed_rows": 0, "backup": None}
+        blocked = blast_radius_block(changed_rows, df.height, force=force)
+        if blocked is not None:
+            return blocked
         scaled = df.with_columns([
             _scaled_expr(col, df.schema[col], factor) for col in SCALED_COLUMNS
         ])
@@ -224,6 +255,7 @@ def replace_symbols(
     backup_root: Path,
     run_id: str,
     dry_run: bool,
+    force: bool = False,
 ) -> dict:
     """按 ``symbol`` 整行替换分区内的行（外部覆盖修复）。
 
@@ -250,6 +282,9 @@ def replace_symbols(
         replaced, changed_rows = _replace_rows(part, df, replacement)
         if changed_rows == 0:            # 没有匹配标的：不备份不写盘
             return {"changed_rows": 0, "backup": None}
+        blocked = blast_radius_block(changed_rows, df.height, force=force)
+        if blocked is not None:
+            return blocked
         target = backup_partition(part, backup_root, run_id)
         _write_partition_unlocked(replaced, part)
     return {"changed_rows": changed_rows, "backup": str(target)}
