@@ -3,8 +3,8 @@
 对每个 symbol 检查四类问题：
 
 - **bar 数**：不足 ``expected_bars``（默认 241）记 ``MISSING_BARS``。停牌、新股
-  首日、提前收盘都会让 bar 数不足，所以这条只是 ``soft``，且停牌名单内的 symbol
-  直接跳过——不能把正常场景刷成告警。
+  首日、提前收盘都会让 bar 数不足，所以这条只是 ``soft``，且停牌名单内的
+  symbol 直接跳过——不能把正常场景刷成告警。
 - **时间戳**：``09:30``–``11:30`` / ``13:01``–``15:00`` 之外 → ``OUT_OF_SESSION``；
   腾讯/新浪的午休边界偶尔会写出 ``13:00`` bar，单独记 ``FORBIDDEN_1300``；
   同一 symbol 同一分钟出现多行 → ``DUPLICATE_BAR``。
@@ -98,20 +98,20 @@ def check_structure(
 
     if len(price_cols) == 4:
         price_order_ok = (
-            (pl.col("high") >= pl.min_horizontal(pl.col("open"), pl.col("close")))
-            & (pl.col("low") <= pl.max_horizontal(pl.col("open"), pl.col("close")))
+            (pl.col("high") >= pl.max_horizontal(pl.col("open"), pl.col("close")))
+            & (pl.col("low") <= pl.min_horizontal(pl.col("open"), pl.col("close")))
             & (pl.col("high") >= pl.col("low"))
         )
         price_order_bad = (~price_order_ok).fill_null(False) & ~price_nonfinite
     else:
         price_order_bad = pl.lit(False)
 
-    neg_volume = (pl.col("volume") < 0).fill_null(False) if "volume" in df.columns else pl.lit(False)
-    neg_amount = (pl.col("amount") < 0).fill_null(False) if "amount" in df.columns else pl.lit(False)
+    has_volume = "volume" in df.columns
+    has_amount = "amount" in df.columns
+    neg_volume = (pl.col("volume") < 0).fill_null(False) if has_volume else pl.lit(False)
+    neg_amount = (pl.col("amount") < 0).fill_null(False) if has_amount else pl.lit(False)
     ohlc_bad = price_order_bad | neg_volume | neg_amount
-    zero_volume = (
-        (pl.col("volume").fill_null(0) == 0) if "volume" in df.columns else pl.lit(False)
-    )
+    zero_volume = (pl.col("volume").fill_null(0) == 0) if has_volume else pl.lit(False)
 
     annotated = df.with_columns(
         forbidden.alias("_forbidden"),

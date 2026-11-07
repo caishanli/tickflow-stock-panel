@@ -1,7 +1,7 @@
 """L0 结构检查：分区逐 symbol 的 bar 数 / 时间戳 / 数值合法性。
 
-停牌、新股首日、提前收盘这些正常场景不能刷屏，所以 bar 数不足只记 ``soft``，
-且停牌名单内的 symbol 直接跳过 ``MISSING_BARS`` / ``ALL_ZERO``。
+停牌、新股首日、提前收盘这些正常场景不能刷屏，所以 bar 数不足只记
+``soft``，且停牌名单内的 symbol 直接跳过 ``MISSING_BARS`` / ``ALL_ZERO``。
 """
 
 from datetime import date, datetime
@@ -47,6 +47,16 @@ def test_suspended_symbol_with_zero_volume_not_flagged():
     assert codes == []
 
 
+def test_suspended_symbol_fewer_bars_not_flagged():
+    df = _frame([
+        (r[0], r[1], 10.0, 10.0, 10.0, 10.0, 0.0, 0.0)
+        for r in _day_rows("600000.SH", n=200)
+    ])
+    codes = [f.code for f in check_structure(
+        df, table="kline_minute", day=DAY, suspended_symbols={"600000.SH"})]
+    assert codes == []
+
+
 def test_duplicate_and_1300_bar_flagged():
     base = _day_rows("600000.SH")
     rows = [*base, base[0], ("600000.SH", datetime(2026, 11, 6, 13, 0), 1, 1, 1, 1, 1, 1)]
@@ -60,6 +70,26 @@ def test_ohlc_invalid_and_non_finite():
     rows[1] = ("600000.SH", datetime(2026, 11, 6, 9, 31), float("nan"), 10, 9, 10, 100, 1000)
     codes = {f.code for f in check_structure(_frame(rows), table="kline_minute", day=DAY)}
     assert "OHLC_INVALID" in codes and "NON_FINITE" in codes
+
+
+def test_ohlc_high_below_close_only_flagged():
+    rows = _day_rows("600000.SH")
+    # high(10.5) >= min(open, close)=10，但 < close=11：旧实现会漏报。
+    rows[0] = ("600000.SH", datetime(2026, 11, 6, 9, 30), 10.0, 10.5, 9.0, 11.0, 100.0, 1000.0)
+    ohlc = [f for f in check_structure(_frame(rows), table="kline_minute", day=DAY)
+            if f.code == "OHLC_INVALID"]
+    assert len(ohlc) == 1
+    assert ohlc[0].detail == {"price_order_rows": 1, "rows": 1}
+
+
+def test_ohlc_low_above_open_only_flagged():
+    rows = _day_rows("600000.SH")
+    # low(10.5) <= max(open, close)=11，但 > open=10：旧实现会漏报。
+    rows[0] = ("600000.SH", datetime(2026, 11, 6, 9, 30), 10.0, 11.5, 10.5, 11.0, 100.0, 1000.0)
+    ohlc = [f for f in check_structure(_frame(rows), table="kline_minute", day=DAY)
+            if f.code == "OHLC_INVALID"]
+    assert len(ohlc) == 1
+    assert ohlc[0].detail == {"price_order_rows": 1, "rows": 1}
 
 
 def test_out_of_session_bar_flagged():
