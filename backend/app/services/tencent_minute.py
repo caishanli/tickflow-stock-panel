@@ -12,7 +12,9 @@
   bar，与 mootdx 口径一致）；
 - 行格式 ``[时间, 开, 收, 高, 低, 量(手), {}, 换手率(基点)]``——注意第 2
   列是**收**不是高（已用 600000 全天 rollup vs 快照 OHLCV 逐项对齐验证，
-  量合计 653274 vs 653273 手）；
+  量合计 653274 vs 653273 手）；**量的单位随板块而变**：主板/创业板/ETF 为
+  「手」，科创板 688/689 为「股」（统一口径见
+  ``app.quant.data_verify.units.tencent_m1_volume_factor``，落盘前一律折成股）；
 - 第 7 列是换手率基点**不是成交额**；成交额无字段，按
   ``volume(股) × typical((H+L+C)/3)`` 估算（分钟级回测/展示够用，日线级
   对账以 TickFlow 日线为准）；
@@ -39,6 +41,8 @@ from datetime import datetime as _datetime
 
 import polars as pl
 import requests
+
+from app.quant.data_verify.units import tencent_m1_volume_factor
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +141,13 @@ def fetch_m1(session: requests.Session, vendor: str) -> list | None:
 def parse_m1_rows(symbol: str, rows: list, days: set[_date]) -> pl.DataFrame:
     """m1 行 -> 分钟分区帧（北京 naive；volume 股；amount 估算）。
 
+    单位：行内第 6 列对主板/创业板/ETF 是「手」、对科创板 688/689 是「股」
+    （见 ``app.quant.data_verify.units.tencent_m1_volume_factor``），统一折算成
+    股后落盘——``kline_minute`` 的 volume 契约是股。
+
     只保留 ``days`` 内 bar；非法行丢弃。空输入返回空帧（不断言）。
     """
+    factor = tencent_m1_volume_factor(symbol)
     out: list[tuple] = []
     for r in rows:
         try:
@@ -150,7 +159,7 @@ def parse_m1_rows(symbol: str, rows: list, days: set[_date]) -> pl.DataFrame:
             o, c, h, lo = float(r[1]), float(r[2]), float(r[3]), float(r[4])
             if o <= 0 or c <= 0 or h <= 0 or lo <= 0:
                 continue
-            vol = float(r[5]) * 100.0
+            vol = float(r[5]) * factor
             if vol < 0:
                 continue
             typical = (h + lo + c) / 3.0
