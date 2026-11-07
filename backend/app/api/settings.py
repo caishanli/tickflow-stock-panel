@@ -1704,3 +1704,82 @@ def update_review_push(req: ReviewPushIn) -> dict:
     from app.services import preferences
     saved = preferences.set_review_push_channels(req.channels)
     return {"review_push_channels": saved}
+
+
+# ================================================================
+# 多源数据核验 (data_verify) — 状态查询 / 手动触发
+# ================================================================
+# 报告落盘与清单合并见 app.quant.data_verify.report；这里只做「读上一轮状态」
+# 和「起后台任务跑一轮 all(apply=True)」。鉴权沿用全局 auth_middleware
+# (未登录 401)，不额外加依赖。
+
+
+def _run_verify_job(job_id: str) -> None:
+    """后台线程体：跑一轮 all + apply，写状态文件，进度/结果进 job_store。
+
+    单独抽成模块级函数（而非嵌在端点里）是为了测试能同步驱动它，不必
+    起真线程、也不真扫全量分区。
+    """
+    from app.config import settings
+    from app.quant.data_verify.report import write_status
+    from app.quant.data_verify.runner import run_verify
+    from app.services.pipeline_jobs import JobCancelledError, job_store
+
+    def progress(stage: str, pct: int, msg: str) -> None:
+        job_store.progress(job_id, stage, pct, msg)
+
+    try:
+        job_store.start(job_id)
+        report = run_verify("all", apply=True, progress=progress)
+        write_status(report, settings.data_dir)
+        job_store.succeed(job_id, report)
+    except JobCancelledError:
+        # 已被 reap/手动取消终止：job 状态已由 terminate() 写成 failed。
+        logger.warning("data_verify job %s cancelled", job_id)
+    except Exception as exc:
+        logger.exception("data_verify job %s failed", job_id)
+        job_store.fail(job_id, str(exc))
+
+
+def _spawn_verify_job(job_id: str) -> None:
+    """起独立 daemon 线程跑核验（端点本身快速返回 job_id）。"""
+    import threading
+
+    threading.Thread(
+        target=_run_verify_job,
+        args=(job_id,),
+        daemon=True,
+        name=f"data-verify-{job_id[:8]}",
+    ).start()
+
+
+@router.get("/data-verify/status")
+def get_data_verify_status() -> dict:
+    """上一轮核验状态；从未跑过返回 ``{"status": "never"}``。
+
+    有记录时返回状态文件全部固定键 + ``status="ok"``，并附 ``last_run``
+    (= ``last_run_at`` 的别名，兼容旧前端字段名)。
+    """
+    from app.config import settings
+    from app.quant.data_verify.report import read_status
+
+    status = read_status(settings.data_dir)
+    if status is None:
+        return {"status": "never"}
+    return {"status": "ok", "last_run": status["last_run_at"], **status}
+
+
+@router.post("/data-verify/run")
+def run_data_verify() -> dict:
+    """手动触发一轮全量核验(all + apply)，立即返回 job_id。
+
+    单飞：已有 pending/running 任务时直接复用其 id(``reused=True``)，不再
+    另起线程——两次并发核验会同时写同一批分区与状态文件。
+    """
+    from app.services.pipeline_jobs import job_store
+
+    job_id, is_new = job_store.create(long_running=True)
+    if not is_new:
+        return {"job_id": job_id, "reused": True}
+    _spawn_verify_job(job_id)
+    return {"job_id": job_id, "reused": False}
