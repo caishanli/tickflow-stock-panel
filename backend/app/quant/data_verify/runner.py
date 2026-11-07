@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -184,20 +185,46 @@ def _empty_bars() -> pl.DataFrame:
     })
 
 
-def _fetch_for_day(
-    source: _MinuteSource, symbol: str, day: date
+def _full_history(
+    source: _MinuteSource,
+    symbol: str,
+    cache: dict[tuple[str, str], pl.DataFrame | None] | None,
 ) -> pl.DataFrame | None:
-    """取一个源某标的的当日 bar；``None`` = 该源本次调用失败（不可用）。
+    """一个源某标的的全量 bar（按 ``(source, symbol)`` 每轮只拉一次）。
 
-    空帧 = 源可用但该标的当日无数据（停牌、超过源深度等）。
+    缓存值是 ``None`` 表示该次拉取失败（后续 day 不再重试）；空帧表示源可用
+    但该标的无数据。``cache=None`` 时不缓存（测试/一次性调用）。
     """
+    key = (source.name, symbol)
+    if cache is not None and key in cache:
+        return cache[key]
     try:
         frame = source.fetch(symbol)
     except Exception as exc:       # ImportError / 网络 / 解析错误：该源本轮跳过
         logger.debug("分钟源 %s 拉取 %s 失败: %s: %s",
                      source.name, symbol, type(exc).__name__, exc)
+        frame = None
+    if cache is not None:
+        cache[key] = frame
+    return frame
+
+
+def _fetch_for_day(
+    source: _MinuteSource,
+    symbol: str,
+    day: date,
+    cache: dict[tuple[str, str], pl.DataFrame | None] | None = None,
+) -> pl.DataFrame | None:
+    """取一个源某标的的当日 bar；``None`` = 该源本次调用失败（不可用）。
+
+    全量历史按 ``(source, symbol)`` 缓存，逐日循环只做内存切片——否则默认
+    94 天 × 100 只会把同一只标的的完整历史重复拉 94 次。
+    空帧 = 源可用但该标的当日无数据（停牌、超过源深度等）。
+    """
+    frame = _full_history(source, symbol, cache)
+    if frame is None:
         return None
-    if frame is None or frame.is_empty():
+    if frame.is_empty():
         return _empty_bars()
     required = {"symbol", "datetime", "close", "volume"}
     absent = sorted(required - set(frame.columns))
@@ -225,33 +252,55 @@ def _first_symbol(data_root: Path, day: date) -> str | None:
 
 
 def _sources_reachable(
-    sources: Sequence[_MinuteSource], data_root: Path, day: date
+    sources: Sequence[_MinuteSource],
+    data_root: Path,
+    day: date,
+    cache: dict[tuple[str, str], pl.DataFrame | None] | None = None,
 ) -> bool:
     """用最新分区的一只标的探一次源，全部失败则整轮跳过（不逐标的硬刷超时）。"""
     symbol = _first_symbol(data_root, day)
     if symbol is None:
         return True
     return any(
-        _fetch_for_day(source, symbol, day) is not None for source in sources
+        _fetch_for_day(source, symbol, day, cache) is not None for source in sources
     )
 
 
-def _is_auction_bar(value: datetime) -> bool:
-    """09:30/09:31 是竞价撮合+首分钟，跨源分桶口径不同，不参与逐 bar 数值比对。
+def _is_auction_bar(value: datetime, *, source: str = "") -> bool:
+    """竞价 bar 不参与数值比对（design §5.3）。
 
-    本地把 09:25 竞价量记为 09:30 一根、09:31 是首分钟；新浪把竞价并进 09:31。
-    设计 §5.3 明确「集合竞价 09:30 bar 不单独校验」，这里把 09:31 也一并放过。
+    09:30 对所有源都跳过（本地把 09:25 竞价量记在 09:30 一根）。09:31 只有
+    新浪需要跳过：它把竞价并进 09:31（腾讯与本地一样是独立的一分钟）。
+    把 09:31 对所有源都跳过会漏掉腾讯 09:31 的真实错误。
     """
-    return value.hour == 9 and value.minute < 32
+    if value.hour != 9:
+        return False
+    if value.minute == 30:
+        return True
+    return value.minute == 31 and source == "sina"
 
 
-def _diff_stats(local: pl.DataFrame, external: pl.DataFrame) -> dict[str, Any]:
+def _finite(value: Any) -> float | None:
+    """``None`` / NaN / ±Inf 一律当「不可比」（不参与比对与求和）。"""
+    if value is None:
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _diff_stats(
+    local: pl.DataFrame, external: pl.DataFrame, *, skip_0931: bool = False
+) -> dict[str, Any]:
     """逐 bar 对齐后的差异计数（按 datetime join，不猜单位）。
 
     跨源 1m 的**分桶边界**并不可比：同一笔成交在 A 源记 11:19、B 源可能记
     11:20，逐 bar 相对差会大面积误报（实测新浪 vs 本地 238 根里 195 根超
-    0.5%）。所以量的容差按**当日总量**的 0.5% 计（design §5.2 的相对容差在
-    跨源场景只剩「总量」可比）；价格仍按 L1 的每 bar 容差。
+    0.5%）。所以量的**逐 bar** 容差按当日总量的 0.5% 计（design §5.2 的相对
+    容差在跨源场景只剩「总量」可比）；价格仍按 L1 的每 bar 容差。
+
+    但只看逐 bar 会漏掉「总量守恒的重新分配」：因此额外返回
+    ``volume_total_mismatch``——共同 bar 的 Σ量差 > 0.5% × Σ本地量。
+    竞价 bar（09:30 全部、09:31 仅新浪）不参与任何数值比对。
     """
     left = local.select([
         pl.col("datetime"),
@@ -271,16 +320,21 @@ def _diff_stats(local: pl.DataFrame, external: pl.DataFrame) -> dict[str, Any]:
 
     close_bad = 0
     volume_bad = 0
+    matched_local_volume = 0.0
+    matched_external_volume = 0.0
     examples: list[dict[str, Any]] = []
     for row in matched.iter_rows(named=True):
-        if _is_auction_bar(row["datetime"]):
+        source = "sina" if skip_0931 else ""
+        if _is_auction_bar(row["datetime"], source=source):
             continue
-        l_close = row["l_close"]
-        e_close = row["e_close"]
-        l_volume = row["l_volume"]
-        e_volume = row["e_volume"]
-        if None in (l_close, e_close, l_volume, e_volume):
+        l_close = _finite(row["l_close"])
+        e_close = _finite(row["e_close"])
+        l_volume = _finite(row["l_volume"])
+        e_volume = _finite(row["e_volume"])
+        if l_close is None or e_close is None or l_volume is None or e_volume is None:
             continue
+        matched_local_volume += l_volume
+        matched_external_volume += e_volume
         tolerance = max(EXTERNAL_PRICE_ABS_TOL, EXTERNAL_PRICE_REL_TOL * abs(l_close))
         if abs(e_close - l_close) > tolerance:
             close_bad += 1
@@ -296,6 +350,8 @@ def _diff_stats(local: pl.DataFrame, external: pl.DataFrame) -> dict[str, Any]:
             if len(examples) < 3:
                 examples.append({"datetime": row["datetime"].isoformat(),
                                  "local_volume": l_volume, "external_volume": e_volume})
+    total_tolerance = EXTERNAL_VOLUME_REL_TOL * matched_local_volume
+    total_diff = abs(matched_external_volume - matched_local_volume)
     return {
         "matched": matched.height,
         "local_only": local_only.height,
@@ -303,6 +359,11 @@ def _diff_stats(local: pl.DataFrame, external: pl.DataFrame) -> dict[str, Any]:
         "close_mismatch": close_bad,
         "volume_mismatch": volume_bad,
         "volume_tolerance": volume_tolerance,
+        "volume_total_local": matched_local_volume,
+        "volume_total_external": matched_external_volume,
+        "volume_total_mismatch": matched_local_volume > 0
+        and total_diff > total_tolerance,
+        "volume_total_tolerance": total_tolerance,
         "examples": examples,
         "external_only_times": [
             value.isoformat()
@@ -312,17 +373,32 @@ def _diff_stats(local: pl.DataFrame, external: pl.DataFrame) -> dict[str, Any]:
 
 
 def _disagrees(stats: dict[str, Any]) -> bool:
-    """该源是否支持「本地有错」：缺 bar 或价/量不一致。"""
+    """该源是否支持「本地有错」：缺 bar 或价/量（逐 bar 或总量）不一致。"""
     return bool(
-        stats["external_only"] or stats["close_mismatch"] or stats["volume_mismatch"]
+        stats["external_only"]
+        or stats["close_mismatch"]
+        or stats["volume_mismatch"]
+        or stats["volume_total_mismatch"]
     )
 
 
-def _frames_agree(left: pl.DataFrame, right: pl.DataFrame) -> bool:
+def _frames_agree(
+    left: pl.DataFrame,
+    right: pl.DataFrame,
+    *,
+    left_name: str = "",
+    right_name: str = "",
+) -> bool:
     """两个外部源在共同 bar 上是否一致（价格 + 量，容差同 L1）。"""
-    stats = _diff_stats(left, right)
-    return stats["matched"] > 0 and stats["close_mismatch"] == 0 \
+    stats = _diff_stats(
+        left, right, skip_0931="sina" in (left_name, right_name)
+    )
+    return (
+        stats["matched"] > 0
+        and stats["close_mismatch"] == 0
         and stats["volume_mismatch"] == 0
+        and not stats["volume_total_mismatch"]
+    )
 
 
 def _source_findings(
@@ -330,7 +406,7 @@ def _source_findings(
     symbol: str, source: str,
 ) -> list[Finding]:
     """一个源 vs 本地的逐 bar 结论（每类一条，detail 里带计数与示例）。"""
-    stats = _diff_stats(local, external)
+    stats = _diff_stats(local, external, skip_0931=source == "sina")
     findings: list[Finding] = []
     base = {"source": source, **stats}
     if stats["external_only"]:
@@ -344,10 +420,15 @@ def _source_findings(
             table=table, day=day, symbol=symbol, code=EXTERNAL_CLOSE_MISMATCH,
             severity=SEVERITY_HARD, detail=dict(base),
         ))
-    if stats["volume_mismatch"]:
+    if stats["volume_mismatch"] or stats["volume_total_mismatch"]:
         findings.append(Finding(
             table=table, day=day, symbol=symbol, code=EXTERNAL_VOLUME_MISMATCH,
-            severity=SEVERITY_HARD, detail=dict(base),
+            severity=SEVERITY_HARD,
+            detail={**base, "scope": (
+                "bars+aggregate" if stats["volume_mismatch"]
+                and stats["volume_total_mismatch"]
+                else "bars" if stats["volume_mismatch"] else "aggregate"
+            )},
         ))
     # 外部源少 bar（腾讯 800 根上限 / 新浪把收盘竞价并进 15:00）只是覆盖度
     # 差异，不产出 finding（design §6.3：不删数据、不因此改本地）。
@@ -382,13 +463,22 @@ def _resolve_replacement(
         name: frame for name, frame in external.items()
         if frame is not None and not frame.is_empty()
     }
-    disagree = [name for name, frame in usable.items() if _disagrees(_diff_stats(local, frame))]
+    disagree = [
+        name for name, frame in usable.items()
+        if _disagrees(_diff_stats(local, frame, skip_0931=name == "sina"))
+    ]
     agree_local = [name for name in usable if name not in disagree]
 
     clusters: list[list[str]] = []
     for name in sorted(disagree, key=lambda item: (-priorities.get(item, 0), item)):
         for cluster in clusters:
-            if all(_frames_agree(usable[name], usable[other]) for other in cluster):
+            if all(
+                _frames_agree(
+                    usable[name], usable[other],
+                    left_name=name, right_name=other,
+                )
+                for other in cluster
+            ):
                 cluster.append(name)
                 break
         else:
@@ -407,7 +497,9 @@ def _resolve_replacement(
     if len(group) >= 2:
         decision["action"] = "repair"
         decision["confirmed"] = True
-    elif len(group) == 1 and not agree_local:
+    elif len(group) == 1 and not agree_local and len(usable) == 1:
+        # 只有「本轮总共只有一个可用外源」才允许单源修复。两个外源互相矛盾
+        # 时各成单元素簇，不能靠优先级挑一个当 single_source 硬修（§5.4 冲突）。
         decision["action"] = "repair"
         decision["single_source"] = True
     elif group:
@@ -443,6 +535,36 @@ def _merge_bars(
     new_bars = staged.join(
         df.select(["symbol", "datetime"]), on=["symbol", "datetime"], how="anti"
     )
+    # 只覆盖真正不一致的已有 bar（容差内的 tick/浮点差异不动），避免「确认修复」
+    # 把整只标的 241 根 bar 全部重写一遍。
+    value_columns = [
+        column for column in ("open", "high", "low", "close", "volume")
+        if column in df.columns and column in staged.columns
+    ]
+    if value_columns:
+        compared = staged.select(["symbol", "datetime", *value_columns]).join(
+            df.select(["symbol", "datetime", *value_columns]),
+            on=["symbol", "datetime"], how="inner", suffix="_local",
+        )
+        mask = pl.lit(False)
+        for column in ("open", "high", "low", "close"):
+            if column in value_columns:
+                tolerance = pl.max_horizontal(
+                    pl.lit(EXTERNAL_PRICE_ABS_TOL),
+                    pl.lit(EXTERNAL_PRICE_REL_TOL) * pl.col(f"{column}_local").abs(),
+                )
+                mask = mask | (
+                    (pl.col(column) - pl.col(f"{column}_local")).abs() > tolerance
+                )
+        if "volume" in value_columns:
+            volume_tolerance = pl.lit(EXTERNAL_VOLUME_REL_TOL) * pl.max_horizontal(
+                pl.col("volume_local").abs(), pl.lit(1.0)
+            )
+            mask = mask | (
+                (pl.col("volume") - pl.col("volume_local")).abs() > volume_tolerance
+            )
+        keys = compared.filter(mask.fill_null(False)).select(["symbol", "datetime"])
+        staged = staged.join(keys, on=["symbol", "datetime"], how="semi")
     renames = {
         column: f"__dv_bar__{column}"
         for column in df.columns
@@ -462,7 +584,7 @@ def _merge_bars(
         updated = pl.concat(
             [updated, _cast_to_schema(new_bars, df.schema)], how="vertical_relaxed"
         ).sort(["symbol", "datetime"])
-    return updated, staged.height
+    return updated, staged.height + new_bars.height
 
 
 def _replace_minute_bars(
@@ -471,7 +593,6 @@ def _replace_minute_bars(
     *,
     backup_root: Path,
     run_id: str,
-    dry_run: bool,
 ) -> int:
     """按 ``(symbol, datetime)`` 覆盖分钟 bar（写前备份、持锁原子写）。
 
@@ -480,10 +601,6 @@ def _replace_minute_bars(
     """
     if replacement.is_empty():
         return 0
-    if dry_run:
-        df = pl.read_parquet(part)
-        _, changed = _merge_bars(part, df, replacement)
-        return changed
     with daily_partition_lock(part):
         df = pl.read_parquet(part)
         merged, changed = _merge_bars(part, df, replacement)
@@ -720,6 +837,7 @@ def _verify_external_table(
     sample: int,
     sources: Sequence[_MinuteSource],
     minute: pl.DataFrame | None = None,
+    cache: dict[tuple[str, str], pl.DataFrame | None] | None = None,
 ) -> tuple[list[Finding], int, bool, bool, bool]:
     """外部分钟源比对 + 仲裁修复一个分区。
 
@@ -751,7 +869,7 @@ def _verify_external_table(
         external: dict[str, pl.DataFrame] = {}
         for source in sources:
             attempted = True
-            frame = _fetch_for_day(source, symbol, day)
+            frame = _fetch_for_day(source, symbol, day, cache)
             if frame is None:
                 continue
             reachable = True
@@ -771,7 +889,7 @@ def _verify_external_table(
             continue
         if apply and allow_repair:
             changed = _replace_minute_bars(
-                part, replacement, backup_root=backup_root, run_id=run_id, dry_run=False
+                part, replacement, backup_root=backup_root, run_id=run_id
             )
             repaired += 1 if changed else 0
             logger.info("%s %s 用 %s 覆盖 %s（%d bar, %s）",
@@ -798,6 +916,7 @@ def _verify_table(
     run_id: str,
     external_sources: Sequence[_MinuteSource] = (),
     sample: int = DEFAULT_SAMPLE,
+    external_cache: dict[tuple[str, str], pl.DataFrame | None] | None = None,
 ) -> tuple[list[Finding], int, bool, bool, bool]:
     """核验单个分区（``<table>/date=<day>``）。
 
@@ -858,6 +977,7 @@ def _verify_table(
             sample=sample,
             sources=external_sources,
             minute=minute,
+            cache=external_cache,
         )
         findings.extend(ext_findings)
         repaired += ext_repaired
@@ -920,9 +1040,13 @@ def run_verify(
     if stage == STAGE_EXTERNAL_MINUTE:
         selected = [day for day in selected if day in external_days]
 
+    # 全量历史按 (source, symbol) 每轮只拉一次，逐日循环只做内存切片。
+    external_cache: dict[tuple[str, str], pl.DataFrame | None] = {}
     external_ready = external_stage and bool(sources)
     if external_ready and selected:
-        external_ready = _sources_reachable(sources, root, selected[-1])
+        external_ready = _sources_reachable(
+            sources, root, selected[-1], external_cache
+        )
     if stage == STAGE_EXTERNAL_MINUTE and not external_ready:
         logger.warning("分钟外部源均不可用，跳过 external_minute")
         return {
@@ -964,6 +1088,7 @@ def run_verify(
                 run_id=run_id,
                 external_sources=sources if run_external else (),
                 sample=sample,
+                external_cache=external_cache,
             )
             day_findings += len(table_findings)
             repaired_count += repaired

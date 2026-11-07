@@ -107,6 +107,13 @@ class _FakeBar:
     amount: float
 
 
+def test_eltdx_vendor_rejects_convertible_bonds():
+    """可转债一手 10 张，×100 换股数是错的——直接不核验。"""
+    assert eltdx_m1._vendor("113001.SH") is None
+    assert eltdx_m1._vendor("123001.SZ") is None
+    assert eltdx_m1._vendor("600000.SH") == "sh600000"
+
+
 def test_parse_eltdx_bars_lots_to_shares_naive_beijing():
     bar = _FakeBar("2026-11-06T15:00:00+08:00", 10.0, 10.1, 9.9, 10.05, 9555.0, 9_600_000.0)
     df = parse_eltdx_bars("600000.SH", [bar])
@@ -344,22 +351,65 @@ def test_external_repair_keeps_local_only_bars(tmp_path, monkeypatch):
     assert got.filter(pl.col("datetime") == datetime(2026, 11, 5, 10, 0)).height == 1
 
 
-def test_diff_stats_ignores_auction_bar_and_uses_daily_volume_tolerance():
-    """竞价分桶与 1m 边界重分配不算差异；量的容差按当日总量 0.5%。"""
+def test_diff_stats_skips_0930_for_all_and_0931_only_for_sina():
+    """09:30 对所有源跳过；09:31 只有新浪跳过（腾讯 09:31 的真实错误必须报）。"""
     from app.quant.data_verify.runner import _diff_stats
 
     local = _bars(SYMBOL, DAY, close=10.0, volume=1000.0)
-    external = local.with_columns([
-        pl.when(pl.col("datetime").dt.hour() == 9)
-        .then(pl.lit(20.0)).otherwise(pl.col("close")).alias("close"),
-        # 09:xx 只 +10（在当日总量 3000 × 0.5% = 15 容差内），15:00 +20（超容差）
-        pl.when(pl.col("datetime").dt.hour() == 15)
-        .then(pl.col("volume") + 20).otherwise(pl.col("volume") + 10).alias("volume"),
-    ])
+    external = local.with_columns(
+        pl.when(pl.col("datetime") == datetime(2026, 11, 5, 9, 31))
+        .then(pl.lit(20.0)).otherwise(pl.col("close")).alias("close")
+    )
+    assert _diff_stats(local, external)["close_mismatch"] == 1          # tencent
+    assert _diff_stats(local, external, skip_0931=True)["close_mismatch"] == 0  # sina
+
+
+def test_diff_stats_detects_redistribution_with_total_check():
+    """逐 bar 都在容差内、但总量不守恒（重新分配）必须报 aggregate。"""
+    from app.quant.data_verify.runner import _diff_stats
+
+    local = _bars(SYMBOL, DAY, close=10.0, volume=1000.0)
+    external = local.with_columns((pl.col("volume") + 6).alias("volume"))
     stats = _diff_stats(local, external)
-    assert stats["close_mismatch"] == 0          # 09:30/09:31 竞价 bar 不比
-    assert stats["volume_mismatch"] == 1         # 15:00 的 +20 > 15
+    # 逐 bar：6 <= 当日总量 3000 × 0.5% = 15，全部过
+    assert stats["volume_mismatch"] == 0
     assert stats["volume_tolerance"] == pytest.approx(15.0)
+    # 总量：非竞价 bar（09:31+15:00）Σ差 12 > 2000 × 0.5% = 10
+    assert stats["volume_total_mismatch"] is True
+    assert stats["volume_total_tolerance"] == pytest.approx(10.0)
+
+
+def test_resolve_replacement_conflicting_singletons_is_quarantine():
+    """两个外源互相矛盾（各成单元素簇）→ 不得靠优先级挑一个 single_source 修复。"""
+    from app.quant.data_verify.runner import _resolve_replacement
+
+    local = _bars(SYMBOL, DAY, close=10.0)
+    tencent = _bars(SYMBOL, DAY, close=10.5)
+    sina = _bars(SYMBOL, DAY, close=11.0)
+    replacement, decision = _resolve_replacement(
+        local, {"tencent": tencent, "sina": sina}
+    )
+    assert replacement is None
+    assert decision["action"] == "quarantine"
+    assert decision["conflict"] is True
+    assert decision["single_source"] is False
+
+
+def test_external_minute_conflicting_sources_do_not_repair(tmp_path, monkeypatch):
+    _write_minute_partition(tmp_path, DAY, _bars(SYMBOL, DAY, close=10.0))
+    rep = _run_external(
+        tmp_path,
+        monkeypatch,
+        [
+            _source("sina", _bars(SYMBOL, DAY, close=11.0), 2),
+            _source("tencent", _bars(SYMBOL, DAY, close=10.5), 3),
+        ],
+    )
+    assert rep["repaired"] == 0
+    local = pl.read_parquet(
+        tmp_path / "kline_minute" / f"date={DAY.isoformat()}" / "part.parquet"
+    )
+    assert local["close"].unique().to_list() == [10.0]
 
 
 def test_sample_symbols_is_deterministic_and_evenly_strided():
@@ -381,6 +431,51 @@ def test_resolve_replacement_marks_single_source():
     assert replacement is not None
     assert replacement.height == 3
     assert decision["single_source"] is True and decision["confirmed"] is False
+
+
+def test_external_fetch_is_memoized_per_source_symbol(tmp_path, monkeypatch):
+    """逐日循环不能把同一只标的的完整历史重复拉 94 次。"""
+    from app.quant.data_verify import runner
+    from app.quant.data_verify.runner import _MinuteSource
+
+    day1, day2 = date(2026, 11, 4), date(2026, 11, 5)
+    frame1, frame2 = _bars(SYMBOL, day1), _bars(SYMBOL, day2)
+    _write_minute_partition(tmp_path, day1, frame1)
+    _write_minute_partition(tmp_path, day2, frame2)
+    full = pl.concat([frame1, frame2])
+    calls: list[str] = []
+
+    def fetch(symbol):
+        calls.append(symbol)
+        return full
+
+    monkeypatch.setattr(
+        runner, "_configured_sources",
+        lambda: [_MinuteSource("tencent", fetch, 3)],
+    )
+    rep = runner.run_verify("external_minute", days=[day1, day2], data_root=tmp_path)
+    assert rep["days"] == 2
+    assert calls == [SYMBOL]              # probe + 2 天共用同一次全量拉取
+
+
+def test_merge_bars_only_rewrites_mismatching_keys(tmp_path):
+    """确认修复只覆盖真正不一致的 bar，容差内的 tick 差异不动。"""
+    from app.quant.data_verify.runner import _merge_bars
+
+    df = _bars(SYMBOL, DAY, close=10.0)
+    replacement = df.with_columns([
+        pl.when(pl.col("datetime").dt.hour() == 15)
+        .then(pl.lit(10.5)).otherwise(pl.col("close")).alias("close"),
+        # 09:31 的 0.001 差异在容差内，不应触发整行重写
+        pl.when(pl.col("datetime") == datetime(2026, 11, 5, 9, 31))
+        .then(pl.col("open") + 0.001).otherwise(pl.col("open")).alias("open"),
+    ])
+    merged, changed = _merge_bars(tmp_path / "part.parquet", df, replacement)
+    assert changed == 1
+    early = merged.filter(pl.col("datetime") == datetime(2026, 11, 5, 9, 31))
+    assert early["open"][0] == 10.0
+    late = merged.filter(pl.col("datetime").dt.hour() == 15)
+    assert late["close"][0] == 10.5
 
 
 def test_external_minute_lookback_limits_days(tmp_path, monkeypatch):

@@ -39,6 +39,9 @@ SCHEMA: dict[str, pl.DataType] = {
 HTTP_TIMEOUT = 10.0
 
 _MARKET_PREFIX = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
+#: 可转债（沪 110/113/118、深 123/127/128）：eltdx 的 ``volume_lots`` 是「手」
+#: 但一手 10 张，与股票/基金一手 100 股不同；单位换算不通用，直接不核验。
+_CONVERTIBLE_PREFIXES = ("110", "113", "118", "123", "127", "128")
 _BEIJING = ZoneInfo("Asia/Shanghai")
 #: 通达信 ``volume_lots``（手）→ 本地分钟 volume（股）。
 LOTS_TO_SHARES = 100.0
@@ -62,10 +65,16 @@ def available_sources() -> list[str]:
 
 
 def _vendor(symbol: str) -> str | None:
-    """``600000.SH`` → ``sh600000``；非法/未知市场返回 ``None``。"""
+    """``600000.SH`` → ``sh600000``；非法/未知市场/可转债返回 ``None``。
+
+    可转债的 ``volume_lots`` 一手 10 张，与股票/基金的一手 100 股不同，
+    本探针不做单位猜测，直接返回空（不核验）。
+    """
     pure, _, market = symbol.partition(".")
     prefix = _MARKET_PREFIX.get(market.upper())
     if prefix is None or len(pure) != 6 or not pure.isdigit():
+        return None
+    if pure.startswith(_CONVERTIBLE_PREFIXES):
         return None
     return f"{prefix}{pure}"
 
