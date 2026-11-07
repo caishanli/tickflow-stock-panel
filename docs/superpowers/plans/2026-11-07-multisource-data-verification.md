@@ -836,6 +836,8 @@ git commit -m "feat(data-verify): 外部覆盖修复 + enriched 重算"
 - Create: `backend/app/quant/data_verify/probes/tencent_m1.py`
 - Create: `backend/app/quant/data_verify/probes/sina_m1.py`
 - Create: `backend/app/quant/data_verify/probes/eltdx_m1.py`
+- Modify: `backend/pyproject.toml`（新增可选 extra `verify = ["eltdx>=3.3"]`）
+- Modify: `backend/app/quant/data_verify/runner.py`（新增 `external_minute` stage）
 - Test: `backend/tests/quant/test_data_verify_minute_probes.py`
 
 **Interfaces:**
@@ -847,9 +849,12 @@ git commit -m "feat(data-verify): 外部覆盖修复 + enriched 重算"
   - `fetch_eltdx_m1(symbol: str, *, all_pages: bool = True) -> pl.DataFrame`；
     未安装 `eltdx` 时抛 `ImportError`（调用方捕获后跳过）
   - `available_sources() -> list[str]`
-  - 在 `runner.run_verify` 增加 `external_minute` stage：三方 probe → 按
-    `compare_minute_to_daily` 同口径比对本地分区 → `repair.replace_symbols` 修近 94 个交易日；
-    `"all"` 定义为 `structure + internal + external_minute`。
+  - 在 `runner.run_verify` 增加 `external_minute` stage：三方 probe → 与本地分区逐 bar 比对
+    （按 `datetime` join，容差同 L1；缺 bar/close/volume 不一致产出 finding）→
+    `repair.replace_symbols` 修被 ≥2 个源确认的 symbol；`"all"` 定义为
+    `structure + internal + external_minute`。
+  - stage 参数：`sample: int = 100`（每天按 symbol 排序后等距抽样）、
+    `lookback_days: int = 94`（eltdx 深度）。外部源不可用时该 stage 直接跳过并记入报告。
 
 - [ ] **Step 1: 写失败测试（离线 fixture）**
 
