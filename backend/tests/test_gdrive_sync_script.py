@@ -217,8 +217,16 @@ def test_whitelist_covers_every_data_directory():
         "user_data", "kline_ext", "adj_factor",  # adj_factor：归档版因子表（已废弃，见文档）
         # 隐藏的运行时目录
         ".backtest_matrix_cache", ".raw_partition_locks",
+        # 运维脚本与核验备份：非行情数据，且备份本身不进备份
+        "ops", "data_verify_backup",
     }
     data_dirs = {p.name for p in data_root.iterdir() if p.is_dir()}
+    # 临时实验目录 / 日期戳备份副本（本地产物，不承载唯一数据）
+    runtime_patterns = ("tmp_", ".audit_backup_", ".daily_basis_backup")
+    data_dirs = {
+        name for name in data_dirs
+        if not name.startswith(runtime_patterns) and "_bak" not in name
+    }
     missing = data_dirs - listed - runtime_dirs
     assert not missing, f"data/ 下这些目录不在备份白名单里：{sorted(missing)}"
 
