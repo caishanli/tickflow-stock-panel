@@ -4,6 +4,9 @@
 默认（及显式 ``--dry-run``）只读：科创板项的「修复数」表示可修复数；
 只有显式 ``--apply`` 才会调用 runner 修复并复查。qfq 项把 baostock 放在
 独立子进程中，硬超时后终止，避免其 socket 挂起拖死验收脚本。
+
+科创板检查区分两种 PASS：修复前的「检出且可修复」（``detected >= 600``）
+与修复完成后的「clean」（``detected == 0``）。部分检出或仍有残留一律 FAIL。
 """
 from __future__ import annotations
 
@@ -62,13 +65,19 @@ def check_star_x100(
     min_per_day: int = 600,
     apply: bool = False,
 ) -> dict[str, Any]:
-    """验收科创板 ×100：每天检出/修复（dry-run 时为可修复）不少于 600。"""
+    """验收科创板 ×100：修复前检出/修复不少于 600，或修复后已 clean。
+
+    每天独立判断：``detected >= min_per_day`` 且无残留为 repairable；
+    ``detected == 0`` 且无残留为 clean。两者都是 PASS；部分检出
+    （``0 < detected < min_per_day``）或仍有残留保持 FAIL。
+    """
     per_day: list[dict[str, Any]] = []
     ok = True
     for day in days:
         if not all(_part(data_root, table, day).is_file()
                    for table in ("kline_minute", "kline_daily")):
-            per_day.append({"day": day, "error": "缺少分钟或日线分区"})
+            per_day.append({"day": day, "error": "缺少分钟或日线分区",
+                            "state": "invalid", "ok": False})
             ok = False
             continue
         before = [f for f in _star_findings(data_root, day) if f.code == MINUTE_VOLUME_X100]
@@ -86,19 +95,26 @@ def check_star_x100(
         repaired = detected - sum(f.code == MINUTE_VOLUME_X100 for f in after_findings)
         if not apply:
             repaired = detected
-        day_ok = detected >= min_per_day and repaired >= min_per_day and remaining == 0
+        clean = detected == 0 and remaining == 0
+        repairable = (
+            detected >= min_per_day and repaired >= min_per_day and remaining == 0
+        )
+        day_ok = clean or repairable
+        state = "clean" if clean else "repairable" if repairable else "invalid"
         ok = ok and day_ok
         per_day.append({
             "day": day,
             "detected": detected,
             "repaired": repaired,
             "remaining": remaining,
+            "state": state,
             "ok": day_ok,
         })
     detected = sum(item.get("detected", 0) for item in per_day)
     repaired = sum(item.get("repaired", 0) for item in per_day)
-    mode = "实际修复" if apply else "dry-run 可修复"
-    detail = f"检出={detected}，{mode}={repaired}；{per_day}"
+    mode = "+".join(sorted({item["state"] for item in per_day})) or "invalid"
+    repair_label = "实际修复" if apply else "dry-run 可修复"
+    detail = f"模式={mode}，检出={detected}，{repair_label}={repaired}；{per_day}"
     return _result("PASS" if ok else "FAIL", detail,
                    detected=detected, repaired=repaired, days=per_day)
 

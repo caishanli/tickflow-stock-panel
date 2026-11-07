@@ -247,38 +247,81 @@ def test_run_daily_incremental_excludes_today_before_selecting_last_n(tmp_path, 
     assert result["daily_days"] == 2
 
 
-def test_acceptance_star_dry_run_counts_repairable_without_writing(tmp_path):
-    """验收 dry-run 的「修复数」是可修复数，且不得改分钟分区。"""
+def _acceptance_module():
     import importlib.util
     from pathlib import Path
 
-    day = "2026-11-06"
+    script = Path(__file__).parents[2] / "scripts" / "verify_acceptance.py"
+    spec = importlib.util.spec_from_file_location("verify_acceptance", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_star_minute(root, day: str, *, volume: float):
     symbol = "688001.SH"
-    _write_daily(tmp_path, day, volume=100.0, symbol=symbol)
-    minute_part = tmp_path / "kline_minute" / f"date={day}" / "part.parquet"
-    minute_part.parent.mkdir(parents=True)
+    _write_daily(root, day, volume=100.0, symbol=symbol)
+    part = root / "kline_minute" / f"date={day}" / "part.parquet"
+    part.parent.mkdir(parents=True)
     pl.DataFrame(
         [(symbol, datetime(2026, 11, 6, 15, 0), 10.0, 10.0, 10.0, 10.0,
-          1_000_000.0, 10_000_000.0)],
+          volume, volume * 10.0)],
         schema={
             "symbol": pl.String, "datetime": pl.Datetime("us"),
             "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
             "close": pl.Float64, "volume": pl.Float64, "amount": pl.Float64,
         },
         orient="row",
-    ).write_parquet(minute_part)
+    ).write_parquet(part)
+    return part
+
+
+def test_acceptance_star_dry_run_counts_repairable_without_writing(tmp_path):
+    """验收 dry-run 的「修复数」是可修复数，且不得改分钟分区。"""
+    day = "2026-11-06"
+    minute_part = _write_star_minute(tmp_path, day, volume=1_000_000.0)
     before = minute_part.read_bytes()
 
-    script = Path(__file__).parents[2] / "scripts" / "verify_acceptance.py"
-    spec = importlib.util.spec_from_file_location("verify_acceptance", script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    result = module.check_star_x100(tmp_path, [day], min_per_day=1, apply=False)
+    result = _acceptance_module().check_star_x100(
+        tmp_path, [day], min_per_day=1, apply=False
+    )
 
     assert result["status"] == "PASS"
     assert result["detected"] == 1
     assert result["repaired"] == 1
+    assert result["days"][0]["state"] == "repairable"
     assert minute_part.read_bytes() == before
+
+
+def test_acceptance_star_clean_day_passes_without_detection_threshold(tmp_path):
+    """修复完成后 detected=0 的干净日应 PASS，并明确标记为 clean。"""
+    day = "2026-11-06"
+    # 日线 volume=100 手 → 10,000 股；分钟量同单位，无 ×100 问题。
+    _write_star_minute(tmp_path, day, volume=10_000.0)
+
+    result = _acceptance_module().check_star_x100(
+        tmp_path, [day], min_per_day=600, apply=False
+    )
+
+    assert result["status"] == "PASS"
+    assert result["detected"] == 0
+    assert result["repaired"] == 0
+    assert result["days"][0]["state"] == "clean"
+    assert "模式=clean" in result["detail"]
+
+
+def test_acceptance_star_partial_detection_is_fail(tmp_path):
+    """0 < detected < min_per_day 是部分/模糊状态，仍必须 FAIL。"""
+    day = "2026-11-06"
+    _write_star_minute(tmp_path, day, volume=1_000_000.0)
+
+    result = _acceptance_module().check_star_x100(
+        tmp_path, [day], min_per_day=2, apply=False
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["detected"] == 1
+    assert result["days"][0]["state"] == "invalid"
 
 
 def test_scheduled_data_verify_skips_when_job_store_is_active(monkeypatch):
