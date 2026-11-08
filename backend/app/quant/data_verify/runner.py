@@ -53,7 +53,7 @@ import logging
 import math
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Final
@@ -76,6 +76,7 @@ from app.quant.data_verify.repair import (
     blast_radius_block,
     scale_minute_volume_amount,
 )
+from app.quant.data_verify.retention import BACKUP_DIRNAME
 from app.quant.data_verify.units import MINUTE_TABLE_TO_DAILY
 from app.raw_partition_lock import daily_partition_lock
 
@@ -114,7 +115,6 @@ DAY_PREFIX: Final = "date="
 
 #: 断点状态与备份的落点（与分区表同级，不进任何 ``date=*`` 目录）。
 STATE_FILENAME: Final = "data_verify_state.json"
-BACKUP_DIRNAME: Final = "data_verify_backup"
 
 #: 分区读取失败的结论码（只在本模块产生，不影响修复决策）。
 PARTITION_UNREADABLE: Final = "PARTITION_UNREADABLE"
@@ -161,15 +161,10 @@ class _PartitionOutcome:
     touched: bool = False
     attempted: bool = False
     reachable: bool = False
-    quarantine: list[dict[str, Any]] | None = None
-    receipts: list[dict[str, Any]] | None = None
+    quarantine: list[dict[str, Any]] = field(default_factory=list)
+    receipts: list[dict[str, Any]] = field(default_factory=list)
     single_source: int = 0
-    repair_failures: list[dict[str, Any]] | None = None
-
-    def __post_init__(self) -> None:
-        self.quarantine = self.quarantine or []
-        self.receipts = self.receipts or []
-        self.repair_failures = self.repair_failures or []
+    repair_failures: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _configured_sources() -> list[_MinuteSource]:
@@ -321,14 +316,14 @@ def _finite(value: Any) -> float | None:
 def _nonfinite_bar_fields(frame: pl.DataFrame) -> dict[str, int]:
     """NaN/Inf 计数（null 由结构检查负责），用于拒绝无效外部票。"""
     result: dict[str, int] = {}
-    for field in ("close", "volume", "amount"):
-        if field not in frame.columns:
+    for column in ("close", "volume", "amount"):
+        if column not in frame.columns:
             continue
         count = frame.filter(
-            (~pl.col(field).cast(pl.Float64).is_finite()).fill_null(False)
+            (~pl.col(column).cast(pl.Float64).is_finite()).fill_null(False)
         ).height
         if count:
-            result[field] = count
+            result[column] = count
     return result
 
 
@@ -1517,10 +1512,19 @@ def run_verify(
             root, selected, fetcher=factor_fetcher or _default_factor_fetcher, sample=sample
         ))
 
+    retention: dict[str, Any] | None = None
     if apply:
         from app.quant.data_verify.report import write_receipts
 
         write_receipts(all_receipts, root, run_id)
+        # 备份/receipt 按轮次滚动清理：定时任务每天跑，不清理就是净增长。
+        # 清理失败只告警——它是卫生，不该影响核验结论。
+        try:
+            from app.quant.data_verify.retention import prune_old_runs
+
+            retention = prune_old_runs(root)
+        except Exception as exc:
+            logger.warning("data_verify 旧产物清理失败（不影响本轮结果）: %s", exc)
     if all_receipts:
         try:
             from app.api.data import invalidate_storage_cache
@@ -1528,7 +1532,6 @@ def run_verify(
             invalidate_storage_cache()
         except Exception as exc:
             logger.warning("data_verify 缓存失效失败（修复已落盘）: %s", exc)
-
     report: dict[str, Any] = {
         "stage": stage, "run_id": run_id, "findings": len(all_findings),
         "finding_details": [finding.to_dict() for finding in all_findings],
@@ -1536,6 +1539,7 @@ def run_verify(
         "sources": source_names, "quarantine": all_quarantine,
         "quarantined": len(all_quarantine), "receipts": all_receipts,
         "single_source": single_source_count, "repair_failures": repair_failures,
+        "retention": retention,
     }
     if external_stage and not external_reachable and (not external_ready or external_attempted):
         logger.warning("分钟外部源均不可用（attempted=%s），跳过 external_minute",
