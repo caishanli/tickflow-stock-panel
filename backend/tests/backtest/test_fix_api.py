@@ -24,11 +24,11 @@ from fastapi.testclient import TestClient
 
 from app.api import backtest as api
 from app.api.backtest import (
+    _OPT_BT_FIELDS,
     BACKTEST_MAX_SYMBOLS,
     FACTOR_DEFAULT_DAYS,
     OPTIMIZE_MAX_WORKERS,
     STRATEGY_DEFAULT_DAYS,
-    _OPT_BT_FIELDS,
     _make_job_key,
     _make_opt_job_key,
     _opt_backtest_kwargs,
