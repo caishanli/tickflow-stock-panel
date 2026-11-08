@@ -9,7 +9,7 @@ from dataclasses import asdict
 from datetime import date, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -18,20 +18,56 @@ from app.services.backtest import (
     BacktestConfig,
     BacktestService,
     VectorbtUnavailable,
+    is_available,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
-FACTOR_DEFAULT_DAYS = 180
-STRATEGY_DEFAULT_DAYS = 365 * 3
+#: A8：重任务（回测/优化）的全局并发闸门。
+#: 没有它时并发请求各自起线程池，优化器 max_workers=99 会瞬间打满 CPU/内存。
+_backtest_semaphore = threading.BoundedSemaphore(2)
+
+# A6：名字与实际口径对齐。因子回测默认 3 年（IC/分层需要长样本），
+# 策略回测默认 180 天（内存守卫上限 186 天，长区间必 OOM）。
+FACTOR_DEFAULT_DAYS = 365 * 3
+STRATEGY_DEFAULT_DAYS = 180
 BACKTEST_MAX_SERVER_DAYS = 186
 FACTOR_MAX_SYMBOLS = 1000
+#: 单次回测允许的最大标的数（策略/因子共用同一上限，独立命名便于前端提示）。
+BACKTEST_MAX_SYMBOLS = FACTOR_MAX_SYMBOLS
+#: 参数优化并发上限（绝对值钳制，与 settings 里的可调值取 min）。
+OPTIMIZE_MAX_WORKERS = 8
 BACKTEST_SERVER_GUARD_MESSAGE = (
     "当前服务器内存约 1.8GB，回测区间最多支持 6 个月；"
     "更长周期容易触发 OOM，建议在 8GB 以上内存环境或本机运行。"
 )
+
+
+def _precheck_json(value: str | None, field: str) -> None:
+    """建 job 之前校验 JSON 参数；非法直接 400（不留下 pending job）。"""
+    if not value:
+        return
+    try:
+        json.loads(value)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{field} 不是合法 JSON: {exc}",
+        ) from exc
+
+
+def _parse_date_or_400(value: str | None, *, field: str) -> date | None:
+    """解析 ``YYYY-MM-DD``；非法格式抛 400 而不是让 ``date.fromisoformat`` 冒 500。"""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} 不是合法日期 (应为 YYYY-MM-DD): {value}",
+        ) from exc
 
 
 def _get_engine(request: Request):
@@ -68,8 +104,8 @@ def _guard_server_backtest_range(start: date, end: date):
 
 @router.get("/status")
 def status():
-    """前端可用此接口判断回测页是否要灰显。"""
-    return {"available": True}
+    """前端可用此接口判断回测页是否要灰显（按 vectorbt 实际可用性）。"""
+    return {"available": is_available()}
 
 
 # ================================================================
@@ -82,21 +118,32 @@ class BacktestRequest(BaseModel):
     end: date | None = None
     entries: list[str] = []
     exits: list[str] = []
-    stop_loss_pct: float | None = None
-    max_hold_days: int | None = None
-    fees_pct: float = 0.0002
-    slippage_bps: float = 5
+    stop_loss_pct: float | None = Field(None, ge=0, le=1)
+    max_hold_days: int | None = Field(None, gt=0)
+    fees_pct: float = Field(0.0002, ge=0)
+    slippage_bps: float = Field(5.0, ge=0)
     matching: Literal["close_t", "open_t+1"] = "close_t"
     asset_type: str = "stock"
 
 
 @router.post("/run")
 def run(req: BacktestRequest, request: Request):
-    """信号回测 — 现有接口，向后兼容。"""
+    """信号回测 — 现有接口，向后兼容。
+
+    与因子/策略端点对齐：先查标的上限（guard 关闭时也生效），再过服务端
+    范围守卫。此前这个端点两者都没有，等于唯一一个不受内存保护的回测入口。
+    """
     repo = request.app.state.repo
     svc = BacktestService(repo)
     end = req.end or date.today()
     start = req.start or (end - timedelta(days=365 * 3))
+
+    if req.symbols is not None and len(req.symbols) > BACKTEST_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"指定标的最多支持 {BACKTEST_MAX_SYMBOLS} 只，请缩小标的范围。",
+        )
+    _guard_server_backtest_range(start, end)
 
     cfg = BacktestConfig(
         symbols=req.symbols,
@@ -141,8 +188,8 @@ class FactorBacktestRequest(BaseModel):
     n_groups: int = Field(5, ge=2, le=10)
     rebalance: Literal["daily", "weekly", "monthly"] = "monthly"
     weight: Literal["equal", "factor_weight"] = "equal"
-    fees_pct: float = 0.0002
-    slippage_bps: float = 5.0
+    fees_pct: float = Field(0.0002, ge=0)
+    slippage_bps: float = Field(5.0, ge=0)
     asset_type: str = "stock"
 
 
@@ -158,7 +205,7 @@ def factor_run(req: FactorBacktestRequest, request: Request):
     svc = FactorBacktestService(engine)
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
+    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
     symbols = req.symbols if req.symbols else None
     if symbols is not None and len(symbols) > FACTOR_MAX_SYMBOLS:
@@ -191,8 +238,8 @@ class FactorBatchRequest(BaseModel):
     n_groups: int = Field(5, ge=2, le=10)
     rebalance: Literal["daily", "weekly", "monthly"] = "monthly"
     weight: Literal["equal", "factor_weight"] = "equal"
-    fees_pct: float = 0.0002
-    slippage_bps: float = 5.0
+    fees_pct: float = Field(0.0002, ge=0)
+    slippage_bps: float = Field(5.0, ge=0)
     asset_type: str = "stock"
 
 
@@ -212,7 +259,7 @@ def factor_batch(req: FactorBatchRequest, request: Request):
         raise HTTPException(status_code=400, detail=f"不支持的因子: {', '.join(invalid)}")
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
+    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
     symbols = req.symbols if req.symbols else None
     if symbols is not None and len(symbols) > FACTOR_MAX_SYMBOLS:
@@ -331,16 +378,16 @@ class StrategyBacktestRequest(BaseModel):
     matching: Literal["close_t", "open_t+1"] = "open_t+1"
     entry_fill: Literal["close_t", "open_t+1"] | None = None
     exit_fill: Literal["close_t", "open_t+1", "signal_next_minute"] | None = None
-    fees_pct: float = 0.0002
-    commission_pct: float | None = None
-    stamp_tax_pct: float | None = None
-    slippage_bps: float = 5.0
-    max_positions: int = 10
-    max_exposure_pct: float = 1.0
-    initial_capital: float = 1_000_000.0
+    fees_pct: float = Field(0.0002, ge=0)
+    commission_pct: float | None = Field(None, ge=0)
+    stamp_tax_pct: float | None = Field(None, ge=0)
+    slippage_bps: float = Field(5.0, ge=0)
+    max_positions: int = Field(10, gt=0)
+    max_exposure_pct: float = Field(1.0, gt=0)
+    initial_capital: float = Field(1_000_000.0, gt=0)
     position_sizing: Literal["equal", "score_weight"] = "equal"
     mode: Literal["position", "full"] = "position"
-    holding_days: int = 5
+    holding_days: int = Field(5, gt=0)
     asset_type: str = "stock"
     minute_fill: bool = False
     regime_filter: dict | None = None
@@ -353,7 +400,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     from app.backtest.worker import make_worker_task, run_worker_task
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
+    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
 
     cfg = StrategyBacktestConfig(
@@ -465,22 +512,22 @@ async def strategy_stream(
     symbols: str | None = None,
     start: str | None = None,
     end: str | None = None,
-    matching: str = "open_t+1",
-    entry_fill: str | None = None,
-    exit_fill: str | None = None,
-    fees_pct: float = 0.0002,
-    commission_pct: float | None = None,
-    stamp_tax_pct: float | None = None,
-    slippage_bps: float = 5.0,
-    max_positions: int = 10,
-    max_exposure_pct: float = 1.0,
-    initial_capital: float = 1_000_000.0,
-    position_sizing: str = "equal",
+    matching: Literal["close_t", "open_t+1"] = "open_t+1",
+    entry_fill: Literal["close_t", "open_t+1"] | None = None,
+    exit_fill: Literal["close_t", "open_t+1", "signal_next_minute"] | None = None,
+    fees_pct: float = Query(0.0002, ge=0),
+    commission_pct: float | None = Query(None, ge=0),
+    stamp_tax_pct: float | None = Query(None, ge=0),
+    slippage_bps: float = Query(5.0, ge=0),
+    max_positions: int = Query(10, gt=0),
+    max_exposure_pct: float = Query(1.0, gt=0),
+    initial_capital: float = Query(1_000_000.0, gt=0),
+    position_sizing: Literal["equal", "score_weight"] = "equal",
     params: str | None = None,
     overrides: str | None = None,
-    mode: str = "position",
-    holding_days: int = 5,
-    asset_type: str = "stock",
+    mode: Literal["position", "full"] = "position",
+    holding_days: int = Query(5, gt=0),
+    asset_type: Literal["stock", "etf"] = "stock",
     minute_fill: bool = False,
     regime_filter: str | None = None,
 ):
@@ -498,13 +545,17 @@ async def strategy_stream(
     from app.backtest.strategy import StrategyBacktestConfig
     from app.backtest.worker import make_worker_task, run_worker_task
 
-    end_date = date.fromisoformat(end) if end else date.today()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
+    end_date = _parse_date_or_400(end, field="end") or date.today()
+    start_date = _parse_date_or_400(start, field="start")
+    if start_date is None:
         # 空 start = 全部历史: 用本地最早日K日期, 查不到再回退到默认窗口
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
+
+    # params/overrides 必须在建 job 之前解析：非法 JSON 若拖到 SSE 里才发现，
+    # 前端已拿到 job_key 却永远等不到结果（且 job 残留在表里）。
+    _precheck_json(params, "params")
+    _precheck_json(overrides, "overrides")
 
     # 服务端范围保护
     guard_violated = False
@@ -513,8 +564,11 @@ async def strategy_stream(
         if days > BACKTEST_MAX_SERVER_DAYS:
             guard_violated = True
 
+    # A7：key 必须用**解析后**的日期。用原始 start/end 时缺省值为 None，
+    # 于是「今天跑」和「明天跑」算出同一个 key，重连会命中昨天那条已完成的任务，
+    # 且 cancel 侧（解析后传日期）永远匹配不上。
     job_key = _make_job_key(
-        strategy_id, symbols, start, end,
+        strategy_id, symbols, start_date.isoformat(), end_date.isoformat(),
         matching, entry_fill, exit_fill,
         fees_pct, slippage_bps, max_positions, max_exposure_pct, initial_capital, position_sizing,
         params, overrides,
@@ -540,6 +594,9 @@ async def strategy_stream(
     async def event_generator():
         # 范围保护: 直接报错
         if guard_violated:
+            # A5：失败必须把 job 置 done，否则前端重连同参时会拿到同一个 pending job、
+            # SSE 不再发任何事件（空转），且 _cleanup_stale_jobs 永远清不掉。
+            _finish_job(job, error=BACKTEST_SERVER_GUARD_MESSAGE)
             yield f"event: error\ndata: {json.dumps({'message': BACKTEST_SERVER_GUARD_MESSAGE}, ensure_ascii=False)}\n\n"
             return
 
@@ -547,6 +604,7 @@ async def strategy_stream(
         if minute_fill:
             guard_error = _check_minute_fill_guard(request, start_date)
             if guard_error is not None:
+                _finish_job(job, error=guard_error)
                 yield f"event: error\ndata: {json.dumps({'message': guard_error}, ensure_ascii=False)}\n\n"
                 return
 
@@ -583,6 +641,9 @@ async def strategy_stream(
                     shared_heavy_job_limiter,
                 )
 
+                # A8：全局并发闸门。用显式 acquire/release 而非 with，
+                # 便于测试注入只实现这两个方法的假信号量。
+                _backtest_semaphore.acquire()
                 try:
                     with shared_heavy_job_limiter.slot(
                         "normal",
@@ -599,6 +660,8 @@ async def strategy_stream(
                     _finish_job(job, error="回测已取消")
                 except Exception as e:
                     _finish_job(job, error=str(e))
+                finally:
+                    _backtest_semaphore.release()
 
             # 启动后台线程 (不阻塞事件循环)
             threading.Thread(target=_run_backtest, daemon=True).start()
@@ -647,7 +710,11 @@ async def strategy_stream(
 
 @router.post("/strategy/cancel")
 async def strategy_cancel(request: Request):
-    """取消正在运行的回测任务 (前端传 query string, 后端算 job_key)。"""
+    """取消正在运行的回测任务 (前端传 query string, 后端算 job_key)。
+
+    空串/非法数值一律按「算不出 key」处理并返回 ``ok=False``，不抛 500——
+    取消是幂等清理动作，前端在超时收尾时可能带着残缺的 qs 再调一次。
+    """
     body = await request.json()
     qs = body.get("qs", "")
     # 解析 qs 得到参数
@@ -659,28 +726,46 @@ async def strategy_cancel(request: Request):
         # 可选成本参数: 缺省或空串 → None (与 stream 侧 float | None 口径一致, 保证 job_key 对齐)。
         v = _get(key)
         return float(v) if v else None
-    job_key = _make_job_key(
-        _get("strategy_id"),
-        _get("symbols") or None,
-        _get("start") or None,
-        _get("end") or None,
-        _get("matching", "open_t+1"),
-        _get("entry_fill") or None,
-        _get("exit_fill") or None,
-        float(_get("fees_pct", "0.0002")),
-        float(_get("slippage_bps", "5")),
-        int(_get("max_positions", "10")),
-        float(_get("max_exposure_pct", "1")),
-        float(_get("initial_capital", "1000000")),
-        _get("position_sizing", "equal"),
-        _get("params") or None,
-        _get("overrides") or None,
-        _get("mode", "position"),
-        int(_get("holding_days", "5")),
-        commission_pct=_get_opt_float("commission_pct"),
-        stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
-        asset_type=_get("asset_type", "stock"),
-    )
+    try:
+        # A7：stream 侧 key 用**解析后**的日期（缺省 start = 本地最早日K、
+        # 缺省 end = 今天）。cancel 侧必须复刻同一套解析，否则缺省参数的任务
+        # 永远取消不掉。
+        _end_raw = _get("end") or None
+        _end_date = _parse_date_or_400(_end_raw, field="end") or date.today()
+        _start_date = _parse_date_or_400(_get("start") or None, field="start")
+        if _start_date is None:
+            _earliest = getattr(request.app.state, "repo", None)
+            _start_date = (
+                _earliest.earliest_daily_date() if _earliest is not None else None
+            ) or (_end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
+        job_key = _make_job_key(
+            _get("strategy_id"),
+            _get("symbols") or None,
+            _start_date.isoformat(),
+            _end_date.isoformat(),
+            _get("matching", "open_t+1"),
+            _get("entry_fill") or None,
+            _get("exit_fill") or None,
+            float(_get("fees_pct", "0.0002")),
+            float(_get("slippage_bps", "5")),
+            int(_get("max_positions", "10")),
+            float(_get("max_exposure_pct", "1")),
+            float(_get("initial_capital", "1000000")),
+            _get("position_sizing", "equal"),
+            _get("params") or None,
+            _get("overrides") or None,
+            _get("mode", "position"),
+            int(_get("holding_days", "5")),
+            commission_pct=_get_opt_float("commission_pct"),
+            stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
+            asset_type=_get("asset_type", "stock"),
+            # A1：stream 侧 key 含 minute_fill/regime_filter，cancel 侧漏传会算不出同一个
+            # key → 开了分钟K的任务永远取消不掉（前端只能等超时）。
+            minute_fill=_get("minute_fill") in ("1", "true", "True"),
+            regime_filter=_get("regime_filter") or None,
+        )
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "message": f"参数非法, 无法定位任务: {exc}"}
     # 持锁读任务表: 与 _cleanup_stale_jobs 的 pop、stream 的写入互斥
     with _jobs_lock:
         job = _running_jobs.get(job_key)
@@ -710,9 +795,10 @@ def _json_safe(obj):
 
 # 透传给每组回测的 StrategyBacktestConfig 字段 (作为 backtest_kwargs)。
 _OPT_BT_FIELDS = [
-    "matching", "fees_pct", "commission_pct", "stamp_tax_pct", "slippage_bps",
+    "matching", "entry_fill", "exit_fill", "asset_type", "minute_fill",
+    "fees_pct", "commission_pct", "stamp_tax_pct", "slippage_bps",
     "max_positions", "max_exposure_pct", "initial_capital", "position_sizing",
-    "mode", "holding_days", "minute_fill",
+    "mode", "holding_days",
 ]
 
 
@@ -740,9 +826,20 @@ def _opt_backtest_kwargs(
     matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
     max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
     minute_fill: bool = False,
+    entry_fill: str | None = None,
+    exit_fill: str | None = None,
+    asset_type: str = "stock",
 ) -> dict:
+    """优化器透传给回测的口径参数。
+
+    ``entry_fill``/``exit_fill``/``asset_type``/``minute_fill`` 必须一起带上：
+    漏一个，优化跑的就是「另一套配置」，排名结果与用户实际回测不可比。
+    """
     return {
         "matching": matching,
+        "entry_fill": entry_fill,
+        "exit_fill": exit_fill,
+        "asset_type": asset_type,
         "fees_pct": fees_pct,
         "commission_pct": commission_pct,
         "stamp_tax_pct": stamp_tax_pct,
@@ -822,10 +919,9 @@ async def optimize_stream(
     from app.backtest.optimizer import OptimizeConfig
     from app.backtest.worker import make_worker_task, run_worker_task
 
-    end_date = date.fromisoformat(end) if end else date.today()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
+    end_date = _parse_date_or_400(end, field="end") or date.today()
+    start_date = _parse_date_or_400(start, field="start")
+    if start_date is None:
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
 
@@ -870,6 +966,8 @@ async def optimize_stream(
         yield f"event: job\ndata: {json.dumps({'key': job_key}, ensure_ascii=False)}\n\n"
 
         if guard_violated:
+            # A5：同 strategy/stream —— 失败置 done，否则 job 僵死。
+            _finish_job(job, error=BACKTEST_SERVER_GUARD_MESSAGE)
             yield f"event: error\ndata: {json.dumps({'message': BACKTEST_SERVER_GUARD_MESSAGE}, ensure_ascii=False)}\n\n"
             return
 
@@ -915,7 +1013,8 @@ async def optimize_stream(
                     param_grid=grid,
                     objective=objective,
                     direction=direction,
-                    max_workers=int(max_workers),
+                    # A8：用户传多大都不许超过绝对上限（99 路并发会打满机器）。
+                    max_workers=max(1, min(int(max_workers), OPTIMIZE_MAX_WORKERS)),
                     matrix_cache_max_mb=int(matrix_cache_max_mb),
                     base_params=base_params if isinstance(base_params, dict) else {},
                     overrides=ov if isinstance(ov, dict) else None,
@@ -928,6 +1027,9 @@ async def optimize_stream(
                         shared_heavy_job_limiter,
                     )
 
+                    # A8：全局并发闸门。用显式 acquire/release 而非 with，
+                    # 便于测试注入只实现这两个方法的假信号量。
+                    _backtest_semaphore.acquire()
                     try:
                         with shared_heavy_job_limiter.slot(
                             "normal",
@@ -944,6 +1046,8 @@ async def optimize_stream(
                         _finish_job(job, error="优化已取消")
                     except Exception as e:
                         _finish_job(job, error=str(e))
+                    finally:
+                        _backtest_semaphore.release()
 
                 threading.Thread(target=_run_opt, daemon=True).start()
 
@@ -1054,10 +1158,9 @@ async def walkforward_stream(
 
     direction = direction or None
 
-    end_date = date.fromisoformat(end) if end else date.today()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
+    end_date = _parse_date_or_400(end, field="end") or date.today()
+    start_date = _parse_date_or_400(start, field="start")
+    if start_date is None:
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=STRATEGY_DEFAULT_DAYS))
 
@@ -1141,7 +1244,8 @@ async def walkforward_stream(
                     train_days=int(train_days),
                     test_days=int(test_days),
                     step_days=int(step_days),
-                    max_workers=int(max_workers),
+                    # A8：用户传多大都不许超过绝对上限（99 路并发会打满机器）。
+                    max_workers=max(1, min(int(max_workers), OPTIMIZE_MAX_WORKERS)),
                     base_params=base_params if isinstance(base_params, dict) else {},
                     overrides=ov if isinstance(ov, dict) else None,
                     backtest_kwargs=bt_kwargs,
