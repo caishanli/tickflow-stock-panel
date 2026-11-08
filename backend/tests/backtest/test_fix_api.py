@@ -88,8 +88,27 @@ class _BlockingSvc:
 
 
 def _patch_blocking_svc(monkeypatch):
-    import app.backtest.strategy as strat_mod
-    monkeypatch.setattr(strat_mod, "StrategyBacktestService", _BlockingSvc)
+    """同进程替身：把「spawn 子进程跑回测」换成阻塞到 cancel 的假任务。
+
+    生产端点用 ``run_worker_task`` 起子进程，跨进程 monkeypatch 不生效
+    （在父进程替换 ``StrategyBacktestService``/``StrategyOptimizer`` 都没用）。
+    因此替身下沉到 worker 边界：替换 ``make_worker_task``/``run_worker_task``，
+    保留端点其余逻辑（信号量、job 生命周期、SSE、cancel 拼 key）原样被测。
+    """
+    import app.backtest.worker as worker_mod
+
+    def fake_make_worker_task(kind, data_dir, config):
+        return {"kind": kind, "data_dir": str(data_dir), "config": config}
+
+    def fake_run_worker_task(task, progress_cb=None, cancel_event=None):
+        if progress_cb:
+            progress_cb({"day": 1, "total": 2, "date": "2025-01-02", "equity": 1.0})
+        if cancel_event is not None:
+            cancel_event.wait(10)
+        return {"error": "cancelled"}
+
+    monkeypatch.setattr(worker_mod, "make_worker_task", fake_make_worker_task)
+    monkeypatch.setattr(worker_mod, "run_worker_task", fake_run_worker_task)
 
 
 # strategy_stream 直接调用时的显式参数 (Query(...) 默认值只在 FastAPI 路由层生效,
@@ -416,8 +435,20 @@ class _RecOptimizer:
 
 
 def test_optimize_uses_semaphore_and_clamps_max_workers(monkeypatch):
-    import app.backtest.optimizer as opt_mod
-    monkeypatch.setattr(opt_mod, "StrategyOptimizer", _RecOptimizer)
+    import app.backtest.worker as worker_mod
+
+    seen: dict = {}
+
+    def fake_make_worker_task(kind, data_dir, config):
+        seen["kind"] = kind
+        seen["config"] = config
+        return {"kind": kind, "data_dir": str(data_dir), "config": config}
+
+    def fake_run_worker_task(task, progress_cb=None, cancel_event=None):
+        return {"best_params": {"p": 1}, "results": []}
+
+    monkeypatch.setattr(worker_mod, "make_worker_task", fake_make_worker_task)
+    monkeypatch.setattr(worker_mod, "run_worker_task", fake_run_worker_task)
     sem = _RecSem()
     monkeypatch.setattr(api, "_backtest_semaphore", sem)
 
@@ -430,11 +461,13 @@ def test_optimize_uses_semaphore_and_clamps_max_workers(monkeypatch):
     assert r.status_code == 200
     assert "best_params" in r.text  # done 事件
 
-    # A8: _run_opt 走信号量; max_workers 钳到绝对上限
+    # A8: _run_opt 走信号量; max_workers 钳到绝对上限（用户传 99）
     assert sem.acquired == 1
-    assert _RecOptimizer.seen["max_workers"] == OPTIMIZE_MAX_WORKERS
+    ocfg = seen["config"]
+    assert seen["kind"] == "optimize"
+    assert ocfg.max_workers == OPTIMIZE_MAX_WORKERS
     # #6: 用户口径完整透传给优化器
-    bt = _RecOptimizer.seen["backtest_kwargs"]
+    bt = ocfg.backtest_kwargs
     assert bt["entry_fill"] == "close_t"
     assert bt["asset_type"] == "etf"
     assert bt["minute_fill"] is True
