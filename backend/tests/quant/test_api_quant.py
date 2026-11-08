@@ -46,6 +46,17 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "account_start", lambda aid: db.update_sim_account(
         aid, status="running", started_at="2026-01-01T00:00:00"))
 
+    # 路由层是从 app.quant.api.quant 导入的 account_start（import 期绑定），
+    # 只 patch service 那只不影响路由。这里再 patch 路由模块的引用，
+    # 同时钉住内存门禁——开发机上常驻真实模拟盘进程会让 _guard_memory 返回
+    # 400，测试不该依赖宿主机内存与进程数。
+    from app.quant.api import quant as _qmod
+
+    monkeypatch.setattr(_qmod, "account_start", lambda aid: db.update_sim_account(
+        aid, status="running", started_at="2026-01-01T00:00:00"))
+    monkeypatch.setattr(
+        service, "_guard_memory", lambda aid: None, raising=False)
+
     from app.quant.api.quant import router
 
     app = FastAPI()

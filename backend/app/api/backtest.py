@@ -543,20 +543,11 @@ async def strategy_stream(
             yield f"event: error\ndata: {json.dumps({'message': BACKTEST_SERVER_GUARD_MESSAGE}, ensure_ascii=False)}\n\n"
             return
 
-        # 分钟K精确回测: Pro+ 门控 + 数据范围检查
+        # 分钟K精确回测: Pro+ 门控 + 数据范围检查（与 optimize/stream 同一实现）
         if minute_fill:
-            capset = request.app.state.capabilities
-            from app.tickflow.capabilities import Cap
-            if not capset.has(Cap.KLINE_MINUTE_BATCH):
-                yield f"event: error\ndata: {json.dumps({'message': '分钟K精确回测需要 Pro+ 权限 (kline.minute.batch)'}, ensure_ascii=False)}\n\n"
-                return
-            # 检查本地分钟K历史是否覆盖回测区间
-            repo = request.app.state.repo
-            earliest_minute = repo.earliest_minute_date() if hasattr(repo, "earliest_minute_date") else None
-            if earliest_minute is not None and start_date < earliest_minute:
-                msg = (f"本地分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
-                       f"请先用「扩展分钟K历史」功能拉取更多数据, 或缩小回测区间。")
-                yield f"event: error\ndata: {json.dumps({'message': msg}, ensure_ascii=False)}\n\n"
+            guard_error = _check_minute_fill_guard(request, start_date)
+            if guard_error is not None:
+                yield f"event: error\ndata: {json.dumps({'message': guard_error}, ensure_ascii=False)}\n\n"
                 return
 
         # 如果是新任务, 启动回测线程
@@ -721,7 +712,7 @@ def _json_safe(obj):
 _OPT_BT_FIELDS = [
     "matching", "fees_pct", "commission_pct", "stamp_tax_pct", "slippage_bps",
     "max_positions", "max_exposure_pct", "initial_capital", "position_sizing",
-    "mode", "holding_days",
+    "mode", "holding_days", "minute_fill",
 ]
 
 
@@ -748,6 +739,7 @@ def _make_opt_job_key(
 def _opt_backtest_kwargs(
     matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
     max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+    minute_fill: bool = False,
 ) -> dict:
     return {
         "matching": matching,
@@ -761,7 +753,36 @@ def _opt_backtest_kwargs(
         "position_sizing": position_sizing,
         "mode": mode,
         "holding_days": int(holding_days),
+        "minute_fill": bool(minute_fill),
     }
+
+
+def _check_minute_fill_guard(request: Request, start_date: date) -> str | None:
+    """分钟K精确回测的统一门控：权限 + 本地分钟K覆盖。
+
+    返回 ``None`` 表示放行；否则返回用户可读的错误文案（调用方据此
+    ``_finish_job`` 并把消息推给前端）。strategy/stream 与 optimize/stream
+    共用这一处，避免两侧口径漂移（此前 optimize 侧完全没有检查）。
+    """
+    app_state = getattr(request, "app", None)
+    state = getattr(app_state, "state", None)
+    capset = getattr(state, "capabilities", None)
+    try:
+        from app.tickflow.capabilities import Cap
+
+        if capset is None or not capset.has(Cap.KLINE_MINUTE_BATCH):
+            return "分钟K精确回测需要 Pro+ 权限 (kline.minute.batch)"
+    except Exception:  # noqa: BLE001 - 能力探测失败按无权限处理
+        return "分钟K精确回测需要 Pro+ 权限 (kline.minute.batch)"
+
+    repo = getattr(state, "repo", None)
+    earliest_minute = None
+    if repo is not None and hasattr(repo, "earliest_minute_date"):
+        earliest_minute = repo.earliest_minute_date()
+    if earliest_minute is not None and start_date < earliest_minute:
+        return (f"本地分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
+                f"请先用「扩展分钟K历史」功能拉取更多数据, 或缩小回测区间。")
+    return None
 
 
 @router.get("/optimize/stream")
@@ -789,6 +810,7 @@ async def optimize_stream(
     position_sizing: str = "equal",
     mode: str = "position",
     holding_days: int = 5,
+    minute_fill: bool = False,
 ):
     """SSE 流式参数优化: 并行跑各参数组回测, 按 objective 排序。
 
@@ -816,6 +838,7 @@ async def optimize_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        minute_fill=minute_fill,
     )
     bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
     job_key = _make_opt_job_key(
@@ -849,6 +872,15 @@ async def optimize_stream(
         if guard_violated:
             yield f"event: error\ndata: {json.dumps({'message': BACKTEST_SERVER_GUARD_MESSAGE}, ensure_ascii=False)}\n\n"
             return
+
+        # 分钟K精确回测：与 strategy/stream 同一门控（权限 + 数据覆盖）。
+        # 失败必须 _finish_job，否则 job 永远 pending、SSE 空转。
+        if minute_fill:
+            guard_error = _check_minute_fill_guard(request, start_date)
+            if guard_error is not None:
+                _finish_job(job, error=guard_error)
+                yield f"event: error\ndata: {json.dumps({'message': guard_error}, ensure_ascii=False)}\n\n"
+                return
 
         if is_new and not job.done:
             try:

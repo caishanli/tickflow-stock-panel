@@ -982,13 +982,20 @@ class BacktestEngine:
                 "entry_price": entry_price,
                 "entry_score": score,
                 "hold_days": 0,
-                "max_high": max(entry_price, float(matrix.high[time_id, asset_id])),
+                # 移动止损/回撤止盈的峰值起点：close_t 当日收盘买入，当日 high 发生在
+                # 买入之前，不能并入（旧值 max(entry, high) 会把止损线抬到成本之上，
+                # 盈利也记成 trailing_stop）；open_t+1 成交后当日 high 有效，见下方补并。
+                "max_high": entry_price,
                 "pending_exit_reason": None,
                 "pending_exit_signal_date": None,
                 "pending_exit_signal_id": None,
                 "pending_exit_next_open": False,
                 "blocked_exit_days": 0,
             }
+            if config.entry_fill == "open_t+1":
+                entry_high = float(matrix.high[time_id, asset_id])
+                if _valid_price(entry_high):
+                    pos["max_high"] = max(float(pos["max_high"]), entry_high)
             closed = False
             for future in future_times:
                 pos["hold_days"] += 1
@@ -1732,7 +1739,11 @@ class BacktestEngine:
         }
 
         minute_cache: dict = {}
-        if config.minute_fill:
+        # 只有 open_t+1 腿才真正使用分钟K。close_t + minute_fill 在 _refill_price 里
+        # 降级为日K收盘价（前视不可修正），这里不必读盘。
+        _needs_minute = config.minute_fill and "open_t+1" in (
+            config.entry_fill, config.exit_fill)
+        if _needs_minute:
             trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
             trigger_dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             trigger_symbols = {matrix.symbols[int(a)] for a in trigger_assets}
@@ -1745,6 +1756,9 @@ class BacktestEngine:
                     self.repo, list(trigger_symbols), trigger_dates, asset_type,
                 )
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
+
+        # close_t + minute_fill 降级 warning：每次回测只发一次（与 legacy 口径一致）
+        _minute_warned = [False]
 
         def _count(key: str) -> None:
             execution_stats[key] = execution_stats.get(key, 0) + 1
@@ -1768,7 +1782,20 @@ class BacktestEngine:
             return total
 
         def _refill_price(time_id: int, asset_id: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
+                return daily_price
+            fill = config.entry_fill if side == "buy" else config.exit_fill
+            if fill != "open_t+1":
+                # close_t 信号 15:00 才确认，分钟K优化（按 9:30 后的分钟价格成交）
+                # 本质前视且无法精确 → 降级为日K收盘口径。
+                if not _minute_warned[0]:
+                    _minute_warned[0] = True
+                    logger.warning(
+                        "minute_fill 仅对 open_t+1 成交口径生效; %s腿为 close_t, 降级为日K收盘价",
+                        "买入" if side == "buy" else "卖出",
+                    )
+                return daily_price
+            if not minute_cache:
                 return daily_price
             key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
             minute_rows = minute_cache.get(key)
@@ -2098,6 +2125,12 @@ class BacktestEngine:
 
             for asset_id, pos in positions.items():
                 high_price = float(matrix.high[time_id, asset_id])
+                # 当日新建仓位：close_t 收盘买入，当日 high 在买入前，不得并入峰值
+                # （否则止损线被抬到成本之上，盈利也记成 trailing_stop）；open_t+1
+                # 开盘成交，当日 high 在成交后，正常并入。
+                if (pos.get("entry_date") == date_text
+                        and config.entry_fill != "open_t+1"):
+                    continue
                 if _valid_price(high_price):
                     pos["max_high"] = max(float(pos["max_high"]), high_price)
             valid_closes = np.isfinite(matrix.close[time_id]) & (matrix.close[time_id] > 0)

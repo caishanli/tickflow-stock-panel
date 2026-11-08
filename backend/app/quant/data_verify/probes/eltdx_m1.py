@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -109,16 +109,27 @@ def _parse_time(raw: Any) -> datetime:
     return dt
 
 
-def parse_eltdx_bars(symbol: str, bars: list) -> pl.DataFrame:
+def parse_eltdx_bars(
+    symbol: str, bars: list, *, align_open: bool = False
+) -> pl.DataFrame:
     """``KlineBar`` 列表 → 标准分钟表（volume = ``volume_lots × 100`` 股）。
+
+    ``align_open=True``：把每个交易日的第一根 bar 左移一分钟，落到本地
+    ``kline_minute`` 的 09:30（该 bar 实际含 09:30 竞价与 09:31 两段成交，
+    与本地「09:30 bar = 竞价」口径最接近，且保证逐 bar 对齐不整体错位）。
 
     非法/缺字段的行丢弃；空输入返回空帧。
     """
     rows: list[tuple] = []
     estimated = False
+    seen_days: set[date] = set()
     for bar in bars or []:
         try:
             dt = _parse_time(_field(bar, "time"))
+            if align_open and dt.date() not in seen_days:
+                seen_days.add(dt.date())
+                # 当日首根（09:31）左移一分钟 → 09:30
+                dt = dt - timedelta(minutes=1)
             open_ = float(_field(bar, "open"))
             high = float(_field(bar, "high"))
             low = float(_field(bar, "low"))
@@ -155,6 +166,16 @@ def fetch_eltdx_m1(
 
     未安装 ``eltdx`` 时抛 ``ImportError``（调用方捕获后跳过该源）；网络错误由
     eltdx 自身异常冒泡。北交所/未知市场返回空帧（不触网）。
+
+    时间戳口径（2026-11-08 实测，勿改）：eltdx 两种标注都对不上本地
+    ``kline_minute`` 的「左端点 + 含 09:30 竞价 bar」：
+
+    - ``bar_time="start"``：09:31 起、15:00 止，共 240 根（缺 09:30 竞价 bar）；
+    - ``bar_time="end"``：09:32 起、15:01 止，共 240 根（整体右移一分钟）。
+
+    本地是 09:30..11:30 + 13:01..15:00 共 241 根。因此这里取 ``start``，
+    并把首根（09:31，实为 09:30+09:31 合并的早盘首分钟）左移一分钟落到
+    09:30——与本地「09:30 bar 含竞价量」的口径一致，其余 bar 不动。
     """
     vendor = _vendor(symbol)
     if vendor is None:
@@ -164,6 +185,8 @@ def fetch_eltdx_m1(
 
     with TdxClient(timeout=timeout) as client:
         series = client.bars.get(
-            vendor, period="1m", all_pages=all_pages, bar_time="end"
+            vendor, period="1m", all_pages=all_pages, bar_time="start"
         )
-    return parse_eltdx_bars(symbol, list(getattr(series, "bars", None) or []))
+    return parse_eltdx_bars(
+        symbol, list(getattr(series, "bars", None) or []), align_open=True
+    )

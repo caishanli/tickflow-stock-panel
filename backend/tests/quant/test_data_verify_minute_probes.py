@@ -28,6 +28,22 @@ from app.quant.data_verify.probes.tencent_m1 import (
 
 LIVE = os.environ.get("ASTOCK_LIVE") == "1"
 
+
+def _minute_frame(symbol: str, rows: list[tuple]) -> pl.DataFrame:
+    """``[(hour, minute, close, volume), ...]`` → 标准分钟帧（2026-11-06）。"""
+    return pl.DataFrame(
+        [
+            (symbol, datetime(2026, 11, 6, h, m), c, c, c, c, v, c * v)
+            for h, m, c, v in rows
+        ],
+        schema={
+            "symbol": pl.String, "datetime": pl.Datetime("us"),
+            "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
+            "close": pl.Float64, "volume": pl.Float64, "amount": pl.Float64,
+        },
+        orient="row",
+    )
+
 MINUTE_SCHEMA = {
     "symbol": pl.String,
     "datetime": pl.Datetime("us"),
@@ -120,6 +136,32 @@ def test_parse_eltdx_bars_lots_to_shares_naive_beijing():
     assert df["volume"][0] == 955500.0
     assert df["datetime"][0] == datetime(2026, 11, 6, 15, 0)
     assert df.schema["datetime"] == pl.Datetime("us")
+
+
+def test_parse_eltdx_bars_align_open_shifts_first_bar_of_day():
+    """eltdx ``bar_time="start"`` 是 09:31 起、15:00 止（240 根，缺 09:30）。
+
+    本地 ``kline_minute`` 是 09:30 起、241 根。``align_open=True`` 把每日首根
+    左移一分钟落到 09:30，保证逐 bar 比对不整体错位（2026-11-08 实测：
+    不左移时 close 逐项都对不上，因为全部晚一分钟）。
+    """
+    bars = [
+        _FakeBar("2026-11-06T09:31:00+08:00", 9.91, 9.95, 9.88, 9.88, 44821.0, 4.48e7),
+        _FakeBar("2026-11-06T09:32:00+08:00", 9.87, 9.90, 9.86, 9.89, 8639.0, 8.6e6),
+        # 下一交易日首根同样左移
+        _FakeBar("2026-11-09T09:31:00+08:00", 10.0, 10.1, 9.9, 10.05, 1000.0, 1e7),
+    ]
+    df = parse_eltdx_bars("600000.SH", bars, align_open=True)
+    times = df["datetime"].to_list()
+    assert times[0] == datetime(2026, 11, 6, 9, 30)
+    assert times[1] == datetime(2026, 11, 6, 9, 32)   # 非当日首根不动
+    assert times[2] == datetime(2026, 11, 9, 9, 30)
+
+
+def test_parse_eltdx_bars_without_align_keeps_raw():
+    bar = _FakeBar("2026-11-06T09:31:00+08:00", 9.91, 9.95, 9.88, 9.88, 44821.0, 4.48e7)
+    df = parse_eltdx_bars("600000.SH", [bar])
+    assert df["datetime"][0] == datetime(2026, 11, 6, 9, 31)
 
 
 def test_eltdx_available_sources_does_not_import_eltdx(monkeypatch):
@@ -598,3 +640,40 @@ def test_external_minute_blast_radius_is_cumulative_per_partition(tmp_path, monk
     )
     changed_symbols = got.filter(pl.col("close") == 10.5)["symbol"].unique().to_list()
     assert changed_symbols == [symbols[0]]
+
+
+def test_two_sources_agreeing_with_local_beat_one_outlier():
+    """2 个外源确认本地、1 个不一致 → 保留本地（不判冲突、不修）。
+
+    2026-11-08 实测：eltdx + tencent 与本地一致、sina 有偏差时，
+    旧逻辑把 group=[sina]、agree_local=[eltdx,tencent] 判成 conflict 隔离，
+    等于「少数派一票否决」。多数票必须比较两侧数量。
+    """
+    from app.quant.data_verify.runner import _resolve_replacement
+
+    local = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.0, 1000.0)])
+    agree_a = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.0, 1000.0)])
+    agree_b = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.0, 1000.0)])
+    outlier = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.5, 1000.0)])
+
+    replacement, decision = _resolve_replacement(
+        local, {"eltdx": agree_a, "tencent": agree_b, "sina": outlier}
+    )
+    assert replacement is None
+    assert decision["action"] == "keep_local"
+    assert decision["conflict"] is False
+    assert sorted(decision["local_sources"]) == ["eltdx", "tencent"]
+
+
+def test_single_outlier_against_single_local_agreement_still_quarantines():
+    """1 对 1（无多数）仍然隔离：多数票规则不能把「平票」当成本地正确。"""
+    from app.quant.data_verify.runner import _resolve_replacement
+
+    local = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.0, 1000.0)])
+    agree = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.0, 1000.0)])
+    outlier = _minute_frame("600000.SH", [(9, 30, 10.0, 1000.0), (9, 32, 10.5, 1000.0)])
+
+    replacement, decision = _resolve_replacement(local, {"tencent": agree, "sina": outlier})
+    assert replacement is None
+    assert decision["action"] == "quarantine"
+    assert decision["conflict"] is True

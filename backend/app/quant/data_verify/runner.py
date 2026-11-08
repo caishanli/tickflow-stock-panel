@@ -560,6 +560,13 @@ def _resolve_replacement(
     if local_nonfinite:
         decision["action"] = "quarantine"
         return None, decision
+    # 多数票要比较「外源簇」与「与本地一致的源数」，不是「有没有源同意本地」：
+    # 2 个源确认本地、1 个源不一致（2026-11-08 实测 eltdx+tencent vs sina）
+    # 说明本地是对的，应 keep_local，而不是判冲突隔离。
+    if len(agree_local) >= 2 and len(agree_local) > len(group):
+        decision["action"] = "keep_local"
+        decision["confirmed"] = True
+        return None, decision
     if len(group) >= 2:
         decision["action"] = "repair"
         decision["confirmed"] = True

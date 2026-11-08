@@ -2345,6 +2345,13 @@ def build_market_matrix_from_signals(
         trigger_mask = signals.exit != 0
         resolved_reference_price[trigger_mask] = trigger_reference[trigger_mask]
 
+    # 参考线必须取**信号日**（T 日已知）而不是成交日：成交日的均线含当日收盘，
+    # 用它做穿越判定就是前视（2026-07 案例：open_t+1 用成交日 ma5=11.0 判定，
+    # 而信号日 ma5=10.0 才无前视）。
+    if entry_delay_bars:
+        source_rows = np.where(entry_signal_time >= 0, entry_signal_time, 0)
+        resolved_reference_price = resolved_reference_price[source_rows, np.arange(market.shape[1])[None, :]]
+
     _make_read_only(
         entry,
         exit_,

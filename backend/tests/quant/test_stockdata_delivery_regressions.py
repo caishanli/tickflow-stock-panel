@@ -27,9 +27,22 @@ def write_partition(root, subdir, day, frame):
     temporary.replace(folder / "part.parquet")
 
 
+def _recent_weekday(today: dt.date | None = None) -> dt.date:
+    """最近的工作日（含今天）。
+
+    测试原来直接用 ``date.today()``：周末跑必然得到 False 的实时门
+    （``_in_trading_or_grace`` 要求 weekday<5），两个用例在周六/周日
+    无故变红。这里只把日期落到工作日，时间仍是盘中 10:05，语义不变。
+    """
+    day = today or dt.date.today()
+    while day.weekday() >= 5:
+        day -= dt.timedelta(days=1)
+    return day
+
+
 @pytest.fixture
 def delivery(tmp_path, monkeypatch):
-    now = dt.datetime.combine(dt.date.today(), dt.time(10, 5))
+    now = dt.datetime.combine(_recent_weekday(), dt.time(10, 5))
     monkeypatch.setattr(sources, "_now", lambda: now, raising=False)
     monkeypatch.setattr(sources, "_in_trading", lambda *_a, **_k: True)
     src = sources.DataSources(data_root=str(tmp_path), fetch_workers=1)

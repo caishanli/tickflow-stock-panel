@@ -248,15 +248,19 @@ def test_startup_backfill_gates_shortfall_by_window(tmp_path, monkeypatch):
     from app.services import etf_nav_service as _nav
     monkeypatch.setattr(_nav, "_partition_dates", lambda: [])
     monkeypatch.setattr(_nav, "_missing_etf_nav_days", lambda: [])
-    monkeypatch.setattr(ms, "sync_stock_minute", lambda limit=None: {"rows": 0, "query_failed": []})
-    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days: 0)
-    monkeypatch.setattr(ms, "sync_etf_minute", lambda day=None: 0)
-    monkeypatch.setattr(ms, "sync_index_daily", lambda d: {"written": 0})
-    monkeypatch.setattr(ms, "sync_adj_factor", lambda: {"rows": 0})
+    # 桩函数必须接受生产签名里的关键字参数（sync_stock_minute 有 only_missing_keys、
+    # sync_daily 有 create_only）：否则 TypeError 被 backfill 内部 except 吞掉，
+    # 缺口日静默不进 repaired，测试表现为「收盘后也没修」。
+    monkeypatch.setattr(ms, "sync_stock_minute",
+                        lambda limit=None, **kw: {"rows": 0, "query_failed": []})
+    monkeypatch.setattr(ms, "sync_stock_minute_range", lambda days, **kw: 0)
+    monkeypatch.setattr(ms, "sync_etf_minute", lambda day=None, **kw: 0)
+    monkeypatch.setattr(ms, "sync_index_daily", lambda d, **kw: {"written": 0})
+    monkeypatch.setattr(ms, "sync_adj_factor", lambda **kw: {"rows": 0})
 
     repaired = []
     monkeypatch.setattr(ms, "sync_daily",
-                        lambda d: repaired.append(d) or {"stock": 1, "etf": 1})
+                        lambda d, **kw: repaired.append(d) or {"stock": 1, "etf": 1})
 
     # 盘前/盘中窗口：不检测、不修复缺口日
     monkeypatch.setattr(ms, "_shortfall_repair_allowed",
