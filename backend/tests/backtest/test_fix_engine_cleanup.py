@@ -7,7 +7,7 @@
 - E5  全量模式 sharpe/sortino: 日收益序列补齐 [首次退出, 末次退出] 内全部
       交易日 (无退出日记 0), 稀疏退出不再因 ×sqrt(252) 年化虚高。
 - Task6 optimize/stream 补 minute_fill 门控 (Pro+ 权限 + 分钟K数据覆盖),
-      与 strategy/stream 共用 _check_minute_fill_guard, 失败走 _fail_job。
+      与 strategy/stream 共用 _check_minute_fill_guard, 失败走 _finish_job。
 """
 from __future__ import annotations
 
@@ -84,17 +84,7 @@ def _open_t1_config(**kw) -> MatcherConfig:
 
 
 def test_e4_sz_etf_minute_fill_uses_config_asset_type():
-    """组合模式现行口径 (matrix-native): heuristic 判定, 忽略 MatcherConfig.asset_type。
-
-    行为变更点 b6cf049 (matrix-native engine): simulate_portfolio 经
-    build_market_matrix → _simulate_portfolio_matrix (engine.py:1735-1747),
-    用旧启发式 ``etf if all(.SH+5开头) else stock`` 直定 asset_type,
-    不读 config.asset_type / _panel_ctx / _resolve_minute_asset_type。
-    159915.SZ 以 .SZ 结尾 → 必为 stock。f2070ae 时代 (legacy 直接撮合 +
-    _resolve) 才有“显式 etf 直达”语义, 现行热路径已无此语义, 测试向现行对齐。
-    Helper 本身的优先级契约见 test_e4_heuristic_fallback_warns /
-    test_e4_explicit_config_wins_over_panel_record (仍绿)。
-    """
+    """组合矩阵路径优先使用显式配置，深市 ETF 不得读股票分钟分区。"""
     panel = _panel([_SZ_ETF], days=3)
     repo = _RecMinuteRepo(_minute_df(_SZ_ETF, date(2024, 1, 2)))
     entries = _mask(panel, {(_SZ_ETF, 0)})
@@ -103,18 +93,11 @@ def test_e4_sz_etf_minute_fill_uses_config_asset_type():
     BacktestEngine(repo=repo).simulate_portfolio(
         panel, entries, exits, _open_t1_config(asset_type="etf"))
 
-    assert repo.seen_asset_types == ["stock"]
+    assert repo.seen_asset_types == ["etf"]
 
 
 def test_e4_full_mode_uses_config_asset_type():
-    """全量模式现行口径 (matrix-native): 硬编码 "stock", 忽略显式配置。
-
-    simulate_independent_candidates → _simulate_independent_matrix
-    (engine.py:748-755) 直接 ``get_minute_by_dates(..., "stock")``,
-    不调 _resolve_minute_asset_type。f2070ae 时代 legacy 路径才有
-    “显式 etf 必达”语义 (当时 _resolve 在 460 行附近被调用)。
-    现行热路径下显式 etf 也收到 stock, 测试向现行对齐。
-    """
+    """全量矩阵路径同样优先使用显式配置，不得硬编码股票分区。"""
     panel = _panel([_SZ_ETF], days=3)
     repo = _RecMinuteRepo(_minute_df(_SZ_ETF, date(2024, 1, 2)))
     entries = _mask(panel, {(_SZ_ETF, 0)})
@@ -123,20 +106,11 @@ def test_e4_full_mode_uses_config_asset_type():
     BacktestEngine(repo=repo).simulate_independent_candidates(
         panel, entries, exits, _open_t1_config(asset_type="etf"))
 
-    assert repo.seen_asset_types == ["stock"]
+    assert repo.seen_asset_types == ["etf"]
 
 
 def test_e4_asset_type_falls_back_to_load_panel_record():
-    """同线程 load_panel 记录现行口径 (matrix-native): 热路径忽略 _panel_ctx。
-
-    生产链路 strategy.py 现走 build_market_matrix →
-    simulate_market_matrix / simulate_independent_market_matrix,
-    均不读 engine._panel_ctx.asset_type (只 legacy 路径
-    simulate_portfolio_legacy:2278 / simulate_independent_candidates_legacy:1124
-    才调 _resolve_minute_asset_type 实现 配置>记录>启发式)。
-    故即使 _panel_ctx.asset_type="etf", 组合矩阵路径仍按启发式得 stock。
-    测试向现行对齐; _resolve 本身的回退契约由后两个单测覆盖。
-    """
+    """未显式配置时，矩阵路径回退到同线程 load_panel 记录的资产类型。"""
     panel = _panel([_SZ_ETF], days=3)
     repo = _RecMinuteRepo(_minute_df(_SZ_ETF, date(2024, 1, 2)))
     engine = BacktestEngine(repo=repo)
@@ -146,7 +120,20 @@ def test_e4_asset_type_falls_back_to_load_panel_record():
 
     engine.simulate_portfolio(panel, entries, exits, _open_t1_config())
 
-    assert repo.seen_asset_types == ["stock"]
+    assert repo.seen_asset_types == ["etf"]
+
+
+@pytest.mark.parametrize("method_name", ["simulate_portfolio", "simulate_independent_candidates"])
+def test_minute_fill_actual_data_gap_fails_closed(method_name):
+    panel = _panel([_SZ_ETF], days=3)
+    repo = _RecMinuteRepo(pl.DataFrame())
+    entries = _mask(panel, {(_SZ_ETF, 0)})
+    exits = _mask(panel, set())
+
+    with pytest.raises(ValueError, match="分钟K数据缺失"):
+        getattr(BacktestEngine(repo=repo), method_name)(
+            panel, entries, exits, _open_t1_config(asset_type="etf"),
+        )
 
 
 def test_e4_heuristic_fallback_warns(caplog):
@@ -230,14 +217,21 @@ def _clean_jobs():
 class _FakeRepo:
     """最小 repo: 只实现端点用到的日期探测方法。"""
 
-    def __init__(self, earliest_minute=None):
+    def __init__(self, earliest_minute=date(2020, 1, 1), latest_minute=date(2099, 1, 1)):
         self._earliest_minute = earliest_minute
+        self._latest_minute = latest_minute
+        self.seen_asset_types = []
 
     def earliest_daily_date(self):
         return date(2020, 1, 1)
 
-    def earliest_minute_date(self):
+    def earliest_minute_date(self, asset_type="stock"):
+        self.seen_asset_types.append(asset_type)
         return self._earliest_minute
+
+    def latest_minute_date_global(self, asset_type="stock"):
+        self.seen_asset_types.append(asset_type)
+        return self._latest_minute
 
 
 class _FakeCaps:
@@ -248,10 +242,14 @@ class _FakeCaps:
         return self._allowed
 
 
-def _make_app(caps: bool = True, earliest_minute=None) -> FastAPI:
+def _make_app(
+    caps: bool = True,
+    earliest_minute=date(2020, 1, 1),
+    latest_minute=date(2099, 1, 1),
+) -> FastAPI:
     app = FastAPI()
     app.include_router(api.router)
-    app.state.repo = _FakeRepo(earliest_minute)
+    app.state.repo = _FakeRepo(earliest_minute, latest_minute)
     # 预设 dummy engine, 避免 _get_engine 构造真 BacktestEngine
     app.state.backtest_engine = object()
     app.state.strategy_engine = object()
@@ -286,6 +284,47 @@ def test_optimize_minute_fill_data_not_covering_marks_job_done():
 
 
 def test_optimize_minute_fill_guard_passes_when_allowed():
-    """Task6: 权限具备且数据覆盖时门控放行 (guard 返回 None, 不误伤正常路径)。"""
+    """Task6: 权限具备且数据覆盖时门控放行，并按资产类型查询。"""
     req = type("Req", (), {"app": _make_app(caps=True, earliest_minute=date(2020, 1, 1))})()
-    assert api._check_minute_fill_guard(req, date(2025, 1, 1)) is None
+    assert api._check_minute_fill_guard(
+        req, date(2025, 1, 1), date(2025, 2, 1), "etf",
+    ) is None
+    assert req.app.state.repo.seen_asset_types == ["etf", "etf"]
+
+
+def test_strategy_run_minute_fill_without_data_returns_400(monkeypatch):
+    import app.backtest.worker as worker_mod
+
+    def fake_make_worker_task(kind, data_dir, config):
+        return {"kind": kind, "data_dir": str(data_dir), "config": config}
+
+    def fake_run_worker_task(task, progress_cb=None, cancel_event=None):
+        return {"ok": True}
+
+    monkeypatch.setattr(worker_mod, "make_worker_task", fake_make_worker_task)
+    monkeypatch.setattr(worker_mod, "run_worker_task", fake_run_worker_task)
+    client = TestClient(_make_app(caps=True, earliest_minute=None, latest_minute=None))
+    r = client.post("/api/backtest/strategy/run", json={
+        "strategy_id": "s1", "start": "2025-01-01", "end": "2025-02-01",
+        "minute_fill": True,
+    })
+    assert r.status_code == 400
+    assert "数据为空" in r.json()["detail"]
+
+
+def test_minute_fill_guard_rejects_no_data_and_end_gap():
+    no_data_req = type("Req", (), {"app": _make_app(
+        caps=True, earliest_minute=None, latest_minute=None,
+    )})()
+    error = api._check_minute_fill_guard(
+        no_data_req, date(2025, 1, 1), date(2025, 2, 1), "stock",
+    )
+    assert error is not None and "数据为空" in error
+
+    end_gap_req = type("Req", (), {"app": _make_app(
+        caps=True, earliest_minute=date(2020, 1, 1), latest_minute=date(2025, 1, 15),
+    )})()
+    error = api._check_minute_fill_guard(
+        end_gap_req, date(2025, 1, 1), date(2025, 2, 1), "stock",
+    )
+    assert error is not None and "最新到 2025-01-15" in error

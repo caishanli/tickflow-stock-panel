@@ -9,9 +9,9 @@
 - ``KlineBar.volume_lots`` 单位是**手**（A 股/基金），本地分钟分区存**股**，
   所以解析时 ×100；``amount`` 有就用，缺失才按 ``vol × typical`` 估算。
 
-时间戳：eltdx 默认 ``bar_time="start"``（通达信原始，左端标注），本地
-``kline_minute`` 是右端标注（09:30 首根、15:00 末根），所以取数时显式传
-``bar_time="end"``，否则整列会左移一分钟、逐 bar 比对全错。
+时间戳：取 ``bar_time="start"``，并把每日首根左移一分钟到 09:30，
+与本地 ``kline_minute`` 的 09:30..11:30 + 13:01..15:00 口径对齐；
+两种原始标注与本地口径的差异见 ``fetch_eltdx_m1``。
 """
 
 from __future__ import annotations

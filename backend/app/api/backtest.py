@@ -45,16 +45,18 @@ BACKTEST_SERVER_GUARD_MESSAGE = (
 )
 
 
-def _precheck_json(value: str | None, field: str) -> None:
+def _precheck_json(value: str | None, field: str, *, require_object: bool = False) -> None:
     """建 job 之前校验 JSON 参数；非法直接 400（不留下 pending job）。"""
     if not value:
         return
     try:
-        json.loads(value)
+        parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError) as exc:
         raise HTTPException(
             status_code=400, detail=f"{field} 不是合法 JSON: {exc}",
         ) from exc
+    if require_object and not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail=f"{field} 必须是 JSON 对象")
 
 
 def _parse_date_or_400(value: str | None, *, field: str) -> date | None:
@@ -96,6 +98,21 @@ def _guard_server_backtest_range(start: date, end: date):
     days = (end - start).days + 1
     if days > BACKTEST_MAX_SERVER_DAYS:
         raise HTTPException(status_code=400, detail=BACKTEST_SERVER_GUARD_MESSAGE)
+
+
+def _guard_backtest_symbols(symbols: list[str] | str | None) -> None:
+    if symbols is None:
+        return
+    count = (
+        len([item for item in symbols.split(",") if item.strip()])
+        if isinstance(symbols, str)
+        else len(symbols)
+    )
+    if count > BACKTEST_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"指定标的最多支持 {BACKTEST_MAX_SYMBOLS} 只，请缩小标的范围。",
+        )
 
 
 # ================================================================
@@ -401,7 +418,12 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
 
     end = req.end or date.today()
     start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
+    _guard_backtest_symbols(req.symbols)
     _guard_server_backtest_range(start, end)
+    if req.minute_fill:
+        guard_error = _check_minute_fill_guard(request, start, end, req.asset_type)
+        if guard_error is not None:
+            raise HTTPException(status_code=400, detail=guard_error)
 
     cfg = StrategyBacktestConfig(
         strategy_id=req.strategy_id,
@@ -554,8 +576,10 @@ async def strategy_stream(
 
     # params/overrides 必须在建 job 之前解析：非法 JSON 若拖到 SSE 里才发现，
     # 前端已拿到 job_key 却永远等不到结果（且 job 残留在表里）。
-    _precheck_json(params, "params")
-    _precheck_json(overrides, "overrides")
+    _precheck_json(params, "params", require_object=True)
+    _precheck_json(overrides, "overrides", require_object=True)
+    _guard_backtest_symbols(symbols)
+    _precheck_json(regime_filter, "regime_filter", require_object=True)
 
     # 服务端范围保护
     guard_violated = False
@@ -602,7 +626,7 @@ async def strategy_stream(
 
         # 分钟K精确回测: Pro+ 门控 + 数据范围检查（与 optimize/stream 同一实现）
         if minute_fill:
-            guard_error = _check_minute_fill_guard(request, start_date)
+            guard_error = _check_minute_fill_guard(request, start_date, end_date, asset_type)
             if guard_error is not None:
                 _finish_job(job, error=guard_error)
                 yield f"event: error\ndata: {json.dumps({'message': guard_error}, ensure_ascii=False)}\n\n"
@@ -854,13 +878,13 @@ def _opt_backtest_kwargs(
     }
 
 
-def _check_minute_fill_guard(request: Request, start_date: date) -> str | None:
-    """分钟K精确回测的统一门控：权限 + 本地分钟K覆盖。
-
-    返回 ``None`` 表示放行；否则返回用户可读的错误文案（调用方据此
-    ``_finish_job`` 并把消息推给前端）。strategy/stream 与 optimize/stream
-    共用这一处，避免两侧口径漂移（此前 optimize 侧完全没有检查）。
-    """
+def _check_minute_fill_guard(
+    request: Request,
+    start_date: date,
+    end_date: date,
+    asset_type: str = "stock",
+) -> str | None:
+    """分钟K精确回测门控：权限 + 对应资产在目标起止日内的数据覆盖。"""
     app_state = getattr(request, "app", None)
     state = getattr(app_state, "state", None)
     capset = getattr(state, "capabilities", None)
@@ -872,13 +896,24 @@ def _check_minute_fill_guard(request: Request, start_date: date) -> str | None:
     except Exception:  # noqa: BLE001 - 能力探测失败按无权限处理
         return "分钟K精确回测需要 Pro+ 权限 (kline.minute.batch)"
 
+    label = "ETF" if asset_type == "etf" else "股票"
     repo = getattr(state, "repo", None)
-    earliest_minute = None
-    if repo is not None and hasattr(repo, "earliest_minute_date"):
-        earliest_minute = repo.earliest_minute_date()
-    if earliest_minute is not None and start_date < earliest_minute:
-        return (f"本地分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
+    if (
+        repo is None
+        or not hasattr(repo, "earliest_minute_date")
+        or not hasattr(repo, "latest_minute_date_global")
+    ):
+        return f"无法确认本地{label}分钟K数据覆盖，不能执行分钟精确回测。"
+    earliest_minute = repo.earliest_minute_date(asset_type)
+    latest_minute = repo.latest_minute_date_global(asset_type)
+    if earliest_minute is None or latest_minute is None:
+        return f"本地{label}分钟K数据为空，无法执行分钟精确回测；请先同步分钟K数据。"
+    if start_date < earliest_minute:
+        return (f"本地{label}分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
                 f"请先用「扩展分钟K历史」功能拉取更多数据, 或缩小回测区间。")
+    if end_date > latest_minute:
+        return (f"本地{label}分钟K历史最新到 {latest_minute}, 无法覆盖回测结束日 {end_date}。"
+                f"请先同步分钟K数据, 或缩小回测区间。")
     return None
 
 
@@ -928,6 +963,10 @@ async def optimize_stream(
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
 
+    _precheck_json(params, "params", require_object=True)
+    _precheck_json(overrides, "overrides", require_object=True)
+    _guard_backtest_symbols(symbols)
+
     guard_violated = False
     if settings.backtest_range_guard and (end_date - start_date).days + 1 > BACKTEST_MAX_SERVER_DAYS:
         guard_violated = True
@@ -946,8 +985,8 @@ async def optimize_stream(
     job_key = _make_opt_job_key(
         strategy_id,
         symbols,
-        start,
-        end,
+        start_date.isoformat(),
+        end_date.isoformat(),
         param_grid,
         objective,
         direction,
@@ -980,7 +1019,7 @@ async def optimize_stream(
         # 分钟K精确回测：与 strategy/stream 同一门控（权限 + 数据覆盖）。
         # 失败必须 _finish_job，否则 job 永远 pending、SSE 空转。
         if minute_fill:
-            guard_error = _check_minute_fill_guard(request, start_date)
+            guard_error = _check_minute_fill_guard(request, start_date, end_date, asset_type)
             if guard_error is not None:
                 _finish_job(job, error=guard_error)
                 yield f"event: error\ndata: {json.dumps({'message': guard_error}, ensure_ascii=False)}\n\n"
@@ -1000,17 +1039,8 @@ async def optimize_stream(
             if grid is not None:
                 # 未扫描参数固定为用户当前值 (base_params); overrides 让策略的 basic_filter/
                 # 信号/风控按用户当前配置参与, 保证优化的就是用户实际回测的策略。
-                try:
-                    base_params = json.loads(params) if params else {}
-                except (json.JSONDecodeError, TypeError):
-                    # 静默降级会让"用户配置丢失"变成无声 bug: 至少 warn 供诊断 (前端应传合法 JSON)。
-                    logger.warning("optimize: params JSON 解析失败, 降级为空 params: %r", params)
-                    base_params = {}
-                try:
-                    ov = json.loads(overrides) if overrides else None
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("optimize: overrides JSON 解析失败, 降级为 None: %r", overrides)
-                    ov = None
+                base_params = json.loads(params) if params else {}
+                ov = json.loads(overrides) if overrides else None
                 ocfg = OptimizeConfig(
                     strategy_id=strategy_id,
                     symbols=[s.strip() for s in symbols.split(",") if s.strip()] if symbols else None,
@@ -1022,8 +1052,8 @@ async def optimize_stream(
                     # A8：用户传多大都不许超过绝对上限（99 路并发会打满机器）。
                     max_workers=max(1, min(int(max_workers), OPTIMIZE_MAX_WORKERS)),
                     matrix_cache_max_mb=int(matrix_cache_max_mb),
-                    base_params=base_params if isinstance(base_params, dict) else {},
-                    overrides=ov if isinstance(ov, dict) else None,
+                    base_params=base_params,
+                    overrides=ov,
                     backtest_kwargs=bt_kwargs,
                 )
 
@@ -1170,6 +1200,10 @@ async def walkforward_stream(
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=STRATEGY_DEFAULT_DAYS))
 
+    _precheck_json(params, "params", require_object=True)
+    _precheck_json(overrides, "overrides", require_object=True)
+    _guard_backtest_symbols(symbols)
+
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
@@ -1179,8 +1213,8 @@ async def walkforward_stream(
     job_key = _make_wf_job_key(
         strategy_id,
         symbols,
-        start,
-        end,
+        start_date.isoformat(),
+        end_date.isoformat(),
         param_grid,
         objective,
         direction,
@@ -1213,6 +1247,7 @@ async def walkforward_stream(
 
         if wf_guard_violated:
             msg = f"单折窗口最多 {BACKTEST_MAX_SERVER_DAYS} 天 (当前 train/test 更大), 请减小训练/测试窗口或在更大内存环境运行。"
+            _finish_job(job, error=msg)
             yield f"event: error\ndata: {json.dumps({'message': msg}, ensure_ascii=False)}\n\n"
             return
 
@@ -1228,17 +1263,8 @@ async def walkforward_stream(
                 grid = None
 
             if grid is not None:
-                try:
-                    base_params = json.loads(params) if params else {}
-                except (json.JSONDecodeError, TypeError):
-                    # 静默降级会让"用户配置丢失"变成无声 bug: 至少 warn 供诊断 (前端应传合法 JSON)。
-                    logger.warning("walkforward: params JSON 解析失败, 降级为空 params: %r", params)
-                    base_params = {}
-                try:
-                    ov = json.loads(overrides) if overrides else None
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("walkforward: overrides JSON 解析失败, 降级为 None: %r", overrides)
-                    ov = None
+                base_params = json.loads(params) if params else {}
+                ov = json.loads(overrides) if overrides else None
                 wf_cfg = WalkForwardConfig(
                     strategy_id=strategy_id,
                     symbols=[s.strip() for s in symbols.split(",") if s.strip()] if symbols else None,
@@ -1252,8 +1278,8 @@ async def walkforward_stream(
                     step_days=int(step_days),
                     # A8：用户传多大都不许超过绝对上限（99 路并发会打满机器）。
                     max_workers=max(1, min(int(max_workers), OPTIMIZE_MAX_WORKERS)),
-                    base_params=base_params if isinstance(base_params, dict) else {},
-                    overrides=ov if isinstance(ov, dict) else None,
+                    base_params=base_params,
+                    overrides=ov,
                     backtest_kwargs=bt_kwargs,
                     matrix_cache_max_mb=int(matrix_cache_max_mb),
                 )

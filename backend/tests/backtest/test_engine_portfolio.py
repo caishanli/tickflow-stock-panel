@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 import polars as pl
+import pytest
 
 from app.backtest.engine import BacktestEngine, MatcherConfig
 
@@ -440,27 +441,30 @@ def _minute_trigger_panel() -> tuple[pl.DataFrame, pl.Series, pl.Series]:
             ("A", 3): {"open": 8.8, "high": 9.0, "low": 8.7, "close": 8.9},
         },
     ).with_columns([
-        pl.Series("ma20", [10.0, 10.0, 9.95, 9.9]),
+        # 首日参考线刻意不同于卖出触发线，防止买入延迟覆盖卖出参考价。
+        pl.Series("ma20", [20.0, 10.0, 9.95, 9.9]),
         pl.Series("signal_ma20_breakdown", [False, False, True, False]),
     ])
     return panel, _mask(panel, {("A", 0)}), _mask(panel, {("A", 2)})
 
 
-def test_minute_signal_exit_fills_at_next_minute_open():
+@pytest.mark.parametrize("entry_fill", ["open_t+1", "close_t"])
+def test_minute_signal_exit_fills_at_next_minute_open(entry_fill):
     panel, entries, exits = _minute_trigger_panel()
     minute = pl.DataFrame({
-        "symbol": ["A", "A", "A"],
+        "symbol": ["A"] * 4,
         "datetime": [
+            datetime(2024, 1, 2, 9, 31),
             datetime(2024, 1, 3, 9, 31),
             datetime(2024, 1, 3, 9, 32),
             datetime(2024, 1, 3, 9, 33),
         ],
-        "open": [10.2, 10.1, 9.7],
-        "high": [10.3, 10.2, 9.8],
-        "low": [10.1, 9.8, 9.6],
-        "close": [10.2, 9.9, 9.7],
-        "volume": [100.0, 100.0, 100.0],
-        "amount": [1020.0, 990.0, 970.0],
+        "open": [10.0, 10.2, 10.1, 9.7],
+        "high": [10.2, 10.3, 10.2, 9.8],
+        "low": [9.9, 10.1, 9.8, 9.6],
+        "close": [10.1, 10.2, 9.9, 9.7],
+        "volume": [100.0] * 4,
+        "amount": [1010.0, 1020.0, 990.0, 970.0],
     })
 
     result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(
@@ -468,7 +472,7 @@ def test_minute_signal_exit_fills_at_next_minute_open():
         entries,
         exits,
         MatcherConfig(
-            entry_fill="open_t+1",
+            entry_fill=entry_fill,
             exit_fill="signal_next_minute",
             minute_fill=True,
             fees_pct=0,
@@ -488,14 +492,14 @@ def test_minute_signal_exit_fills_at_next_minute_open():
 def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
     panel, entries, exits = _minute_trigger_panel()
     minute = pl.DataFrame({
-        "symbol": ["A"],
-        "datetime": [datetime(2024, 1, 3, 15, 0)],
-        "open": [9.9],
-        "high": [10.0],
-        "low": [8.9],
-        "close": [9.0],
-        "volume": [100.0],
-        "amount": [900.0],
+        "symbol": ["A", "A"],
+        "datetime": [datetime(2024, 1, 2, 9, 31), datetime(2024, 1, 3, 15, 0)],
+        "open": [10.0, 9.9],
+        "high": [10.2, 10.0],
+        "low": [9.9, 8.9],
+        "close": [10.1, 9.0],
+        "volume": [100.0, 100.0],
+        "amount": [1010.0, 900.0],
     })
 
     result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(

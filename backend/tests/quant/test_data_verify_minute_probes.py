@@ -677,3 +677,26 @@ def test_single_outlier_against_single_local_agreement_still_quarantines():
     assert replacement is None
     assert decision["action"] == "quarantine"
     assert decision["conflict"] is True
+
+
+def test_tied_local_and_external_clusters_still_quarantines():
+    """2 对 2 平票同样没有多数，不得把外部簇直接写入本地。"""
+    from app.quant.data_verify.runner import _resolve_replacement
+
+    local = _minute_frame("600000.SH", [(9, 32, 10.0, 1000.0)])
+    agree_a = _minute_frame("600000.SH", [(9, 32, 10.0, 1000.0)])
+    agree_b = _minute_frame("600000.SH", [(9, 32, 10.0, 1000.0)])
+    alternate_a = _minute_frame("600000.SH", [(9, 32, 10.5, 1000.0)])
+    alternate_b = _minute_frame("600000.SH", [(9, 32, 10.5, 1000.0)])
+
+    replacement, decision = _resolve_replacement(local, {
+        "eltdx": agree_a,
+        "tencent": agree_b,
+        "sina": alternate_a,
+        "baostock": alternate_b,
+    })
+
+    assert replacement is None
+    assert decision["action"] == "quarantine"
+    assert decision["confirmed"] is False
+    assert decision["conflict"] is True

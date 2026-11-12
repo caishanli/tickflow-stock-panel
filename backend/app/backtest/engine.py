@@ -69,8 +69,8 @@ class MatcherConfig:
     score_max: float | None = None
     initial_capital: float = 1_000_000.0
     position_sizing: Literal["equal", "score_weight"] = "equal"
-    # 分钟K精确成交: 仅对 open_t+1 成交腿生效 —— T 日信号确认后, T+1 日用分钟K优化
-    # (参考线取 T 日已知均线值 → 穿越价, 无参考线 → VWAP; 数据缺失时降级为日K口径)。
+    # 分钟K精确成交: open_t+1 成交腿用分钟K优化, signal_next_minute 卖出腿用分钟触发
+    # (参考线取 T 日已知均线值 → 穿越价, 无参考线 → VWAP; 实际成交数据缺失时 fail-closed)。
     # close_t 腿本质前视 (信号 15:00 才确认, 分钟优化却按 9:30 后的价格成交), 无法精确,
     # 开启后 close_t 腿自动降级为日K收盘价并 logger.warning 一次。
     minute_fill: bool = False
@@ -746,13 +746,22 @@ class BacktestEngine:
         }
 
         minute_cache: dict = {}
-        if config.minute_fill:
+        _needs_minute = config.minute_fill and (
+            config.entry_fill == "open_t+1"
+            or config.exit_fill in ("open_t+1", "signal_next_minute")
+        )
+        if _needs_minute:
             trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
             dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if dates and symbols:
-                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, "stock")
+                asset_type = self._resolve_minute_asset_type(config, symbols)
+                loaded = self._load_minute_for_fills(
+                    self.repo, list(symbols), dates, asset_type,
+                )
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
+
+        _minute_warned = [False]
 
         def _count(key: str) -> None:
             execution_stats[key] = execution_stats.get(key, 0) + 1
@@ -773,11 +782,20 @@ class BacktestEngine:
             return matrix.timestamp_labels[signal_time][:10] if signal_time >= 0 else fallback
 
         def _refill(time_id: int, asset_id: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return daily_price
-            rows = minute_cache.get((matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]))
-            if rows is None:
+            fill = config.entry_fill if side == "buy" else config.exit_fill
+            if fill != "open_t+1":
+                if not _minute_warned[0]:
+                    _minute_warned[0] = True
+                    logger.warning(
+                        "minute_fill 仅对 open_t+1 成交口径生效; %s腿为 close_t, 降级为日K收盘价",
+                        "买入" if side == "buy" else "卖出",
+                    )
                 return daily_price
+            rows = self._required_minute_rows(
+                minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10],
+            )
             reference = float(matrix.reference_price[time_id, asset_id])
             precise = self._resolve_minute_fill(
                 rows, reference if _valid_price(reference) else None, side,
@@ -785,11 +803,11 @@ class BacktestEngine:
             return precise if precise is not None else daily_price
 
         def _minute_trigger_price(time_id: int, asset_id: int) -> float | None:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return None
-            rows = minute_cache.get((matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]))
-            if rows is None:
-                return None
+            rows = self._required_minute_rows(
+                minute_cache, matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10],
+            )
             reference = float(matrix.reference_price[time_id, asset_id])
             return self._resolve_minute_exit_trigger(
                 rows,
@@ -1152,13 +1170,9 @@ class BacktestEngine:
                         "买入" if side == "buy" else "卖出",
                     )
                 return daily_price
-            if not minute_cache:
-                return daily_price
             _sym = str(panel_symbols[idx])
             _d = self._date_str(panel_dates[idx])
-            _marr = minute_cache.get((_sym, _d))
-            if _marr is None:
-                return daily_price
+            _marr = self._required_minute_rows(minute_cache, _sym, _d)
             # 参考线: 取前一交易日的均线值 (当日 ma 含当日收盘, 15:00 才确定,
             # 盘中穿越判断用它 = 未来函数); 跨标的边界无前一行 → None (走 VWAP)。
             _ref = None
@@ -1583,7 +1597,7 @@ class BacktestEngine:
 
         历史实现用前 5 个触发标的代码形态猜 ("5 开头 .SH 即 etf"), 深市 ETF
         (159915.SZ) 与混合组合必猜错 → get_minute_by_dates 读错分区目录,
-        分钟K静默 miss 降级日K。MatcherConfig.asset_type 由配置显式传入优先;
+        分钟K miss 导致回测失败。MatcherConfig.asset_type 由配置显式传入优先;
         未传入时回退到同线程 load_panel 的记录 (panel 与分钟K分区同源, 不会猜错);
         再不行才走原启发式并 logger.warning (只兜底, 不再静默)。
         """
@@ -1598,10 +1612,20 @@ class BacktestEngine:
         ) else "stock"
         logger.warning(
             "minute_fill asset_type 未显式指定, 按标的代码形态猜测为 %s; "
-            "猜错将读不到分钟K并静默降级日K, 建议在回测配置中显式传 asset_type",
+            "猜错将无法通过分钟数据覆盖检查, 建议在回测配置中显式传 asset_type",
             guess,
         )
         return guess
+
+    @staticmethod
+    def _required_minute_rows(minute_cache: dict, symbol: str, day: str) -> np.ndarray:
+        rows = minute_cache.get((symbol, day))
+        if rows is None:
+            raise ValueError(
+                f"分钟K数据缺失: {symbol} {day}；无法执行分钟精确回测，"
+                "请补齐数据或关闭分钟精确回测",
+            )
+        return rows
 
     @staticmethod
     def _load_minute_for_fills(
@@ -1741,17 +1765,16 @@ class BacktestEngine:
         minute_cache: dict = {}
         # 只有 open_t+1 腿才真正使用分钟K。close_t + minute_fill 在 _refill_price 里
         # 降级为日K收盘价（前视不可修正），这里不必读盘。
-        _needs_minute = config.minute_fill and "open_t+1" in (
-            config.entry_fill, config.exit_fill)
+        _needs_minute = config.minute_fill and (
+            config.entry_fill == "open_t+1"
+            or config.exit_fill in ("open_t+1", "signal_next_minute")
+        )
         if _needs_minute:
             trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
             trigger_dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             trigger_symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if trigger_dates and trigger_symbols:
-                asset_type = "etf" if all(
-                    symbol.endswith(".SH") and symbol.startswith("5")
-                    for symbol in list(trigger_symbols)[:5]
-                ) else "stock"
+                asset_type = self._resolve_minute_asset_type(config, trigger_symbols)
                 loaded = self._load_minute_for_fills(
                     self.repo, list(trigger_symbols), trigger_dates, asset_type,
                 )
@@ -1795,12 +1818,8 @@ class BacktestEngine:
                         "买入" if side == "buy" else "卖出",
                     )
                 return daily_price
-            if not minute_cache:
-                return daily_price
             key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
-            minute_rows = minute_cache.get(key)
-            if minute_rows is None:
-                return daily_price
+            minute_rows = self._required_minute_rows(minute_cache, *key)
             reference = float(matrix.reference_price[time_id, asset_id])
             precise = self._resolve_minute_fill(
                 minute_rows,
@@ -1810,12 +1829,10 @@ class BacktestEngine:
             return precise if precise is not None else daily_price
 
         def _minute_trigger_price(time_id: int, asset_id: int) -> float | None:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return None
             key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
-            minute_rows = minute_cache.get(key)
-            if minute_rows is None:
-                return None
+            minute_rows = self._required_minute_rows(minute_cache, *key)
             reference = float(matrix.reference_price[time_id, asset_id])
             return self._resolve_minute_exit_trigger(
                 minute_rows,
@@ -2319,7 +2336,7 @@ class BacktestEngine:
         _minute_warned = [False]  # close_t + minute_fill 降级 warning 每次回测只发一次
 
         def _refill_price(idx: int, side: str, daily_price: float) -> float:
-            """分钟K精确成交价 (仅 open_t+1 腿); close_t 腿/无数据则降级为 daily_price。"""
+            """分钟K精确成交价 (仅 open_t+1 腿); close_t 腿降级，实际数据缺失则报错。"""
             if not config.minute_fill:
                 return daily_price
             fill = config.entry_fill if side == "buy" else config.exit_fill
@@ -2333,13 +2350,9 @@ class BacktestEngine:
                         "买入" if side == "buy" else "卖出",
                     )
                 return daily_price
-            if not minute_cache:
-                return daily_price
             sym = str(panel_symbols[idx])
             d_str = self._date_str(panel_dates[idx])
-            marr = minute_cache.get((sym, d_str))
-            if marr is None:
-                return daily_price
+            marr = self._required_minute_rows(minute_cache, sym, d_str)
             # 参考线: 取前一交易日的均线值 (当日 ma 含当日收盘, 15:00 才确定,
             # 盘中穿越判断用它 = 未来函数); 跨标的边界无前一行 → None (走 VWAP)。
             ref = None

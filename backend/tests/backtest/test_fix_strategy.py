@@ -89,15 +89,23 @@ def _panel() -> pl.DataFrame:
     ]).sort(["symbol", "date"])
 
 
-def _run(overrides: dict | None, strategy: StrategyDef | None = None):
+def _run(overrides: dict | None, strategy: StrategyDef | None = None, **config_kwargs):
     engine = _EngineStub(_panel())
     svc = StrategyBacktestService(engine=engine, strategy_engine=_StrategyEngineStub(strategy or _strategy()))
     start = date(2024, 1, 1)
     result = svc.run(StrategyBacktestConfig(
         strategy_id="test", symbols=None, start=start, end=start + timedelta(days=2),
-        matching="close_t", mode="position", overrides=overrides,
+        matching="close_t", mode="position", overrides=overrides, **config_kwargs,
     ))
     return result, engine
+
+
+def test_asset_type_reaches_matcher_config():
+    strategy = _strategy()
+    strategy.meta["asset_types"] = ["stock", "etf"]
+    result, engine = _run(None, strategy, asset_type="etf")
+    assert result.error is None
+    assert engine.matcher_config.asset_type == "etf"
 
 
 # ── A3: 风控 override 统一语义 ──────────────────────────────────

@@ -1840,12 +1840,13 @@ class KlineRepository:
             pass
         return None
 
-    def latest_minute_date_global(self) -> date | None:
-        """全市场最近分钟K日期 (不分 symbol)。用于非交易日回退到上一交易日。"""
+    def latest_minute_date_global(self, asset_type: str = "stock") -> date | None:
+        """全市场最近分钟K日期 (不分 symbol)。用于非交易日回退与覆盖检查。"""
+        table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
         try:
             with self._lock:
                 row = self.db.execute(
-                    "SELECT max(CAST(datetime AS DATE)) FROM kline_minute",
+                    f"SELECT max(CAST(datetime AS DATE)) FROM {table}",
                 ).fetchone()
             if row and row[0]:
                 return row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0]))
@@ -1866,12 +1867,13 @@ class KlineRepository:
             return None
         return None
 
-    def earliest_minute_date(self) -> date | None:
-        """本地分钟K数据的最早日期。"""
+    def earliest_minute_date(self, asset_type: str = "stock") -> date | None:
+        """本地分钟K数据的最早日期，按资产类型区分分区。"""
+        table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
         try:
             with self._lock:
                 res = self.db.execute(
-                    "SELECT min(CAST(datetime AS DATE)) FROM kline_minute",
+                    f"SELECT min(CAST(datetime AS DATE)) FROM {table}",
                 ).fetchone()
             if res and res[0]:
                 d = res[0]

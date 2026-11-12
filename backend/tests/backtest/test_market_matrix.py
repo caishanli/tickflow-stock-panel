@@ -108,6 +108,30 @@ def test_open_t_plus_one_keeps_legacy_next_asset_bar_semantics():
     assert matrix.entry_signal_time[2, 0] == 0
 
 
+def test_delayed_fill_references_use_their_own_signal_rows():
+    panel = pl.DataFrame([
+        _row("A", 0, 10, signal_entry=True),
+        _row("A", 1, 10),
+        _row("A", 2, 10, signal_exit=True),
+        _row("A", 3, 10),
+    ]).with_columns(pl.Series("ma5", [9.0, 10.0, 11.0, 12.0]))
+    matrix = build_market_matrix(
+        panel,
+        panel["signal_entry"],
+        panel["signal_exit"],
+        entry_delay_bars=1,
+        exit_delay_bars=1,
+        entry_signal_ids=["signal_entry"],
+        exit_signal_ids=["signal_exit"],
+    )
+
+    assert matrix.entry_signal_time[1, 0] == 0
+    assert matrix.exit_signal_time[3, 0] == 2
+    assert matrix.reference_price[1, 0] == 9.0
+    assert matrix.reference_price[2, 0] == 11.0
+    assert matrix.reference_price[3, 0] == 11.0
+
+
 def test_matrix_matcher_matches_legacy_trade_records_and_equity():
     rows = []
     for symbol, score in (("A", 90), ("B", 80), ("C", 70)):

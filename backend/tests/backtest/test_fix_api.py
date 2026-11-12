@@ -47,11 +47,18 @@ def _clean_jobs():
 class _FakeRepo:
     """最小 repo: 只实现端点用到的日期探测方法。"""
 
+    def __init__(self, earliest_minute=date(2020, 1, 1), latest_minute=date(2099, 1, 1)):
+        self._earliest_minute = earliest_minute
+        self._latest_minute = latest_minute
+
     def earliest_daily_date(self):
         return date(2020, 1, 1)
 
-    def earliest_minute_date(self):
-        return None
+    def earliest_minute_date(self, asset_type="stock"):
+        return self._earliest_minute
+
+    def latest_minute_date_global(self, asset_type="stock"):
+        return self._latest_minute
 
 
 class _FakeCaps:
@@ -234,6 +241,27 @@ def test_cancel_resolves_dates_like_stream(monkeypatch):
     assert r["ok"] is True
 
 
+def test_optimize_and_walkforward_keys_use_resolved_dates():
+    app = _make_app()
+    today = date.today().isoformat()
+    for end in (None, today):
+        resp = asyncio.run(api.optimize_stream(
+            _stream_request(app), strategy_id="s1", param_grid='{"p": [1]}',
+            start="2025-01-01", end=end, **_STREAM_DEFAULTS,
+        ))
+        del resp
+    assert len(_running_jobs) == 1
+
+    _running_jobs.clear()
+    for end in (None, today):
+        resp = asyncio.run(api.walkforward_stream(
+            _stream_request(app), strategy_id="s1", param_grid='{"p": [1]}',
+            start="2025-01-01", end=end,
+        ))
+        del resp
+    assert len(_running_jobs) == 1
+
+
 def test_cancel_tolerates_empty_numeric_params():
     """#8: cancel 侧 float("") 不得抛 ValueError (修复前 500)。"""
     app = _make_app()
@@ -308,6 +336,31 @@ def test_optimize_guard_failure_marks_job_done(monkeypatch):
     assert job.error == api.BACKTEST_SERVER_GUARD_MESSAGE
 
 
+def test_walkforward_guard_failure_marks_job_done_and_reconnect_safe(monkeypatch):
+    monkeypatch.setattr(api.settings, "backtest_range_guard", True)
+    client = TestClient(_make_app())
+    params = {
+        "strategy_id": "s1", "param_grid": '{"p": [1, 2]}',
+        "start": "2020-01-01", "end": "2026-01-01", "train_days": 300,
+    }
+
+    r = client.get("/api/backtest/walkforward/stream", params=params)
+    assert r.status_code == 200
+    assert "event: error" in r.text
+    job = next(iter(_running_jobs.values()))
+    assert job.done is True
+    assert "单折窗口最多" in job.error
+    assert job.finish_ts > 0
+
+    r2 = client.get("/api/backtest/walkforward/stream", params=params)
+    assert "event: error" in r2.text
+    assert len(_running_jobs) == 1
+
+    job.finish_ts -= api._JOB_TTL + 1
+    api._cleanup_stale_jobs()
+    assert not _running_jobs
+
+
 # ---------------------------------------------------------------- #8 非法输入 4xx
 
 def test_invalid_date_returns_400():
@@ -328,6 +381,17 @@ def test_invalid_params_json_returns_400_before_stream():
     })
     assert r.status_code == 400
     assert not _running_jobs
+
+
+def test_invalid_regime_filter_json_returns_400_before_stream():
+    client = TestClient(_make_app())
+    for value in ("{invalid", "[]"):
+        r = client.get("/api/backtest/strategy/stream", params={
+            "strategy_id": "s1", "start": "2025-01-01", "end": "2025-02-01",
+            "regime_filter": value,
+        })
+        assert r.status_code == 400
+        assert not _running_jobs
 
 
 # ---------------------------------------------------------------- #7 参数校验
@@ -471,3 +535,69 @@ def test_optimize_uses_semaphore_and_clamps_max_workers(monkeypatch):
     assert bt["entry_fill"] == "close_t"
     assert bt["asset_type"] == "etf"
     assert bt["minute_fill"] is True
+
+
+@pytest.mark.parametrize("endpoint", ["optimize", "walkforward"])
+@pytest.mark.parametrize("field", ["params", "overrides"])
+def test_optimizer_json_objects_are_checked_before_stream(monkeypatch, endpoint, field):
+    import app.backtest.worker as worker_mod
+
+    def fake_make_worker_task(kind, data_dir, config):
+        return {"kind": kind, "data_dir": str(data_dir), "config": config}
+
+    def fake_run_worker_task(task, progress_cb=None, cancel_event=None):
+        return {"best_params": {"p": 1}, "results": [], "folds": []}
+
+    monkeypatch.setattr(worker_mod, "make_worker_task", fake_make_worker_task)
+    monkeypatch.setattr(worker_mod, "run_worker_task", fake_run_worker_task)
+    client = TestClient(_make_app())
+    for value in ("{invalid", "[]"):
+        r = client.get(f"/api/backtest/{endpoint}/stream", params={
+            "strategy_id": "s1", "param_grid": '{"p": [1]}',
+            "start": "2025-01-01", "end": "2025-02-01", field: value,
+        })
+        assert r.status_code == 400
+        assert not _running_jobs
+
+
+@pytest.mark.parametrize("field", ["params", "overrides", "regime_filter"])
+def test_strategy_stream_rejects_non_object_json(field):
+    client = TestClient(_make_app())
+    r = client.get("/api/backtest/strategy/stream", params={
+        "strategy_id": "s1", "start": "2025-01-01", "end": "2025-02-01",
+        field: "[]",
+    })
+    assert r.status_code == 400
+    assert not _running_jobs
+
+
+def test_symbol_cap_applies_to_all_strategy_jobs(monkeypatch):
+    import app.backtest.worker as worker_mod
+
+    def fake_make_worker_task(kind, data_dir, config):
+        return {"kind": kind, "data_dir": str(data_dir), "config": config}
+
+    def fake_run_worker_task(task, progress_cb=None, cancel_event=None):
+        return {"ok": True, "best_params": {"p": 1}, "results": [], "folds": []}
+
+    monkeypatch.setattr(worker_mod, "make_worker_task", fake_make_worker_task)
+    monkeypatch.setattr(worker_mod, "run_worker_task", fake_run_worker_task)
+    client = TestClient(_make_app())
+    symbols = [f"{600000 + i}.SH" for i in range(BACKTEST_MAX_SYMBOLS + 1)]
+    r = client.post("/api/backtest/strategy/run", json={
+        "strategy_id": "s1", "symbols": symbols,
+        "start": "2025-01-01", "end": "2025-02-01",
+    })
+    assert r.status_code == 400
+
+    encoded_symbols = ",".join(symbols)
+    for endpoint in ("strategy", "optimize", "walkforward"):
+        params = {
+            "strategy_id": "s1", "symbols": encoded_symbols,
+            "start": "2025-01-01", "end": "2025-02-01",
+        }
+        if endpoint != "strategy":
+            params["param_grid"] = '{"p": [1]}'
+        r = client.get(f"/api/backtest/{endpoint}/stream", params=params)
+        assert r.status_code == 400, endpoint
+        assert not _running_jobs

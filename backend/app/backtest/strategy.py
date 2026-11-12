@@ -1234,6 +1234,7 @@ class StrategyBacktestService:
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
             minute_fill=config.minute_fill,
+            asset_type=config.asset_type,
         )
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]

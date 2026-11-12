@@ -567,7 +567,8 @@ def _resolve_replacement(
         decision["action"] = "keep_local"
         decision["confirmed"] = True
         return None, decision
-    if len(group) >= 2:
+    # 外部簇也必须严格多于支持本地的来源；平票属于无多数，不能修复。
+    if len(group) >= 2 and len(group) > len(agree_local):
         decision["action"] = "repair"
         decision["confirmed"] = True
     elif len(group) == 1 and not agree_local and len(usable) == 1:
