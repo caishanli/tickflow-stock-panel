@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import ReactECharts from 'echarts-for-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
@@ -188,11 +189,29 @@ function computeHoldDays(trades: any[], tradeDays: string[]): Map<number, { hold
 
 export function QuantSim() {
   const qc = useQueryClient()
-  const [view, setView] = useState<'list' | 'detail'>('list')
-  const [sel, setSel] = useState<string | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const sel = searchParams.get('id')?.trim() || null
+  const view: 'list' | 'detail' = sel ? 'detail' : 'list'
   const [dialog, setDialog] = useState(false)
 
-  const { data: accounts } = useQuery({
+  const openDetail = useCallback((id: string) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('id', id)
+      return next
+    })
+  }, [setSearchParams])
+
+  const closeDetail = useCallback((replace = false) => {
+    setSearchParams((prev) => {
+      if (!prev.has('id')) return prev
+      const next = new URLSearchParams(prev)
+      next.delete('id')
+      return next
+    }, { replace })
+  }, [setSearchParams])
+
+  const { data: accounts, isSuccess: accountsLoaded } = useQuery({
     queryKey: ['quant', 'sim', 'accounts'], queryFn: api.listAccounts,
     refetchInterval: view === 'list' ? 5000 : false,
     // 列表页做监控台用：后台标签页/窗口失焦也要继续拉取，回到页面立即刷新，
@@ -201,6 +220,13 @@ export function QuantSim() {
     refetchIntervalInBackground: true,
     refetchOnWindowFocus: true,
   })
+
+  useEffect(() => {
+    if (sel && accountsLoaded && !accounts?.some((a: any) => a.id === sel)) {
+      closeDetail(true)
+    }
+  }, [sel, accountsLoaded, accounts, closeDetail])
+
   const { data: strategies } = useQuery({ queryKey: ['quant', 'strategies'], queryFn: api.listStrategies })
   const strategyName = useMemo(() => {
     const m = new Map<string, string>()
@@ -223,14 +249,15 @@ export function QuantSim() {
   const resetMut = useMutation({ mutationFn: () => api.resetAccount(sel!), onSuccess: invalidate })
   const deleteMut = useMutation({
     mutationFn: (id: string) => api.deleteAccount(id),
-    onSuccess: () => { setView('list'); setSel(null); invalidate() },
+    onSuccess: (_data, deletedId) => {
+      if (deletedId === sel) closeDetail(true)
+      invalidate()
+    },
   })
   const createMut = useMutation({
     mutationFn: (b: AccountForm) => api.createAccount(b),
     onSuccess: () => { setDialog(false); invalidate() },
   })
-
-  const openDetail = (id: string) => { setSel(id); setView('detail') }
 
   return (
     <div className="flex flex-col h-full">
@@ -251,9 +278,10 @@ export function QuantSim() {
         />
       ) : (
         <SimDetail
+          key={sel!}
           aid={sel!}
           strategyName={strategyName}
-          onBack={() => setView('list')}
+          onBack={() => closeDetail()}
           startMut={startMut}
           pauseMut={pauseMut}
           resetMut={resetMut}
